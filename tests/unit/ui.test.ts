@@ -13,6 +13,10 @@
  *  3. SSE: a state change updates an already-rendered card, and the FIRST-FRAME
  *     contract renders the full current state before any change happens.
  *
+ * Plus the mount path: the bundle registers its page through the host's `slots`
+ * service (a fake slots service records the registration), and claims no
+ * `document.body` mount point of its own.
+ *
  * Two seams make this testable in jsdom, where `EventSource` does not exist:
  * `eventSourceFactory` (a controllable fake) and `codeLifetimeMs` (the transient
  * display window). Both default to production behaviour.
@@ -24,9 +28,11 @@
 import { describe, expect, it, afterEach, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createElement } from 'react'
-import type { ComponentProps } from 'react'
+import type { ComponentProps, ComponentType } from 'react'
 import type { EventSourceLike } from '../../ui/src/types'
 import { App } from '../../ui/src/App'
+import { inject, apply, SETTINGS_NAMESPACE, SETTINGS_SLOT } from '../../ui/src/main'
+import type { SlotRegistration, SlotsService } from '../../ui/src/main'
 
 afterEach(() => {
   cleanup()
@@ -436,6 +442,84 @@ describe('sse driven state', () => {
     await waitFor(() => {
       expect(screen.queryByText('135790')).toBeNull()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Mount path: registration through the host's slots service
+// ---------------------------------------------------------------------------
+
+/** Records what the bundle registers, in the shape the reference pattern uses. */
+class FakeSlots implements SlotsService {
+  readonly injected: string[] = []
+  readonly registrations: Array<{ options: SlotRegistration; component: ComponentType }> = []
+
+  inject(slot: string, callback: () => void | (() => void)): void {
+    this.injected.push(slot)
+    // The real service defers the callback until the slot exists; calling it
+    // synchronously is the immediate-availability case and still proves the
+    // registration happens inside it.
+    callback()
+  }
+
+  register(options: SlotRegistration, component: ComponentType): () => void {
+    this.registrations.push({ options, component })
+    return () => {}
+  }
+}
+
+describe('settings page registration', () => {
+  it('declares the slots service dependency by module short name', () => {
+    expect(inject).toEqual(['slots'])
+  })
+
+  it('registers the settings section through slots.inject, not a body mount', () => {
+    const slots = new FakeSlots()
+    const before = document.body.childElementCount
+    const disposers: Array<() => void> = []
+
+    apply({
+      slots,
+      effect: (callback: () => void | (() => void)) => {
+        const dispose = callback()
+        if (typeof dispose === 'function') disposers.push(dispose)
+      },
+    })
+
+    // The registration is claimed inside the slot's inject callback, exactly as
+    // the reference plugin does.
+    expect(slots.injected).toEqual([SETTINGS_SLOT])
+    expect(slots.registrations).toHaveLength(1)
+
+    const registration = slots.registrations[0]
+    expect(registration?.options.name).toBe(SETTINGS_SLOT)
+    expect(registration?.options.id).toBe(SETTINGS_NAMESPACE)
+    expect(typeof registration?.options.order).toBe('number')
+    // The label is a callback so the shell can re-resolve it on a locale change.
+    expect(registration?.options.label()).toBe('Cherry Studio 互联')
+
+    // No ad-hoc container: the shell owns where a settings section appears.
+    expect(document.body.childElementCount).toBe(before)
+
+    // Every teardown is safe to call, and the styles node goes away with them.
+    expect(document.head.querySelectorAll('[data-cherry-remote-styles]').length).toBe(1)
+    for (const dispose of disposers) expect(dispose).not.toThrow()
+    expect(document.head.querySelectorAll('[data-cherry-remote-styles]').length).toBe(0)
+  })
+
+  it('renders the registered component as the settings page', () => {
+    const slots = new FakeSlots()
+    installFetch([['GET', '/cherry-remote/api/devices', jsonResponse(200, [])]])
+
+    apply({ slots, effect: (callback: () => void | (() => void)) => void callback() })
+
+    const Section = slots.registrations[0]?.component
+    expect(Section).toBeTypeOf('function')
+    render(createElement(Section as ComponentType))
+
+    // The page the shell would show is this plugin's settings view.
+    expect(screen.getByText('Cherry Studio 互联')).toBeTruthy()
+    expect(screen.getByLabelText('配对 payload')).toBeTruthy()
   })
 })
 

@@ -61,19 +61,23 @@ export default defineConfig(({ mode }) => {
           lib: {
             entry: resolve(here, 'src', 'main.tsx'),
             name: '__CherryRemoteClient',
-            // CJS, not IIFE: the external `react`/`react-dom` specifiers must
-            // become `require("react")` calls against the LOADER's resolver. An
-            // IIFE emits bare identifiers (`(function(exports, react) {...})`)
-            // that resolve to nothing at runtime — see the reference bundle,
-            // which calls `require` exactly this way.
+            // CJS, not IIFE: external specifiers must become `require("react")`
+            // calls against the LOADER's resolver. An IIFE emits bare
+            // identifiers (`(function(exports, react) {...})`) that resolve to
+            // nothing at runtime — see the reference bundle, which calls
+            // `require` exactly this way.
             formats: ['cjs'],
             fileName: () => 'client.js',
             cssFileName: 'client',
           },
           rollupOptions: {
-            // Provided by the host: resolving them through its `require` keeps a
-            // single React instance across the shell and this bundle.
-            external: ['react', 'react-dom', 'react/jsx-runtime', 'react-dom/client'],
+            // Provided by the host: resolving `react` through its `require` keeps
+            // ONE React instance across the shell and this bundle, which hooks
+            // require. `react-dom` is deliberately absent — the shell owns the
+            // DOM root and renders this bundle's component, so nothing here
+            // imports it, and externalizing an unused specifier only invites
+            // drift if that ever changes.
+            external: ['react'],
             output: {
               banner: loaderBanner,
               footer: loaderFooter,

@@ -11,12 +11,14 @@
  * Two fields the host reads off the bundle's exports:
  *
  *  - `exports.inject` — this bundle's SERVICE dependencies **by module short
- *    name** (the reference declares `["slots","sessions","workspaces",
- *    "conversation"]`). This plugin consumes none of the shell's services: it
- *    renders its own settings view from the same-origin HTTP API, so the array
- *    is EMPTY. This is a different field from the manifest's
- *    `dsh.client.inject` (a module-graph preload row list, also empty here);
- *    `@deepseek-ai/dsh-client-ui-*` package names belong in neither.
+ *    name**. The settings page is registered into the shell's `settings.section`
+ *    slot, so the one service it consumes is `slots`. (The reference declares
+ *    `["slots","sessions","workspaces","conversation"]` because it also renders
+ *    into session and sidebar seats; a longer list here would declare services
+ *    this plugin never touches.) This is a DIFFERENT layer from the manifest's
+ *    `dsh.client.inject`, which is a module-graph PRELOAD row list and stays
+ *    empty — this plugin has no dependent graph rows. Package names such as
+ *    `@deepseek-ai/dsh-client-ui-*` belong in neither field.
  *  - `exports.apply(ctx)` — the host's mount hook.
  *
  * `react`/`react-dom` stay external: the host already loaded them, and a second
@@ -24,60 +26,93 @@
  * breaking hooks.
  */
 import { createElement } from 'react'
-import { createRoot } from 'react-dom/client'
+import type { ComponentType } from 'react'
 import { App } from './App'
 import styles from './styles.css?inline'
 
+/** The slot a settings page registers into, per the shell's settings contract. */
+export const SETTINGS_SLOT = 'settings.section'
+
+/** The settings-pages namespace: this plugin's nav id and locale key. */
+export const SETTINGS_NAMESPACE = 'cherry-remote'
+
 /** This bundle's service dependencies, by module short name. */
-const inject: string[] = []
+const inject: string[] = ['slots']
 
-/** The element the settings page mounts into when the shell provides none. */
-const MOUNT_ATTRIBUTE = 'data-cherry-remote-settings'
+/** The `slots` service surface this bundle uses. */
+export interface SlotsService {
+  /**
+   * Declares that this bundle owns content for `slot`, invoking `callback` when
+   * the slot is available; the callback's return value is the disposer.
+   */
+  inject(slot: string, callback: () => void | (() => void)): void
+  /** Registers one entry into a slot; returns the disposer removing it. */
+  register(options: SlotRegistration, component: ComponentType): () => void
+}
 
-/** The host context this bundle uses; it declares no services, so only `effect`. */
+/** A `settings.section` registration, as the shell reads it. */
+export interface SlotRegistration {
+  name: string
+  /** The section's stable id; also its route key. */
+  id: string
+  /** Nav ordering among the settings sections. */
+  order: number
+  /** The nav label; a callback so it re-resolves on a locale change. */
+  label: () => string
+  /** The injected-props face handed to the component. */
+  inject: () => Record<string, unknown>
+}
+
+/** The host context: the services declared in {@link inject}, plus lifecycle. */
 export interface ClientContext {
-  effect?(callback: () => void | (() => void)): void
+  slots?: SlotsService
+  effect?(callback: () => void | (() => void), label?: string): void
 }
 
 /**
- * Mounts the settings page.
+ * Registers the settings page with the host shell.
  *
- * `ctx.effect` ties the rendered tree to the plugin's lifecycle, so disabling
- * the plugin unmounts it and reopening it renders a fresh subscription.
+ * Registration goes through the `slots` service, exactly as the reference
+ * plugin does — the host owns where a settings section appears, so a plugin
+ * must never append its own container to `document.body`. `slots.inject` waits
+ * for the slot to exist before `slots.register` claims a seat, and the returned
+ * disposer is returned so the caller can tie it to the plugin lifecycle.
  */
 function apply(ctx: ClientContext): void {
-  ctx.effect?.(() => {
-    // Styles arrive as a STRING (vite `?inline`), not as a sibling .css file:
-    // the host loads `lib/client.js` through the module loader, which has no
-    // notion of a co-located stylesheet, so a separate `lib/client.css` would
-    // simply never load. Injecting a <style> node is the pattern the reference
-    // plugin uses too.
-    const style = installStyles()
-    const target = document.querySelector(`[${MOUNT_ATTRIBUTE}]`) ?? createMountNode()
-    const root = createRoot(target)
-    root.render(createElement(App))
-    return () => {
-      root.unmount()
-      style.remove()
-    }
-  })
+  // Styles arrive as a STRING (vite `?inline`), not as a sibling .css file: the
+  // host loads `lib/client.js` through the module loader, which has no notion of
+  // a co-located stylesheet, so a separate `lib/client.css` would never load.
+  // Injecting a <style> node is the pattern the reference plugin uses too.
+  ctx.effect?.(() => installStyles(), `${SETTINGS_NAMESPACE}: settings styles`)
+
+  if (ctx.slots === undefined) {
+    console.warn(`[${SETTINGS_NAMESPACE}] client slots service unavailable; settings page not registered`)
+    return
+  }
+
+  ctx.slots.inject(SETTINGS_SLOT, () =>
+    ctx.slots?.register(
+      {
+        name: SETTINGS_SLOT,
+        id: SETTINGS_NAMESPACE,
+        order: 50,
+        label: () => 'Cherry Studio 互联',
+        inject: () => ({}),
+      },
+      // The shell passes the slot's runtime props to the component; this page
+      // renders from its own same-origin API, so it ignores them.
+      App as ComponentType,
+    ),
+  )
 }
 
-/** Injects the page styles once, returning the node so it can be removed. */
-function installStyles(): HTMLStyleElement {
+/** Injects the page styles, returning the disposer that removes the node. */
+function installStyles(): () => void {
   const node = document.createElement('style')
   node.setAttribute('data-cherry-remote-styles', '')
   node.textContent = styles
   document.head.append(node)
-  return node
-}
-
-/** A host page without a dedicated settings seat still gets a mount point. */
-function createMountNode(): Element {
-  const node = document.createElement('div')
-  node.setAttribute(MOUNT_ATTRIBUTE, '')
-  document.body.append(node)
-  return node
+  return () => node.remove()
 }
 
 export { inject, apply }
