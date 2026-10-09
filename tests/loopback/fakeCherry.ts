@@ -1,5 +1,5 @@
 import type { AddressInfo } from 'node:net'
-import { randomInt, randomUUID } from 'node:crypto'
+import { createHash, randomInt, randomUUID } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { ComponentLogger, Logger } from '@libp2p/interface'
 import {
@@ -159,6 +159,101 @@ export interface FakeAgentOptions {
    * enter the recovery chain deterministically.
    */
   forceCheckpointMode?: boolean
+  /**
+   * Read-face fixtures (Task 8): the agent/workspace/session/message/part
+   * records the read RPCs serve. Absent means "no records registered", which is
+   * the honest state of a desktop that has none.
+   */
+  agents?: FakeAgentRecord[]
+  workspaces?: FakeWorkspaceRecord[]
+  sessions?: FakeSessionRecord[]
+  /** Messages every registered session serves; `parts` decide the two-level read. */
+  messages?: FakeMessageRecord[]
+  /**
+   * Page size the read faces use when a request omits `limit` (the real peer's
+   * `DEFAULT_PAGE` is 20). Every reply is clamped to `remoteLimits.pageItems`
+   * regardless, exactly like the real `pageOf`.
+   */
+  defaultPageSize?: number
+  /**
+   * A ceiling the read faces impose on EVERY page on top of the requested
+   * limit — a peer that pages smaller than the protocol cap. Models the
+   * three-pages-of-50 case without violating the protocol's 100-item cap.
+   */
+  maxPageSize?: number
+  /**
+   * One-shot failures for the read faces, keyed by method name. Each entry is
+   * consumed by the first call it matches (the §6 REVISION_EXPIRED injection).
+   */
+  failNext?: Record<string, FakeFailure>
+  /**
+   * PERSISTENT failures for the read faces, keyed by method name: every call
+   * answers this failure. The "never converges" anchor for the single-retry
+   * rule.
+   */
+  failAlways?: Record<string, FakeFailure>
+}
+
+/**
+ * One agent as `agent.agents.list` serves it. `model` mirrors the protocol's
+ * nullable model summary, so a fixture can pin the null case too.
+ */
+export interface FakeAgentRecord {
+  agentId: string
+  name: string
+  emoji?: string
+  model?: { modelId: string; providerId: string; name: string } | null
+}
+
+/** One registered workspace as `agent.workspaces.list` serves it. */
+export interface FakeWorkspaceRecord {
+  workspaceId: string
+  name: string
+}
+
+/**
+ * One session as `agent.sessions.list`/`agent.sessions.get` serve it. The
+ * `historyRevision` is the read baseline's first hop; `workspaceKind` defaults
+ * to `registered` because a system-workspace session must say so explicitly.
+ */
+export interface FakeSessionRecord {
+  sessionId: string
+  agentId: string
+  workspaceId: string
+  workspaceKind?: 'registered' | 'system'
+  title: string
+  historyRevision: string
+  updatedAt?: string
+  activeExecutionId?: string
+}
+
+/**
+ * One message as `agent.messages.list` serves it, with the parts
+ * `agent.parts.list` then serves under its `messageRevision`.
+ *
+ * A part's `content` is either inline `{text}` or a `{ref}` — the large-text
+ * externalization the real peer applies above 4096 UTF-16 units. A `ref` part
+ * is only resolvable through `agent.content.read`, and that read verifies the
+ * whole content's sha256 (not the slice's), exactly like `sliceContent`.
+ */
+export interface FakeMessageRecord {
+  messageId: string
+  revision: string
+  role: 'system' | 'user' | 'assistant'
+  status: 'success' | 'error' | 'pending' | 'paused'
+  parts: FakePartRecord[]
+}
+
+/** One part fixture; `text` is the FULL text a `{ref}` part resolves to. */
+export interface FakePartRecord {
+  kind: 'text' | 'reasoning' | 'tool-input' | 'tool-output' | 'file' | 'data'
+  text: string
+  /** Force the `{ref}` externalized form regardless of length. */
+  external?: boolean
+  state?: 'completed' | 'streaming' | 'failed'
+  toolName?: string
+  toolCallId?: string
+  name?: string
 }
 
 /** One event appended to a fake journal; `seq`/`streamEpoch` are assigned on append. */
@@ -210,6 +305,13 @@ const JSON_RPC_ERROR_CODE = 1000
 /** The invitation lifetime the real desktop uses (protocol `invitationMs`). */
 const INVITATION_MS = 120_000
 const CLAIM_ID = 'claim-1'
+/** The real peer's `INLINE_TEXT_LIMIT`: above it, part text travels as a `{ref}`. */
+const INLINE_TEXT_LIMIT = 4096
+
+/** The real peer's content digest: lowercase hex sha256 over the whole content. */
+function sha256Hex(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex')
+}
 
 /** A callable libp2p logger: noise/inbound streams invoke it as `log('msg')`. */
 function makeLogger(name: string): Logger {
@@ -324,6 +426,21 @@ export class FakeCherry {
   #agentCallSequence: string[] = []
   #agentCallTimestamps: Array<{ method: string; at: number }> = []
 
+  // Read-face observation (Task 8).
+  /** Every read-face request's params exactly as the peer received them. */
+  #readCalls: Array<{ method: string; params: Record<string, unknown> }> = []
+  /** One-shot read-face failures, consumed by the first matching call. */
+  #readFailNext: Map<string, FakeFailure>
+  /** Externalized content bytes, keyed `<contentId>:<revision>` (the peer's pins). */
+  #contentBytes = new Map<string, Uint8Array>()
+  /**
+   * The digest each pin ADVERTISED when its `{ref}` part was projected. The
+   * real peer's `content.read` returns this same recorded digest, so a
+   * mutation of the bytes shows up as a disagreement exactly as it would
+   * against the real desktop.
+   */
+  #contentDigests = new Map<string, string>()
+
   constructor(options: FakeCherryOptions = {}) {
     this.#options = options
     this.#identity = options.identity !== undefined ? Promise.resolve(options.identity) : createDeviceIdentity()
@@ -333,6 +450,7 @@ export class FakeCherry {
     this.#journalEpoch = options.agent?.streamEpoch ?? 'epoch-1'
     this.#watermark = options.agent?.watermark ?? 0
     this.#failNextCheckpointCall = options.agent?.failNextCheckpointCall
+    this.#readFailNext = new Map(Object.entries(options.agent?.failNext ?? {}))
   }
 
   /** The desktop's pinned peer id, for `DeviceRecord.desktopIdentity`. */
@@ -522,6 +640,43 @@ export class FakeCherry {
     return this.#agentCallTimestamps
       .filter((entry) => entry.method === method)
       .map((entry) => entry.at)
+  }
+
+  // -------------------------------------------------------------------------
+  // Read-face observation (Task 8)
+  // -------------------------------------------------------------------------
+
+  /** Every read-face call in arrival order, with its params verbatim. */
+  get readCalls(): readonly { method: string; params: Record<string, unknown> }[] {
+    return this.#readCalls
+  }
+
+  /**
+   * The params of every call to one read-face method, in arrival order — the
+   * currency for "the per-page limit was clamped" and "the baseline revisions
+   * were threaded through" assertions.
+   */
+  readCallsFor(method: string): readonly Record<string, unknown>[] {
+    return this.#readCalls.filter((entry) => entry.method === method).map((entry) => entry.params)
+  }
+
+  /** Install a one-shot read-face failure (consumed by the first match). */
+  setReadFailure(method: string, failure: FakeFailure | undefined): void {
+    if (failure === undefined) this.#readFailNext.delete(method)
+    else this.#readFailNext.set(method, failure)
+  }
+
+  /**
+   * Corrupt one `{ref}` content: the stored bytes are replaced while the
+   * digest the pin ADVERTISED stays as it was. A caller that trusts the bytes
+   * without verifying sha256 therefore accepts corrupted text; a caller that
+   * verifies rejects it. The advertised digest is deliberately NOT re-derived,
+   * which is exactly the peer-side fault this check exists for.
+   */
+  tamperContent(contentId: string, revision: string, replacement = 'tampered'): void {
+    const key = `${contentId}:${revision}`
+    if (!this.#contentBytes.has(key)) throw new Error(`no externalized content ${key}`)
+    this.#contentBytes.set(key, new TextEncoder().encode(replacement))
   }
 
   /** The current journal watermark cursor for a session. */
@@ -771,6 +926,14 @@ export class FakeCherry {
         return this.#handlePairingGet(params, live)
       case 'agent.sessions.subscribe':
         return this.#handleAgentSubscribe(params)
+      case 'agent.agents.list':
+      case 'agent.workspaces.list':
+      case 'agent.sessions.list':
+      case 'agent.sessions.get':
+      case 'agent.messages.list':
+      case 'agent.parts.list':
+      case 'agent.content.read':
+        return this.#handleRead(method, params)
       case 'agent.checkpoints.read':
         return await this.#handleCheckpointRead(params)
       case 'agent.subscriptions.activate':
@@ -1202,11 +1365,224 @@ export class FakeCherry {
     this.#notify('agent.subscriptions.resetRequired', { subscriptionId: subscription.subscriptionId, reason })
   }
 
+  // -------------------------------------------------------------------------
+  // Read face (Task 8) — ported from the real peer's `agentQueries.ts` /
+  // `agentHandlers.ts`: the same `pageOf` cursor arithmetic (a numeric offset
+  // string, clamped to `remoteLimits.pageItems`), the same
+  // REVISION_EXPIRED-on-stale-revision rule for `messages.list`/`parts.list`,
+  // the same INLINE_TEXT_LIMIT / `{ref}` / sha256-over-the-whole-content
+  // externalization for `content.read`.
+  // -------------------------------------------------------------------------
+
+  /** One read-face call: inject a failure, then serve the ported semantics. */
+  #handleRead(method: string, params: Record<string, unknown>): Record<string, unknown> {
+    this.#readCalls.push({ method, params })
+    const always = this.#agent().failAlways?.[method]
+    if (always !== undefined) throw new FakeRpcError(always)
+    const once = this.#readFailNext.get(method)
+    if (once !== undefined) {
+      this.#readFailNext.delete(method)
+      throw new FakeRpcError(once)
+    }
+    switch (method) {
+      case 'agent.agents.list':
+        return this.#page(
+          (this.#agent().agents ?? []).map((agent) => ({
+            agentId: agent.agentId,
+            name: agent.name,
+            ...(agent.emoji === undefined ? {} : { emoji: agent.emoji }),
+            model: agent.model ?? null,
+          })),
+          params,
+        )
+      case 'agent.workspaces.list': {
+        const agentId = params['agentId'] as string
+        if (!(this.#agent().agents ?? []).some((agent) => agent.agentId === agentId)) {
+          throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Agent not found' })
+        }
+        return { ...this.#page(this.#agent().workspaces ?? [], params), systemWorkspace: true }
+      }
+      case 'agent.sessions.list': {
+        const agentId = params['agentId'] as string | undefined
+        const workspaceId = params['workspaceId'] as string | undefined
+        const items = (this.#agent().sessions ?? []).filter(
+          (session) =>
+            (agentId === undefined || session.agentId === agentId) &&
+            (workspaceId === undefined || session.workspaceId === workspaceId),
+        )
+        return this.#page(items.map((session) => this.#sessionSummary(session)), params)
+      }
+      case 'agent.sessions.get': {
+        const session = this.#requireSession(params['sessionId'] as string)
+        return { session: this.#sessionSummary(session) }
+      }
+      case 'agent.messages.list':
+        return this.#handleMessagesList(params)
+      case 'agent.parts.list':
+        return this.#handlePartsList(params)
+      default:
+        return this.#handleContentRead(params)
+    }
+  }
+
+  /** The protocol's session summary, including the `workspaceKind` discriminator. */
+  #sessionSummary(session: FakeSessionRecord): Record<string, unknown> {
+    return {
+      sessionId: session.sessionId,
+      agentId: session.agentId,
+      workspaceId: session.workspaceId,
+      workspaceKind: session.workspaceKind ?? 'registered',
+      title: session.title,
+      updatedAt: session.updatedAt ?? new Date(0).toISOString(),
+      historyRevision: session.historyRevision,
+      ...(session.activeExecutionId === undefined
+        ? { idleRevision: session.historyRevision }
+        : { activeExecutionId: session.activeExecutionId }),
+    }
+  }
+
+  #requireSession(sessionId: string): FakeSessionRecord {
+    const session = (this.#agent().sessions ?? []).find((entry) => entry.sessionId === sessionId)
+    if (session === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Resource not found' })
+    return session
+  }
+
+  /**
+   * The real `listMessages`: a `historyRevision` that no longer matches the
+   * session's current one is REVISION_EXPIRED, which is exactly what makes the
+   * caller re-pull the baseline.
+   */
+  #handleMessagesList(params: Record<string, unknown>): Record<string, unknown> {
+    const session = this.#requireSession(params['sessionId'] as string)
+    if (session.historyRevision !== params['historyRevision']) {
+      throw new FakeRpcError({ reason: 'REVISION_EXPIRED', message: 'History revision expired' })
+    }
+    const messages = (this.#agent().messages ?? []).map((message) => ({
+      messageId: message.messageId,
+      revision: message.revision,
+      role: message.role,
+      partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
+      status: message.status,
+    }))
+    return this.#page(messages, params)
+  }
+
+  /** The real `listParts`: a stale `messageRevision` is REVISION_EXPIRED. */
+  #handlePartsList(params: Record<string, unknown>): Record<string, unknown> {
+    this.#requireSession(params['sessionId'] as string)
+    const messages = this.#agent().messages ?? []
+    const message = messages.find((entry) => entry.messageId === params['messageId'])
+    if (message === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Resource not found' })
+    if (message.revision !== params['messageRevision']) {
+      throw new FakeRpcError({ reason: 'REVISION_EXPIRED', message: 'Message revision expired' })
+    }
+    const parts = message.parts.map((part, index) => this.#part(message.messageId, index, part))
+    return this.#page(parts, params)
+  }
+
+  /**
+   * Project one part fixture onto the wire. Text above the peer's inline limit
+   * (or a fixture that asks for it) becomes a `{ref}`; the ref's byteLength and
+   * sha256 describe the FULL content, and the bytes themselves are held for
+   * `agent.content.read` to slice.
+   */
+  #part(messageId: string, index: number, part: FakePartRecord): Record<string, unknown> {
+    const partId = `${messageId}:${index}`
+    const revision = this.#revisionFor(messageId)
+    const bytes = new TextEncoder().encode(part.text)
+    const external = part.external === true || part.text.length > INLINE_TEXT_LIMIT
+    const digest = sha256Hex(bytes)
+    const key = `${partId}:${revision}`
+    // Content pins are IMMUTABLE once created (the real peer pins them when the
+    // part is projected and re-serves the same bytes thereafter), so a tamper
+    // survives re-listing the parts.
+    const pinned = this.#contentBytes.has(key)
+    const advertised = this.#contentDigests.get(key) ?? digest
+    const content = external
+      ? {
+          ref: {
+            contentId: partId,
+            revision,
+            byteLength: String(bytes.length),
+            mediaType: 'text/plain',
+            sha256: advertised,
+          },
+        }
+      : { text: part.text }
+    if (!pinned) {
+      this.#contentBytes.set(key, bytes)
+      this.#contentDigests.set(key, digest)
+    }
+    return {
+      partId,
+      revision,
+      kind: part.kind,
+      content,
+      ...(part.kind === 'tool-input' || part.kind === 'tool-output'
+        ? { toolName: part.toolName ?? 'tool', ...(part.toolCallId === undefined ? {} : { toolCallId: part.toolCallId }) }
+        : {}),
+      ...(part.kind === 'file' || part.kind === 'data' ? { name: part.name ?? 'file' } : {}),
+      ...(part.kind === 'text' || part.kind === 'reasoning' || part.kind === 'tool-input'
+        ? { state: part.state ?? 'completed' }
+        : part.kind === 'tool-output'
+          ? { state: part.state ?? 'completed' }
+          : {}),
+    }
+  }
+
+  #revisionFor(messageId: string): string {
+    return (this.#agent().messages ?? []).find((entry) => entry.messageId === messageId)?.revision ?? '0'
+  }
+
+  /**
+   * `agent.content.read`, faithful to `sliceContent`: `offset` is a numeric
+   * string, the slice is capped by `maxBytes`, `eof` says whether the slice
+   * reached the end, and `sha256` is the digest of the WHOLE content — the
+   * caller's verification target.
+   */
+  #handleContentRead(params: Record<string, unknown>): Record<string, unknown> {
+    const contentId = params['contentId'] as string
+    const revision = params['revision'] as string
+    const bytes = this.#contentBytes.get(`${contentId}:${revision}`)
+    if (bytes === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Content not found' })
+    const start = Number(params['offset'])
+    if (!Number.isSafeInteger(start) || start < 0 || start > bytes.length) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Offset exceeds content length' })
+    }
+    const maxBytes = params['maxBytes'] as number
+    const slice = bytes.subarray(start, start + maxBytes)
+    return {
+      contentId,
+      revision,
+      offset: params['offset'],
+      dataBase64: Buffer.from(slice).toString('base64'),
+      nextOffset: String(start + slice.length),
+      eof: start + slice.length === bytes.length,
+      // The digest recorded with the pin, NOT re-derived from the bytes on
+      // hand — that is exactly what makes a mutation detectable.
+      sha256: this.#contentDigests.get(`${contentId}:${revision}`) ?? sha256Hex(bytes),
+    }
+  }
+
+  /** The real `pageOf`: a numeric-offset cursor, clamped to the protocol cap. */
+  #page<T>(items: readonly T[], params: Record<string, unknown>): { items: T[]; nextCursor: string | null } {
+    const start = params['cursor'] === undefined ? 0 : Number(params['cursor'])
+    if (!Number.isSafeInteger(start) || start < 0) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Invalid page cursor' })
+    }
+    const requested = (params['limit'] as number | undefined) ?? this.#agent().defaultPageSize ?? 20
+    // Two independent ceilings: the protocol's own page cap, and a peer that
+    // pages smaller than the cap. The effective page is the smaller of the two.
+    const ceiling = Math.min(remoteLimits.pageItems, this.#agent().maxPageSize ?? remoteLimits.pageItems)
+    const limit = Math.max(1, Math.min(requested, ceiling))
+    const end = start + limit
+    return { items: items.slice(start, end), nextCursor: end < items.length ? String(end) : null }
+  }
+
   /**
    * Failure injection across the two checkpoint faces. `alwaysExpireCheckpoints`
    * is PERSISTENT (never converges); `failNextCheckpointCall` is one-shot.
-   */
-  #consumeInjectedCheckpointFailure(): void {
+   */  #consumeInjectedCheckpointFailure(): void {
     const failure = this.#agent().alwaysExpireCheckpoints
       ? { reason: 'CHECKPOINT_EXPIRED', message: 'Preparation lease expired' }
       : this.#failNextCheckpointCall
