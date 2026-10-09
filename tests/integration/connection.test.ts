@@ -178,6 +178,9 @@ describe('DeviceConnection over a real loopback channel', () => {
       identity,
       record: recordFor(mismatchInfo),
       helloProtocolVersions: [1, 2], // differs from the [1] prelude offer
+      // Short backoff so the no-retry window below actually discriminates: a
+      // regression that kept retrying this terminal face would fire inside it.
+      backoffInitialMs: 30,
     })
     await expect(mismatchConnection.connect()).rejects.toThrow()
     expect(mismatchConnection.state).toBe('offline')
@@ -228,6 +231,8 @@ describe('DeviceConnection over a real loopback channel', () => {
     const connection = makeConnection({
       identity,
       record: recordFor(fakeInfo, { desktopIdentity: deviceIdentityId(otherKey) }),
+      // Short backoff so the no-retry window below actually discriminates.
+      backoffInitialMs: 30,
     })
 
     await expect(connection.connect()).rejects.toThrow()
@@ -408,13 +413,14 @@ describe('DeviceConnection over a real loopback channel', () => {
     const fakeInfo = await makeFake({
       authenticateFailure: { reason: 'GRANT_REVOKED', message: 'grant revoked on desktop' },
     })
-    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), backoffInitialMs: 30 })
 
     await expect(connection.connect()).rejects.toThrow()
     expect(connection.state).toBe('offline')
     const messages = consoleError.mock.calls.flat().map(String)
     expect(messages.some((m) => m.includes('re-pair'))).toBe(true)
-    // Terminal: retrying a revoked grant would only hammer the peer.
+    // Terminal: retrying a revoked grant would only hammer the peer. With the
+    // short backoff above, a retrying regression would fire inside this window.
     await sleep(250)
     expect(fakeInfo.fake.authenticateCount).toBe(1)
   })
@@ -492,4 +498,21 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(connectSpy.mock.calls.length).toBe(connectCallsBefore)
     expect(fakeInfo.fake.socketCount).toBe(attemptsBefore)
   })
+
+  it('rejects a pending connect() when close() races the in-flight attempt — never a silent hang', async () => {
+    const identity = await createDeviceIdentity()
+    // Slow handshake: hello alone takes 5s server-side, so the attempt is
+    // reliably still in flight when close() lands (stall-tolerant).
+    const fakeInfo = await makeFake({ requestDelayMs: 5_000 })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    const pending = connection.connect()
+    await sleep(50) // inside the hello round-trip / dial
+    await connection.close()
+
+    // Bounded by this test's timeout: a hang fails the test instead of
+    // leaking a forever-pending promise into the pool's shutdown awaits.
+    await expect(pending).rejects.toThrow(/closed/)
+    expect(connection.state).toBe('offline')
+  }, 10_000)
 })

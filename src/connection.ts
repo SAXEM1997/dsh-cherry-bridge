@@ -391,6 +391,11 @@ export class DeviceConnection {
     this.#clearAllTimers()
     this.#teardownLink()
     this.#setState('offline')
+    // A caller awaiting connect() must never hang on shutdown: settle the
+    // cycle explicitly (a no-op if it already settled). The epoch bump above
+    // makes the in-flight attempt's handlers return early WITHOUT settling,
+    // so this is the only place the pending promise learns about the close.
+    this.#cycle.reject(new Error(`device ${this.record.deviceId}: connection closed`))
   }
 
   // -------------------------------------------------------------------------
