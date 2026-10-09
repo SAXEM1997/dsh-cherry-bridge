@@ -7,6 +7,7 @@ import type { DeviceRecord } from './deviceStore'
 import type { DeviceStore } from './deviceStore'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient'
 import { toRemoteSocket } from './rpc/wsAdapter'
+import { urlHost } from './urlHost'
 
 /**
  * The pairing half of the bridge (spec §3.3): turn the desktop's pairing
@@ -256,16 +257,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/**
- * Renders a host as a URL authority component. The archive stores bare hosts
- * (ruling 2), so a bare IPv6 literal must be bracketed again before it is
- * spliced into a URL — `ws://::1:35543/...` is not a valid URL.
- */
-export function urlHost(host: string): string {
-  // A colon can only mean IPv6 here: a `host:port` pair never reaches this
-  // layer (the port travels separately).
-  return host.includes(':') ? `[${host}]` : host
-}
+// urlHost() moved to its shared home (./urlHost): both dial sites — pairing's
+// candidate dial and DeviceConnection's per-device dial — bracket IPv6 the
+// same way. Re-exported here to keep this module's original public surface.
+export { urlHost } from './urlHost'
 
 /** Dials one candidate address and completes the Noise handshake.
  *

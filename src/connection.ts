@@ -5,6 +5,7 @@ import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transpo
 import { remoteConnectPath } from '@cherrystudio/remote-protocol'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient'
 import { toRemoteSocket } from './rpc/wsAdapter'
+import { urlHost } from './urlHost'
 import type { DeviceRecord } from './deviceStore'
 
 /**
@@ -506,7 +507,9 @@ export class DeviceConnection {
   }
 
   async #dial(host: string, port: number, epoch: number): Promise<LiveLink> {
-    const url = `ws://${host}:${port}${remoteConnectPath}`
+    // Bare IPv6 hosts (the archive's normalized form) must be bracketed into
+    // a URL authority or `new WebSocket` throws Invalid URL.
+    const url = `ws://${urlHost(host)}:${port}${remoteConnectPath}`
     const ws = new WebSocket(url)
     const controller = new AbortController()
 

@@ -515,4 +515,21 @@ describe('DeviceConnection over a real loopback channel', () => {
     await expect(pending).rejects.toThrow(/closed/)
     expect(connection.state).toBe('offline')
   }, 10_000)
+
+  it('regression (fix round 2): dials a bare IPv6 host — the archive stores bare hosts, the URL layer brackets them', async () => {
+    const identity = await createDeviceIdentity()
+    // Task 6's plan-mandated normalization stores BARE IPv6 hosts (`::1`);
+    // splicing that raw into ws://<host>:<port> is an invalid URL. The dial
+    // must bracket IPv6 at the URL-authorility layer and reach a fake bound
+    // to ::1 (fakeCherry's Task 6 `bindHost` option).
+    const fakeInfo = await makeFake({ bindHost: '::1' })
+    expect(fakeInfo.host).toBe('::1')
+    const record = recordFor(fakeInfo, { hosts: ['::1'] })
+    const connection = makeConnection({ identity, record })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+    expect(fakeInfo.fake.authenticateCount).toBe(1)
+  })
 })
