@@ -1,0 +1,24 @@
+# dsh-cherry-bridge 插件（DSH Bundle patch）
+#
+# 作为 bundle 被合入 profile 时，自动插入本插件行。
+# 插件把本机 DSH 桥接到局域网内的 Cherry Studio 桌面端：设备连接池、`cherry_*`
+# 工具面，以及同源设置页 UI（`dsh.client`）。
+#
+# ⚠️ patch 的 `config` 是**整体替换**而非与 bundle 默认值合并：装配层必须对缺键
+#    回落默认值（`src/index.ts` 的 `resolveBridgeConfig`，Task 10 落地）。因此这里
+#    列出的键就是该 profile 下的**完整**配置面；删掉一个键不等于"沿用默认"，
+#    而是让装配层用自己的默认值（二者当前一致，见下）。
+#
+# 键值与 spec §8 一致：
+#   - perSessionCacheBytes：每个会话的本地订阅事件缓存上限（字节）。2 MiB。
+#   - rateBudgetPerSecond：每设备二级平滑请求预算（请求/秒），与
+#     `DeviceConnection` 默认值一致，远低于桌面端实现的 64 req/s 硬上限
+#     （该上限无协商通道，超限会以 close 1011 终止整条会话）。
+#   - dataDir 故意不写：留空时装配层按 $DSH_HOME/cherry-remote 解析，
+#     写死会让所有 profile 共用同一份设备档案。
+- insert:
+    - id: cherry-remote
+      name: 'dsh-cherry-bridge'
+      config:
+        perSessionCacheBytes: 2097152
+        rateBudgetPerSecond: 32

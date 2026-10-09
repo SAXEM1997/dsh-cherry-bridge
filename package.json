@@ -2,8 +2,18 @@
   "name": "dsh-cherry-bridge",
   "version": "0.1.0",
   "type": "module",
-  "private": true,
+  "private": false,
   "description": "DeepSeek Harness plugin bridging to Cherry Studio desktop instances over remote transport",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cherry-studio",
+    "remote-access"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
@@ -13,14 +23,26 @@
     "client": {
       "platform": "web",
       "inject": []
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
     }
   },
+  "files": [
+    "lib",
+    "src",
+    "ui",
+    "docs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
   "scripts": {
     "test": "vitest run",
     "build": "tsdown",
     "build:client": "vite build --mode client --config ui/vite.config.ts",
     "dev:ui": "vite --config ui/vite.config.ts",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.ui.json"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.ui.json",
+    "prepublishOnly": "npm run build && npm run build:client"
   },
   "dependencies": {
     "@cherrystudio/remote-protocol": "0.3.0",

@@ -4,6 +4,8 @@ import type { DeviceStore } from './deviceStore'
 import type { DeviceState } from './connection'
 import { PairingError } from './pairing'
 import type { PairWithPayloadOptions } from './pairing'
+import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics'
+import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics'
 
 /**
  * The plugin's same-origin HTTP face (spec §3.7, M2): device management REST
@@ -149,6 +151,22 @@ export interface CherryHttpDeps {
   onDeviceState(cb: (event: DeviceStateEvent) => void): void
   /** Assembly channel: one pairing run advanced a stage. */
   onPairingProgress(cb: (event: PairingProgressEvent) => void): void
+
+  // --- M4 diagnostics (Task 13) -------------------------------------------
+  //
+  // All four are OPTIONAL and default to empty: the endpoint must work on a
+  // deployment (or a test rig) that never wired a stats source, and an absent
+  // source must read as "nothing reported" rather than as a failure. The
+  // plugin assembly supplies them from the same pool the tool face uses.
+
+  /** Pool counters: connections, sockets, requests, subscriptions. */
+  diagnosticsStats?(): Partial<DiagnosticsStats>
+  /** Local per-session subscription bookkeeping (sessionId is whitelisted). */
+  diagnosticsSessions?(): readonly SubscriptionStat[]
+  /** The ring of recent errors; the sanitizer keeps reason/message only. */
+  diagnosticsErrors?(): readonly DiagnosticsError[]
+  /** Plan §8 config values, surfaced so an operator can see the effective knobs. */
+  diagnosticsConfig?(): { rateBudgetPerSecond: number; perSessionCacheBytes: number }
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +696,17 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
       return openEvents(req, res, route)
     }
 
+    // M4: the operations diagnostics report. It rides the SAME prefix seat and
+    // therefore the SAME fence as every other route (ruling 3) — there is no
+    // second registration and no second fence site to forget.
+    if (first === 'diagnostics' && match.segments.length === 1) {
+      if (method !== 'GET') {
+        writeError(res, 405, 'method-not-allowed', 'GET only')
+        return
+      }
+      return writeJson(res, 200, diagnosticsReport(route))
+    }
+
     writeError(res, 404, 'not-found', 'unknown route')
   } catch (error) {
     // Defense in depth: the routes below handle their own failures, so reaching
@@ -702,6 +731,72 @@ function listDevices(res: HttpResponseLike, route: RouteContext): void {
     port: device.port,
   }))
   writeJson(res, 200, devices)
+}
+
+/**
+ * The `GET /diagnostics` body (spec §5).
+ *
+ * The aggregator in `src/diagnostics.ts` owns the redaction whitelist; this
+ * function only supplies it with the live pool surfaces. `connect` is passed
+ * as a state projection (not the connection object) so nothing but a state
+ * string can escape into the report — a caller cannot accidentally serialize a
+ * connection holding a live token.
+ *
+ * The six contract differences ride along so an operator reads the fake-vs-real
+ * caveats in the same place they read the health of the deployment.
+ */
+function diagnosticsReport(route: RouteContext): unknown {
+  const deps = route.deps
+  const config = safely(() => deps.diagnosticsConfig?.(), undefined)
+  return {
+    ...buildDiagnostics({
+      store: deps.store,
+      // A state projection, never the connection object: nothing but a state
+      // string can reach the report, so a live token cannot be serialized by
+      // accident.
+      connect: (deviceId) => ({ state: projectState(deviceById(deps, deviceId), deps.connect) }),
+      stats: () => safely(() => deps.diagnosticsStats?.(), {}),
+      sessions: () => safely(() => deps.diagnosticsSessions?.(), []),
+      recentErrors: () => safely(() => deps.diagnosticsErrors?.(), []),
+    }),
+    // Effective config is appended AFTER the aggregator's own projection: both
+    // keys are numbers the plugin already logs, never a credential.
+    ...(config === undefined ? {} : { config }),
+    contractDifferences: CONTRACT_DIFFERENCES.map((entry) => ({ id: entry.id, title: entry.title })),
+  }
+}
+
+/** Resolves one record for the state projection, or a disabled stand-in. */
+function deviceById(deps: CherryHttpDeps, deviceId: string): DeviceRecord {
+  const found = deps.store.list().find((device) => device.deviceId === deviceId)
+  if (found !== undefined) return found
+  return {
+    schemaVersion: 2,
+    deviceId,
+    displayName: '',
+    hosts: [],
+    port: 0,
+    desktopIdentity: '',
+    grants: [],
+    enabled: false,
+  }
+}
+
+/**
+ * Runs one optional source, falling back when it is absent OR throws.
+ *
+ * An overload pair rather than one signature: with a fallback the result is
+ * ALWAYS `T` (the whole point of passing one), while the no-fallback call site
+ * gets `T | undefined` so "this source genuinely has nothing" stays expressible.
+ */
+function safely<T>(read: () => T | undefined, fallback: T): T
+function safely<T>(read: () => T | undefined): T | undefined
+function safely<T>(read: () => T | undefined, fallback?: T): T | undefined {
+  try {
+    return read() ?? fallback
+  } catch {
+    return fallback
+  }
 }
 
 function deleteDevice(res: HttpResponseLike, route: RouteContext, deviceId: string): void {

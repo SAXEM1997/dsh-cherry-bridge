@@ -15,6 +15,7 @@ import type {
   DeviceStateEvent,
   PairingProgressEvent,
 } from './httpApi'
+import type { DiagnosticsError } from './diagnostics'
 
 export const name = 'cherry-remote'
 
@@ -167,6 +168,34 @@ interface AssemblyState {
   readonly pairingProgressListeners: Set<(event: PairingProgressEvent) => void>
   /** The previous `apply`'s teardown, so a re-apply rebinds instead of stacking. */
   disposers: Array<() => void>
+  /**
+   * Connections the pool has BUILT since the last `apply` — the "连接统计"
+   * dimension of the diagnostics report. Deliberately NOT an RPC counter: the
+   * transport layer owns request accounting, and re-deriving it here would
+   * mean a second, drifting source.
+   */
+  connectionsBuilt: number
+  /**
+   * The bounded ring of recent error summaries `GET /diagnostics` serves.
+   * Deliberately small and in-memory: it exists to answer "what just went
+   * wrong", not to be a log store. Only the reason and a sanitized message are
+   * kept — never a payload.
+   */
+  readonly recentErrors: DiagnosticsError[]
+}
+
+/** How many recent errors the diagnostics ring holds. */
+const RECENT_ERROR_LIMIT = 20
+
+/**
+ * Records one error summary for the diagnostics endpoint.
+ *
+ * Exported for the assembly's own call sites; the message is truncated so a
+ * peer that echoes a long payload into an error cannot inflate the report.
+ */
+export function noteError(entry: DiagnosticsError): void {
+  state.recentErrors.unshift(entry)
+  if (state.recentErrors.length > RECENT_ERROR_LIMIT) state.recentErrors.length = RECENT_ERROR_LIMIT
 }
 
 const state: AssemblyState = {
@@ -179,6 +208,8 @@ const state: AssemblyState = {
   deviceStateListeners: new Set(),
   pairingProgressListeners: new Set(),
   disposers: [],
+  connectionsBuilt: 0,
+  recentErrors: [],
 }
 
 /** A placeholder archive path; `apply` always replaces it before any use. */
@@ -250,9 +281,20 @@ function connectionFor(deviceId: string): DeviceConnection {
     record,
     rateBudgetPerSecond: state.rateBudgetPerSecond,
   })
+  state.connectionsBuilt += 1
   connection.onState((deviceState: DeviceState) => {
     // The event source (ruling 9): every transition reaches the SSE fan-out.
     publishDeviceState({ deviceId, state: deviceState })
+    // Diagnostics (§5 「最近错误摘要」): landing in `offline` after having been up
+    // is the connection-level error an operator comes to this report for.
+    if (deviceState === 'offline' || deviceState === 'identity-mismatch') {
+      noteError({
+        at: new Date().toISOString(),
+        deviceId,
+        reason: deviceState === 'identity-mismatch' ? 'IDENTITY_MISMATCH' : 'CONNECTION_OFFLINE',
+        message: `device transitioned to ${deviceState}`,
+      })
+    }
     // Subscription recovery (ruling 8): a transition INTO `connected` means the
     // link is back, and the peer has forgotten every subscription with it.
     if (deviceState === 'connected') void recoverSubscriptions(deviceId)
@@ -465,6 +507,27 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
     onPairingProgress: (cb) => {
       state.pairingProgressListeners.add(cb)
     },
+    // Diagnostics (Task 13): the SAME pool the tool face reads, projected onto
+    // counters and identifiers only. Every source here is synchronous and
+    // non-throwing by construction; the HTTP face still guards each one.
+    diagnosticsStats: () => ({
+      connections: state.connections.size,
+      sockets: [...state.connections.values()].filter((connection) => connection.state === 'connected').length,
+      requests: state.connectionsBuilt,
+      subscriptions: [...state.subscriptions.values()].reduce(
+        (total, layer) => total + layer.activeSessions().length,
+        0,
+      ),
+    }),
+    diagnosticsSessions: () =>
+      [...state.subscriptions.entries()].flatMap(([deviceId, layer]) =>
+        layer.activeSessions().map((sessionId) => ({ deviceId, sessionId, subscriptions: 1 })),
+      ),
+    diagnosticsErrors: () => [...state.recentErrors],
+    diagnosticsConfig: () => ({
+      rateBudgetPerSecond: state.rateBudgetPerSecond,
+      perSessionCacheBytes: state.perSessionCacheBytes,
+    }),
   }
 }
 
@@ -531,6 +594,11 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
     },
     (error: unknown) => {
       console.error('[cherry-remote] failed to load the device identity', error)
+      noteError({
+        at: new Date().toISOString(),
+        reason: 'IDENTITY_LOAD_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+      })
     },
   )
 }

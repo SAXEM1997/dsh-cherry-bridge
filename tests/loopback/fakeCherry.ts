@@ -234,9 +234,14 @@ export interface FakeAgentOptions {
   /**
    * The `agent.messages.send` outcome. `'applied'` (default) admits a run;
    * `'busy'` answers the rejected receipt "Session is busy";
-   * `'target-unavailable'` answers the §6 TARGET_UNAVAILABLE rejected receipt.
+   * `'target-unavailable'` answers the §6 TARGET_UNAVAILABLE rejected receipt;
+   * `'resource-exhausted'` answers a rejected RECEIPT carrying
+   * `reason: 'RESOURCE_EXHAUSTED'` — the RECEIPT-ledger dimension of the §6
+   * RESOURCE_EXHAUSTED row (Task 13⑥), where the peer refuses the command while
+   * the SESSION stays healthy. Distinct from the subscription dimension Task 7⑨
+   * anchors on `agent.sessions.subscribe`.
    */
-  sendOutcome?: 'applied' | 'busy' | 'target-unavailable'
+  sendOutcome?: 'applied' | 'busy' | 'target-unavailable' | 'resource-exhausted'
   /** Same injection for `agent.executions.cancel` (Task 9⑮ covers both verbs). */
   cancelOutcome?: 'applied' | 'target-unavailable'
   /**
@@ -1971,6 +1976,16 @@ export class FakeCherry {
       return this.#rejectedReceipt(params, 'agent.messages.send', {
         reason: 'TARGET_UNAVAILABLE',
         message: 'Session delivery target is unavailable',
+      })
+    }
+    if (outcome === 'resource-exhausted') {
+      // The RECEIPT dimension (Task 13⑥): the peer's command ledger is full,
+      // so the command is REFUSED as a rejected receipt while the session and
+      // its socket stay up. A caller that mishandled this as a transport
+      // failure would drop a healthy connection.
+      return this.#rejectedReceipt(params, 'agent.messages.send', {
+        reason: 'RESOURCE_EXHAUSTED',
+        message: 'Command receipt ledger is full',
       })
     }
 
