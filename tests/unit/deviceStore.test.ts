@@ -236,23 +236,40 @@ describe('DeviceStore schema migration', () => {
     expect(await readArchive(file)).toEqual({ schemaVersion: SCHEMA_VERSION, devices: [makeRecord()] })
   })
 
-  it('rejects an incomplete archive without schemaVersion instead of migrating (③)', async () => {
+  it('rejects an incomplete version-less entry before migrating it (③)', async () => {
     const file = await makeStoreFile()
     const { schemaVersion: _current, port: _port, grants: _grants, ...partial } = makeRecord()
+    // No entry-level schemaVersion, and fields missing: rejected up front.
     await writeArchive(file, [partial], 1)
+    const before = await readFile(file, 'utf8')
 
-    expect(() => new DeviceStore(file).list()).toThrow(/port, grants/)
-    // The rejected archive is left exactly as it was: no migration, no rewrite.
+    // The guard fires — not the post-migration backstop. `不迁移` means the
+    // rejection happens BEFORE any migration step runs.
+    expect(() => new DeviceStore(file).list()).toThrow(/incomplete field set/)
+    // Rejected, so nothing was migrated or written back.
+    expect(await readFile(file, 'utf8')).toBe(before)
     expect((await readArchive(file)).schemaVersion).toBe(1)
   })
 
-  it('rejects a version-less archive whose entry is missing fields, instead of migrating (③)', async () => {
+  it('rejects a version-less entry missing a single field before migrating it (③)', async () => {
     const file = await makeStoreFile()
     const { schemaVersion: _current, port: _port, ...partial } = makeRecord()
     await writeArchive(file, [partial], 1)
+    const before = await readFile(file, 'utf8')
 
-    expect(() => new DeviceStore(file).list()).toThrow(/port/)
-    expect((await readArchive(file)).schemaVersion).toBe(1)
+    expect(() => new DeviceStore(file).list()).toThrow(/incomplete field set/)
+    expect(await readFile(file, 'utf8')).toBe(before)
+  })
+
+  it('rejects a version-less entry missing fields even when the archive is current (③)', async () => {
+    const file = await makeStoreFile()
+    const { schemaVersion: _current, port: _port, ...partial } = makeRecord()
+    // The entry's own completeness is judged regardless of the archive version.
+    await writeArchive(file, [partial], SCHEMA_VERSION)
+    const before = await readFile(file, 'utf8')
+
+    expect(() => new DeviceStore(file).list()).toThrow(/incomplete field set/)
+    expect(await readFile(file, 'utf8')).toBe(before)
   })
 
   it('re-reads a current-version archive without re-migrating or altering it (④)', async () => {
@@ -279,12 +296,48 @@ describe('DeviceStore schema migration', () => {
     expect((await readArchive(file)).schemaVersion).toBe(99)
   })
 
-  it('rejects an entry whose schemaVersion is newer than the archive itself (⑤)', async () => {
+  it('rejects an entry whose schemaVersion disagrees with its archive (F2)', async () => {
     const file = await makeStoreFile()
+    // Archive is current; the entry claims 99 of its own.
     await writeArchive(file, [makeRecord({ schemaVersion: 99 })])
 
-    expect(() => new DeviceStore(file).list()).toThrow(/99/)
-    expect((await readArchive(file)).schemaVersion).toBe(SCHEMA_VERSION)
+    const store = new DeviceStore(file)
+
+    // Entry-level versions are inert: they never drive migration or rejection on
+    // their own, they are only checked for consistency with the archive.
+    expect(() => store.list()).toThrow(
+      /entry declares schemaVersion 99 but its archive is schemaVersion 2/,
+    )
+  })
+
+  it('rejects an entry that trails its own archive version (F2)', async () => {
+    const file = await makeStoreFile()
+    await writeArchive(file, [makeRecord({ schemaVersion: 1 })], SCHEMA_VERSION)
+
+    expect(() => new DeviceStore(file).list()).toThrow(
+      /entry declares schemaVersion 1 but its archive is schemaVersion 2/,
+    )
+  })
+
+  it('migrates a version-less entry by the ARCHIVE version, not its own (F2)', async () => {
+    const file = await makeStoreFile()
+    const { schemaVersion: _current, ...fields } = makeRecord()
+    // Archive says v1; the entries carry no version of their own. The archive is
+    // the single migration authority, so the entries are migrated with it.
+    await writeArchive(file, [fields], 1)
+
+    expect(new DeviceStore(file).list()).toEqual([makeRecord()])
+    expect(await readArchive(file)).toEqual({
+      schemaVersion: SCHEMA_VERSION,
+      devices: [makeRecord()],
+    })
+  })
+
+  it('accepts an entry that agrees with its archive version (F2)', async () => {
+    const file = await makeStoreFile()
+    await writeArchive(file, [makeRecord()], SCHEMA_VERSION)
+
+    expect(new DeviceStore(file).list()).toEqual([makeRecord()])
   })
 })
 

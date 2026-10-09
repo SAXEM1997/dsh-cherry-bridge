@@ -93,10 +93,10 @@ const V1_KEYS = [
 const REQUIRED_KEYS = [...V1_KEYS, 'schemaVersion'] as const satisfies readonly (keyof DeviceRecord)[]
 
 /**
- * A loose entry counts as a complete v1 archive — and therefore safe to
- * migrate — only when every v1 field is present. An entry missing keys must be
- * rejected rather than migrated: a missing `schemaVersion` alone means v1, a
- * missing `schemaVersion` plus missing fields means corruption.
+ * A version-less entry reads as the legacy (v1) shape only when every v1 field
+ * is present. A missing `schemaVersion` alone means v1; a missing
+ * `schemaVersion` plus missing fields means corruption, and the entry must be
+ * rejected rather than migrated.
  */
 function hasCompleteFieldSet(disk: DeviceRecordOnDisk): boolean {
   return V1_KEYS.every((key) => disk[key] !== undefined)
@@ -132,42 +132,54 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
 }
 
 /**
- * Read path, fixed order: loose parse -> version judgement -> migration ->
- * assert the required `DeviceRecord` type.
+ * Read path, fixed order: loose parse -> completeness gate -> version judgement
+ * -> migration -> assert the required `DeviceRecord` type.
+ *
+ * `archiveVersion` is the single migration authority: it decides the migration
+ * chain for every entry, and an entry's own `schemaVersion` is inert — present
+ * only as a cross-check against the archive, never to drive migration, version
+ * rejection, or a version-less default of its own.
+ *
+ * `archiveVersion` is always a version this build understands, because
+ * {@link parseArchive} rejects unknown archive versions before reaching here.
  */
-function parseRecord(raw: unknown): DeviceRecord {
+function parseRecord(raw: unknown, archiveVersion: number): DeviceRecord {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     throw new Error('device archive entry must be a JSON object')
   }
 
-  let disk = raw as DeviceRecordOnDisk
-  const version = disk.schemaVersion ?? 1
+  const disk = raw as DeviceRecordOnDisk
+  const declared = disk.schemaVersion
 
-  // An archive without a version number reads as v1, but only a complete field
-  // set proves it really is one: an incomplete archive is rejected, not migrated.
-  if (!(version in MIGRATIONS) && !hasCompleteFieldSet(disk)) {
+  // A version-less entry only reads as the pre-versioning v1 shape, and only a
+  // COMPLETE field set proves it really is one. This gate runs before any
+  // migration, so an incomplete entry is rejected rather than migrated.
+  if (declared === undefined && !hasCompleteFieldSet(disk)) {
     throw new Error(
       'device archive entry has no schemaVersion and an incomplete field set; ' +
-        'only a complete field set may be read as v1',
+        'only a complete field set may be read as a legacy (v1) entry',
     )
   }
 
-  if (version > CURRENT_SCHEMA_VERSION) {
+  // An entry that does declare a version must agree with the archive that
+  // contains it — a mismatch means the file was hand-edited or half-written.
+  if (declared !== undefined && declared !== archiveVersion) {
     throw new Error(
-      `device archive entry declares schemaVersion ${version}, newer than supported ` +
-        `${CURRENT_SCHEMA_VERSION}; refusing to read it`,
+      `device archive entry declares schemaVersion ${declared} but its archive is ` +
+        `schemaVersion ${archiveVersion}; the archive version is authoritative`,
     )
   }
 
-  for (let step = version; step < CURRENT_SCHEMA_VERSION; step += 1) {
+  let migrated = disk
+  for (let step = archiveVersion; step < CURRENT_SCHEMA_VERSION; step += 1) {
     const migrate = MIGRATIONS[step]
     if (migrate === undefined) {
       throw new Error(`no migration registered from device archive schemaVersion ${step}`)
     }
-    disk = migrate(disk)
+    migrated = migrate(migrated)
   }
 
-  return assertValidRecord(disk)
+  return assertValidRecord(migrated)
 }
 
 function parseArchive(parsed: unknown): ArchiveFile {
@@ -188,10 +200,13 @@ function parseArchive(parsed: unknown): ArchiveFile {
   if (!Array.isArray(archive.devices)) {
     throw new Error('device archive is missing a devices array')
   }
+  // Bound to a local so the narrowing survives into the mapping closure: this
+  // is the single version every entry below is read under.
+  const archiveVersion = archive.schemaVersion
 
   return {
-    schemaVersion: archive.schemaVersion,
-    devices: archive.devices.map((record) => parseRecord(record)),
+    schemaVersion: archiveVersion,
+    devices: archive.devices.map((record) => parseRecord(record, archiveVersion)),
   }
 }
 
