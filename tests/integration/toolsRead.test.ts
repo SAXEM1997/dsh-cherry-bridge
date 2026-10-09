@@ -289,6 +289,51 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(calls[0]!['limit']).toBe(60)
   })
 
+  it('②b2 attributes a stop that lands on the safety bound to the BOUND, not to the caller limit', async () => {
+    // `limit: 1000` is BOTH the caller's maximum and the internal safety bound,
+    // so the two ceilings are EQUAL here. The old comparison (`aggregate <=
+    // bound ? 'limit' : 'safety-bound'`) called that 'limit' — telling the caller
+    // "you asked for 1000" about a walk that was actually stopped by the plugin's
+    // own circuit-breaker. The same code path serves `limit: Infinity`, so a
+    // wrong equal-case label is also a wrong unbounded-walk label.
+    const agents = Array.from({ length: 1_500 }, (_unused, index) => ({
+      agentId: `agent-${index}`,
+      name: `Agent ${index}`,
+    }))
+    const rig = await makeRig({ agent: { agents } })
+
+    const result = (await rig.call('cherry_agents', { device: 'dev-A', limit: 1000 })) as {
+      items: Array<{ agentId: string }>
+      truncated?: boolean
+      truncationReason?: string
+      nextCursor?: string
+    }
+
+    expect(result.items).toHaveLength(1000)
+    expect(result.truncated).toBe(true)
+    // THE ATTRIBUTION: the equality case belongs to the safety bound.
+    expect(result.truncationReason).toBe('safety-bound')
+    // The peer still had data, and the resume point is reported.
+    expect(result.nextCursor).toBeDefined()
+  })
+
+  it('②b3 still attributes a stop STRICTLY below the safety bound to the caller limit', async () => {
+    // The other half of the rule: a caller limit that really is the constraint
+    // must still say so, or the fix above would have moved the mislabel.
+    const agents = Array.from({ length: 150 }, (_unused, index) => ({
+      agentId: `agent-${index}`,
+      name: `Agent ${index}`,
+    }))
+    const rig = await makeRig({ agent: { agents } })
+
+    const result = (await rig.call('cherry_agents', { device: 'dev-A', limit: 60 })) as {
+      items: Array<{ agentId: string }>
+      truncationReason?: string
+    }
+    expect(result.items).toHaveLength(60)
+    expect(result.truncationReason).toBe('limit')
+  })
+
   it('②c cherry_sessions aggregates across pages and passes workspaceId/agentId through to agent.sessions.list', async () => {
     const sessions = Array.from({ length: 150 }, (_unused, index) => ({
       sessionId: `s-${String(index).padStart(3, '0')}`,

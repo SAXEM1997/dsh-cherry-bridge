@@ -6,6 +6,7 @@ import { remoteConnectPath } from '@cherrystudio/remote-protocol'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { digestIdentity } from './diagnostics.js'
+import { DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
 import { urlHost } from './urlHost.js'
 import type { DeviceRecord } from './deviceStore.js'
 
@@ -84,7 +85,6 @@ export class DeviceUnavailableError extends Error {
 // Defaults (spec §3.4 and controller rulings; values are contractual).
 // ---------------------------------------------------------------------------
 
-const DEFAULT_RATE_BUDGET_PER_SECOND = 32
 /**
  * CEILING for the business-request window — not the window itself. The window
  * is owned by the rpc layer and is sized from the peer's hello-reported
@@ -225,6 +225,33 @@ class AllHostsUnreachableError extends Error {
 /** True when the attempt failed because NO candidate host could be dialed. */
 function isAllHostsUnreachable(error: unknown): error is AllHostsUnreachableError {
   return error instanceof AllHostsUnreachableError
+}
+
+/**
+ * Whether a failed establishment attempt blames THIS ADDRESS or the PAIRING.
+ *
+ * The per-host class is the default because the alternative is worse: a stale
+ * first address on a multi-homed desktop would otherwise abort the whole pass
+ * even though a later candidate would have connected. The terminal faces are
+ * named explicitly:
+ *
+ *  - {@link IdentityMismatchError} — the peer's pinned static key is wrong. That
+ *    is about the PAIRING, and the supervisor marks the device
+ *    `identity-mismatch`; another address cannot fix it.
+ *  - {@link ProtocolVersionError} — the peer refused the version echo. Also the
+ *    pairing, not the address.
+ *  - {@link AuthRejectedError} — authenticate was refused (GRANT_REVOKED /
+ *    UNAUTHENTICATED). Same reasoning.
+ *  - {@link CancelledError} — `close()` raced the attempt; the supervisor's epoch
+ *    guard handles it, and falling through to another candidate would be wrong.
+ */
+function isPerHostFailure(error: unknown): boolean {
+  return !(
+    error instanceof IdentityMismatchError ||
+    error instanceof ProtocolVersionError ||
+    error instanceof AuthRejectedError ||
+    error instanceof CancelledError
+  )
 }
 
 interface HelloResult {
@@ -385,6 +412,19 @@ export class DeviceConnection {
   }
 
   /**
+   * Whether a dialed link is currently committed.
+   *
+   * Read-only view of state this class already owns, exposed because the
+   * `connecting`-with-a-link window is a REAL state a test must be able to
+   * target: `#establish` commits `#link` before `#handshake` completes, so
+   * "state is connecting" and "no link exists" are different situations with
+   * different correct behaviour for a business request.
+   */
+  get hasLink(): boolean {
+    return this.#link !== undefined
+  }
+
+  /**
    * Business-facing rpc facade.
    *
    * `dispose` is ALWAYS a local no-op, even when a client is live. Tearing down
@@ -412,13 +452,16 @@ export class DeviceConnection {
           // registry is a Set, so a re-add is already a no-op there — the
           // listener attach needs its own guard to match.
           //
-          // With no live link this still records the handler as "attached",
-          // which is what makes the guard correct rather than merely harmless:
-          // #handshake attaches the WHOLE registry to every new client, so a
-          // handler registered while offline is covered by that pass and must
-          // not trigger a second attach now.
+          // `#attachedHandlers` means "attached to the CURRENT live client", and
+          // NOTHING is attached while there is no link — so a handler registered
+          // while offline is deliberately NOT marked here. `#handshake` attaches
+          // the whole registry to every new client and marks them then, which is
+          // what covers the offline registration exactly once. Marking it here
+          // instead would make `#handshake` skip it forever.
+          const link = this.#link
+          if (link === undefined) return
           if (this.#attachedHandlers.has(handler)) return
-          this.#link?.client.onNotification(handler)
+          link.client.onNotification(handler)
           this.#attachedHandlers.add(handler)
         }
       }
@@ -564,6 +607,15 @@ export class DeviceConnection {
    * One establishment pass: try each candidate host in order. Per-host
    * network failures fall through to the next candidate — the §6
    * 「候选地址全部不可达」 verdict only holds when EVERY host failed.
+   *
+   * "Per-host" covers the CHANNEL-LEVEL handshake failures as well as the dial:
+   * a socket that opens and then dies mid-handshake (the peer accepted the TCP
+   * connection and went away, a proxy reset it, the Noise exchange was cut) is a
+   * property of THAT ADDRESS, and a multi-homed desktop whose first address is
+   * stale is exactly the case the candidate list exists for. The terminal faces
+   * — identity mismatch, protocol-version confirmation, rejected authentication —
+   * are properties of the PAIRING, so they still abort the whole pass instead of
+   * being blamed on one address.
    */
   async #establish(epoch: number): Promise<void> {
     this.#setState('connecting')
@@ -592,8 +644,21 @@ export class DeviceConnection {
       // tears it down through #teardownLink (business traffic is still gated
       // by state !== 'connected').
       this.#link = link
-      await this.#handshake(link, epoch)
-      return
+      try {
+        await this.#handshake(link, epoch)
+        return
+      } catch (error) {
+        // The terminal faces end the pass: they describe the PAIRING, not this
+        // address, so trying the next candidate would only repeat them.
+        if (!isPerHostFailure(error)) throw error
+        // A channel-level failure (socket dropped mid-handshake) is this
+        // ADDRESS's problem: tear the link down here, since the loop's next
+        // iteration would otherwise overwrite `#link` and leak this socket, and
+        // fall through to the next candidate.
+        this.#teardownLink()
+        lastError = error instanceof Error ? error : new Error(String(error))
+        continue
+      }
     }
     throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, lastError)
   }
@@ -634,7 +699,9 @@ export class DeviceConnection {
     // DEFERRED: it would need a per-code policy the protocol does not yet
     // guarantee, and a uniform honest retry is strictly safer than guessing a
     // longer one. The rate limiter still bounds the retry storm in the
-    // meantime, and ⑦ pins the uniform transition shape in both cases.
+    // meantime, and the contract suite's `rate-limit-terminates-session` item
+    // proves the uniform transition shape: the 1011 close routes through
+    // offline → reconnect rather than surfacing a per-request refusal.
     ws.on('close', () => this.#onLinkLost(epoch, 'socket closed'))
     ws.on('error', () => this.#onLinkLost(epoch, 'socket error'))
 
@@ -738,7 +805,15 @@ export class DeviceConnection {
     // subscriptions (Tasks 7/9) survive reconnects transparently. `#teardownLink`
     // cleared the attached-set when the previous client died, so this repopulates
     // it for the new one.
+    //
+    // Guarded on the set, the same way the facade's `onNotification` is: a
+    // handler registered WHILE this handshake was in flight is already attached
+    // to this very client (the facade attaches to a live `#link` immediately),
+    // and attaching it again would double-deliver every notification for the
+    // rest of the cycle. The registry being a Set makes a re-ADD harmless; this
+    // is the listener attach, which has no such protection.
     for (const handler of this.#notificationHandlers) {
+      if (this.#attachedHandlers.has(handler)) continue
       link.client.onNotification(handler)
       this.#attachedHandlers.add(handler)
     }
@@ -937,9 +1012,21 @@ export class DeviceConnection {
       console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
       throw new DeviceUnavailableError(this.record.deviceId, this.#state)
     }
+    // The pacing wait can outlast the link: `acquire` may block for a whole
+    // rate window, and a socket lost (or replaced by a reconnect mid-handshake)
+    // during it leaves `#link` pointing at a client that is not authenticated.
+    // `#establish` commits `#link` BEFORE `#handshake` completes, so the
+    // `#link === undefined` guard alone does NOT cover the `connecting` case —
+    // a request released into that window rides an unauthenticated client and
+    // surfaces a raw `JSON-RPC client disposed` instead of the §6
+    // `{device, state}` face this method promises. Re-judge the state AFTER the
+    // wait; the checks below are ordered so the structured error always wins.
     await this.#limiter.acquire()
     const link = this.#link
-    if (link === undefined) throw new DeviceUnavailableError(this.record.deviceId, this.#state)
+    if (this.#state !== 'connected' || link === undefined) {
+      console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
+      throw new DeviceUnavailableError(this.record.deviceId, this.#state)
+    }
     return link.client.request<T>(method, params, opts)
   }
 

@@ -39,7 +39,11 @@ async function persistIdentity(path: string, key: Uint8Array): Promise<void> {
  * The two failure modes are deliberately NOT treated alike:
  *
  *  - MISSING (`ENOENT`) is the normal first run: a new identity is generated
- *    silently, which is exactly what the caller asked for.
+ *    silently, which is exactly what the caller asked for. ONLY `ENOENT` counts
+ *    as missing. Every other read failure (EACCES/EISDIR/EIO/…) means bytes are
+ *    there that this process could not read, and regenerating over them would
+ *    destroy the only evidence of the previous key — so those take the CORRUPT
+ *    path below and say so, instead of posing as a quiet first run.
  *  - CORRUPT is a data-loss event with a consequence the operator cannot infer
  *    from a fresh key alone: the desktop pinned the OLD public key, so every
  *    stored pairing is now invalid and will be refused until re-approved. The
@@ -50,14 +54,22 @@ async function persistIdentity(path: string, key: Uint8Array): Promise<void> {
 export async function loadOrCreateIdentity(dataDir: string): Promise<DeviceIdentity> {
   const path = identityPath(dataDir)
 
-  let stored: Uint8Array
+  let stored: Uint8Array | undefined
+  let readError: unknown
   try {
     stored = new Uint8Array(await readFile(path))
-  } catch {
-    return generateIdentity(dataDir, path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+      return generateIdentity(dataDir, path)
+    }
+    readError = error
   }
 
   try {
+    // An unreadable (non-ENOENT) file lands here with no bytes and is reported
+    // through the corruption path: the operator learns the load FAILED, with the
+    // original error, rather than receiving an unexplained new identity.
+    if (stored === undefined) throw readError
     return parseIdentity(stored)
   } catch (error) {
     // Preserve first, then complain, then regenerate: a failed copy must not

@@ -369,6 +369,28 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(store.list()).toEqual([])
   }, 15_000)
 
+  it('④d refuses an approval whose expiresAt is unparsable, never archiving a NaN expiry', async () => {
+    // `Date.parse` yields NaN for anything it cannot read, and a NaN
+    // `tokenExpiresAt` is the worst kind of value to persist: every freshness
+    // comparison against it is FALSE, so the record reads as permanently expired
+    // (or permanently fresh) depending on the comparison, and the device is
+    // silently unusable with no explanation. A malformed expiry is a broken
+    // receipt, so the pairing FAILS with a structured error instead.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      pairingDecision: 'approved',
+      pairingGetPendingPolls: APPROVE_AFTER_POLLS,
+      pairingApprovedExpiresAt: 'not-a-timestamp',
+    })
+    const store = await makeStore()
+
+    const error = await pairingError(pair({ identity, store, payload: payloadFor(fakeInfo) }))
+
+    expect(error.kind).toBe('rejected')
+    // NOTHING was archived: no record with a NaN expiry exists on disk.
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
   it('⑤ ignores payload fields outside the consumed manifest (e.g. name) and warns about them', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeApprovingFake()

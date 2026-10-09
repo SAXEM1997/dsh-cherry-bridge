@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deviceIdentityId } from '@cherrystudio/remote-transport'
@@ -8,10 +8,13 @@ import { loadOrCreateIdentity } from '../../src/identity.js'
 const dataDirs: string[] = []
 
 beforeEach(() => {
-  // A corrupt identity is traced on stderr by design (F3), and one test below
-  // exercises that path. Silence it globally so the suite output stays
-  // pristine; the test that ASSERTS on the trace re-spies inside itself.
+  // A corrupt identity is traced on stderr by design (F3), and tests below
+  // exercise that path — including the best-effort preservation copy, which
+  // WARNS when it cannot copy (a non-ENOENT read failure has no bytes to
+  // preserve). Silence both so the suite output stays pristine; the tests that
+  // ASSERT on the trace re-spy inside themselves.
   vi.spyOn(console, 'error').mockImplementation(() => {})
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
 })
 
 afterEach(async () => {
@@ -131,5 +134,32 @@ describe('loadOrCreateIdentity', () => {
     // First run is not corruption: no error, no `.corrupt` file.
     expect(error).not.toHaveBeenCalled()
     await expect(readFile(`${keyPath(dataDir)}.corrupt`)).rejects.toThrow()
+  })
+
+  it('treats a non-ENOENT read failure as corruption, never as a silent first run', async () => {
+    // ONLY `ENOENT` means "nothing here yet". Every other read failure — EACCES,
+    // EISDIR, EIO, a transient mount error — means bytes ARE there and this
+    // process could not read them. Regenerating silently would leave the operator
+    // with a fresh key and no explanation, while the desktop still pins the OLD
+    // public key and will refuse every stored pairing. The honest reading is
+    // CORRUPTION: preserve, complain loudly, then regenerate.
+    //
+    // A DIRECTORY at the key path makes `readFile` fail with EISDIR — a
+    // deterministic, privilege-independent non-ENOENT read error.
+    const dataDir = await makeDataDir()
+    await mkdir(keyPath(dataDir))
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    // The regeneration write cannot succeed (a directory occupies the path), so
+    // the call rejects; what this test pins is WHICH path was taken on the way.
+    await expect(loadOrCreateIdentity(dataDir)).rejects.toThrow()
+
+    expect(error).toHaveBeenCalled()
+    const messages = error.mock.calls.flat().map(String).join('\n')
+    expect(messages).toContain(keyPath(dataDir))
+    // The CORRUPTION report — not the silent first-run path. It names the
+    // consequence the operator has to act on (the desktop still pins the old key).
+    expect(messages).toMatch(/corrupt/i)
+    expect(messages).toMatch(/re-approval|re-pair|pin/i)
   })
 })

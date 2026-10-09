@@ -487,8 +487,7 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(connection.state).toBe('offline')
   })
 
-  it('(F5c) re-registering the same notification handler does not double-deliver', async () => {
-    const identity = await createDeviceIdentity()
+  it('(F5c) re-registering the same notification handler does not double-deliver', async () => {    const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake()
     const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
 
@@ -509,6 +508,38 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(seen).toHaveLength(1)
     expect(seen[0]).toBe('agent.events')
   }, 10_000)
+
+  it('⑬c attaches a handler registered WHILE the handshake is in flight exactly once', async () => {
+    // `#establish` commits `#link` BEFORE `#handshake` runs, and the facade
+    // attaches a newly registered handler to a live link immediately. So a
+    // handler registered during the handshake is on the client BEFORE
+    // `#handshake`'s re-attach loop reaches the registry — and that loop must
+    // skip it, or every later notification for this cycle is delivered twice.
+    const identity = await createDeviceIdentity()
+    // Slow handshake: the whole server side is stalled long enough to register
+    // inside it.
+    const fakeInfo = await makeFake({ requestDelayMs: 300 })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    const seen: string[] = []
+    const handler = (method: string): void => {
+      seen.push(method)
+    }
+
+    const pending = connection.connect()
+    // Park until the link is committed but not yet connected — the raced window.
+    await waitFor(() => connection.hasLink && connection.state === 'connecting', 5_000)
+    connection.rpc.onNotification(handler)
+
+    await pending
+    expect(connection.state).toBe('connected')
+
+    fakeInfo.fake.pushNotification('agent.events', { events: [] })
+    await waitFor(() => seen.length >= 1)
+    await sleep(50)
+    // ONE delivery: the mid-handshake attach is not repeated by #handshake.
+    expect(seen).toEqual(['agent.events'])
+  }, 15_000)
 
   it('(F5b) logs the desktop identity as a 12-hex digest, never the raw pin', async () => {
     const identity = await createDeviceIdentity()
@@ -727,6 +758,53 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(connectSpy.mock.calls.length).toBe(connectCallsBefore)
     expect(fakeInfo.fake.socketCount).toBe(attemptsBefore)
   })
+
+  it('⑬b surfaces {device, state} when the link is lost during the rate-limiter wait', async () => {
+    // THE RACE (review E2-4): `#businessRequest` checked `state === 'connected'`
+    // and THEN awaited the pacing limiter. `#establish` commits `#link` BEFORE
+    // `#handshake` completes, so a request parked in the limiter can be released
+    // into a reconnect that has already dialed (`#link` set) but has NOT yet
+    // authenticated (state `connecting`) — and ride that unauthenticated client.
+    // It then surfaces a raw `JSON-RPC client disposed` instead of the §6
+    // `{device, state}` face the tool layer promises.
+    const identity = await createDeviceIdentity()
+    // Short heartbeat so the silence window (2×heartbeatMs) closes quickly.
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 120 } })
+    // Budget 1/s ⇒ the pacing gap is (1000+150)/1 = 1150ms: the SECOND request
+    // is reliably parked inside the limiter while the link changes underneath it.
+    const record = recordFor(fakeInfo)
+    const connection = makeConnection({
+      identity,
+      record,
+      rateBudgetPerSecond: 1,
+      backoffInitialMs: 1,
+    })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    // First request consumes this window's only admission.
+    await connection.rpc.request('connection.ping', { nonce: 'first' })
+
+    // Stall the peer's server-side work, so the RECONNECT's dial commits
+    // `#link` and then sits in the handshake — a wide, predictable window.
+    fakeInfo.fake.setRequestDelay(3_000)
+
+    // Park the request in the limiter, then take the live link down (the peer
+    // stops answering pings, so the client's silence judgement fires).
+    const inFlight = assemblyToolCall(connection, 'connection.ping', { nonce: 'second' })
+    fakeInfo.fake.setDropPings(true)
+
+    // Wait for the exact raced state: reconnected socket committed, handshake
+    // not finished. The limiter releases inside this window.
+    await waitFor(() => connection.state === 'connecting' && connection.hasLink, 10_000)
+
+    // The structured fail-fast face — never a raw RPC/channel error.
+    await expect(inFlight).rejects.toMatchObject({ device: record.deviceId, state: 'connecting' })
+    await expect(inFlight).rejects.not.toThrow(/JSON-RPC client disposed|channel closed/i)
+
+    fakeInfo.fake.setDropPings(false)
+    fakeInfo.fake.setRequestDelay(undefined)
+  }, 30_000)
 
   it('rejects a pending connect() when close() races the in-flight attempt — never a silent hang', async () => {
     const identity = await createDeviceIdentity()

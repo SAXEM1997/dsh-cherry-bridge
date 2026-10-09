@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { QuarantinedArchiveError } from './deviceStore.js'
+import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
 import type { DeviceState, EffectiveLimits } from './connection.js'
@@ -242,11 +242,41 @@ function header(headers: Record<string, string | string[] | undefined>, name: st
   return value
 }
 
+/**
+ * Whether a `URL.hostname`-shaped authority names the local machine.
+ *
+ * The input is the WHATWG host SERIALIZATION, which KEEPS the brackets on an
+ * IPv6 literal: `new URL('http://[::1]:23023').hostname` is `'[::1]'` in Node
+ * and in the browser alike, so the bracketed spellings below are the real ones.
+ * (Review E2-2 claimed the brackets are stripped and the `'[::1]'` literal was
+ * therefore dead; that is measurably false — the fence already admitted
+ * `[::1]:23023` before this change. Both spellings are accepted so a caller
+ * passing a raw `Host` header value gets the same verdict either way.)
+ *
+ * The gap that WAS real is the IPv4-MAPPED loopback family: a dual-stack
+ * listener reached over IPv6 is addressed as `::ffff:127.0.0.1`, and the
+ * WHATWG serializer rewrites that to the hex form `[::ffff:7f00:1]`. Those are
+ * loopback by any honest reading and now qualify. Only the mapped 127/8 range
+ * does — `[::ffff:8.8.8.8]` is NOT loopback, so this is not a blanket "any v6
+ * with a ffff: prefix" admission.
+ */
 function isLoopbackHostname(hostname: string): boolean {
-  if (hostname === 'localhost' || hostname === '[::1]') return true
+  if (hostname === 'localhost' || hostname === '::1' || hostname === '[::1]') return true
+  // Unwrap the serialization once, then judge the bare address.
+  const bare = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
+  if (bare === '::1') return true
+  // IPv4-mapped loopback. The dotted-quad spelling of the low 32 bits is the
+  // readable one; the serializer emits the hex one, so both are decoded.
+  if (bare.startsWith('::ffff:')) {
+    const mapped = bare.slice('::ffff:'.length)
+    // Hex form (`7f00:1`) — only the `7fxx:xxxx` range is 127/8.
+    const hex = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(mapped)
+    if (hex !== null) return Number.parseInt(hex[1]!, 16) >>> 8 === 0x7f
+    return isLoopbackHostname(mapped)
+  }
   // Any IPv4 address in 127/8 is loopback: the whole range, not just 127.0.0.1,
   // because a host may bind 127.0.0.53 and a browser may name it.
-  const parts = hostname.split('.')
+  const parts = bare.split('.')
   return (
     parts.length === 4 &&
     parts[0] === '127' &&
@@ -373,9 +403,10 @@ function writeQuarantineRefusal(res: HttpResponseLike, route: RouteContext, erro
     // message uses, so an operator is never sent to a file that does not exist
     // merely because the copy could not be made.
     corrupt: error.corruptPath ?? `${error.file}.corrupt`,
-    recovery:
-      'the device archive cannot be read and the plugin will not overwrite it; move the bad file ' +
-      'aside (then restart or re-apply the plugin) to resume device management',
+    // The shared recovery instruction: identical to the one `cherry_pair`
+    // returns in-band and the SSE stage publishes, so the three faces cannot
+    // drift into three different instructions.
+    recovery: QUARANTINE_RECOVERY,
     message: error.message,
   })
   return true
@@ -559,6 +590,15 @@ class SseHub {
   }
 
   subscribe(req: HttpRequestLike, res: HttpResponseLike): void {
+    // SNAPSHOT FIRST, headers second. `#snapshot()` reads the archive, which is
+    // a legitimate thrower (a quarantined store refuses to be read). Taking it
+    // after `writeHead(200, ...)` would mean the throw happens with the response
+    // ALREADY COMMITTED: the client gets a 200 it can never use, the SSE client
+    // is never registered, and no error status can be sent any more. Reading it
+    // first keeps a failed snapshot an ordinary pre-commit failure the caller
+    // can still turn into a structured error.
+    const snapshot = this.#snapshot()
+
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-store, no-transform',
@@ -573,7 +613,7 @@ class SseHub {
     res.on?.('close', close)
 
     // First frame: the current full state, one frame per known device.
-    for (const device of this.#snapshot()) {
+    for (const device of snapshot) {
       this.#write(client, 'device-state', { deviceId: device.deviceId, state: device.state })
     }
 

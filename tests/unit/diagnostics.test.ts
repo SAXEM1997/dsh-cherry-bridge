@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { digestIdentity, sanitizeDevice } from '../../src/diagnostics.js'
+import { buildDiagnostics, digestIdentity, sanitizeDevice } from '../../src/diagnostics.js'
+import type { DiagnosticsSources } from '../../src/diagnostics.js'
 import type { DeviceRecord } from '../../src/deviceStore.js'
 
 /**
@@ -44,5 +45,41 @@ describe('final review: digestIdentity on an absent identity', () => {
   it('R10c: a device with no pinned identity reports `unknown` through sanitizeDevice', () => {
     const projected = sanitizeDevice(record({ desktopIdentity: '' }), 'offline')
     expect(projected.desktopIdentity).toBe('unknown')
+  })
+})
+
+describe('fix round 2: a throwing source degrades its own section only', () => {
+  /** The smallest source set that satisfies `DiagnosticsSources`. */
+  const sourcesWith = (overrides: Partial<DiagnosticsSources>): DiagnosticsSources =>
+    ({
+      store: { list: () => [] },
+      connect: () => ({ state: 'offline' as const }),
+      stats: () => ({}),
+      sessions: () => [],
+      recentErrors: () => [],
+      ...overrides,
+    }) as unknown as DiagnosticsSources
+
+  it('a store whose list() throws degrades the device section instead of failing the report', () => {
+    // THE POINT OF THE GUARD: this endpoint is opened exactly when something is
+    // wrong, so it must not be the thing that fails. Every OTHER source is read
+    // through a guard (sessions/stats/recentErrors below); `store.list()` was the
+    // one that could still throw out of `buildDiagnostics` as a 500.
+    const report = buildDiagnostics(
+      sourcesWith({
+        store: {
+          list: () => {
+            throw new Error('the archive resolver exploded')
+          },
+        } as unknown as DiagnosticsSources['store'],
+        stats: () => ({ connections: 3 }),
+        recentErrors: () => [],
+      }),
+    )
+
+    // The section is empty-but-present, and the REST of the report still went out.
+    expect(report.devices).toEqual([])
+    expect(report.stats.connections).toBe(3)
+    expect(report.plugin.name).toBe('dsh-cherry-bridge')
   })
 })

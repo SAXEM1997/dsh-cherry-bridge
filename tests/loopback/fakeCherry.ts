@@ -78,6 +78,12 @@ export interface FakeCherryOptions {
   /** Number of `pairing.get` calls answered `pending` before the decision. */
   pairingGetPendingPolls?: number
   /**
+   * Overrides the `expiresAt` the approved `pairing.get` branch reports. Default
+   * is a well-formed ISO timestamp; a test injects a malformed one to exercise
+   * the receipt-validation path.
+   */
+  pairingApprovedExpiresAt?: string
+  /**
    * Capability domains the approved `pairing.get` branch grants (default
    * ['agent']). An empty array models a desktop that approved nothing usable.
    */
@@ -444,6 +450,12 @@ interface LiveConnection {
   controller: AbortController
   /** Set once `connection.hello` confirmed the prelude offer, like the peer's. */
   hello: boolean
+  /**
+   * Arrival timestamps for THIS socket, which is the window the rate cap is
+   * judged over. The real desktop's cap is per-connection: a second client
+   * dialing in has its own budget and cannot be starved by a noisy first one.
+   */
+  arrivals: number[]
 }
 
 const noop = (): void => {}
@@ -539,6 +551,7 @@ export class FakeCherry {
   #refreshFailure: FakeFailure | undefined
   #authenticateFailure: FakeFailure | undefined
   #dropPings: boolean
+  #requestDelayMs: number | undefined
 
   // Observation surface.
   #socketCount = 0
@@ -1112,6 +1125,15 @@ export class FakeCherry {
     this.#dropPings = drop
   }
 
+  /**
+   * Overrides the per-request server delay at runtime. A test that needs to hold
+   * the HANDSHAKE open (so the client has a dialed link whose state is still
+   * `connecting`) sets this after `start()`.
+   */
+  setRequestDelay(ms: number | undefined): void {
+    this.#requestDelayMs = ms
+  }
+
   async stop(): Promise<void> {
     for (const { socket, controller } of this.#live) {
       controller.abort()
@@ -1150,7 +1172,7 @@ export class FakeCherry {
     })
       .then((channel) => {
         this.#connectionCount += 1
-        const live: LiveConnection = { socket, channel, controller, hello: false }
+        const live: LiveConnection = { socket, channel, controller, hello: false, arrivals: [] }
         this.#live.push(live)
         void this.#serve(live)
       })
@@ -1181,6 +1203,8 @@ export class FakeCherry {
     const method = frame.method
     const params = parseParams(method, frame.params)
     this.#countArrival(method)
+    // The per-SOCKET arrival, which is the window the rate cap is judged over.
+    live.arrivals.push(Date.now())
     if (method === 'connection.hello' && Array.isArray(params?.['protocolVersions'])) {
       this.#lastHelloProtocolVersions = [...(params['protocolVersions'] as number[])]
     }
@@ -1221,7 +1245,8 @@ export class FakeCherry {
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    if (this.#options.requestDelayMs !== undefined) await sleep(this.#options.requestDelayMs)
+    const delay = this.#requestDelayMs ?? this.#options.requestDelayMs
+    if (delay !== undefined) await sleep(delay)
     switch (method) {
       case 'connection.hello':
         return this.#handleHello(live)
@@ -1380,7 +1405,7 @@ export class FakeCherry {
     this.#approvedDeviceId ??= `dev-${randomUUID()}`
     const token = this.#issueToken()
     this.#issuedAccessToken = token.token
-    this.#approvedTokenExpiresAt = new Date(token.expiresAt).toISOString()
+    this.#approvedTokenExpiresAt = this.#options.pairingApprovedExpiresAt ?? new Date(token.expiresAt).toISOString()
     const grants = (this.#options.approvedGrants ?? ['agent']).map((domain) => ({
       domain,
       grantId: `grant-${domain}`,
@@ -2003,7 +2028,15 @@ export class FakeCherry {
         : ((params['workspace'] as { id?: string } | undefined)?.id ?? '')
     const systemWorkspace = params['workspaceId'] === undefined
     const sessionId = `session-${randomUUID().slice(0, 8)}`
-    this.#agent().sessions?.push({
+    // Materialize the array before pushing (the same fix `#appendTerminalMessage`
+    // carries): `sessions` is optional in the fixture, so an `?.push` silently
+    // DROPS the new session when a test supplies an agent fixture without one.
+    // The run then fails on its own follow-up (`agent.sessions.get` cannot find
+    // the id it was just handed) — a fixture-shaped failure that looks like a
+    // production bug.
+    const agent = this.#agent()
+    agent.sessions ??= []
+    agent.sessions.push({
       sessionId,
       agentId,
       workspaceId: systemWorkspace ? 'system-workspace' : workspaceId,
@@ -2205,38 +2238,55 @@ export class FakeCherry {
     interaction.revision = String(this.#interactionRevision + 100)
     const parked = this.#parkedRuns.get(interaction.interactionId)
     const sessionId = parked?.sessionId ?? this.#sessionOfExecution(interaction.executionId)
-    this.#notify('agent.events', {
-      sessionId,
-      subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === sessionId)
-        ?.subscriptionId,
-      streamEpoch: this.#journalEpoch,
-      events: [
-        {
-          kind: 'interaction.updated',
-          seq: String(++this.#watermark),
-          payload: this.#interactionView(interaction),
-        },
-      ],
-    })
+    // UNRESOLVABLE: no session owns this execution and no parked run claims it,
+    // so there is no honest sessionId to announce. Emitting the frame under a
+    // fabricated id would publish an interaction event against a session that
+    // does not exist — the peer never does that, and a client that trusted it
+    // would create state for a phantom session. Skip the notify instead; the
+    // resume path below still runs when a parked run exists.
+    if (sessionId !== undefined) {
+      this.#notify('agent.events', {
+        sessionId,
+        subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === sessionId)
+          ?.subscriptionId,
+        streamEpoch: this.#journalEpoch,
+        events: [
+          {
+            kind: 'interaction.updated',
+            seq: String(++this.#watermark),
+            payload: this.#interactionView(interaction),
+          },
+        ],
+      })
+    }
 
     if (parked === undefined) return
     this.#parkedRuns.delete(interaction.interactionId)
     // A DENIED interaction ends the run as cancelled (the work is abandoned); an
     // APPROVED/answered one proceeds to its configured terminal.
     const status2 = status === 'denied' ? 'cancelled' : parked.status
-    this.#emitExecutionUpdated(sessionId, parked.executionId, status2, parked.messageId)
+    this.#emitExecutionUpdated(parked.sessionId, parked.executionId, status2, parked.messageId)
     if (status2 !== 'running' && status2 !== 'finalizing' && status2 !== 'awaiting-approval') {
       this.#activeExecutionId = undefined
     }
   }
 
-  /** The session an execution belongs to, from the execution's own fixture. */
-  #sessionOfExecution(executionId: string): string {
+  /**
+   * The session an execution belongs to, from the execution's own fixture, or
+   * `undefined` when nothing resolvable owns it.
+   *
+   * The fallback used to be `sessions[0]?.sessionId ?? 'session-1'`: a
+   * FABRICATED id for a session this fixture does not model. Emitting under it
+   * published an interaction event against a phantom session, which is worse
+   * than emitting nothing — the caller cannot tell a real session from an
+   * invented one. `undefined` is the honest answer, and callers skip the notify.
+   */
+  #sessionOfExecution(executionId: string): string | undefined {
     const sessions = this.#agent().sessions ?? []
     const owning = sessions.find((entry) => entry.activeExecutionId === executionId)
     if (owning !== undefined) return owning.sessionId
-    // The live run's session is the only one this fake models.
-    return sessions[0]?.sessionId ?? 'session-1'
+    // The live run's session, when the fixture models exactly one.
+    return sessions[0]?.sessionId
   }
 
   #appliedReceipt(
@@ -2455,13 +2505,21 @@ export class FakeCherry {
    * Whole-session rate termination: over-budget closes the socket with 1011
    * and returns true. Per-connection (per-socket) counting only — no global
    * scheduling, mirroring the real desktop's per-connection rate window.
+   *
+   * The window is over `live.arrivals`, NOT the global `#requestTimestamps`:
+   * the global list is the TEST's observation surface (`requestTimestamps`), and
+   * judging the cap from it made the limit effectively process-wide, so a second
+   * connection's traffic could terminate the first. The comment above was the
+   * contract; this is the implementation matching it.
    */
   #rateLimited(live: LiveConnection): boolean {
     const budget = this.#options.rateLimitPerSecond
     if (budget === undefined) return false
     const now = Date.now()
-    const inWindow = this.#requestTimestamps.filter((t) => now - t < 1000).length
-    if (inWindow <= budget) return false
+    const arrivals = live.arrivals
+    // Drop entries too old to matter, so the per-socket list stays bounded.
+    while (arrivals.length > 0 && now - arrivals[0]! >= 1000) arrivals.shift()
+    if (arrivals.length <= budget) return false
     live.socket.close(1011, 'rate limit exceeded')
     return true
   }

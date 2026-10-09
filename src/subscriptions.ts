@@ -1,5 +1,6 @@
 import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcClient } from './rpc/jsonRpcClient.js'
+import { DEFAULT_PER_SESSION_CACHE_BYTES } from './defaults.js'
 import type { AgentCursor, AgentEvent } from '@cherrystudio/remote-protocol/agent'
 
 /**
@@ -22,8 +23,6 @@ import type { AgentCursor, AgentEvent } from '@cherrystudio/remote-protocol/agen
 
 /** The default peer subscription cap when the caller does not supply one. */
 const DEFAULT_SUBSCRIPTIONS_LIMIT = 8
-/** The default local per-session cache budget: 2 MiB of event text (spec §3.5). */
-const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 /** The peer's prepared-lease window, used to bound recovery-chain retries. */
 const DEFAULT_CHECKPOINT_MS = 300_000
 /**
@@ -204,6 +203,18 @@ export class SessionSubscriptions {
   }
 
   /**
+   * How many resolvers are currently parked on `sessionId`.
+   *
+   * A read-only view of state this layer owns, exposed because ABANDONED PARKS
+   * are invisible otherwise: a caller that re-parks without disposing (the
+   * `cherry_wait` poll loop) leaves one resolver per pass in the queue, and the
+   * only symptom is a queue that grows silently. Zero for an untracked session.
+   */
+  waiterCount(sessionId: string): number {
+    return this.#sessions.get(sessionId)?.waiters.length ?? 0
+  }
+
+  /**
    * The session's CURRENT stream cursor — the newest position this layer knows
    * is durable for it — or undefined when the session is untracked.
    *
@@ -376,9 +387,18 @@ export class SessionSubscriptions {
    * Parks a resolver that settles when the session buffer advances past
    * `cursor`. Tasks 8/9's waiters ride this; the wake is coalesced so a batch
    * of notifications wakes each waiter exactly once.
+   *
+   * Returns a DISPOSER alongside the promise. Without one, a caller that parks
+   * repeatedly (the `cherry_wait` poll loop re-parks after every judgement pass)
+   * leaves the previous park's resolver in the session's waiter queue forever:
+   * the queue grows once per poll interval for the life of the wait, and every
+   * buffer advance settles all of them. The disposer removes the park if it is
+   * still queued; calling it after the park settled is a harmless no-op, so a
+   * caller may use it unconditionally.
    */
-  waitFor(sessionId: string, cursor?: AgentCursor): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
+  waitFor(sessionId: string, cursor?: AgentCursor): { promise: Promise<void>; dispose: () => void } {
+    let dispose = (): void => {}
+    const promise = new Promise<void>((resolve, reject) => {
       const state = this.#sessions.get(sessionId)
       if (state === undefined) {
         reject(new Error(`no subscription for session ${sessionId}`))
@@ -390,8 +410,18 @@ export class SessionSubscriptions {
         resolve()
         return
       }
-      state.waiters.push({ resolve, reject })
+      const waiter: Waiter = { resolve, reject }
+      state.waiters.push(waiter)
+      // Idempotent: a second call (or a call after the park settled and the
+      // waiter was spliced out) must not disturb the queue.
+      dispose = (): void => {
+        const index = state.waiters.indexOf(waiter)
+        if (index >= 0) state.waiters.splice(index, 1)
+      }
     })
+    // Background/rejected paths are already handled by callers; keep the
+    // promise's rejection observable exactly as before (no extra catch here).
+    return { promise, dispose }
   }
 
   /** Releases every live peer subscription (assembly teardown). */

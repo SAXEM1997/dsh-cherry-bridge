@@ -564,6 +564,21 @@ function recordFrom(
     throw new PairingError('rejected', 'the desktop approved no agent capability for this device')
   }
 
+  // The expiry MUST parse. `Date.parse` returns NaN for anything it cannot read,
+  // and a persisted NaN `tokenExpiresAt` is worse than a missing one: every
+  // freshness comparison against it is false, so the device is silently treated
+  // as permanently expired (or never) with nothing to explain why. A receipt
+  // whose expiry cannot be read is malformed, so the run fails here rather than
+  // archiving it.
+  const tokenExpiresAt = Date.parse(approved.expiresAt)
+  if (!Number.isFinite(tokenExpiresAt)) {
+    throw new PairingError(
+      'rejected',
+      `the desktop approved the pairing with an unreadable token expiry ` +
+        `(${JSON.stringify(approved.expiresAt)}); re-pair the device`,
+    )
+  }
+
   return {
     schemaVersion: 2,
     deviceId: approved.deviceId,
@@ -573,7 +588,7 @@ function recordFrom(
     desktopIdentity: payload.desktopIdentity,
     grants,
     accessToken: approved.accessToken,
-    tokenExpiresAt: Date.parse(approved.expiresAt),
+    tokenExpiresAt,
     enabled: true,
   }
 }

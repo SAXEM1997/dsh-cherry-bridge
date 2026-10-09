@@ -26,6 +26,8 @@
  * before subscribing loses the verification code forever.
  */
 import { describe, expect, it, afterEach, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createElement } from 'react'
 import type { ComponentProps, ComponentType } from 'react'
@@ -34,6 +36,7 @@ import { App } from '../../ui/src/App'
 import { DeviceCard } from '../../ui/src/DeviceCard'
 import { inject, apply, SETTINGS_NAMESPACE, SETTINGS_SLOT } from '../../ui/src/main'
 import type { SlotRegistration, SlotsService } from '../../ui/src/main'
+import { STAGE_LABELS } from '../../ui/src/types'
 
 afterEach(() => {
   cleanup()
@@ -246,33 +249,43 @@ describe('pairing wizard', () => {
     // place, the very first `pairing-progress` frame reaches the wizard. (The
     // inverse — POSTing first — is asserted positionally in the ordering test.)
     await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-11' })]])
+    expect(stream().listeners.get('pairing-progress')?.size ?? 0).toBeGreaterThan(0)
 
-    // The stream subscribes before the POST, so the frame is not replayed away.
-    // It carries THIS run's claim id, which is what makes it attributable.
+    submitPayload()
+    await screen.findByText('配对进行中')
+
+    // The code frame carries THIS run's claim id, which is what makes it
+    // attributable — and a frame can only be attributed once `POST /pair` has
+    // returned the id, so this is the earliest real point one can arrive.
     stream().emit({
       event: 'pairing-progress',
       data: { stage: 'verification-code', detail: '204816', claimId: 'claim-11' },
     })
-    submitPayload()
 
     expect(await screen.findByText('204816')).toBeTruthy()
   })
 
   // Every post-202 failure verdict the server can publish (src/httpApi.ts
-  // `pairingVerdict` → `PairingErrorKind`). These arrive as `pairing-progress`
-  // frames with `stage = verdict.error`, NOT as an HTTP error — the 202 was
-  // already returned — so each one must settle the wizard just like a terminal
-  // approval would. Missing any of them leaves the run stuck in 'waiting' with
-  // the submit button permanently disabled.
+  // `pairingVerdict` → `PairingErrorKind`, plus the quarantined-archive stage).
+  // These arrive as `pairing-progress` frames with `stage = verdict.error`, NOT
+  // as an HTTP error — the 202 was already returned — so each one must settle
+  // the wizard just like a terminal approval would. Missing any of them leaves
+  // the run stuck in 'waiting' with the submit button permanently disabled.
+  //
+  // The copy each one must render is the STAGE_LABELS RECOVERY text, asserted in
+  // full: a wizard that settles with `progress` already cleared would fall back
+  // to '未知错误' in the settled frame, and a substring match on the verdict word
+  // alone ('配对被拒绝') cannot tell that apart from the real guidance. These
+  // stages therefore assert the recovery clause the user is supposed to act on.
   const postPairingFailures = [
-    ['unreachable', '无法连接 Cherry Studio'],
-    ['invalid-payload', '配对信息无效'],
-    ['rejected', '配对被拒绝'],
-    ['expired', '配对邀请已过期'],
+    ['unreachable', '无法连接 Cherry Studio，请确认桌面端已启动且与本机同网'],
+    ['invalid-payload', '配对信息无效或已过期，请在 Cherry Studio 重新生成后重试'],
+    ['rejected', '配对被拒绝——请核对桌面端显示的 6 位验证码是否与本页一致，并在 Cherry Studio 重新生成配对码后重试'],
+    ['expired', '配对邀请已过期——请在 Cherry Studio 重新生成配对码后重试'],
   ] as const
 
-  for (const [stage, label] of postPairingFailures) {
-    it(`settles the wizard on a post-202 ${stage} frame`, async () => {
+  for (const [stage, guidance] of postPairingFailures) {
+    it(`settles the wizard on a post-202 ${stage} frame with its recovery guidance`, async () => {
       await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-fail' })]])
 
       submitPayload()
@@ -286,9 +299,13 @@ describe('pairing wizard', () => {
         data: { stage, detail: 'peer is offline', claimId: 'claim-fail' },
       })
 
-      // The run ends, in user-facing copy rather than a raw stage string.
-      const settled = await screen.findByText(new RegExp(label))
-      expect(settled.textContent).not.toContain(stage === 'rejected' ? 'pairing-progress' : 'undefined')
+      // The SETTLED paragraph, not the frame immediately after the emit: the app
+      // clears `progress` when the run ends, so the terminal render has no frame
+      // left to label the verdict from. The content must therefore come from the
+      // wizard's own captured verdict.
+      const settled = await screen.findByText(`配对失败：${guidance}`)
+      expect(settled.textContent).not.toContain('未知错误')
+      expect(settled.textContent).not.toContain('undefined')
 
       await waitFor(() => {
         expect(screen.queryByText('配对进行中')).toBeNull()
@@ -300,8 +317,44 @@ describe('pairing wizard', () => {
       expect(screen.getByLabelText('配对 payload')).toBeTruthy()
       // No raw stage string leaks into the UI.
       expect(screen.queryByText(stage)).toBeNull()
+
+      // ...and the verdict SURVIVES the cleared frame: a later unrelated render
+      // (the app re-reads /devices when the run settles) must not blank it out.
+      await waitFor(() => {
+        expect(screen.getByText(`配对失败：${guidance}`)).toBeTruthy()
+      })
     })
   }
+
+  it('keeps the settled verdict after a run that published progress frames first', async () => {
+    // The multi-stage shape: a real run narrates validate → connect → claim →
+    // verification-code before it fails. The terminal must still render ITS
+    // stage's guidance once the frame is cleared — the wizard cannot rely on
+    // whatever `progress` happened to hold, because the app drops it on settle.
+    await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-multi' })]])
+
+    submitPayload()
+    await screen.findByText('配对进行中')
+
+    for (const stage of ['validate', 'connect', 'claim'] as const) {
+      stream().emit({ event: 'pairing-progress', data: { stage, claimId: 'claim-multi' } })
+      await screen.findByText(STAGE_LABELS[stage]!)
+    }
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '482915', claimId: 'claim-multi' },
+    })
+    await screen.findByText('482915')
+
+    stream().emit({ event: 'pairing-progress', data: { stage: 'expired', claimId: 'claim-multi' } })
+
+    const settled = await screen.findByText(`配对失败：${STAGE_LABELS['expired']!}`)
+    expect(settled.textContent).not.toContain('未知错误')
+    // The transient code went away with the terminal frame, and the verdict did
+    // NOT fall back to the last non-terminal stage's label.
+    expect(screen.queryByText('482915')).toBeNull()
+    expect(screen.queryByText(STAGE_LABELS['claim']!)).toBeNull()
+  })
 
   it('IGNORES another run\'s frames: a foreign claimId cannot show its code or settle this wizard', async () => {
     // The stream is shared by every tab. A second tab pairing a different
@@ -343,10 +396,14 @@ describe('pairing wizard', () => {
 
   it('tells the user how to recover from an expired and a rejected pairing', async () => {
     // The two failure labels carry the RECOVERY step, not just the verdict: the
-    // user is standing in front of two windows with nothing else to go on.
+    // user is standing in front of two windows with nothing else to go on. Read
+    // from the SETTLED paragraph, after the app has cleared the progress frame —
+    // the point of the copy is that it is still there when the user looks.
     for (const [stage, advice] of [
-      ['expired', /重新生成配对码/],
-      ['rejected', /6 位验证码/],
+      ['expired', /重新生成配对码后重试/],
+      // The RECOVERY clause, not the bare '6 位验证码': the wizard's step list
+      // mentions the code too, so the loose pattern is not a unique match.
+      ['rejected', /核对桌面端显示的 6 位验证码是否与本页一致/],
     ] as const) {
       cleanup()
       await renderWithDevice([
@@ -357,8 +414,16 @@ describe('pairing wizard', () => {
 
       stream().emit({ event: 'pairing-progress', data: { stage, claimId: `claim-${stage}` } })
 
-      const settled = await screen.findByText(advice)
-      expect(settled).toBeTruthy()
+      // Settled state reached, then re-read: the guidance must persist.
+      await waitFor(() => {
+        expect(screen.queryByText('配对进行中')).toBeNull()
+      })
+      // Scoped to the wizard panel: this loop renders the page repeatedly without
+      // a full teardown, so a document-wide query could match a stale tree.
+      const panel = screen.getByRole('region', { name: '配对向导' })
+      const settled = within(panel).getByText(new RegExp(advice))
+      expect(settled.textContent).toContain(STAGE_LABELS[stage]!)
+      expect(settled.textContent).not.toContain('未知错误')
     }
   })
 
@@ -699,6 +764,32 @@ describe('settings page registration', () => {
     // The page the shell would show is this plugin's settings view.
     expect(screen.getByText('Cherry Studio 互联')).toBeTruthy()
     expect(screen.getByLabelText('配对 payload')).toBeTruthy()
+  })
+
+  it('scopes every stylesheet rule to the plugin root, so no host UI is restyled', () => {
+    // The stylesheet is injected into the HOST page's head, not a sandboxed
+    // frame: a bare `button {}` rule would restyle every button in the shell.
+    // Every selector in the shipped file must therefore be rooted at the
+    // plugin's own class (or be a scoped descendant/pseudo of one).
+    const css = readFileSync(join(process.cwd(), 'ui', 'src', 'styles.css'), 'utf8')
+    // Strip comments so prose (which may contain braces or the word `button`)
+    // is never mistaken for a selector.
+    const withoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '')
+    // Selectors are everything before a `{`, minus at-rule preludes.
+    const selectors = [...withoutComments.matchAll(/(^|[};])\s*([^{}@;]+?)\s*\{/g)].flatMap((match) =>
+      match[2]!
+        .split(',')
+        .map((selector) => selector.trim())
+        .filter((selector) => selector !== ''),
+    )
+
+    expect(selectors.length).toBeGreaterThan(20)
+    for (const selector of selectors) {
+      expect(
+        selector.startsWith('.cherry-'),
+        `stylesheet rule "${selector}" is not scoped to the plugin root and would leak into the host UI`,
+      ).toBe(true)
+    }
   })
 })
 

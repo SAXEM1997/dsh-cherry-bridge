@@ -113,6 +113,9 @@ profile 手工加行等价于：
 | `GET /cherry-remote/api/events` | SSE：`device-state` / `pairing-progress`（每帧带产生它的 `claimId`，含心跳）。 |
 | `GET /cherry-remote/api/diagnostics` | 运维诊断报告（见下）。 |
 
+> `pairing-progress` 帧的最小形状是 `{stage, detail?}`；本插件在其上**额外**附带可选的
+> `claimId`（跨 run 隔离用的裁定扩展，非计划内最小字段），消费方须容忍该字段缺失。
+
 **信任 fence**：每个路由在动手前都自行过一遍同源判定，四分支按序为
 (1) 非回环且未声明的 `Host` → 拒绝；(2) `sec-fetch-site: cross-site` → 拒绝；
 (3) 附带 `Origin` 与 `Host` 非同源 → 拒绝；(4) **`Origin` 缺失 → 放行**（那是

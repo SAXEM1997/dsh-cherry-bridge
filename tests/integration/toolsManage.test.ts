@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
+import { QuarantinedArchiveError } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import { pairWithPayload } from '../../src/pairing.js'
 import { registerCherryTools } from '../../src/tools.js'
@@ -261,6 +262,58 @@ describe('① cherry_pair: the full pairing lifecycle through the tool seam', ()
 
     expect(fakeInfo.fake.socketCount).toBe(0)
     expect(rig.store.list()).toEqual([])
+  })
+
+  it('①f returns the archive-quarantined outcome as a RESULT, never a throw', async () => {
+    // Pairing ends by PERSISTING a record. With a damaged (quarantined) archive
+    // the run fails at that last step, and the store refuses to write. That is
+    // still "every pairing outcome is a RESULT": the caller needs the structured
+    // verdict and the recovery step, not an exception with a raw file error.
+    const { store } = await (async () => {
+      const tmp = await mkdtemp(join(tmpdir(), 'cherry-pair-quarantine-'))
+      dirs.push(tmp)
+      const file = join(tmp, 'devices.json')
+      // A damaged archive: bytes exist that the store cannot read.
+      writeFileSync(file, '{ not json', 'utf8')
+      const store = new DeviceStore(file)
+      // PREMISE: the store really is poisoned (it will refuse every write).
+      let quarantined: unknown
+      try {
+        store.upsert(recordFor('dev-x', 'X'))
+      } catch (error) {
+        quarantined = error
+      }
+      expect(quarantined).toBeInstanceOf(QuarantinedArchiveError)
+      return { store }
+    })()
+
+    const ctx = makeCtx()
+    registerCherryTools(ctx, {
+      store,
+      connect: () => {
+        throw new Error('never dials')
+      },
+      subs: () => {
+        throw new Error('never subscribes')
+      },
+      // The pairing face approves, then fails on the store write — the exact
+      // ordering the HTTP face already maps to its `archive-quarantined` stage.
+      pair: async () => {
+        store.upsert(recordFor('dev-x', 'X'))
+        throw new Error('unreachable')
+      },
+      evict: async () => {},
+    })
+    const definition = ctx.definitions.find((entry) => entry.name === 'cherry_pair')!
+
+    const result = (await definition.execute({ payload: '{"v":2}' })) as Record<string, unknown>
+
+    expect(result['status']).toBe('archive-quarantined')
+    // The recovery guidance is present and actionable: the operator has to move
+    // the bad file aside, and the verdict names the file.
+    expect(typeof result['message']).toBe('string')
+    expect(result['message']).toContain('devices.json')
+    expect(String(result['message'])).toMatch(/move|aside/i)
   })
 })
 

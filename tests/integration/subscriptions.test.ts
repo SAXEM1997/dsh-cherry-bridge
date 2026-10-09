@@ -649,7 +649,7 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     await rig.subs.ensure('s1')
 
     let woken = false
-    const parked = rig.subs.waitFor('s1', cursor('s1', 0)).then(() => {
+    const parked = rig.subs.waitFor('s1', cursor('s1', 0)).promise.then(() => {
       woken = true
     })
     // Not woken by the mere act of parking.
@@ -659,6 +659,37 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await parked
     expect(woken).toBe(true)
+  })
+
+  it('⑭b a disposed park leaves the waiter queue, so re-parking cannot accumulate resolvers', async () => {
+    // The `cherry_wait` poll loop re-parks after every judgement pass. Without a
+    // disposer each pass left a resolver behind forever: the queue grew once per
+    // poll interval for the whole wait, and every buffer advance then settled all
+    // of them. The disposer is what keeps the queue at the ONE live park.
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+    expect(rig.subs.waiterCount('s1')).toBe(0)
+
+    const first = rig.subs.waitFor('s1', cursor('s1', 0))
+    expect(rig.subs.waiterCount('s1')).toBe(1)
+
+    // Re-parking (as the poll loop does) with the previous park disposed: the
+    // queue holds exactly one resolver, not two.
+    first.dispose()
+    expect(rig.subs.waiterCount('s1')).toBe(0)
+    const second = rig.subs.waitFor('s1', cursor('s1', 0))
+    expect(rig.subs.waiterCount('s1')).toBe(1)
+
+    // Disposing a park that already settled is a no-op — a caller may use it
+    // unconditionally on every exit path.
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
+    await second.promise
+    expect(rig.subs.waiterCount('s1')).toBe(0)
+    expect(() => {
+      first.dispose()
+      second.dispose()
+    }).not.toThrow()
+    expect(rig.subs.waiterCount('s1')).toBe(0)
   })
 
   it('⑰ ignores a replayed LOWER seq per (sessionId, streamEpoch): the cursor never regresses and no waiter is woken', async () => {
@@ -681,7 +712,7 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     // Park a waiter at the CURRENT position: a lower seq is not progress, so it
     // must not settle — settling would tell the caller "something new arrived".
     let woken = false
-    void rig.subs.waitFor('s1', cursor('s1', 2)).then(() => {
+    void rig.subs.waitFor('s1', cursor('s1', 2)).promise.then(() => {
       woken = true
     })
     await sleep(30)

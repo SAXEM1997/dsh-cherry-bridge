@@ -30,6 +30,12 @@ export interface PairingWizardProps {
   progress: PairingProgressEvent | undefined
   /** How long the verification code stays on screen. Injectable for tests. */
   codeLifetimeMs?: number
+  /**
+   * Called when a NEW run is submitted, before `POST /pair`: the app retires the
+   * previous run's frame here, so the settled render never has to compete with a
+   * frame being cleared underneath it (see the `verdict` state).
+   */
+  onRunStart?(): void
   /** Called once a run reaches a terminal stage, so the app can reset the frame. */
   onSettled?(): void
 }
@@ -38,6 +44,7 @@ export function PairingWizard({
   subscribed,
   progress,
   codeLifetimeMs = DEFAULT_CODE_LIFETIME_MS,
+  onRunStart,
   onSettled,
 }: PairingWizardProps): ReturnType<typeof Object> {
   const [payload, setPayload] = useState('')
@@ -46,12 +53,23 @@ export function PairingWizard({
   const [error, setError] = useState<string | undefined>(undefined)
   const [code, setCode] = useState<string | undefined>(undefined)
   const [busy, setBusy] = useState(false)
+  // The terminal stage of the LAST settled run, captured in the wizard's OWN
+  // state before `onSettled` runs. This is deliberately not a read of
+  // `progress`: the app clears the frame when a run ends
+  // (`onSettled` → `setProgress(undefined)`), and React 18 batches that with
+  // this effect's own `setPhase('failed')` into a SINGLE commit — so the first
+  // `phase === 'failed'` render already sees `progress === undefined`. Labelling
+  // the verdict from `progress` therefore falls through to the '未知错误'
+  // fallback on every failure, permanently, and all five recovery labels are
+  // unreachable. The verdict must be an INPUT to the settled render rather than
+  // derived from a frame that is being cleared underneath it.
+  const [verdict, setVerdict] = useState<string | undefined>(undefined)
 
   const stage = progress?.stage
   const frameClaimId = progress?.claimId
 
   useEffect(() => {
-    // `progress` is reset by the app on `onSettled`, and a fresh run must never
+    // `progress` is reset when the next run STARTS, and a fresh run must never
     // inherit the previous run's frames.
     if (stage === undefined) {
       setCode(undefined)
@@ -74,6 +92,9 @@ export function PairingWizard({
     // Terminal frame: the code is a transient display and goes away with it.
     if ((TERMINAL_STAGES as readonly string[]).includes(stage)) {
       setCode(undefined)
+      // Capture FIRST: `onSettled` is the app's chance to clear the frame, and
+      // everything below must already be independent of it.
+      setVerdict(stage)
       setPhase(stage === APPROVED_STAGE ? 'done' : 'failed')
       setBusy(false)
       onSettled?.()
@@ -99,6 +120,13 @@ export function PairingWizard({
     setError(undefined)
     setPhase('submitting')
     setClaimId(undefined)
+    // A NEW run starts here, so the previous run's verdict is retired now — not
+    // when the frame arrives. Clearing it at start (rather than relying on the
+    // frame going away) keeps the settled paragraph correct for exactly one run.
+    setVerdict(undefined)
+    // ...and the APP retires the previous run's frame here rather than on settle,
+    // so a batched terminal commit cannot take the label away with it.
+    onRunStart?.()
     void startPairing(trimmed).then(
       (result) => {
         setClaimId(result.claimId)
@@ -163,10 +191,13 @@ export function PairingWizard({
       {phase === 'done' && <p className="cherry-ok">配对成功</p>}
       {/* Labelled verdict, never a raw stage string: `STAGE_LABELS` carries copy
           for every terminal stage, and the fallback keeps an unknown future
-          stage readable without leaking the enum into the UI. */}
+          stage readable without leaking the enum into the UI. The label is read
+          from the wizard's CAPTURED verdict, never from `progress` — the app
+          clears the frame as the run settles, so the frame is already gone by
+          the time this paragraph renders (see the `verdict` state above). */}
       {phase === 'failed' && (
         <p className="cherry-error" role="alert">
-          配对失败：{STAGE_LABELS[stage ?? ''] ?? '未知错误'}
+          配对失败：{STAGE_LABELS[verdict ?? ''] ?? '未知错误'}
         </p>
       )}
       {error !== undefined && (

@@ -309,6 +309,19 @@ function reasonOf(error: unknown): string {
 }
 
 /**
+ * The one recovery instruction for a quarantined archive, shared by every face
+ * that reports it (the HTTP 503 body, the SSE `archive-quarantined` stage, and
+ * `cherry_pair`'s structured result).
+ *
+ * It lives beside the error because the error is the only thing that knows the
+ * condition, and three independently-worded copies of "move the file aside"
+ * would drift into three different instructions the first time one is edited.
+ */
+export const QUARANTINE_RECOVERY =
+  'the device archive cannot be read and the plugin will not overwrite it; move the bad file ' +
+  'aside (then restart or re-apply the plugin) to resume device management'
+
+/**
  * The structured write-refusal raised by an archive the store could not read.
  *
  * It is deliberately NOT a plain {@link Error}: the assembly and the HTTP API

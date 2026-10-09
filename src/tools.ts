@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { DeviceUnavailableError } from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
+import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
@@ -377,7 +378,12 @@ export interface CherryPairRequest {
  * what the user is comparing when they decide.
  */
 export interface CherryPairResult {
-  status: 'approved' | PairingErrorKind
+  /**
+   * `approved` on success, the peer's/plugin's `PairingErrorKind` verdict on a
+   * pairing failure, or `archive-quarantined` when the run failed at its last
+   * step because the device archive is unreadable and READ-ONLY.
+   */
+  status: 'approved' | PairingErrorKind | 'archive-quarantined'
   /** The paired device id. Present only on `approved`: no other branch has one. */
   device?: string
   /** The name the desktop shows for this device. Present only on `approved`. */
@@ -399,6 +405,27 @@ export interface CherryUnpairResult {
 interface ResolvedDevice {
   record: DeviceRecord
   connection: DeviceConnection
+}
+
+/**
+ * The waiter's incremental fold state, carried from one poll pass to the next.
+ *
+ * The session buffer is append-only, so a pass only has to fold what arrived
+ * since the last one. This carries the accumulated result — the pending
+ * interaction map, the pre-baseline settled set, the adopted execution and its
+ * observed terminal, and the high-water `scannedSeq` — so each pass is
+ * proportional to the NEW events instead of the whole run.
+ */
+interface ObservationCarry {
+  /** Highest event seq already folded; entries at or below it are skipped. */
+  scannedSeq?: number
+  pending?: Map<string, { interactionId: string; kind: string; summary: string; questions: string[] }>
+  settledBeforeBaseline?: Set<string>
+  /** The execution this wait attached to, once adopted or supplied. */
+  awaited?: string
+  executionId?: string
+  terminalStatus?: string
+  terminalMessageId?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -753,13 +780,21 @@ class CherryToolEngine {
     const aggregate = Math.max(1, Math.floor(limit))
     const bound = Math.max(1, Math.floor(safetyBound))
     const ceiling = Math.min(aggregate, bound)
+    // WHICH ceiling the stop is attributed to. The caller's limit is the
+    // constraint only when it is STRICTLY below the safety bound; at or above
+    // it, the walk stops because of the internal breaker, and saying 'limit'
+    // would tell the caller "you asked for this many" about a bound they never
+    // set. The equality case is the one that matters: `limit === safetyBound`
+    // must read as 'safety-bound', because that is the only reason the walk is
+    // not allowed to continue. An unbounded walk (`limit: Infinity`) is always
+    // the safety bound.
+    const bindsCallerLimit = aggregate < bound
     const items: T[] = []
     let cursor: string | undefined
 
     for (let pages = 0; ; pages += 1) {
       if (items.length >= ceiling) {
-        // Which ceiling stopped it decides how the caller reads the result:
-        // the caller's own limit, or the internal circuit-breaker.
+        // Which ceiling stopped it decides how the caller reads the result.
         //
         // BOUNDARY (honest, not exact): `'limit'` is ALSO reported when the
         // caller's limit lands exactly on the peer's last item — at that point
@@ -767,7 +802,7 @@ class CherryToolEngine {
         // stops before it ever learns whether a further page existed. The
         // conservative reading is the right one for a caller: "there may be
         // more" is safe to re-ask, whereas a false "complete" is not.
-        return this.#truncated(items, aggregate <= bound ? 'limit' : 'safety-bound', cursor)
+        return this.#truncated(items, bindsCallerLimit ? 'limit' : 'safety-bound', cursor)
       }
       if (pages >= MAX_AGGREGATE_PAGES) {
         throw new Error(
@@ -2030,8 +2065,9 @@ class CherryToolEngine {
         'content it shows). The 6-digit `verificationCode` the desktop displays is returned so ' +
         'the user can confirm it matches. Every outcome is a RESULT, never an error: `status` is ' +
         '"approved" (with the new device id), or the terminal "rejected"/"expired" verdict, or ' +
-        'this plugin\'s own "invalid-payload"/"unreachable". Pairing can take up to a minute — it ' +
-        'waits for the user to approve on the desktop.',
+        'this plugin\'s own "invalid-payload"/"unreachable", or "archive-quarantined" when the ' +
+        'device archive is unreadable and must be moved aside by hand. Pairing can take up to a ' +
+        'minute — it waits for the user to approve on the desktop.',
       parameters: {
         type: 'object',
         properties: {
@@ -2074,11 +2110,15 @@ class CherryToolEngine {
   /**
    * Runs one pairing and maps its outcome onto {@link CherryPairResult}.
    *
-   * The mapping is TOTAL over the pairing error currency: `PairingError.kind`
-   * IS the result's `status`, so no terminal state can be silently reclassified
-   * as success or swallowed. Anything that is NOT a `PairingError` is a real
-   * fault (a bug, or the identity not being loaded yet) and is rethrown — the
-   * tool has no honest in-band shape for "this should not have happened".
+   * The mapping is TOTAL over the outcome currency a pairing can legitimately
+   * reach: `PairingError.kind` IS the result's `status`, and the quarantined
+   * archive — the run's LAST step, the persist — gets its own structured status
+   * rather than an exception. "Every pairing outcome is a RESULT" is the tool's
+   * whole contract: a damaged `devices.json` is a condition the caller must be
+   * told about in-band, with the recovery step, not a raw file error thrown out
+   * of a tool call. Anything else that is NOT a `PairingError` is a real fault
+   * (a bug, or the identity not being loaded yet) and is rethrown — the tool has
+   * no honest in-band shape for "this should not have happened".
    */
   async #runPair(request: CherryPairRequest): Promise<CherryPairResult> {
     try {
@@ -2089,6 +2129,17 @@ class CherryToolEngine {
         displayName: record.displayName,
       }
     } catch (error) {
+      // The persist step failed because the archive is READ-ONLY. The copy is
+      // deliberate: the SAME recovery instruction the HTTP face returns (503)
+      // and the SSE stage publishes, plus the two paths an operator needs.
+      if (error instanceof QuarantinedArchiveError) {
+        return {
+          status: 'archive-quarantined',
+          message:
+            `${QUARANTINE_RECOVERY} (archive: ${error.file}; preserved as ` +
+            `${error.corruptPath ?? `${error.file}.corrupt`})`,
+        }
+      }
       if (!(error instanceof PairingError)) throw error
       return { status: error.kind, message: error.message }
     }
@@ -2483,6 +2534,10 @@ class CherryToolEngine {
     // terminal — still sitting in the cumulative buffer — can never speak for
     // this wait. Captured ONCE, so each pass is cheap and the cut never moves.
     const baselineSeq = options.baselineSeq ?? this.#newestSeq(subscriptions, sessionId)
+    // The incremental fold state, shared across every pass of THIS wait: the
+    // buffer only appends, so each pass folds just the events that arrived since
+    // the previous one instead of rescanning the whole (cumulative) buffer.
+    const observation: ObservationCarry = {}
 
     for (;;) {
       // The link is the precondition for EVERYTHING below: a closed connection
@@ -2494,6 +2549,7 @@ class CherryToolEngine {
 
       const observed = this.#observedState(subscriptions, sessionId, {
         baselineSeq,
+        carry: observation,
         ...(latestExecutionId === undefined ? {} : { awaitedExecutionId: latestExecutionId }),
       })
       // STICKY ADOPTION: the first pass with no id lets `#observedState` adopt
@@ -2562,14 +2618,19 @@ class CherryToolEngine {
       // wake therefore falls back to a full poll interval before the next pass.
       const cursor = this.#cursorOf(subscriptions, sessionId)
       const pollMs = Math.min(this.#waitPollMs, Math.max(1, deadline - now))
-      const woke = await Promise.race([
-        subscriptions.waitFor(sessionId, cursor).then(
-          () => true,
-          () => false,
-        ),
-        sleep(pollMs).then(() => true),
-      ])
-      if (!woke) await sleep(pollMs)
+      // The park is CANCELLED before the next one is made, and also when this
+      // pass ends for any other reason. Without the disposer the loop would
+      // leave one resolver in the session's waiter queue on every judgement
+      // pass, for the whole life of the wait — an unbounded queue that every
+      // buffer advance then walks. `dispose` is idempotent and a no-op once the
+      // park settled, so it is safe on every exit path.
+      const park = subscriptions.waitFor(sessionId, cursor)
+      try {
+        const woke = await Promise.race([park.promise.then(() => true, () => false), sleep(pollMs).then(() => true)])
+        if (!woke) await sleep(pollMs)
+      } finally {
+        park.dispose()
+      }
     }
   }
 
@@ -2600,11 +2661,23 @@ class CherryToolEngine {
    * `pendingInteractions` is a SET, not a slot: the soft-terminal predicate is
    * "ANY unanswered pending interaction" (spec §3.6), so two pendings where the
    * later-registered settles first must leave the earlier one visible.
+   *
+   * INCREMENTAL BY DESIGN. The fold is cumulative over the session buffer, which
+   * only ever APPENDS, so re-reading it from index 0 on every poll pass is
+   * wasted work that grows with the run's length. `carry` is the fold state from
+   * the previous pass; when supplied, only entries with a seq above
+   * `carry.scannedSeq` are folded, and the pending map / settled set / terminal
+   * observation are inherited rather than rebuilt. The semantics are IDENTICAL —
+   * the same events are folded in the same order, exactly once — because the
+   * buffer preserves order and `scannedSeq` only ever moves forward.
+   *
+   * A caller with no carry (the first pass) simply folds everything, which is
+   * still linear in the buffer once.
    */
   #observedState(
     subscriptions: SessionSubscriptions,
     sessionId: string,
-    options: { baselineSeq: number; awaitedExecutionId?: string },
+    options: { baselineSeq: number; awaitedExecutionId?: string; carry?: ObservationCarry },
   ): {
     executionId?: string
     terminalStatus?: string
@@ -2636,7 +2709,12 @@ class CherryToolEngine {
     // cumulative buffer — can never be adopted. `#adoptExecution` is
     // one-time and sticky in the caller, so a LATER unrelated run cannot steal
     // a wait that has already attached to one.
-    const awaited = options.awaitedExecutionId ?? this.#adoptExecution(
+    //
+    // The adopted id is CARRIED: once a run has been attached to, a later pass
+    // must not re-adopt (the caller's sticky `latestExecutionId` also guards
+    // this, but the carry keeps the two consistent when the caller passes it
+    // back down).
+    const awaited = options.awaitedExecutionId ?? options.carry?.awaited ?? this.#adoptExecution(
       subscriptions,
       sessionId,
       options.baselineSeq,
@@ -2644,17 +2722,38 @@ class CherryToolEngine {
     // Keyed by interactionId: a later `interaction.updated` for the same
     // interaction REPLACES its entry, and a settled one REMOVES it — but only
     // its own, so an unrelated pending is never clobbered.
-    const pending = new Map<
-      string,
-      { interactionId: string; kind: string; summary: string; questions: string[] }
-    >()
+    //
+    // When a carry exists the map is INHERITED (same object, mutated in place),
+    // which is what makes the incremental fold equivalent: the pending set is
+    // the accumulated result of every interaction event seen so far.
+    const pending =
+      options.carry?.pending ??
+      new Map<string, { interactionId: string; kind: string; summary: string; questions: string[] }>()
     // The baseline decides ONLY whether an execution terminal is in scope. An
     // execution that had already settled when the wait began belongs to an
     // earlier run; one that settles after it is this wait's answer.
-    const settledBeforeBaseline = new Set<string>()
+    const settledBeforeBaseline = options.carry?.settledBeforeBaseline ?? new Set<string>()
+    // Where the previous pass stopped. Entries at or below it were folded then.
+    const scannedSeq = options.carry?.scannedSeq
+    // The terminal observed so far for `awaited`, inherited so a pass that folds
+    // no new events still reports it.
+    state.executionId = options.carry?.executionId
+    state.terminalStatus = options.carry?.terminalStatus
+    state.terminalMessageId = options.carry?.terminalMessageId
+
+    // The high-water mark moves INSIDE the fold below, so the next pass skips
+    // exactly what this one already consumed without a second scan (which would
+    // be the very full rescan this exists to remove).
+    let scannedSeqNext = scannedSeq ?? -Infinity
 
     for (const entry of this.#eventsOf(subscriptions, sessionId)) {
       const seq = Number(entry['seq'])
+      // INCREMENTAL SKIP: only entries past the previous pass's high-water mark
+      // are new. Entries without a finite seq are never skippable (they were not
+      // counted into the mark), so they are re-folded — which is what the
+      // full-scan version did too.
+      if (scannedSeq !== undefined && Number.isFinite(seq) && seq <= scannedSeq) continue
+      if (Number.isFinite(seq) && seq > scannedSeqNext) scannedSeqNext = seq
       const beforeBaseline = !Number.isFinite(seq) || seq <= options.baselineSeq
 
       const kind = String(entry['kind'] ?? '')
@@ -2721,6 +2820,19 @@ class CherryToolEngine {
       state.executionId = awaited
     }
     state.pendingInteractions = [...pending.values()]
+    // Publish the fold state for the next pass: the same pending map and settled
+    // set (mutated in place), the observation so far, and the new high-water
+    // mark. A caller that passes this back gets an incremental fold with
+    // identical semantics.
+    if (options.carry !== undefined) {
+      options.carry.pending = pending
+      options.carry.settledBeforeBaseline = settledBeforeBaseline
+      options.carry.awaited = awaited
+      options.carry.executionId = state.executionId
+      options.carry.terminalStatus = state.terminalStatus
+      options.carry.terminalMessageId = state.terminalMessageId
+      options.carry.scannedSeq = Number.isFinite(scannedSeqNext) ? scannedSeqNext : undefined
+    }
     return state
   }
 
@@ -2935,9 +3047,13 @@ class CherryToolEngine {
    * with candidate cursors, which was worse in every dimension: the probe
    * compared seqs as NUMBERS while the verdict compares them numerically too,
    * but it could not tell "below the window" apart from "wrong stream epoch",
-   * and it scanned upward one seq at a time before bisecting — so a session
-   * whose window start was far above 0 walked the whole interval. The comment
-   * there claimed a binary search; the bracketing loop was linear.
+   * and it scanned upward one seq at a time, so a session whose window start
+   * was far above 0 walked the whole interval.
+   *
+   * The read-only accessor is the same adjudication `subscriptions.ts` records
+   * for its own boundary (controller ruling in commit f2b852b): the layer is
+   * the only thing that knows the window start, so it publishes it rather than
+   * leaving callers to rediscover it.
    *
    * `streamEpoch` is reported from the LAYER's current epoch rather than from
    * the caller's stale cursor: the verdict is about what can be served NOW, and

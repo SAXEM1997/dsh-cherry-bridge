@@ -463,7 +463,18 @@ export function buildDiagnostics(
   sources: DiagnosticsSources,
   identity: DiagnosticsIdentity = DEFAULT_IDENTITY,
 ): DiagnosticsReport {
-  const records = sources.store.list()
+  // Guarded like every other source below. The store is a legitimate thrower (a
+  // quarantined archive refuses to be read at all), and this endpoint is opened
+  // exactly when something is wrong — so it must not itself be the thing that
+  // fails. A failed read degrades the DEVICE section to empty and the rest of
+  // the report still ships, which is the same contract the sessions/stats/
+  // recentErrors guards below already honour.
+  let records: readonly DeviceRecord[] = []
+  try {
+    records = sources.store.list()
+  } catch {
+    records = []
+  }
   const devices: DiagnosticsDevice[] = []
   const sessions: DiagnosticsSession[] = []
 

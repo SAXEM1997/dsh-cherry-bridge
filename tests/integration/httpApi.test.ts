@@ -655,6 +655,27 @@ describe('② trust fence', () => {
     expect(isTrustedWebRequest(req as never, [])).toBe(false)
   })
 
+  it('admits IPv6 loopback hosts, including the IPv4-mapped forms', async () => {
+    // The host arrives as the WHATWG serialization, which KEEPS the brackets:
+    // `new URL('http://[::1]:23023').hostname` is `'[::1]'`. So a browser on
+    // `http://[::1]:23023` sends a bracketed authority, and it must be admitted.
+    expect(isTrustedWebRequest(new FakeRequest('/', { host: '[::1]:23023' }) as never, [])).toBe(true)
+
+    // THE REAL GAP: the IPv4-MAPPED loopback family. A dual-stack listener
+    // reached over IPv6 is addressed as `::ffff:127.0.0.1`, which the serializer
+    // rewrites to the HEX form `[::ffff:7f00:1]` — so that is the spelling the
+    // fence actually sees, and the dotted spelling must work too for a caller
+    // passing a raw header.
+    expect(isTrustedWebRequest(new FakeRequest('/', { host: '[::ffff:7f00:1]:23023' }) as never, [])).toBe(true)
+    expect(isTrustedWebRequest(new FakeRequest('/', { host: '[::ffff:127.0.0.1]:23023' }) as never, [])).toBe(true)
+
+    // Still refused: this widens the loopback set by the mapped 127/8 range, not
+    // by "anything with a v6 shape". A mapped NON-loopback address is not local.
+    expect(isTrustedWebRequest(new FakeRequest('/', { host: '[::2]:23023' }) as never, [])).toBe(false)
+    expect(isTrustedWebRequest(new FakeRequest('/', { host: '[2001:db8::1]:23023' }) as never, [])).toBe(false)
+    expect(isTrustedWebRequest(new FakeRequest('/', { host: '[::ffff:8.8.8.8]:23023' }) as never, [])).toBe(false)
+  })
+
   it('rejects a cross-origin Origin', async () => {
     mount()
     const req = new FakeRequest(`${PREFIX}/devices`, { host: HOST, origin: 'http://evil.example.com' })

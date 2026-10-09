@@ -173,7 +173,12 @@
   border-top: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
 }
 
-button {
+/* SCOPED DELIBERATELY. This stylesheet is injected into the HOST page's
+   document head, not a sandboxed frame, so a bare `button {}` rule restyles
+   every button in the host UI — a plugin must not do that. Every rule in this
+   file is therefore rooted at the plugin's own `.cherry-settings` class, which
+   is the single element the settings slot renders. */
+.cherry-settings button {
   padding: 4px 10px;
   border-radius: 6px;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -183,7 +188,7 @@ button {
   cursor: pointer;
 }
 
-button:disabled {
+.cherry-settings button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }

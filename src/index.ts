@@ -4,6 +4,7 @@ import { DeviceStore } from './deviceStore.js'
 import { loadOrCreateIdentity } from './identity.js'
 import { DeviceConnection } from './connection.js'
 import type { DeviceState } from './connection.js'
+import { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
 import { registerCherryTools } from './tools.js'
@@ -96,10 +97,16 @@ export interface ResolvedBridgeConfig {
   perSessionCacheBytes: number
 }
 
-/** The second-level smoothed request budget (matches `DeviceConnection`'s own). */
-export const DEFAULT_RATE_BUDGET_PER_SECOND = 32
-/** 2 MiB of event text per session (spec §3.5). */
-export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
+/**
+ * The second-level smoothed request budget and the per-session cache budget.
+ *
+ * Declared in `defaults.ts` and re-exported here: the connection and
+ * subscription layers apply these SAME constants, so a single source is what
+ * keeps the assembly's documented default from drifting away from the value
+ * those layers actually fall back to. The names stay exported from this module
+ * (the plugin's public entry) for callers and the contract test.
+ */
+export { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
 
 /** Applies the documented fallbacks to the plugin config's numeric keys. */
 export function resolveBridgeConfig(config: CherryBridgeConfig = {}): ResolvedBridgeConfig {
@@ -156,6 +163,13 @@ interface AssemblyState {
   store: DeviceStore
   /** Resolved once the identity load settles; pairing reads it lazily. */
   identity: Uint8Array | undefined
+  /**
+   * The identity load's failure, once it has failed. Distinguishes "the load is
+   * still in flight" from "the load is over and it FAILED" — without it, every
+   * later call reports "still loading; retry in a moment" forever, which sends
+   * the caller to retry a load that will never complete and hides the real cause.
+   */
+  identityError: unknown
   /**
    * The current apply's resolved config. Held on the state (rather than closed
    * over) because the pool helpers are module functions the HTTP face and the
@@ -218,6 +232,7 @@ export function noteError(entry: DiagnosticsError): void {
 const state: AssemblyState = {
   store: new DeviceStore(join(tmpdirFallback(), 'devices.json')),
   identity: undefined,
+  identityError: undefined,
   rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
   perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
   connections: new Map(),
@@ -257,6 +272,17 @@ function publishPairingProgress(event: PairingProgressEvent): void {
 
 function requireIdentity(): Uint8Array {
   if (state.identity === undefined) {
+    // FAILED and STILL-LOADING are different answers. Reporting "still loading;
+    // retry in a moment" after the load has already rejected sends the caller to
+    // retry forever and hides the cause; the failed branch names the failure.
+    if (state.identityError !== undefined) {
+      const reason =
+        state.identityError instanceof Error ? state.identityError.message : String(state.identityError)
+      throw new Error(
+        `cherry-remote: the device identity FAILED to load (${reason}); ` +
+          'fix the plugin data directory (see the logs) and re-apply the plugin',
+      )
+    }
     throw new Error('cherry-remote: the device identity is still loading; retry in a moment')
   }
   return state.identity
@@ -691,8 +717,12 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   void loadOrCreateIdentity(dataDir).then(
     (identity) => {
       state.identity = identity.key
+      // A later successful load (a re-apply after the operator fixed the data
+      // directory) clears the failure, so `requireIdentity` stops blaming it.
+      state.identityError = undefined
     },
     (error: unknown) => {
+      state.identityError = error
       console.error('[cherry-remote] failed to load the device identity', error)
       noteError({
         at: new Date().toISOString(),

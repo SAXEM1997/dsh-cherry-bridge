@@ -135,10 +135,22 @@ export function App({ eventSourceFactory = defaultEventSourceFactory, codeLifeti
   const onSettled = useCallback(() => {
     // A terminal pairing stage changes the archive (approved) or ends the run;
     // either way the card list is re-read so a newly paired device appears
-    // without a manual reload. The frame is cleared so a second run starts clean.
-    setProgress(undefined)
+    // without a manual reload.
+    //
+    // The frame is deliberately NOT cleared here. Clearing it in the same
+    // batched commit as the wizard's own terminal `setPhase` is what made every
+    // failure verdict render as '未知错误': the wizard's settled paragraph read
+    // the label off a frame that this very update had already removed. The
+    // wizard now carries its own captured verdict, and the stale frame is
+    // retired when the NEXT run starts (`startRun` below) — which is also what
+    // the wizard's claim filter expects, since re-running resets `claimId`.
     refresh()
   }, [refresh])
+
+  /** Retires the previous run's frame; a fresh run must never inherit it. */
+  const startRun = useCallback(() => {
+    setProgress(undefined)
+  }, [])
 
   const sorted = useMemo(
     () => [...devices].sort((left, right) => left.displayName.localeCompare(right.displayName)),
@@ -164,6 +176,7 @@ export function App({ eventSourceFactory = defaultEventSourceFactory, codeLifeti
         subscribed={subscribed}
         progress={progress}
         {...(codeLifetimeMs === undefined ? {} : { codeLifetimeMs })}
+        onRunStart={startRun}
         onSettled={onSettled}
       />
 
