@@ -63,8 +63,28 @@ export type EventSourceFactory = (url: string) => EventSourceLike
 /** The state machine of one pairing run, derived from the progress stages. */
 export type PairingPhase = 'idle' | 'submitting' | 'waiting' | 'done' | 'failed'
 
-/** The pairing stages that end a run. */
-export const TERMINAL_STAGES = ['approved', 'rejected', 'expired'] as const
+/**
+ * The pairing stages that end a run.
+ *
+ * `approved` is the one success. The rest are the FAILURE verdicts the server
+ * publishes after the 202: `POST /pair` returns immediately, so a failure is not
+ * an HTTP status — it arrives as a `pairing-progress` frame whose `stage` is
+ * `verdict.error` (src/httpApi.ts `startPairing`), and `PairingErrorKind` is
+ * `invalid-payload | rejected | expired | unreachable`. Every one of them must
+ * end the run, or the wizard sits in 'waiting' forever with a disabled submit
+ * button. `pairing-failed` is the non-`PairingError` fallback verdict.
+ */
+export const TERMINAL_STAGES = [
+  'approved',
+  'rejected',
+  'expired',
+  'unreachable',
+  'invalid-payload',
+  'pairing-failed',
+] as const
+
+/** The single stage that ends a run successfully. */
+export const APPROVED_STAGE = 'approved'
 
 /** The single stage that carries the 6-digit verification code (ruling). */
 export const VERIFICATION_CODE_STAGE = 'verification-code'
@@ -78,6 +98,9 @@ export const STAGE_LABELS: Record<string, string> = {
   'pairing-failed': '配对失败',
   rejected: '配对被拒绝',
   expired: '配对邀请已过期',
+  // The everyday failure: the desktop is off, asleep, or off the network.
+  unreachable: '无法连接 Cherry Studio，请确认桌面端已启动且与本机同网',
+  'invalid-payload': '配对信息无效或已过期，请在 Cherry Studio 重新生成后重试',
 }
 
 /** Human labels for the five states, shared by the light and the light's name. */

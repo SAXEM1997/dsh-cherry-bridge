@@ -17,7 +17,7 @@
 import { useEffect, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import { startPairing } from './api'
-import { STAGE_LABELS, TERMINAL_STAGES, VERIFICATION_CODE_STAGE } from './types'
+import { APPROVED_STAGE, STAGE_LABELS, TERMINAL_STAGES, VERIFICATION_CODE_STAGE } from './types'
 import type { PairingPhase, PairingProgressEvent } from './types'
 
 /** The countdown the transient code display gets, in seconds. */
@@ -60,11 +60,10 @@ export function PairingWizard({
       setCode(progress?.detail)
       return
     }
-    const terminal = (TERMINAL_STAGES as readonly string[]).includes(stage)
-    if (terminal || stage === 'pairing-failed') {
-      // Terminal frame: the code is a transient display and goes away with it.
+    // Terminal frame: the code is a transient display and goes away with it.
+    if ((TERMINAL_STAGES as readonly string[]).includes(stage)) {
       setCode(undefined)
-      setPhase(terminal && stage === 'approved' ? 'done' : 'failed')
+      setPhase(stage === APPROVED_STAGE ? 'done' : 'failed')
       setBusy(false)
       onSettled?.()
     }
@@ -151,7 +150,14 @@ export function PairingWizard({
       )}
 
       {phase === 'done' && <p className="cherry-ok">配对成功</p>}
-      {phase === 'failed' && <p className="cherry-error">配对失败：{STAGE_LABELS[stage ?? ''] ?? stage}</p>}
+      {/* Labelled verdict, never a raw stage string: `STAGE_LABELS` carries copy
+          for every terminal stage, and the fallback keeps an unknown future
+          stage readable without leaking the enum into the UI. */}
+      {phase === 'failed' && (
+        <p className="cherry-error" role="alert">
+          配对失败：{STAGE_LABELS[stage ?? ''] ?? '未知错误'}
+        </p>
+      )}
       {error !== undefined && (
         <p className="cherry-error" role="alert">
           {error}

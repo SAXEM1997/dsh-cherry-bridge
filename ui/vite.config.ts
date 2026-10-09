@@ -4,18 +4,22 @@
  * Two modes share one config:
  *
  *  - `build:client` (`--mode client`, the default here) emits `lib/client.js`,
- *    the published artifact. It is a single-file IIFE wrapped in the host loader
- *    envelope `window.__ModuleLoader__.load({ id, factory })` — the exact shape
- *    `dsh-mcp-connector/lib/client.js` ships, produced by the banner/footer below
- *    so the wrapper has one definition. The factory parameter is named `require`
- *    because that is the host's own module resolver, and `react`/`react-dom` are
- *    externalized so the bundle resolves them through it instead of embedding a
- *    second copy (which would break hooks).
+ *    the published artifact. It is a single-file **CJS** module wrapped in the
+ *    host loader envelope `window.__ModuleLoader__.load({ id, factory })` — the
+ *    exact shape `dsh-mcp-connector/lib/client.js` ships, produced by the
+ *    banner/footer below so the wrapper has one definition. CJS (not IIFE) is
+ *    load-bearing: the factory parameter is named `require` because that is the
+ *    host's own module resolver, and only the CJS format emits `require("react")`
+ *    calls; IIFE would emit bare identifiers that resolve to nothing at runtime.
+ *    Every React entry point is externalized so the bundle resolves the shell's
+ *    single copy through that `require` instead of embedding its own (which
+ *    would break hooks) — see the `external` matcher below.
  *  - `dev` is a plain dev harness page (`ui/index.html`) for rendering the
  *    settings page in a browser against a running host.
  *
- * CSS is emitted into `lib/client.css`; the client bundle imports no asset URLs,
- * so nothing else needs inlining.
+ * No CSS file is emitted: the stylesheet is imported with `?inline` and injected
+ * as a `<style>` node by the bundle entry, because the host's module loader has
+ * no notion of a co-located stylesheet.
  */
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
@@ -71,13 +75,18 @@ export default defineConfig(({ mode }) => {
             cssFileName: 'client',
           },
           rollupOptions: {
-            // Provided by the host: resolving `react` through its `require` keeps
-            // ONE React instance across the shell and this bundle, which hooks
-            // require. `react-dom` is deliberately absent — the shell owns the
-            // DOM root and renders this bundle's component, so nothing here
-            // imports it, and externalizing an unused specifier only invites
-            // drift if that ever changes.
-            external: ['react'],
+            // Every React entry point, externalized so the shell's single copy is
+            // resolved through its `require` — a bundled second copy would give
+            // this tree a different React instance and break hooks.
+            //
+            // The regex is REQUIRED, not stylistic: the bare string `'react'`
+            // matches only that exact specifier, so `react/jsx-runtime` (the
+            // automatic JSX runtime the plugin-react transform injects) was
+            // silently bundled — ~2.6 kB of React's own source in the artifact,
+            // and a second React internal to go with it. `/^react/` covers
+            // `react`, `react/jsx-runtime`, `react/jsx-dev-runtime` and any
+            // `react-dom` subpath.
+            external: [/^react/],
             output: {
               banner: loaderBanner,
               footer: loaderFooter,

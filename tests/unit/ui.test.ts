@@ -250,8 +250,49 @@ describe('pairing wizard', () => {
     expect(await screen.findByText('204816')).toBeTruthy()
   })
 
-  it('surfaces a validation refusal without leaving the wizard', async () => {
-    await renderWithDevice([
+  // Every post-202 failure verdict the server can publish (src/httpApi.ts
+  // `pairingVerdict` → `PairingErrorKind`). These arrive as `pairing-progress`
+  // frames with `stage = verdict.error`, NOT as an HTTP error — the 202 was
+  // already returned — so each one must settle the wizard just like a terminal
+  // approval would. Missing any of them leaves the run stuck in 'waiting' with
+  // the submit button permanently disabled.
+  const postPairingFailures = [
+    ['unreachable', '无法连接 Cherry Studio'],
+    ['invalid-payload', '配对信息无效'],
+    ['rejected', '配对被拒绝'],
+    ['expired', '配对邀请已过期'],
+  ] as const
+
+  for (const [stage, label] of postPairingFailures) {
+    it(`settles the wizard on a post-202 ${stage} frame`, async () => {
+      await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-fail' })]])
+
+      submitPayload()
+      await screen.findByText('配对进行中')
+      expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(true)
+
+      // The everyday failure: the desktop is offline, and the verdict only ever
+      // arrives on the stream.
+      stream().emit({ event: 'pairing-progress', data: { stage, detail: 'peer is offline' } })
+
+      // The run ends, in user-facing copy rather than a raw stage string.
+      const settled = await screen.findByText(new RegExp(label))
+      expect(settled.textContent).not.toContain(stage === 'rejected' ? 'pairing-progress' : 'undefined')
+
+      await waitFor(() => {
+        expect(screen.queryByText('配对进行中')).toBeNull()
+      })
+      // The wizard is usable again: the payload box and submit are re-enabled.
+      await waitFor(() => {
+        expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
+      })
+      expect(screen.getByLabelText('配对 payload')).toBeTruthy()
+      // No raw stage string leaks into the UI.
+      expect(screen.queryByText(stage)).toBeNull()
+    })
+  }
+
+  it('surfaces a validation refusal without leaving the wizard', async () => {    await renderWithDevice([
       [
         'POST',
         '/cherry-remote/api/pair',

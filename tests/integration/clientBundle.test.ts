@@ -83,24 +83,41 @@ type RequireLog = string[]
  * building the module graph must not need a real DOM, only the identifiers the
  * bundle destructures at load time.
  */
+/**
+ * The host-`require` stand-in for the externalized React family.
+ *
+ * Keyed by the specifier the bundle actually asks for. The bundle resolves
+ * `react` and the automatic JSX runtime (`react/jsx-runtime`, or the dev
+ * variant); `react-dom` is listed for completeness but is not expected, since
+ * the shell owns the DOM root and renders this bundle's component.
+ */
+function reactFamilyStub(specifier: string): unknown | undefined {
+  if (specifier === 'react') {
+    return {
+      createElement: () => ({}),
+      StrictMode: () => ({}),
+      useCallback: (fn: unknown) => fn,
+      useEffect: () => {},
+      useMemo: (fn: () => unknown) => fn(),
+      useRef: (initial: unknown) => ({ current: initial }),
+      useState: (initial: unknown) => [typeof initial === 'function' ? (initial as () => unknown)() : initial, () => {}],
+    }
+  }
+  if (specifier === 'react/jsx-runtime' || specifier === 'react/jsx-dev-runtime') {
+    return { jsx: () => ({}), jsxs: () => ({}), Fragment: () => ({}), jsxDEV: () => ({}) }
+  }
+  if (specifier === 'react-dom' || specifier === 'react-dom/client') {
+    return { createRoot: () => ({ render: () => {}, unmount: () => {} }) }
+  }
+  return undefined
+}
+
 function loadBundle(source = readFileSync(bundlePath, 'utf8')): { loaded: LoadedModule; requires: RequireLog } {
   const requires: RequireLog = []
   const loaded: LoadedModule = { id: '', exports: {} }
 
-  const reactStub = {
-    createElement: () => ({}),
-    StrictMode: () => ({}),
-    useCallback: (fn: unknown) => fn,
-    useEffect: () => {},
-    useMemo: (fn: () => unknown) => fn(),
-    useState: (initial: unknown) => [typeof initial === 'function' ? (initial as () => unknown)() : initial, () => {}],
-  }
-  const reactDomClientStub = { createRoot: () => ({ render: () => {}, unmount: () => {} }) }
-  const jsxRuntimeStub = { jsx: () => ({}), jsxs: () => ({}), Fragment: () => ({}) }
-
-  // The bundle mounts into a detached element and injects a <style> node; the
-  // loader smoke is about the ENVELOPE, not about DOM fidelity, so a minimal
-  // element stub is enough and keeps the test free of jsdom.
+  // The bundle injects a <style> node; the loader smoke is about the ENVELOPE,
+  // not DOM fidelity, so a minimal element stub keeps it free of jsdom.
   const fakeElement = {
     setAttribute: () => {},
     append: () => {},
@@ -120,9 +137,8 @@ function loadBundle(source = readFileSync(bundlePath, 'utf8')): { loaded: Loaded
         loaded.id = record.id
         loaded.exports = record.factory((specifier: string) => {
           requires.push(specifier)
-          if (specifier === 'react') return reactStub
-          if (specifier === 'react-dom' || specifier === 'react-dom/client') return reactDomClientStub
-          if (specifier === 'react/jsx-runtime') return jsxRuntimeStub
+          const stub = reactFamilyStub(specifier)
+          if (stub !== undefined) return stub
           throw new Error(`the bundle required an undeclared external: ${specifier}`)
         }) as Record<string, unknown>
       },
@@ -143,13 +159,6 @@ function loadBundleWithDocument(document: Record<string, unknown>): LoadedModule
   const source = readFileSync(bundlePath, 'utf8')
   const captured: LoadedModule = { id: '', exports: {} }
 
-  const reactStub = {
-    createElement: () => ({}),
-    useCallback: (fn: unknown) => fn,
-    useEffect: () => {},
-    useMemo: (fn: () => unknown) => fn(),
-    useState: (initial: unknown) => [initial, () => {}],
-  }
   runInContext(
     source,
     createContext({
@@ -158,13 +167,8 @@ function loadBundleWithDocument(document: Record<string, unknown>): LoadedModule
           load(record: { id: string; factory: (require: (specifier: string) => unknown) => unknown }) {
             captured.id = record.id
             captured.exports = record.factory((specifier: string) => {
-              if (specifier === 'react') return reactStub
-              if (specifier === 'react-dom' || specifier === 'react-dom/client') {
-                return { createRoot: () => ({ render: () => {}, unmount: () => {} }) }
-              }
-              if (specifier === 'react/jsx-runtime') {
-                return { jsx: () => ({}), jsxs: () => ({}), Fragment: () => ({}) }
-              }
+              const stub = reactFamilyStub(specifier)
+              if (stub !== undefined) return stub
               throw new Error(`the bundle required an undeclared external: ${specifier}`)
             }) as Record<string, unknown>
           },
@@ -194,15 +198,32 @@ describe('client bundle (build smoke)', () => {
     expect(loaded.id).toBe(PACKAGE_NAME)
   })
 
-  it('resolves react through the loader require, never a global', () => {
-    const { requires } = loadBundle()
-    expect(requires).toContain('react')
-    // Only `react` is required: the shell owns the React DOM root and renders
-    // this bundle's component itself, so `react-dom/client` is no longer pulled
-    // in. A bundled React would make this tree see a different instance than the
-    // shell and break hooks, so it must be required, not embedded.
-    expect(readFileSync(bundlePath, 'utf8')).not.toContain('react.development.js')
-    expect(readFileSync(bundlePath, 'utf8')).not.toMatch(/var React\s*=/)
+  it('embeds no React source, on any subpath', () => {
+    const source = readFileSync(bundlePath, 'utf8')
+
+    // A robust discriminator: every React file — core, `react-dom`, AND the
+    // `react/jsx-runtime` SUBPATH — carries a `@license React` banner and is
+    // wrapped by rollup's CommonJS interop helper. Asserting on the license text
+    // catches an embedded copy regardless of which entry point pulled it in,
+    // which is exactly how ~2.6 kB of `react-jsx-runtime.production.min.js`
+    // slipped past the earlier (too narrow) assertions.
+    expect(source).not.toContain('@license React')
+    expect(source).not.toContain('react-jsx-runtime')
+    expect(source).not.toContain('react-jsx-dev-runtime')
+    expect(source).not.toContain('react.development.js')
+    expect(source).not.toMatch(/var React\s*=/)
+    // No CommonJS interop wrapper at all: with every react subpath external,
+    // nothing in this bundle needs one.
+    expect(source).not.toContain('__commonJSMin')
+  })
+
+  it('externalizes every react subpath through the loader require', () => {
+    // The build must declare the react FAMILY external, not just the bare
+    // specifier: `external: ['react']` does not match `react/jsx-runtime`, so
+    // the subpath was silently bundled. Asserting the config is what keeps the
+    // artifact assertion above from regressing unnoticed.
+    const config = readFileSync(resolve(repoRoot, 'ui', 'vite.config.ts'), 'utf8')
+    expect(config).toContain("external: [/^react")
   })
 
   it('exports the slots service dependency and an apply function', () => {
