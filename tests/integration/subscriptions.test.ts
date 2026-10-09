@@ -3,11 +3,11 @@ import { WebSocket } from 'ws'
 import type { ComponentLogger, Logger } from '@libp2p/interface'
 import { connectSecureChannel, createDeviceIdentity, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
-import { JsonRpcClient } from '../../src/rpc/jsonRpcClient'
-import { toRemoteSocket } from '../../src/rpc/wsAdapter'
-import { SessionSubscriptions } from '../../src/subscriptions'
-import { FakeCherry } from '../loopback/fakeCherry'
-import type { FakeCherryOptions } from '../loopback/fakeCherry'
+import { JsonRpcClient } from '../../src/rpc/jsonRpcClient.js'
+import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
+import { SessionSubscriptions } from '../../src/subscriptions.js'
+import { FakeCherry } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 /**
  * Task 7 integration suite: `SessionSubscriptions` against a real loopback

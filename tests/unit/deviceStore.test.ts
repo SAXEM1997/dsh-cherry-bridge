@@ -25,7 +25,7 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 import * as fs from 'node:fs'
-import { CURRENT_SCHEMA_VERSION, DeviceStore, type DeviceRecord } from '../../src/deviceStore'
+import { CURRENT_SCHEMA_VERSION, DeviceStore, type DeviceRecord } from '../../src/deviceStore.js'
 
 const SCHEMA_VERSION = 2
 const DEVICES_FILENAME = 'devices.json'

@@ -10,8 +10,8 @@ import {
   RemoteSocketStream,
   type SecureChannel,
 } from '@cherrystudio/remote-transport'
-import { toRemoteSocket } from '../../src/rpc/wsAdapter'
-import { JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient'
+import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
+import { JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 
 const PROTOCOL_VERSION = 1
 

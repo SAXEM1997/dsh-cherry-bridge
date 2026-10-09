@@ -1,5 +1,5 @@
-import { JsonRpcRequestError } from './rpc/jsonRpcClient'
-import type { JsonRpcClient } from './rpc/jsonRpcClient'
+import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import type { JsonRpcClient } from './rpc/jsonRpcClient.js'
 import type { AgentCursor, AgentEvent } from '@cherrystudio/remote-protocol/agent'
 
 /**

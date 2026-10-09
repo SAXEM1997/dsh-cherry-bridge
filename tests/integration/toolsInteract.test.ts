@@ -3,19 +3,19 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
-import { DeviceStore } from '../../src/deviceStore'
-import { DeviceConnection } from '../../src/connection'
-import { JsonRpcRequestError } from '../../src/rpc/jsonRpcClient'
-import { SessionSubscriptions } from '../../src/subscriptions'
-import { registerCherryTools } from '../../src/tools'
+import { DeviceStore } from '../../src/deviceStore.js'
+import { DeviceConnection } from '../../src/connection.js'
+import { JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
+import { SessionSubscriptions } from '../../src/subscriptions.js'
+import { registerCherryTools } from '../../src/tools.js'
 import type {
   CherryToolDefinition,
   CherryToolEngineOptions,
   CherryToolsContext,
   CherryToolsDeps,
-} from '../../src/tools'
-import { FakeCherry } from '../loopback/fakeCherry'
-import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry'
+} from '../../src/tools.js'
+import { FakeCherry } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry.js'
 
 /**
  * Task 9 integration suite: the six INTERACTIVE `cherry_*` tools driven through

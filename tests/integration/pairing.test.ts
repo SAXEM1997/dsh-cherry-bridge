@@ -4,11 +4,11 @@ import { join } from 'node:path'
 import { hostname } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
-import { DeviceStore } from '../../src/deviceStore'
-import { pairWithPayload } from '../../src/pairing'
-import type { PairingError } from '../../src/pairing'
-import { FakeCherry } from '../loopback/fakeCherry'
-import type { FakeCherryOptions } from '../loopback/fakeCherry'
+import { DeviceStore } from '../../src/deviceStore.js'
+import { pairWithPayload } from '../../src/pairing.js'
+import type { PairingError } from '../../src/pairing.js'
+import { FakeCherry } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 /**
  * Task 6 integration suite: the pairing flow (`src/pairing.ts`) against the

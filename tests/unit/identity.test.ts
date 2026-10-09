@@ -3,7 +3,7 @@ import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deviceIdentityId } from '@cherrystudio/remote-transport'
-import { loadOrCreateIdentity } from '../../src/identity'
+import { loadOrCreateIdentity } from '../../src/identity.js'
 
 const dataDirs: string[] = []
 

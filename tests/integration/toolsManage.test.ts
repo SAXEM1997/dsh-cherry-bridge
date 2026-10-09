@@ -4,13 +4,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
-import { DeviceStore } from '../../src/deviceStore'
-import { DeviceConnection } from '../../src/connection'
-import { pairWithPayload } from '../../src/pairing'
-import { registerCherryTools } from '../../src/tools'
-import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools'
-import { FakeCherry } from '../loopback/fakeCherry'
-import type { FakeCherryOptions } from '../loopback/fakeCherry'
+import { DeviceStore } from '../../src/deviceStore.js'
+import { DeviceConnection } from '../../src/connection.js'
+import { pairWithPayload } from '../../src/pairing.js'
+import { registerCherryTools } from '../../src/tools.js'
+import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
+import { FakeCherry } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 /**
  * Task 10 integration suite: the MANAGEMENT `cherry_*` tools (`cherry_pair` /
@@ -657,7 +657,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }
 
   it('③a registers the full 14-tool family on first apply', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
@@ -688,7 +688,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   })
 
   it('③b does not DOUBLE-register on a repeated apply: the registry still holds one of each', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
@@ -711,7 +711,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   })
 
   it('③c registers tools against the assembly\'s OWN store and pool', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake()
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
@@ -740,7 +740,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 15_000)
 
   it('③d threads the plugin config\'s rate budget into the pooled DeviceConnection', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
@@ -780,7 +780,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 15_000)
 
   it('③e publishes pairing progress from the cherry_pair call site (ruling 10)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake({ pairingDecision: 'approved', pairingGetPendingPolls: 1 })
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
@@ -806,7 +806,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 15_000)
 
   it('③f fans the pooled connection states out to the SSE event source (ruling 9)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
@@ -838,7 +838,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 15_000)
 
   it('③g re-ensures a live session at its LAST cursor after a reconnect (ruling 8)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake({
       agent: {
         sessions: [
@@ -884,7 +884,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③h routes peer notifications into the device\'s subscription layer (ruling 7)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake({
       agent: {
         sessions: [
@@ -925,7 +925,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③i takes the subscription limit from the connection\'s hello limits, not a constant (ruling 5)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     // The peer advertises room for TWO live subscriptions. The local LRU must
     // stay INSIDE that cap, which it can only do if the assembly read the
     // hello-reported `limits.subscriptions` — a hardcoded 8 would let the third
@@ -965,7 +965,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③j threads the plugin config\'s per-session cache budget into the subscription layer (ruling 5)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake({
       agent: {
         sessions: [
@@ -1005,8 +1005,8 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③k evicts the stale pooled connection when a re-pair replaces the record (ruling 3)', async () => {
-    const index = await import('../../src/index')
-    const { DeviceConnection } = await import('../../src/connection')
+    const index = await import('../../src/index.js')
+    const { DeviceConnection } = await import('../../src/connection.js')
     const fakeInfo = await makeFake({ pairingDecision: 'approved', pairingGetPendingPolls: 1 })
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
@@ -1071,7 +1071,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③p warns by name and falls back when a config key is present but unusable (review F4)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
 
     // ABSENT keys are the documented defaults and say nothing.
     consoleWarn.mockClear()
@@ -1101,8 +1101,8 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   })
 
   it('③q claims the pool entries synchronously, so an eviction cannot steal a fresh layer (review F2)', async () => {
-    const index = await import('../../src/index')
-    const { DeviceConnection } = await import('../../src/connection')
+    const index = await import('../../src/index.js')
+    const { DeviceConnection } = await import('../../src/connection.js')
     const fakeInfo = await makeFake()
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
@@ -1185,8 +1185,8 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③r isolates a failing session in the recovery loop from the rest (review F3)', async () => {
-    const index = await import('../../src/index')
-    const { SessionSubscriptions } = await import('../../src/subscriptions')
+    const index = await import('../../src/index.js')
+    const { SessionSubscriptions } = await import('../../src/subscriptions.js')
     const fakeInfo = await makeFake({
       agent: {
         sessions: [
@@ -1241,7 +1241,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③s rejects a parked waiter on teardown instead of leaving it to time out (review F1)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake({
       agent: {
         sessions: [
@@ -1308,7 +1308,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③t disposes the subscription layer on a re-apply too (review F1)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const fakeInfo = await makeFake({
       agent: {
         sessions: [
@@ -1366,7 +1366,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   }, 30_000)
 
   it('③o degrades to a warning instead of failing when ctx.tools is absent', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
@@ -1379,7 +1379,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 })
 
 /** A minimal valid record for the store-level assertions. */
-function recordFor(deviceId: string, displayName: string): import('../../src/deviceStore').DeviceRecord {
+function recordFor(deviceId: string, displayName: string): import('../../src/deviceStore.js').DeviceRecord {
   return {
     schemaVersion: 2,
     deviceId,

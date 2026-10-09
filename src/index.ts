@@ -1,22 +1,22 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { DeviceStore } from './deviceStore'
-import { loadOrCreateIdentity } from './identity'
-import { DeviceConnection } from './connection'
-import type { DeviceState } from './connection'
-import { pairWithPayload } from './pairing'
-import { SessionSubscriptions } from './subscriptions'
-import { registerCherryTools } from './tools'
-import type { CherryToolsContext, CherryToolsDeps } from './tools'
-import { registerHttpApi } from './httpApi'
+import { DeviceStore } from './deviceStore.js'
+import { loadOrCreateIdentity } from './identity.js'
+import { DeviceConnection } from './connection.js'
+import type { DeviceState } from './connection.js'
+import { pairWithPayload } from './pairing.js'
+import { SessionSubscriptions } from './subscriptions.js'
+import { registerCherryTools } from './tools.js'
+import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
+import { registerHttpApi } from './httpApi.js'
 import type {
   CherryHttpContext,
   CherryHttpDeps,
   DeviceStateEvent,
   PairingProgressEvent,
-} from './httpApi'
-import type { DiagnosticsError } from './diagnostics'
-import { truncateErrorMessage } from './diagnostics'
+} from './httpApi.js'
+import type { DiagnosticsError } from './diagnostics.js'
+import { truncateErrorMessage } from './diagnostics.js'
 
 export const name = 'cherry-remote'
 

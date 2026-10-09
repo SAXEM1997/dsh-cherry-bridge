@@ -3,11 +3,11 @@ import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
 import { remoteConnectPath } from '@cherrystudio/remote-protocol'
-import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient'
-import { toRemoteSocket } from './rpc/wsAdapter'
-import { digestIdentity } from './diagnostics'
-import { urlHost } from './urlHost'
-import type { DeviceRecord } from './deviceStore'
+import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import { toRemoteSocket } from './rpc/wsAdapter.js'
+import { digestIdentity } from './diagnostics.js'
+import { urlHost } from './urlHost.js'
+import type { DeviceRecord } from './deviceStore.js'
 
 /**
  * Per-device persistent connection: the M1 capstone that owns the WebSocket,

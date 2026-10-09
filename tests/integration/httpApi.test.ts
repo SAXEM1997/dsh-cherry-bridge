@@ -3,13 +3,13 @@ import { EventEmitter } from 'node:events'
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DeviceStore, QuarantinedArchiveError } from '../../src/deviceStore'
-import type { DeviceRecord } from '../../src/deviceStore'
-import { PairingError } from '../../src/pairing'
-import type { PairWithPayloadOptions } from '../../src/pairing'
-import type { DeviceState } from '../../src/connection'
-import { isTrustedWebRequest, registerHttpApi } from '../../src/httpApi'
-import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi'
+import { DeviceStore, QuarantinedArchiveError } from '../../src/deviceStore.js'
+import type { DeviceRecord } from '../../src/deviceStore.js'
+import { PairingError } from '../../src/pairing.js'
+import type { PairWithPayloadOptions } from '../../src/pairing.js'
+import type { DeviceState } from '../../src/connection.js'
+import { isTrustedWebRequest, registerHttpApi } from '../../src/httpApi.js'
+import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
 
 /**
  * Task 11 integration suite: the same-origin HTTP face + SSE stream, driven
@@ -1367,20 +1367,20 @@ describe('plugin assembly (index.ts apply)', () => {
   }
 
   it('declares the plugin identity the host loads it by', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     expect(index.name).toBe('cherry-remote')
     expect(index.inject).toEqual(['tools'])
   })
 
   it('resolves the data directory: explicit > $DSH_HOME > ~/.dsh', async () => {
-    const { resolveDataDir } = await import('../../src/index')
+    const { resolveDataDir } = await import('../../src/index.js')
     expect(resolveDataDir({ dataDir: '/explicit' }, {})).toBe('/explicit')
     expect(resolveDataDir({}, { DSH_HOME: '/harness' })).toBe('/harness/cherry-remote')
     expect(resolveDataDir({}, {})).toContain('.dsh')
   })
 
   it('mounts the route, creates the identity key, and releases both on dispose', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const ctx = assemblyCtx()
 
     index.apply(ctx as never, { dataDir })
@@ -1398,7 +1398,7 @@ describe('plugin assembly (index.ts apply)', () => {
   })
 
   it('does not adopt connections from a previous apply against another archive', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const first = assemblyCtx()
     index.apply(first as never, { dataDir })
 
@@ -1424,8 +1424,8 @@ describe('plugin assembly (index.ts apply)', () => {
   }
 
   it('rebuilds the connection so PATCH address maintenance reaches the dialer (F1a)', async () => {
-    const index = await import('../../src/index')
-    const { DeviceConnection } = await import('../../src/connection')
+    const index = await import('../../src/index.js')
+    const { DeviceConnection } = await import('../../src/connection.js')
     const ctx = assemblyCtx()
     index.apply(ctx as never, { dataDir })
 
@@ -1469,8 +1469,8 @@ describe('plugin assembly (index.ts apply)', () => {
   })
 
   it('does not wedge a device at disabled across disable → enable (F1b)', async () => {
-    const index = await import('../../src/index')
-    const { DeviceConnection } = await import('../../src/connection')
+    const index = await import('../../src/index.js')
+    const { DeviceConnection } = await import('../../src/connection.js')
     const ctx = assemblyCtx()
     index.apply(ctx as never, { dataDir })
 
@@ -1528,8 +1528,8 @@ describe('plugin assembly (index.ts apply)', () => {
   })
 
   it('does not build a connection for a device disabled before any read (F1b, empty pool)', async () => {
-    const index = await import('../../src/index')
-    const { DeviceConnection } = await import('../../src/connection')
+    const index = await import('../../src/index.js')
+    const { DeviceConnection } = await import('../../src/connection.js')
     const ctx = assemblyCtx()
     index.apply(ctx as never, { dataDir })
 
@@ -1580,7 +1580,7 @@ describe('plugin assembly (index.ts apply)', () => {
   })
 
   it('degrades quietly instead of failing the plugin in a headless deployment', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const ctx = assemblyCtx(false)
     const warn = vi.mocked(console.warn)
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { DeviceStore } from '../../src/deviceStore'
-import { registerCherryTools } from '../../src/tools'
-import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools'
+import { DeviceStore } from '../../src/deviceStore.js'
+import { registerCherryTools } from '../../src/tools.js'
+import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.js'
 
 /**
  * Task 8⑧ + Task 10④: literal JSON Schema validation for the WHOLE `cherry_*`

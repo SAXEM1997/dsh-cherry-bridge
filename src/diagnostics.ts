@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import type { DeviceRecord, DeviceStore } from './deviceStore'
-import type { DeviceState, EffectiveLimits } from './connection'
+import type { DeviceRecord, DeviceStore } from './deviceStore.js'
+import type { DeviceState, EffectiveLimits } from './connection.js'
 
 /**
  * M4 operations surface (spec §5 「可观测性与诊断」, §3.7 route prefix).

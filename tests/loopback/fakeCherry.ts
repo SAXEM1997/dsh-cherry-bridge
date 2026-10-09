@@ -12,7 +12,7 @@ import type { SecureChannel } from '@cherrystudio/remote-transport'
 import { connectionMethods, pairingMethods, remoteLimits } from '@cherrystudio/remote-protocol'
 import { agentAuthorizationSchema, agentMethods } from '@cherrystudio/remote-protocol/agent'
 import type { AgentCheckpointPage, AgentCursor } from '@cherrystudio/remote-protocol/agent'
-import { toRemoteSocket } from '../../src/rpc/wsAdapter'
+import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 
 /**
  * A protocol-level failure injected by a test, shaped exactly like the

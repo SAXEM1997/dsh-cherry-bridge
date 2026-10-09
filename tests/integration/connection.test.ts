@@ -8,13 +8,13 @@ import {
   deviceIdentityId,
   RemoteSocketStream,
 } from '@cherrystudio/remote-transport'
-import { JsonRpcClient } from '../../src/rpc/jsonRpcClient'
-import { toRemoteSocket } from '../../src/rpc/wsAdapter'
-import type { DeviceRecord } from '../../src/deviceStore'
-import { DeviceConnection } from '../../src/connection'
-import type { DeviceState, EffectiveLimits } from '../../src/connection'
-import { FakeCherry, maxRequestsInAnyOneSecondWindow } from '../loopback/fakeCherry'
-import type { FakeCherryOptions } from '../loopback/fakeCherry'
+import { JsonRpcClient } from '../../src/rpc/jsonRpcClient.js'
+import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
+import type { DeviceRecord } from '../../src/deviceStore.js'
+import { DeviceConnection } from '../../src/connection.js'
+import type { DeviceState, EffectiveLimits } from '../../src/connection.js'
+import { FakeCherry, maxRequestsInAnyOneSecondWindow } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 /**
  * Task 5 integration suite: DeviceConnection (the per-device persistent

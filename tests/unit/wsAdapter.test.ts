@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { AddressInfo } from 'node:net'
 import type { RemoteSocket } from '@cherrystudio/remote-transport'
-import { toRemoteSocket } from '../../src/rpc/wsAdapter'
+import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 
 const disposers: Array<() => Promise<void>> = []
 

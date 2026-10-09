@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { digestIdentity, sanitizeDevice } from '../../src/diagnostics'
-import type { DeviceRecord } from '../../src/deviceStore'
+import { digestIdentity, sanitizeDevice } from '../../src/diagnostics.js'
+import type { DeviceRecord } from '../../src/deviceStore.js'
 
 /**
  * The diagnostics redaction helpers, unit-tested at their own seam.

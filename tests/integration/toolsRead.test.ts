@@ -3,18 +3,18 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
-import { DeviceStore } from '../../src/deviceStore'
-import { DeviceConnection, DeviceUnavailableError } from '../../src/connection'
-import { SessionSubscriptions } from '../../src/subscriptions'
-import { registerCherryTools } from '../../src/tools'
+import { DeviceStore } from '../../src/deviceStore.js'
+import { DeviceConnection, DeviceUnavailableError } from '../../src/connection.js'
+import { SessionSubscriptions } from '../../src/subscriptions.js'
+import { registerCherryTools } from '../../src/tools.js'
 import type {
   CherryToolDefinition,
   CherryToolEngineOptions,
   CherryToolsContext,
   CherryToolsDeps,
-} from '../../src/tools'
-import { FakeCherry } from '../loopback/fakeCherry'
-import type { FakeCherryOptions } from '../loopback/fakeCherry'
+} from '../../src/tools.js'
+import { FakeCherry } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 /**
  * Task 8 integration suite: the six read-only `cherry_*` tools driven through

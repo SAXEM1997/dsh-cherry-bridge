@@ -10,10 +10,21 @@
   // once — the two `include`/`exclude` sets are proven to partition
   // `tests/**/*.test.ts` by `tests/unit/projectCoverage.test.ts`. Change one
   // side and that test fails rather than letting a file go unchecked.
+  //
+  // `nodenext` is deliberate and differs from `tsconfig.ui.json`'s `bundler`:
+  // this project is the Node half and is BUNDLED EMIT-FREE (`noEmit` here,
+  // tsdown for `dist/`), so `nodenext` is what makes the typechecker model the
+  // real Node ESM resolver the published artifact runs under. The price is the
+  // `nodenext` ESM convention: every RELATIVE import must name the emitted
+  // `.js` file even though the source is `.ts` (`./tools.js` -> `src/tools.ts`).
+  // Bare specifiers (`node:*`, `@cherrystudio/*`, `vitest`, ...) are resolved
+  // from `node_modules` unchanged and MUST NOT be suffixed. vitest/vite resolve
+  // the `.js`-suffixed relative paths back to the `.ts` sources, so the test
+  // run is unaffected. See `docs/` and the fix-d report for the migration.
   "compilerOptions": {
     "target": "ES2023",
-    "module": "ESNext",
-    "moduleResolution": "bundler",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
     "lib": ["ES2023"],
     "types": ["node"],
     "strict": true,

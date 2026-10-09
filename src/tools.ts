@@ -1,11 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { DeviceUnavailableError } from './connection'
-import type { DeviceConnection, DeviceState } from './connection'
-import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore'
-import { JsonRpcRequestError } from './rpc/jsonRpcClient'
-import type { ReadResult, SessionSubscriptions } from './subscriptions'
-import { PairingError } from './pairing'
-import type { PairingErrorKind } from './pairing'
+import { DeviceUnavailableError } from './connection.js'
+import type { DeviceConnection, DeviceState } from './connection.js'
+import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
+import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
+import { PairingError } from './pairing.js'
+import type { PairingErrorKind } from './pairing.js'
 import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
 
 /**

@@ -6,34 +6,34 @@ import { fileURLToPath } from 'node:url'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { connectionMethods, connectionNotificationSchema, pairingMethods } from '@cherrystudio/remote-protocol'
 import { agentNotificationSchema, commandReceiptSchema, executionSchema } from '@cherrystudio/remote-protocol/agent'
-import { DeviceStore } from '../../src/deviceStore'
-import { DeviceConnection } from '../../src/connection'
-import type { DeviceState } from '../../src/connection'
-import { SessionSubscriptions } from '../../src/subscriptions'
-import { registerCherryTools } from '../../src/tools'
-import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools'
-import { pairWithPayload } from '../../src/pairing'
+import { DeviceStore } from '../../src/deviceStore.js'
+import { DeviceConnection } from '../../src/connection.js'
+import type { DeviceState } from '../../src/connection.js'
+import { SessionSubscriptions } from '../../src/subscriptions.js'
+import { registerCherryTools } from '../../src/tools.js'
+import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
+import { pairWithPayload } from '../../src/pairing.js'
 import {
   DEFAULT_PER_SESSION_CACHE_BYTES,
   DEFAULT_RATE_BUDGET_PER_SECOND,
   resolveBridgeConfig,
-} from '../../src/index'
+} from '../../src/index.js'
 import {
   CONTRACT_DIFFERENCES,
   ERROR_MESSAGE_ELLIPSIS,
   ERROR_MESSAGE_MAX,
   buildDiagnostics,
   sanitizeDiagnostics,
-} from '../../src/diagnostics'
-import { registerHttpApi } from '../../src/httpApi'
+} from '../../src/diagnostics.js'
+import { registerHttpApi } from '../../src/httpApi.js'
 import type {
   CherryHttpContext,
   CherryHttpDeps,
   HttpRequestLike,
   HttpResponseLike,
-} from '../../src/httpApi'
-import { FakeCherry } from '../loopback/fakeCherry'
-import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry'
+} from '../../src/httpApi.js'
+import { FakeCherry } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry.js'
 
 /**
  * Task 13 — the CONTRACT suite.
@@ -1429,7 +1429,7 @@ describe('③ release configuration', () => {
 
 describe('③ the real plugin assembly serves /diagnostics', () => {
   it('projects the pooled devices and effective config with no credential in the body', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const server = makeServer()
     const dir = tempDir('cherry-assembly-')
     const ctx = {
@@ -1482,7 +1482,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
   }, 20_000)
 
   it('resets the error ring and the build counter on re-apply (minor 8)', async () => {
-    const index = await import('../../src/index')
+    const index = await import('../../src/index.js')
     const server = makeServer()
     const ctx = {
       inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
@@ -1527,8 +1527,8 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     // Driven at the SEAM rather than through a live peer: the assembly's
     // `diagnosticsSessions` must pass through whatever the layer's `cursorOf`
     // reports, INCLUDING a real cursor and INCLUDING nothing.
-    const { SessionSubscriptions } = await import('../../src/subscriptions')
-    const index = await import('../../src/index')
+    const { SessionSubscriptions } = await import('../../src/subscriptions.js')
+    const index = await import('../../src/index.js')
     const server = makeServer()
     const ctx = {
       inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {

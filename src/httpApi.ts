@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { QuarantinedArchiveError } from './deviceStore'
-import type { DeviceRecord } from './deviceStore'
-import type { DeviceStore } from './deviceStore'
-import type { DeviceState, EffectiveLimits } from './connection'
-import { PairingError } from './pairing'
-import type { PairWithPayloadOptions } from './pairing'
-import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics'
-import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics'
+import { QuarantinedArchiveError } from './deviceStore.js'
+import type { DeviceRecord } from './deviceStore.js'
+import type { DeviceStore } from './deviceStore.js'
+import type { DeviceState, EffectiveLimits } from './connection.js'
+import { PairingError } from './pairing.js'
+import type { PairWithPayloadOptions } from './pairing.js'
+import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics.js'
+import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
 
 /**
  * The plugin's same-origin HTTP face (spec §3.7): device management REST plus
