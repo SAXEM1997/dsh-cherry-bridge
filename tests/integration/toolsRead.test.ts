@@ -511,6 +511,89 @@ describe('read-only cherry tools over a real loopback channel', () => {
     )
   })
 
+  it('④f cherry_read reads MORE than a page-cap\'s worth of parts (>1000) without truncating', async () => {
+    // DISCRIMINATOR for the parts bound: 1001 parts exceeds any plausible
+    // single-page or tool-limit constant, so a walk still bounded by one stops
+    // short and says so. Parts are tiny, so this stays cheap.
+    const PARTS = 1001
+    const parts = Array.from({ length: PARTS }, (_unused, index) => ({
+      kind: 'text' as const,
+      text: `p${index}`,
+    }))
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
+        maxPageSize: 100,
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ content: string }>; partsTruncated?: string }>
+    }
+
+    // All 1001 arrive, the last one included, and nothing claims truncation.
+    expect(result.messages[0]!.parts).toHaveLength(PARTS)
+    expect(result.messages[0]!.parts[PARTS - 1]!.content).toBe(`p${PARTS - 1}`)
+    expect(result.messages[0]!.partsTruncated).toBeUndefined()
+
+    // 11 pages of 100 (the 11th holds the single leftover part).
+    const calls = rig.fake.readCallsFor('agent.parts.list')
+    expect(calls).toHaveLength(11)
+    expect(calls[10]!['cursor']).toBe('1000')
+    for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
+  })
+
+  it('④g an empty page with a dangling nextCursor is a peer fault, refused instead of spun on', async () => {
+    // A walk bounded only by item count can never finish here: the item count
+    // never grows. The read must FAIL rather than spin or return an empty
+    // snapshot as though it were complete.
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts: [] }],
+        emptyPagesWithDanglingCursor: '0',
+      },
+    })
+
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /empty page|no progress|did not advance/i,
+    )
+    // It gave up quickly instead of hammering the peer.
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBeLessThan(5)
+  })
+
+  it('④h a cursor that never advances is a peer fault, refused instead of spun on', async () => {
+    // The same no-progress class reached through NON-EMPTY pages: every page
+    // carries real items but always advertises the same stuck cursor, so an
+    // item ceiling is again never reached. This is the fault the empty-page
+    // guard does NOT cover, so it pins the cursor-advance guard on its own.
+    const parts = Array.from({ length: 10 }, (_unused, index) => ({
+      kind: 'text' as const,
+      text: `stuck-${index}`,
+    }))
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
+        maxPageSize: 5,
+        stuckCursor: '5',
+      },
+    })
+
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /did not advance its cursor/i,
+    )
+    // It stopped as soon as the cursor repeated rather than looping.
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBeLessThan(5)
+  })
+
   it('④b cherry_read verifies the sha256 of an aggregated {ref} and refuses tampered bytes', async () => {
     const big = 'C'.repeat(30 * 1024)
     const rig = await makeRig({

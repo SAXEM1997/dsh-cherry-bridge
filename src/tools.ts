@@ -183,11 +183,21 @@ const CONTENT_READ_MAX_BYTES = 24 * 1024
  * CIRCUIT-BREAKER for the parts walk (a local policy bound, NOT a protocol
  * limit — the protocol caps nothing at 1000 parts). A message's parts are read
  * to COMPLETION, so this exists only to stop a peer that never terminates its
- * pagination. Tripping it is SURFACED (`partsTruncated` + `partsOmitted`),
+ * pagination. Tripping it is SURFACED (`partsTruncated` + `partsResumeCursor`),
  * never silent, so a caller can always tell a complete part list from a
  * circuit-broken one. Injectable for tests.
  */
 const DEFAULT_PARTS_SAFETY_BOUND = 10_000
+/**
+ * PAGE-COUNT BACKSTOP for every aggregate walk, alongside the item ceiling.
+ *
+ * The item ceiling alone cannot stop a peer that answers `items: []` with a
+ * non-null `nextCursor`: the item count never grows, so a bound expressed only
+ * in items is never reached. This is a peer fault, and a walk that hits it
+ * FAILS — an empty page that claims more are coming is never a reason to return
+ * a partial (or empty) result as though it were complete.
+ */
+const MAX_AGGREGATE_PAGES = 10_000
 /**
  * CIRCUIT-BREAKER for one `{ref}`'s content walk, used only when the ref
  * carries no usable `byteLength`. The ref's declared length normally derives
@@ -432,6 +442,10 @@ class CherryToolEngine {
    * internal circuit-breaker against a peer that never terminates, and tripping
    * it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the resume
    * cursor) — a walk never stops early and reports success.
+   *
+   * A peer that answers empty pages with a non-null `nextCursor` is a FAULT,
+   * not a slow walk: no item ceiling can ever be reached, so it is detected
+   * directly and thrown (see {@link MAX_AGGREGATE_PAGES} for the backstop).
    */
   async #aggregate<T>(
     connection: DeviceConnection,
@@ -451,11 +465,16 @@ class CherryToolEngine {
     const items: T[] = []
     let cursor: string | undefined
 
-    for (;;) {
+    for (let pages = 0; ; pages += 1) {
       if (items.length >= ceiling) {
         // Which ceiling stopped it decides how the caller reads the result:
         // the caller's own limit, or the internal circuit-breaker.
         return this.#truncated(items, aggregate <= bound ? 'limit' : 'safety-bound', cursor)
+      }
+      if (pages >= MAX_AGGREGATE_PAGES) {
+        throw new Error(
+          `${method} did not terminate within ${MAX_AGGREGATE_PAGES} page(s) for ${JSON.stringify(params)}`,
+        )
       }
       const request: Record<string, unknown> = {
         ...params,
@@ -472,7 +491,23 @@ class CherryToolEngine {
       }
       const next = extracted.nextCursor
       if (next === null || next === undefined) return { items, truncated: false }
-      cursor = String(next)
+      const advanced = String(next)
+      // An empty page that promises more is not progress: without this the walk
+      // spins forever, because the item ceiling is never reached. Treating it as
+      // a peer fault is the honest verdict — the alternative (returning the
+      // partial items as if complete) would hide real content loss.
+      if (extracted.items.length === 0) {
+        throw new Error(
+          `${method} answered an empty page with nextCursor ${advanced} for ${JSON.stringify(params)}; ` +
+            'refusing to spin on a peer that makes no progress',
+        )
+      }
+      if (advanced === cursor) {
+        throw new Error(
+          `${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`,
+        )
+      }
+      cursor = advanced
     }
   }
 

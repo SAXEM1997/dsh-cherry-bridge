@@ -182,6 +182,19 @@ export interface FakeAgentOptions {
    */
   maxPageSize?: number
   /**
+   * PEER FAULT injection: answer with an EMPTY `items` array plus this dangling
+   * `nextCursor`, forever. Models a broken peer whose pagination never makes
+   * progress — a walk bounded only by item count would spin here indefinitely.
+   */
+  emptyPagesWithDanglingCursor?: string
+  /**
+   * PEER FAULT injection: serve the FIRST page normally, then repeat it forever
+   * with this unchanged `nextCursor`. Models a peer whose cursor never advances
+   * — the same no-progress class as an empty page, but reached through
+   * non-empty pages, so the two guards are independently observable.
+   */
+  stuckCursor?: string
+  /**
    * One-shot failures for the read faces, keyed by method name. Each entry is
    * consumed by the first call it matches (the §6 REVISION_EXPIRED injection).
    */
@@ -1579,9 +1592,19 @@ export class FakeCherry {
 
   /** The real `pageOf`: a numeric-offset cursor, clamped to the protocol cap. */
   #page<T>(items: readonly T[], params: Record<string, unknown>): { items: T[]; nextCursor: string | null } {
+    // Peer-fault face: an empty page that still claims more are coming.
+    const dangling = this.#agent().emptyPagesWithDanglingCursor
+    if (dangling !== undefined) return { items: [], nextCursor: dangling }
     const start = params['cursor'] === undefined ? 0 : Number(params['cursor'])
     if (!Number.isSafeInteger(start) || start < 0) {
       throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Invalid page cursor' })
+    }
+    // Peer-fault face: a cursor that never advances. The page is served
+    // normally, but it always advertises the same stuck position.
+    const stuck = this.#agent().stuckCursor
+    if (stuck !== undefined && start > 0) {
+      const replay = items.slice(0, Math.max(1, Math.min(Number(stuck) || 1, items.length))) as T[]
+      return { items: replay, nextCursor: stuck }
     }
     const requested = (params['limit'] as number | undefined) ?? this.#agent().defaultPageSize ?? 20
     // Two independent ceilings: the protocol's own page cap, and a peer that
