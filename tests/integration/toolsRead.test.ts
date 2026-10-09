@@ -821,9 +821,24 @@ describe('read-only cherry tools over a real loopback channel', () => {
 })
 
 describe('read-only cherry tools: registration framework', () => {
-  it('registers exactly the six read-only tools this task owns', async () => {
+  it('registers exactly the six read-only tools this task owns, ahead of the interactive set', async () => {
     const rig = await makeRig()
-    expect(rig.ctx.definitions.map((definition) => definition.name)).toEqual(READ_TOOL_NAMES)
+    // Task 9 appends six INTERACTIVE tools to the same registry, so this task's
+    // claim is about the read-only PREFIX it owns — its order and its exact
+    // membership — not about being the whole registry. The full 14-tool set
+    // assertion belongs to Task 10④.
+    expect(rig.ctx.definitions.slice(0, READ_TOOL_NAMES.length).map((definition) => definition.name)).toEqual(
+      READ_TOOL_NAMES,
+    )
+    const interactive = rig.ctx.definitions.slice(READ_TOOL_NAMES.length).map((definition) => definition.name)
+    expect(interactive).toEqual([
+      'cherry_create',
+      'cherry_send',
+      'cherry_wait',
+      'cherry_interactions',
+      'cherry_respond',
+      'cherry_cancel',
+    ])
   })
 
   it('every registered definition is a well-formed literal-JSON-Schema tool', async () => {

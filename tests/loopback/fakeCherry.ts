@@ -166,8 +166,16 @@ export interface FakeAgentOptions {
    */
   agents?: FakeAgentRecord[]
   workspaces?: FakeWorkspaceRecord[]
+  /**
+   * Sessions the read face serves. Task 9's create face PUSHES into this array
+   * (the peer's `createSessionTx` really does add a row), so a test can assert
+   * the two-step read-back of a session it just created.
+   */
   sessions?: FakeSessionRecord[]
-  /** Messages every registered session serves; `parts` decide the two-level read. */
+  /**
+   * Messages every registered session serves; `parts` decide the two-level
+   * read. Task 9's `terminalMessage` is appended here by an accepted run.
+   */
   messages?: FakeMessageRecord[]
   /**
    * Page size the read faces use when a request omits `limit` (the real peer's
@@ -205,7 +213,111 @@ export interface FakeAgentOptions {
    * rule.
    */
   failAlways?: Record<string, FakeFailure>
+
+  // --- Interactive command face (Task 9) -----------------------------------
+
+  /**
+   * `agent.interactions.list` fixture: the FULL set the peer holds, exactly as
+   * the real `interactionsOf` merges live journal items with persisted rows
+   * (pending/approved/denied/expired all present). The peer never filters by
+   * status — filtering is CLIENT-side — so a fixture carrying answered items is
+   * the honest shape a settled session serves.
+   */
+  interactions?: FakeInteractionRecord[]
+  /**
+   * The execution the peer considers ACTIVE for the session
+   * (`activeExecutionId`). `agent.executions.cancel` validates
+   * `expectedExecutionId` against it, mirroring the real `abortAndDrain`
+   * precondition.
+   */
+  activeExecutionId?: string
+  /**
+   * The `agent.messages.send` outcome. `'applied'` (default) admits a run;
+   * `'busy'` answers the rejected receipt "Session is busy";
+   * `'target-unavailable'` answers the §6 TARGET_UNAVAILABLE rejected receipt.
+   */
+  sendOutcome?: 'applied' | 'busy' | 'target-unavailable'
+  /** Same injection for `agent.executions.cancel` (Task 9⑮ covers both verbs). */
+  cancelOutcome?: 'applied' | 'target-unavailable'
+  /**
+   * Delay before an accepted run reaches its terminal `execution.updated`
+   * notification. Omitted means the terminal event lands promptly (the
+   * waiter's happy path); a value above the caller's `timeoutMs` is what makes
+   * the timeout face deterministic.
+   */
+  runDelayMs?: number
+  /**
+   * Terminal status the accepted run settles on (default `completed`). Set
+   * `'interrupted'` for Task 9⑭ — the transition the CURRENT real server does
+   * not produce but whose schema is already pinned (Task 13 asserts that
+   * difference). The injected fixture carries `messageId` + the persisted
+   * result fields so it satisfies `executionSchema`'s terminal superRefine;
+   * without those the schema layer would reject it first and the test would be
+   * meaningless.
+   */
+  runTerminalStatus?: 'completed' | 'failed' | 'cancelled' | 'interrupted'
+  /**
+   * Assistant message a completed run appends to `agent.messages.list` (and
+   * whose parts `agent.parts.list` then serves). This is the text the
+   * terminal aggregate must return.
+   */
+  terminalMessage?: FakeMessageRecord
+  /**
+   * The pending interaction a run pushes as `interaction.updated` (spec §3.6's
+   * soft terminal). When set, the soft-terminal scenario is driven entirely by
+   * the peer: send → `interaction.updated` → the tool returns early.
+   */
+  pushInteractionOnRun?: FakeInteractionRecord
+  /** Delay before `pushInteractionOnRun` lands (default 0). */
+  pushInteractionDelayMs?: number
+  /**
+   * Message id a run adopts for its terminal `execution.updated`. Defaults to
+   * `terminalMessage.messageId` when one is configured, else `msg-1`.
+   */
+  runMessageId?: string
 }
+
+/** One interaction as `agent.interactions.list`/`agent.interactions.get` serve it. */
+export interface FakeInteractionRecord {
+  interactionId: string
+  /** The interaction revision, a numeric string (`/^(0|[1-9][0-9]*)$/`). */
+  revision: string
+  executionId: string
+  toolCallId: string
+  status: 'pending' | 'approved' | 'denied' | 'expired'
+  summary: string
+  /** Defaults to `decision` (the peer omits `kind` for non-question cards). */
+  kind?: 'question' | 'decision'
+  /** Defaults to a digest derived from the interaction id (64 lowercase hex). */
+  inputDigest?: string
+  /**
+   * The interaction's FULL input. For `kind: 'question'` this is the
+   * `questionInputSchema` object (`{questions: [{question, options, ...}]}`)
+   * the peer parses to validate a full-answer set. Defaults to a single
+   * question keyed by `summary`.
+   */
+  input?: Record<string, unknown>
+}
+
+/** One execution as the peer's `execution.updated` events report it. */
+export interface FakeExecutionRecord {
+  executionId: string
+  status: 'running' | 'awaiting-approval' | 'finalizing' | 'completed' | 'cancelled' | 'failed' | 'interrupted'
+  messageId?: string
+  commandId?: string
+}
+
+/** One entry in the peer's idempotency ledger (the real `remoteCommandService`). */
+export interface FakeCommandRecord {
+  commandId: string
+  method: string
+  /** Digest of the admitted body; a DIFFERENT body under the same id conflicts. */
+  identityDigest: string
+  receipt: Record<string, unknown>
+}
+
+/** The wire shape `interactions.list` serves for one interaction. */
+export type FakeInteractionView = Record<string, unknown>
 
 /**
  * One agent as `agent.agents.list` serves it. `model` mirrors the protocol's
@@ -324,6 +436,20 @@ const INLINE_TEXT_LIMIT = 4096
 /** The real peer's content digest: lowercase hex sha256 over the whole content. */
 function sha256Hex(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+/**
+ * Deterministic JSON with sorted keys — the digest input for the fake's
+ * idempotency ledger, so a replay of the SAME body hashes identically while a
+ * reordered-but-equal object does not spuriously conflict.
+ */
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (Array.isArray(value)) return `[${value.map((entry) => stableStringify(entry)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entry]) => entry !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+  return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`).join(',')}}`
 }
 
 /** A callable libp2p logger: noise/inbound streams invoke it as `log('msg')`. */
@@ -456,6 +582,33 @@ export class FakeCherry {
   /** Deliberately FALSE `byteLength` declarations (see `understateContentLength`). */
   #contentByteOverrides = new Map<string, number>()
 
+  // Interactive command face observation (Task 9).
+  /**
+   * The peer's command-receipt store, keyed by commandId — the real
+   * `remoteCommandService`'s per-(device, grant, commandId) memory. Replaying
+   * the same id with the same body returns the RECORDED receipt; a different
+   * body is `IDEMPOTENCY_CONFLICT`, exactly like the real `admit`.
+   */
+  #commands = new Map<string, FakeCommandRecord>()
+  /** Every command-face request's params exactly as the peer received them. */
+  #commandCalls: Array<{ method: string; params: Record<string, unknown> }> = []
+  /** Interactions the peer currently serves via `agent.interactions.list`. */
+  #interactions: FakeInteractionRecord[]
+  /** The execution id the peer reports as active for the session. */
+  #activeExecutionId: string | undefined
+  /** Every execution status the peer emitted as `execution.updated`, in order. */
+  #executionUpdates: Array<{ executionId: string; status: string; messageId?: string }> = []
+  /** Monotonic counter behind the fake's own interaction revisions. */
+  #interactionRevision = 0
+  /** The digest of each interaction as the peer LAST projected it. */
+  #interactionDigests = new Map<string, string>()
+  /**
+   * Runs SUSPENDED on an interaction, keyed by that interaction's id. Answering
+   * the interaction resumes the run to the terminal state recorded here — the
+   * peer-side half of spec §3.6's 「respond 后可调 cherry_wait 恢复等待」.
+   */
+  #parkedRuns = new Map<string, { sessionId: string; executionId: string; status: string; messageId: string }>()
+
   constructor(options: FakeCherryOptions = {}) {
     this.#options = options
     this.#identity = options.identity !== undefined ? Promise.resolve(options.identity) : createDeviceIdentity()
@@ -466,6 +619,11 @@ export class FakeCherry {
     this.#watermark = options.agent?.watermark ?? 0
     this.#failNextCheckpointCall = options.agent?.failNextCheckpointCall
     this.#readFailNext = new Map(Object.entries(options.agent?.failNext ?? {}))
+    this.#interactions = [...(options.agent?.interactions ?? [])]
+    this.#activeExecutionId = options.agent?.activeExecutionId
+    for (const interaction of this.#interactions) {
+      this.#interactionDigests.set(interaction.interactionId, this.#digestOf(interaction))
+    }
   }
 
   /** The desktop's pinned peer id, for `DeviceRecord.desktopIdentity`. */
@@ -655,6 +813,55 @@ export class FakeCherry {
     return this.#agentCallTimestamps
       .filter((entry) => entry.method === method)
       .map((entry) => entry.at)
+  }
+
+  // -------------------------------------------------------------------------
+  // Interactive command face observation (Task 9)
+  // -------------------------------------------------------------------------
+
+  /** Every command-face call in arrival order, with its params verbatim. */
+  get commandCalls(): readonly { method: string; params: Record<string, unknown> }[] {
+    return this.#commandCalls
+  }
+
+  /** The params of every call to one command-face method, in arrival order. */
+  commandCallsFor(method: string): readonly Record<string, unknown>[] {
+    return this.#commandCalls.filter((entry) => entry.method === method).map((entry) => entry.params)
+  }
+
+  /** Every command receipt the peer admitted, keyed by commandId. */
+  get admittedCommands(): ReadonlyMap<string, FakeCommandRecord> {
+    return this.#commands
+  }
+
+  /**
+   * The receipt the peer recorded for `commandId`, or undefined. The currency
+   * for "the same id with the same body replays the RECORDED receipt".
+   */
+  receiptFor(commandId: string): Record<string, unknown> | undefined {
+    return this.#commands.get(commandId)?.receipt
+  }
+
+  /** Every terminal/non-terminal `execution.updated` the peer emitted, in order. */
+  get executionUpdates(): readonly { executionId: string; status: string; messageId?: string }[] {
+    return this.#executionUpdates
+  }
+
+  /** The interaction view the peer currently serves, in fixture order. */
+  get interactions(): readonly FakeInteractionView[] {
+    return this.#interactions.map((interaction) => this.#interactionView(interaction))
+  }
+
+  /** The session's active execution as the peer reports it (undefined = idle). */
+  get activeExecutionId(): string | undefined {
+    return this.#activeExecutionId
+  }
+
+  /** Flips one interaction's status without touching its revision. */
+  setInteractionStatus(interactionId: string, status: FakeInteractionRecord['status']): void {
+    const interaction = this.#interactions.find((entry) => entry.interactionId === interactionId)
+    if (interaction === undefined) throw new Error(`no interaction ${interactionId}`)
+    interaction.status = status
   }
 
   // -------------------------------------------------------------------------
@@ -959,6 +1166,14 @@ export class FakeCherry {
       case 'agent.parts.list':
       case 'agent.content.read':
         return this.#handleRead(method, params)
+      case 'agent.sessions.create':
+      case 'agent.messages.send':
+      case 'agent.executions.cancel':
+      case 'agent.interactions.list':
+      case 'agent.interactions.get':
+      case 'agent.interactions.respond':
+      case 'agent.commands.get':
+        return this.#handleCommand(method, params)
       case 'agent.checkpoints.read':
         return await this.#handleCheckpointRead(params)
       case 'agent.subscriptions.activate':
@@ -1452,6 +1667,10 @@ export class FakeCherry {
 
   /** The protocol's session summary, including the `workspaceKind` discriminator. */
   #sessionSummary(session: FakeSessionRecord): Record<string, unknown> {
+    // The LIVE active execution wins over the fixture's static field: an
+    // accepted run really does make the session busy, and its terminal event
+    // really does return it to idle (the real `toSessionSummary(…, activeExecutionId)`).
+    const activeExecutionId = this.#activeExecutionId ?? session.activeExecutionId
     return {
       sessionId: session.sessionId,
       agentId: session.agentId,
@@ -1460,9 +1679,9 @@ export class FakeCherry {
       title: session.title,
       updatedAt: session.updatedAt ?? new Date(0).toISOString(),
       historyRevision: session.historyRevision,
-      ...(session.activeExecutionId === undefined
+      ...(activeExecutionId === undefined
         ? { idleRevision: session.historyRevision }
-        : { activeExecutionId: session.activeExecutionId }),
+        : { activeExecutionId }),
     }
   }
 
@@ -1613,6 +1832,473 @@ export class FakeCherry {
     const limit = Math.max(1, Math.min(requested, ceiling))
     const end = start + limit
     return { items: items.slice(start, end), nextCursor: end < items.length ? String(end) : null }
+  }
+
+  // -------------------------------------------------------------------------
+  // Interactive command face (Task 9) — ported from the real peer's
+  // `agentHandlers.ts` (`command()`'s idempotency ledger, `interactionsOf`'s
+  // unfiltered merge, the respond answer/approve contracts, the cancel
+  // active-execution precondition) and `agentJournal.ts`'s event payloads.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The idempotency ledger, faithful to `remoteCommandService.admit` + the
+   * `command()` wrapper: the FIRST call for a commandId runs the body and
+   * records the outcome; a REPLAY with the same body returns the recorded
+   * receipt (the owner runs at most once, which is what makes Task 9⑮'s
+   * same-id/same-answer assertion possible); a replay with a DIFFERENT body is
+   * `IDEMPOTENCY_CONFLICT` (Task 9⑪).
+   */
+  async #handleCommand(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#commandCalls.push({ method, params })
+    const commandId = params['commandId'] as string | undefined
+
+    // The two query/read verbs of this face are NOT commands: they carry no
+    // commandId and never enter the ledger.
+    if (method === 'agent.interactions.list') return this.#page(this.#interactionViews(), params)
+    if (method === 'agent.interactions.get') {
+      const view = this.#interactionViews().find(
+        (entry) => entry['interactionId'] === params['interactionId'],
+      )
+      if (view === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Interaction not found' })
+      return { interaction: view }
+    }
+    if (method === 'agent.commands.get') {
+      if (commandId === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Command not found' })
+      const recorded = this.#commands.get(commandId)
+      if (recorded === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Command not found' })
+      return recorded.receipt
+    }
+
+    if (commandId === undefined) {
+      throw new FakeRpcError({ reason: 'INTERNAL', message: `missing commandId for ${method}` })
+    }
+    const identityDigest = this.#identityDigest(method, params)
+    const recorded = this.#commands.get(commandId)
+    if (recorded !== undefined) {
+      if (recorded.identityDigest !== identityDigest) {
+        throw new FakeRpcError({
+          reason: 'IDEMPOTENCY_CONFLICT',
+          message: 'Command body differs from the recorded command',
+        })
+      }
+      return recorded.receipt
+    }
+
+    const receipt = await this.#runCommand(method, params)
+    this.#commands.set(commandId, { commandId, method, identityDigest, receipt })
+    return receipt
+  }
+
+  /** The body the idempotency digest is taken over (the real `encodeAgentCommand`). */
+  #identityDigest(method: string, params: Record<string, unknown>): string {
+    const { commandId: _ignored, ...body } = params
+    return sha256Hex(new TextEncoder().encode(`${method}:${stableStringify(body)}`))
+  }
+
+  /** One command body, mirroring the real handler for each verb. */
+  async #runCommand(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const sessionId = params['sessionId'] as string
+    switch (method) {
+      case 'agent.sessions.create':
+        return this.#runSessionCreate(params)
+      case 'agent.messages.send':
+        return this.#runSend(sessionId, params)
+      case 'agent.executions.cancel':
+        return this.#runCancel(sessionId, params)
+      default:
+        return this.#runRespond(sessionId, params)
+    }
+  }
+
+  /**
+   * `agent.sessions.create`: the receipt carries ONLY the sessionId (the real
+   * peer's `{status:'applied', sessionId, result:{sessionId}}`), so the caller
+   * must read the identity back through `agent.sessions.get`.
+   */
+  #runSessionCreate(params: Record<string, unknown>): Record<string, unknown> {
+    const agentId = params['agentId'] as string
+    const workspaceId =
+      typeof params['workspaceId'] === 'string'
+        ? (params['workspaceId'] as string)
+        : ((params['workspace'] as { id?: string } | undefined)?.id ?? '')
+    const systemWorkspace = params['workspaceId'] === undefined
+    const sessionId = `session-${randomUUID().slice(0, 8)}`
+    this.#agent().sessions?.push({
+      sessionId,
+      agentId,
+      workspaceId: systemWorkspace ? 'system-workspace' : workspaceId,
+      workspaceKind: systemWorkspace ? 'system' : 'registered',
+      title: (params['title'] as string | undefined) ?? 'New chat',
+      historyRevision: '1',
+    })
+    return {
+      commandId: params['commandId'],
+      method: 'agent.sessions.create',
+      status: 'applied',
+      admittedAt: new Date().toISOString(),
+      sessionId,
+      result: { sessionId },
+    }
+  }
+
+  /**
+   * `agent.messages.send`, faithful to the real handler: the §6 rejected
+   * receipts (`busy` → CONFLICT "Session is busy", target routing failure →
+   * TARGET_UNAVAILABLE), otherwise `applied` + an executionId, and the run
+   * drives the session's events.
+   */
+  async #runSend(sessionId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.#requireSession(sessionId)
+    const outcome = this.#agent().sendOutcome ?? 'applied'
+    if (outcome === 'busy') {
+      return this.#rejectedReceipt(params, 'agent.messages.send', {
+        reason: 'CONFLICT',
+        message: 'Session is busy',
+      })
+    }
+    if (outcome === 'target-unavailable') {
+      return this.#rejectedReceipt(params, 'agent.messages.send', {
+        reason: 'TARGET_UNAVAILABLE',
+        message: 'Session delivery target is unavailable',
+      })
+    }
+
+    const executionId = `exec-${randomUUID().slice(0, 8)}`
+    this.#activeExecutionId = executionId
+    this.#appendTerminalMessage()
+    const status = this.#agent().runTerminalStatus ?? 'completed'
+    const messageId = this.#agent().runMessageId ?? this.#agent().terminalMessage?.messageId ?? 'msg-1'
+
+    // The run is driven OFF the reply path: the receipt is the RPC result, the
+    // execution's lifecycle is the notification stream — exactly the split the
+    // real peer has.
+    void this.#driveRun(sessionId, executionId, status, messageId)
+    return {
+      commandId: params['commandId'],
+      method: 'agent.messages.send',
+      status: 'applied',
+      admittedAt: new Date().toISOString(),
+      executionId,
+    }
+  }
+
+  /** `agent.executions.cancel`, faithful to `abortAndDrain`'s precondition. */
+  #runCancel(sessionId: string, params: Record<string, unknown>): Record<string, unknown> {
+    this.#requireSession(sessionId)
+    if ((this.#agent().cancelOutcome ?? 'applied') === 'target-unavailable') {
+      return this.#rejectedReceipt(params, 'agent.executions.cancel', {
+        reason: 'TARGET_UNAVAILABLE',
+        message: 'Session delivery target is unavailable',
+      })
+    }
+    const expectedExecutionId = params['expectedExecutionId'] as string
+    // The peer's authority is its OWN active execution — the live run if one is
+    // in flight, otherwise the session fixture's declared one. Comparing
+    // against the live field alone would refuse a cancel of a run the fixture
+    // says is active.
+    const active =
+      this.#activeExecutionId ??
+      (this.#agent().sessions ?? []).find((entry) => entry.sessionId === sessionId)?.activeExecutionId
+    if (active !== expectedExecutionId) {
+      return this.#rejectedReceipt(params, 'agent.executions.cancel', {
+        reason: 'CONFLICT',
+        message: 'Execution is not active',
+      })
+    }
+    const executionId = expectedExecutionId
+    const messageId = this.#agent().runMessageId ?? this.#agent().terminalMessage?.messageId ?? 'msg-1'
+    void this.#driveRun(sessionId, executionId, 'cancelled', messageId)
+    return {
+      commandId: params['commandId'],
+      method: 'agent.executions.cancel',
+      status: 'applied',
+      admittedAt: new Date().toISOString(),
+      executionId,
+      result: { executionId, disposition: 'cancelled' },
+    }
+  }
+
+  /**
+   * `agent.interactions.respond`, faithful to the real handler: the
+   * three-parameter staleness gate, then the answer/approve contracts. BOTH
+   * §6 refusals are COMMAND RECEIPTS (`status:'rejected'` + `error`), never RPC
+   * errors — the distinction Task 9④⑬ is built on.
+   */
+  #runRespond(sessionId: string, params: Record<string, unknown>): Record<string, unknown> {
+    this.#requireSession(sessionId)
+    const interaction = this.#interactions.find(
+      (entry) => entry.interactionId === params['interactionId'],
+    )
+    const response = (params['response'] ?? { kind: params['decision'] }) as Record<string, unknown>
+    if (
+      interaction === undefined ||
+      interaction.status !== 'pending' ||
+      interaction.revision !== params['expectedRevision'] ||
+      interaction.executionId !== params['expectedExecutionId'] ||
+      this.#digestOf(interaction) !== params['inputDigest']
+    ) {
+      return this.#rejectedReceipt(params, 'agent.interactions.respond', {
+        reason: 'CONFLICT',
+        message: 'Interaction changed since it was read',
+      })
+    }
+
+    const kind = response['kind']
+    if (kind === 'answer') {
+      if ((interaction.kind ?? 'decision') !== 'question') {
+        return this.#rejectedReceipt(params, 'agent.interactions.respond', {
+          reason: 'CONFLICT',
+          message: 'Interaction does not accept answers',
+        })
+      }
+      const questions = this.#questionsOf(interaction)
+      const answers = (response['answers'] ?? {}) as Record<string, string>
+      // The FULL-ANSWER contract: the count must match AND every question key
+      // must be present with non-blank text. The refusal message is the fixed
+      // wire文案 — never a per-key diagnostic.
+      if (
+        Object.keys(answers).length !== questions.length ||
+        questions.some(
+          (question) => !Object.hasOwn(answers, question) || answers[question]!.trim() === '',
+        )
+      ) {
+        return this.#rejectedReceipt(params, 'agent.interactions.respond', {
+          reason: 'CONFLICT',
+          message: 'Every question requires an answer',
+        })
+      }
+      this.#settleInteraction(interaction, 'approved')
+      return this.#appliedReceipt(params, 'agent.interactions.respond', interaction.executionId, {
+        interactionId: interaction.interactionId,
+        decision: 'answer',
+      })
+    }
+
+    if (kind === 'approve' && (interaction.kind ?? 'decision') === 'question') {
+      return this.#rejectedReceipt(params, 'agent.interactions.respond', {
+        reason: 'CONFLICT',
+        message: 'Question requires answers',
+      })
+    }
+
+    const approved = kind !== 'deny'
+    this.#settleInteraction(interaction, approved ? 'approved' : 'denied')
+    return this.#appliedReceipt(params, 'agent.interactions.respond', interaction.executionId, {
+      interactionId: interaction.interactionId,
+      decision: approved ? 'approve' : 'deny',
+    })
+  }
+
+  /** The three question keys the peer parses out of a question interaction. */
+  #questionsOf(interaction: FakeInteractionRecord): string[] {
+    const input = interaction.input ?? {
+      questions: [{ question: interaction.summary, options: [{ label: 'ok' }] }],
+    }
+    const questions = input['questions']
+    if (!Array.isArray(questions)) return []
+    return questions.map((question) => String((question as { question?: unknown }).question ?? ''))
+  }
+
+  /**
+   * Records an interaction's new status, streams the `interaction.updated`, and
+   * RESUMES any run that was parked on it (spec §3.6: after a response the
+   * caller can `cherry_wait` again and expect the real terminal).
+   */
+  #settleInteraction(interaction: FakeInteractionRecord, status: 'approved' | 'denied'): void {
+    interaction.status = status
+    this.#interactionRevision += 1
+    interaction.revision = String(this.#interactionRevision + 100)
+    const parked = this.#parkedRuns.get(interaction.interactionId)
+    const sessionId = parked?.sessionId ?? this.#sessionOfExecution(interaction.executionId)
+    this.#notify('agent.events', {
+      sessionId,
+      subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === sessionId)
+        ?.subscriptionId,
+      streamEpoch: this.#journalEpoch,
+      events: [
+        {
+          kind: 'interaction.updated',
+          seq: String(++this.#watermark),
+          payload: this.#interactionView(interaction),
+        },
+      ],
+    })
+
+    if (parked === undefined) return
+    this.#parkedRuns.delete(interaction.interactionId)
+    // A DENIED interaction ends the run as cancelled (the work is abandoned); an
+    // APPROVED/answered one proceeds to its configured terminal.
+    const status2 = status === 'denied' ? 'cancelled' : parked.status
+    this.#emitExecutionUpdated(sessionId, parked.executionId, status2, parked.messageId)
+    if (status2 !== 'running' && status2 !== 'finalizing' && status2 !== 'awaiting-approval') {
+      this.#activeExecutionId = undefined
+    }
+  }
+
+  /** The session an execution belongs to, from the execution's own fixture. */
+  #sessionOfExecution(executionId: string): string {
+    const sessions = this.#agent().sessions ?? []
+    const owning = sessions.find((entry) => entry.activeExecutionId === executionId)
+    if (owning !== undefined) return owning.sessionId
+    // The live run's session is the only one this fake models.
+    return sessions[0]?.sessionId ?? 'session-1'
+  }
+
+  #appliedReceipt(
+    params: Record<string, unknown>,
+    method: string,
+    executionId: string,
+    result: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      commandId: params['commandId'],
+      method,
+      status: 'applied',
+      admittedAt: new Date().toISOString(),
+      executionId,
+      result,
+    }
+  }
+
+  #rejectedReceipt(
+    params: Record<string, unknown>,
+    method: string,
+    error: { reason: string; message: string },
+  ): Record<string, unknown> {
+    return {
+      commandId: params['commandId'],
+      method,
+      status: 'rejected',
+      admittedAt: new Date().toISOString(),
+      error,
+    }
+  }
+
+  /**
+   * The terminal `execution.updated` (+ any soft-terminal interaction) a run
+   * emits.
+   *
+   * With `pushInteractionOnRun`, the run PARKS on the interaction: it emits the
+   * soft terminal and returns, exactly like the real peer suspends a run while
+   * it awaits a decision. {@link #settleInteraction} then finishes it once the
+   * interaction is answered — which is what makes the resume-after-answer
+   * scenario expressible at all.
+   */
+  async #driveRun(
+    sessionId: string,
+    executionId: string,
+    status: string,
+    messageId: string,
+  ): Promise<void> {
+    const interaction = this.#agent().pushInteractionOnRun
+    if (interaction !== undefined) {
+      const delay = this.#agent().pushInteractionDelayMs ?? 0
+      if (delay > 0) await sleep(delay)
+      const live: FakeInteractionRecord = { ...interaction, executionId, status: 'pending' }
+      this.#interactions.push(live)
+      this.#interactionDigests.set(live.interactionId, this.#digestOf(live))
+      this.#parkedRuns.set(live.interactionId, { sessionId, executionId, status, messageId })
+      this.#notify('agent.events', {
+        sessionId,
+        subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === sessionId)
+          ?.subscriptionId,
+        streamEpoch: this.#journalEpoch,
+        events: [
+          {
+            kind: 'interaction.updated',
+            seq: String(++this.#watermark),
+            payload: this.#interactionView(live),
+          },
+        ],
+      })
+      return
+    }
+
+    const delay = this.#agent().runDelayMs ?? 0
+    if (delay > 0) await sleep(delay)
+    this.#emitExecutionUpdated(sessionId, executionId, status, messageId)
+    if (status !== 'running' && status !== 'finalizing' && status !== 'awaiting-approval') {
+      this.#activeExecutionId = undefined
+    }
+  }
+
+  /**
+   * One `execution.updated` notification. A TERMINAL status additionally
+   * carries the persisted result fields (`durable` + `history`) the schema's
+   * terminal superRefine demands ("Terminal executions require a message and a
+   * persistence outcome") — injected without them, the fixture would be
+   * rejected by the schema layer before any waiter could judge it.
+   */
+  #emitExecutionUpdated(sessionId: string, executionId: string, status: string, messageId: string): void {
+    const terminal = status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted'
+    const payload: Record<string, unknown> = {
+      executionId,
+      status,
+      messageId,
+      durable: terminal,
+      ...(terminal ? { history: { messageRevision: '1', historyRevision: '1' } } : {}),
+      ...(status === 'failed'
+        ? { error: { reason: 'INTERNAL', message: 'Run failed' } }
+        : {}),
+    }
+    this.#executionUpdates.push({ executionId, status, messageId })
+    this.#notify('agent.events', {
+      sessionId,
+      subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === sessionId)
+        ?.subscriptionId,
+      streamEpoch: this.#journalEpoch,
+      events: [
+        { kind: 'execution.updated', seq: String(++this.#watermark), payload },
+      ],
+    })
+  }
+
+  /**
+   * A completed run appends its assistant message to the read fixtures.
+   *
+   * The array is MATERIALIZED onto the options object when the fixture declared
+   * none: `?? []` would push into a throwaway and silently serve an empty
+   * message list, which is precisely the bug this face would otherwise hide.
+   */
+  #appendTerminalMessage(): void {
+    const agent = this.#options.agent
+    const message = agent?.terminalMessage
+    if (agent === undefined || message === undefined) return
+    agent.messages ??= []
+    if (agent.messages.some((entry) => entry.messageId === message.messageId)) return
+    agent.messages.push(message)
+  }
+
+  /** Every interaction, in the wire view the real `interactionsOf` serves. */
+  #interactionViews(): FakeInteractionView[] {
+    return this.#interactions.map((interaction) => this.#interactionView(interaction))
+  }
+
+  #interactionView(interaction: FakeInteractionRecord): Record<string, unknown> {
+    return {
+      interactionId: interaction.interactionId,
+      revision: interaction.revision,
+      executionId: interaction.executionId,
+      toolCallId: interaction.toolCallId,
+      status: interaction.status,
+      summary: interaction.summary,
+      ...(interaction.kind === undefined ? {} : { kind: interaction.kind }),
+      inputDigest: this.#digestOf(interaction),
+      input: interaction.input ?? {
+        text: JSON.stringify({
+          questions: [{ question: interaction.summary, options: [{ label: 'ok' }] }],
+        }),
+      },
+    }
+  }
+
+  /** The interaction's current input digest (stable across re-projections). */
+  #digestOf(interaction: FakeInteractionRecord): string {
+    return (
+      interaction.inputDigest ??
+      sha256Hex(new TextEncoder().encode(stableStringify(interaction.input ?? interaction.summary)))
+    )
   }
 
   /**

@@ -10,10 +10,20 @@ import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools'
  * drifts from its documented contract fails here rather than at call time.
  *
  * The 14-tool full-set assertion belongs to Task 10④; this suite pins exactly
- * the read-only set.
+ * the read-only set, so it SELECTS those definitions out of the registry Task 9
+ * has since widened.
  */
 
-/** A collecting fake ctx.tools, mirroring the host's `register` contract. */
+const READ_TOOLS = [
+  'cherry_devices',
+  'cherry_agents',
+  'cherry_workspaces',
+  'cherry_sessions',
+  'cherry_read',
+  'cherry_events',
+] as const
+
+/** The full registry, read-only tools first. */
 function registerAll(): CherryToolDefinition[] {
   const definitions: CherryToolDefinition[] = []
   const ctx: CherryToolsContext = {
@@ -40,6 +50,11 @@ function registerAll(): CherryToolDefinition[] {
   return definitions
 }
 
+/** Just the six read-only definitions THIS suite owns. */
+function registerReadOnly(): CherryToolDefinition[] {
+  return registerAll().filter((definition) => (READ_TOOLS as readonly string[]).includes(definition.name))
+}
+
 function toolOf(name: string): CherryToolDefinition {
   const found = registerAll().find((definition) => definition.name === name)
   if (found === undefined) throw new Error(`tool ${name} is not registered`)
@@ -51,18 +66,11 @@ function properties(definition: CherryToolDefinition): Record<string, Record<str
   return definition.parameters.properties as unknown as Record<string, Record<string, unknown>>
 }
 
-const READ_TOOLS = [
-  'cherry_devices',
-  'cherry_agents',
-  'cherry_workspaces',
-  'cherry_sessions',
-  'cherry_read',
-  'cherry_events',
-] as const
-
 describe('tool parameter schemas: the six read-only tools', () => {
   it('registers exactly the six read-only tools, each with a literal object-root schema', () => {
-    const definitions = registerAll()
+    // Task 9 widened the registry; this suite's subject is its own six, which
+    // Task 8 registers FIRST and in this order.
+    const definitions = registerReadOnly()
     expect(definitions.map((definition) => definition.name)).toEqual([...READ_TOOLS])
     for (const definition of definitions) {
       expect(definition.parameters.type).toBe('object')
@@ -124,8 +132,8 @@ describe('tool parameter schemas: the six read-only tools', () => {
     expect(Object.keys(cursor['properties'] as object).sort()).toEqual(['seq', 'sessionId', 'streamEpoch'])
   })
 
-  it('every tool declares the aggregate limit as an integer within [1, 1000]', () => {
-    for (const definition of registerAll()) {
+  it('every read-only tool declares the aggregate limit as an integer within [1, 1000]', () => {
+    for (const definition of registerReadOnly()) {
       const limit = properties(definition)['limit']
       if (limit === undefined) continue
       expect(limit['type']).toBe('integer')
@@ -136,8 +144,10 @@ describe('tool parameter schemas: the six read-only tools', () => {
 
   it('no read-only tool declares a write-shaped parameter', () => {
     // Read-only means read-only: a `text`/`payload`/`commandId` on this set
-    // would silently widen the M3 read face into a mutation surface.
-    for (const definition of registerAll()) {
+    // would silently widen the M3 read face into a mutation surface. (The
+    // interactive tools Task 9 adds DO carry these — which is exactly why this
+    // assertion is scoped to the read-only six rather than the whole registry.)
+    for (const definition of registerReadOnly()) {
       const keys = Object.keys(properties(definition))
       for (const forbidden of ['text', 'payload', 'commandId', 'name']) {
         expect(keys).not.toContain(forbidden)

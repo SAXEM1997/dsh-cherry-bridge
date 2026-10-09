@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { DeviceUnavailableError } from './connection'
 import type { DeviceConnection, DeviceState } from './connection'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore'
@@ -170,6 +170,49 @@ export interface CherryReadSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive-face contracts (Task 9)
+// ---------------------------------------------------------------------------
+
+/**
+ * `cherry_send`/`cherry_wait`'s result status.
+ *
+ * The FOUR terminal execution states (`completed`/`failed`/`cancelled`/
+ * `interrupted`) are the waiter predicate's whole vocabulary — the protocol's
+ * closed terminal set. The other three are the waiter's OWN verdicts:
+ *
+ *  - `awaiting-interaction` — the SOFT terminal: an unanswered interaction
+ *    arrived, so the run is still alive but cannot progress without the caller.
+ *  - `timeout` — the window elapsed. NOT a failure (spec §6): the caller gets
+ *    what arrived plus the cursor to resume from.
+ *  - `idle` — `cherry_wait` on a session with no in-flight execution: the
+ *    current snapshot, returned at once (no error, no waiting).
+ *
+ * NOTE the deliberate omission: a COMMAND RECEIPT's `interrupted` (the command
+ * outcome is undecided) is a DIFFERENT dimension and never appears here.
+ */
+export type CherryRunStatus =
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted'
+  | 'awaiting-interaction'
+  | 'timeout'
+  | 'idle'
+
+/** The four terminal execution statuses the waiter predicate covers. */
+const TERMINAL_EXECUTION_STATUSES = ['completed', 'failed', 'cancelled', 'interrupted'] as const
+
+/** The `cherry_create` result: the receipt plus the two-step read-back. */
+export interface CherryCreateResult {
+  sessionId: string
+  device: string
+  /** Read back through `agent.sessions.get` — never taken from the receipt. */
+  workspaceId?: string
+  workspaceKind?: string
+  session?: Record<string, unknown>
+}
+
+// ---------------------------------------------------------------------------
 // Protocol constants (values come from the peer's hello, never hardcoded here)
 // ---------------------------------------------------------------------------
 
@@ -205,6 +248,25 @@ const MAX_AGGREGATE_PAGES = 10_000
  * FAILS the read rather than returning a partial (unverifiable) content.
  */
 const DEFAULT_CONTENT_SLICE_BOUND = 4_096
+
+/** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
+const TEXT_MAX_LENGTH = 32_768
+/** The default wait window, in ms (spec §3.6). A default, never a cap. */
+const DEFAULT_WAIT_TIMEOUT_MS = 120_000
+/** The smallest meaningful timeout: below this the wait is a snapshot read. */
+const MIN_WAIT_TIMEOUT_MS = 1
+
+/**
+ * POLL CADENCE for the waiter loop.
+ *
+ * The waiter rides the subscriptions layer's event buffer, which exposes a
+ * cursor-gated `waitFor` rather than a predicate hook, so the run is judged by
+ * re-reading the projection after each wake. This constant only bounds how long
+ * a wait may sit between two judgement passes when the peer has gone quiet, so
+ * a missed wake degrades into a slightly late answer instead of a hang. It is
+ * injectable for tests.
+ */
+const DEFAULT_WAIT_POLL_MS = 25
 
 /**
  * Externalized part content is read in ≤24 KiB slices and the WHOLE content's
@@ -288,6 +350,13 @@ export interface CherryToolEngineOptions {
    * surfaces instead of truncating silently.
    */
   partsSafetyBound?: number
+  /**
+   * How long a waiter may sit between two judgement passes when the session
+   * buffer has not moved. Omitted uses {@link DEFAULT_WAIT_POLL_MS}. Lowering
+   * it makes a wait react sooner at the cost of more wakeups; raising it makes
+   * a quiet peer's answer later.
+   */
+  waitPollMs?: number
 }
 
 /**
@@ -345,6 +414,32 @@ class CherryToolEngine {
    * rather than silently truncating.
    */
   readonly #partsSafetyBound: number
+  /** Poll cadence for the interactive waiters (see `DEFAULT_WAIT_POLL_MS`). */
+  readonly #waitPollMs: number
+  /**
+   * The subscription cache's latest IDLE revision per session — the source of
+   * `agent.messages.send`'s `expectedIdleRevision` (spec §4.2). A cold cache is
+   * baselined from `agent.sessions.get`, so the value sent is always one the
+   * peer itself reported.
+   */
+  readonly #revisionCache = new Map<string, string>()
+  /**
+   * The subscription cache's current ACTIVE execution per session — ONE source
+   * shared by `cherry_cancel`'s `expectedExecutionId` and `cherry_respond`'s
+   * staleness triple, so the two can never disagree about what is running.
+   */
+  readonly #executionCache = new Map<string, string>()
+  /**
+   * The subscription cache's interaction snapshots, keyed `<sessionId>
+   * <interactionId>`: the `expectedRevision`/`expectedExecutionId`/
+   * `inputDigest` triple `cherry_respond` sends. Fed by the real-time
+   * `interaction.updated` stream, and — for a card the peer persisted only
+   * after the turn ended — by an `agent.interactions.list` query.
+   */
+  readonly #interactionCache = new Map<
+    string,
+    { revision: string; executionId: string; inputDigest: string }
+  >()
 
   constructor(deps: CherryToolsDeps, options: CherryToolEngineOptions = {}) {
     this.#deps = deps
@@ -352,6 +447,7 @@ class CherryToolEngine {
       1,
       Math.floor(options.partsSafetyBound ?? DEFAULT_PARTS_SAFETY_BOUND),
     )
+    this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS))
   }
 
   definitions(): CherryToolDefinition[] {
@@ -362,6 +458,13 @@ class CherryToolEngine {
       this.#sessionsTool(),
       this.#readTool(),
       this.#eventsTool(),
+      // The interactive face (Task 9).
+      this.#createTool(),
+      this.#sendTool(),
+      this.#waitTool(),
+      this.#interactionsTool(),
+      this.#respondTool(),
+      this.#cancelTool(),
     ]
   }
 
@@ -1042,11 +1145,1033 @@ class CherryToolEngine {
     })
   }
 
+  // -------------------------------------------------------------------------
+  // Interactive face (Task 9): create / send / wait / interactions / respond /
+  // cancel.
+  //
+  // Two disciplines separate this face from the read one:
+  //
+  //  - **Two failure SURFACES, never conflated** (spec §6). A command's
+  //    state-machine refusal is a RECEIPT (`status:'rejected'` + `error`) the
+  //    call RESOLVES with; a subscription/transport refusal is an RPC ERROR the
+  //    call REJECTS with. This file never converts one into the other.
+  //  - **The staleness triple comes from the CACHE, not the caller.**
+  //    `expectedRevision`/`expectedExecutionId`/`inputDigest` are read from the
+  //    subscription's interaction snapshot (and `expectedIdleRevision` /
+  //    the cancel target from its execution snapshot), so callers cannot
+  //    mis-state what they have seen.
+  // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // ⑥ cherry_create
+  // -------------------------------------------------------------------------
+
+  #createTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_create',
+      description:
+        'Create a session in an agent workspace. The workspace selection is MANDATORY and ' +
+        'explicit: pass `workspaceId` for a registered workspace, or `workspace: "system"` for ' +
+        'the system workspace (which has no enumerable id). There is no implicit default. The ' +
+        'receipt carries only the sessionId, so the workspace identity is read back through ' +
+        'agent.sessions.get.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          agentId: { type: 'string', description: 'The agent that owns the new session.' },
+          workspaceId: {
+            type: 'string',
+            description:
+              'The registered workspace to create the session in. Mutually exclusive with `workspace`.',
+          },
+          workspace: {
+            type: 'string',
+            enum: ['system'],
+            description:
+              'The literal "system" selects the system workspace. Mutually exclusive with `workspaceId`.',
+          },
+          title: { type: 'string', description: 'Optional session title.' },
+          commandId: {
+            type: 'string',
+            description:
+              'Optional idempotency id. Omit to have one generated; REUSE the same id to retry safely.',
+          },
+        },
+        required: ['device', 'agentId'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const resolved = this.#linkOr(requiredString(args, 'device'))
+        if (resolved.link === undefined) return resolved.verdict
+        const { connection, record } = resolved.link
+
+        const agentId = requiredString(args, 'agentId')
+        const workspaceId = optionalString(args['workspaceId'])
+        const system = args['workspace'] === 'system'
+        const title = optionalString(args['title'])
+
+        // The protocol declares TWO union branches, both requiring a workspace
+        // selection, and no "unspecified" form. Choosing one implicitly would
+        // silently write into a workspace the caller never named, so the tool
+        // refuses in band BEFORE reaching the wire.
+        if (workspaceId !== undefined && system) {
+          return {
+            error: 'invalid-workspace-selection',
+            message: 'specify either `workspaceId` or `workspace: "system"`, not both',
+          } satisfies Record<string, unknown>
+        }
+        if (workspaceId === undefined && !system) {
+          return {
+            error: 'workspace-required',
+            message:
+              'a workspace selection is required: pass `workspaceId` for a registered workspace, ' +
+              'or `workspace: "system"` for the system workspace',
+          } satisfies Record<string, unknown>
+        }
+        if (args['workspace'] !== undefined && !system) {
+          return {
+            error: 'invalid-workspace-selection',
+            message: '`workspace` accepts exactly the literal "system"',
+          } satisfies Record<string, unknown>
+        }
+
+        const receipt = await this.#command(connection, 'agent.sessions.create', {
+          commandId: this.#commandId(args),
+          agentId,
+          // The two protocol branches are mutually exclusive by construction.
+          ...(system ? { workspace: { kind: 'system' } } : { workspaceId }),
+          ...(title === undefined ? {} : { title }),
+        })
+
+        const sessionId = typeof receipt['sessionId'] === 'string' ? receipt['sessionId'] : undefined
+        if (sessionId === undefined) {
+          // A rejected/odd receipt is surfaced as-is; there is nothing to read
+          // back without an id.
+          return receipt
+        }
+
+        // TWO-STEP READ-BACK: the receipt's `result` carries only the id, so the
+        // workspace identity comes from a fresh `agent.sessions.get`.
+        const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
+          string,
+          unknown
+        >
+        const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+        const created: CherryCreateResult = {
+          sessionId,
+          device: record.deviceId,
+          ...(typeof session['workspaceId'] === 'string' ? { workspaceId: session['workspaceId'] } : {}),
+          ...(typeof session['workspaceKind'] === 'string' ? { workspaceKind: session['workspaceKind'] } : {}),
+          session,
+        }
+        return { ...receipt, ...created }
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // ⑦ cherry_send
+  // -------------------------------------------------------------------------
+
+  #sendTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_send',
+      description:
+        'Send a message to a session and, by default, wait for the run to reach a terminal state ' +
+        '(completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending ' +
+        'interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with ' +
+        'cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns ' +
+        'the command receipt immediately. A timeout is NOT a failure — it returns the partial content ' +
+        'and the cursor to resume from.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          sessionId: { type: 'string', description: 'The session to send into.' },
+          text: {
+            type: 'string',
+            maxLength: TEXT_MAX_LENGTH,
+            description: `The message text. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling).`,
+          },
+          wait: {
+            type: 'boolean',
+            description: 'Wait for a terminal state (default true). False returns the command receipt at once.',
+          },
+          timeoutMs: {
+            type: 'integer',
+            minimum: MIN_WAIT_TIMEOUT_MS,
+            description: `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}). A default, not a cap.`,
+          },
+          commandId: {
+            type: 'string',
+            description:
+              'Optional idempotency id. Omit to have one generated; REUSE the same id to retry a command ' +
+              'whose outcome is unknown.',
+          },
+        },
+        required: ['device', 'sessionId', 'text'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const resolved = this.#linkOr(requiredString(args, 'device'))
+        if (resolved.link === undefined) return resolved.verdict
+        const { connection, record } = resolved.link
+        const sessionId = requiredString(args, 'sessionId')
+        const text = requiredString(args, 'text')
+
+        // PRE-VALIDATION, before any wire call: the protocol caps `text` at
+        // 32768 characters, so an over-long body is refused here with a hint to
+        // split it rather than round-tripped into a peer error.
+        if (text.length > TEXT_MAX_LENGTH) {
+          return {
+            error: 'text-too-long',
+            limit: TEXT_MAX_LENGTH,
+            length: text.length,
+            message:
+              `the message is ${text.length} characters; the protocol caps a single send at ` +
+              `${TEXT_MAX_LENGTH}. Split it into several cherry_send calls.`,
+          } satisfies Record<string, unknown>
+        }
+
+        await this.#ensureSubscription(record.deviceId, sessionId)
+        const subscriptions = this.#deps.subs(record.deviceId)
+
+        // `expectedIdleRevision` comes from the CACHE's session snapshot. A cold
+        // cache is baselined first (`sessions.get`), so the value is always the
+        // peer's own current revision rather than a caller-supplied guess.
+        const expectedIdleRevision = await this.#idleRevision(connection, subscriptions, sessionId)
+
+        const receipt = await this.#command(connection, 'agent.messages.send', {
+          commandId: this.#commandId(args),
+          sessionId,
+          text,
+          expectedIdleRevision,
+        })
+
+        if (args['wait'] === false) {
+          // The caller asked for the receipt only: hand it back untouched.
+          return receipt
+        }
+        if (receipt['status'] !== 'applied') {
+          // A rejected receipt is the peer's final word on this command; there
+          // is no run to wait for.
+          return receipt
+        }
+
+        const timeoutMs = waitTimeout(args['timeoutMs'])
+        return this.#awaitRun(connection, subscriptions, sessionId, {
+          timeoutMs,
+          startedAt: Date.now(),
+          executionId: typeof receipt['executionId'] === 'string' ? receipt['executionId'] : undefined,
+          commandId: typeof receipt['commandId'] === 'string' ? receipt['commandId'] : undefined,
+        })
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // ⑧ cherry_wait
+  // -------------------------------------------------------------------------
+
+  #waitTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_wait',
+      description:
+        'Wait for a session\'s in-flight execution to reach a terminal state, without sending ' +
+        'anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight ' +
+        'execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, ' +
+        'never a park. Use it to resume after answering an interaction.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          sessionId: { type: 'string', description: 'The session to wait on.' },
+          timeoutMs: {
+            type: 'integer',
+            minimum: MIN_WAIT_TIMEOUT_MS,
+            description: `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}). A default, not a cap.`,
+          },
+        },
+        required: ['device', 'sessionId'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const resolved = this.#linkOr(requiredString(args, 'device'))
+        if (resolved.link === undefined) return resolved.verdict
+        const { connection, record } = resolved.link
+        const sessionId = requiredString(args, 'sessionId')
+
+        await this.#ensureSubscription(record.deviceId, sessionId)
+        const subscriptions = this.#deps.subs(record.deviceId)
+
+        // The session snapshot is the authority on whether anything is running.
+        const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
+          string,
+          unknown
+        >
+        const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+        const activeExecutionId = optionalString(session['activeExecutionId'])
+
+        if (activeExecutionId === undefined) {
+          // The IDLE answer, not a failure and not a wait: nothing is in flight,
+          // so the current snapshot IS the result.
+          return {
+            status: 'idle' satisfies CherryRunStatus,
+            sessionId,
+            session,
+            executionId: null,
+            messages: await this.#readTerminalMessages(connection, sessionId, session),
+            cursor: this.#cursorOf(subscriptions, sessionId),
+          }
+        }
+
+        return this.#awaitRun(connection, subscriptions, sessionId, {
+          timeoutMs: waitTimeout(args['timeoutMs']),
+          startedAt: Date.now(),
+          executionId: activeExecutionId,
+        })
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // ⑨ cherry_interactions
+  // -------------------------------------------------------------------------
+
+  #interactionsTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_interactions',
+      description:
+        'List the session\'s PENDING interactions (questions and approval decisions) that need an ' +
+        'answer. The peer serves the full four-state set (pending/approved/denied/expired) — the ' +
+        'pending filter is applied here. Each entry carries its `kind` (question|decision) and a ' +
+        'summary; answer questions with cherry_respond\'s `response` form and decisions with ' +
+        '`decision`.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          sessionId: { type: 'string', description: 'The session whose interactions to list.' },
+          includeAnswered: {
+            type: 'boolean',
+            description:
+              'Include already-answered interactions too (default false). The peer always returns them; ' +
+              'this only controls the local filter.',
+          },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            maximum: MAX_AGGREGATE_LIMIT,
+            description: 'Maximum number of interactions to return in total across pages (default 100).',
+          },
+        },
+        required: ['device', 'sessionId'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const resolved = this.#linkOr(requiredString(args, 'device'))
+        if (resolved.link === undefined) return resolved.verdict
+        const { connection, record } = resolved.link
+        const sessionId = requiredString(args, 'sessionId')
+
+        await this.#ensureSubscription(record.deviceId, sessionId)
+
+        // The peer's `interactionsOf` MERGES live journal items with persisted
+        // rows and never filters by status, so the whole four-state set arrives
+        // here; crossing `pending` is this tool's own behaviour.
+        const page = await this.#aggregate(
+          connection,
+          'agent.interactions.list',
+          { sessionId },
+          (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+          aggregateLimit(args['limit']),
+        )
+
+        const includeAnswered = args['includeAnswered'] === true
+        const items = page.items
+          .filter((item) => includeAnswered || item['status'] === 'pending')
+          .map((item) => this.#interactionView(item))
+
+        // The REAL-TIME soft-terminal predicate reads this same view, so caching
+        // it keeps a later `cherry_respond` from having to re-ask the peer.
+        const cache = this.#deps.subs(record.deviceId)
+        for (const item of page.items) this.#rememberInteraction(cache, sessionId, item)
+
+        return {
+          items,
+          truncated: page.truncated,
+          ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
+        }
+      },
+    })
+  }
+
+  /** The tool-facing projection of one interaction. */
+  #interactionView(raw: Record<string, unknown>): Record<string, unknown> {
+    const kind = typeof raw['kind'] === 'string' ? raw['kind'] : 'decision'
+    return {
+      interactionId: String(raw['interactionId'] ?? ''),
+      revision: String(raw['revision'] ?? ''),
+      executionId: String(raw['executionId'] ?? ''),
+      toolCallId: String(raw['toolCallId'] ?? ''),
+      status: String(raw['status'] ?? ''),
+      kind,
+      summary: String(raw['summary'] ?? ''),
+      ...(typeof raw['inputDigest'] === 'string' ? { inputDigest: raw['inputDigest'] } : {}),
+      // The `question` kind carries the question TEXTS a caller must key its
+      // answers by; a call never has to parse the raw input itself.
+      ...(kind === 'question' ? { questions: questionKeysOf(raw['input']) } : {}),
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // ⑩ cherry_respond
+  // -------------------------------------------------------------------------
+
+  #respondTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_respond',
+      description:
+        'Answer a pending interaction. A `question` MUST be answered with ' +
+        '`response: {kind: "answer", answers: {...}}`, keyed by the FULL question text and covering ' +
+        'EVERY question (the peer refuses a partial set with CONFLICT). Approving a question is ' +
+        'refused; use `decision: "deny"` to abandon one. A `decision` card takes ' +
+        '`decision: "approve" | "deny"`. The staleness triple (expectedRevision / ' +
+        'expectedExecutionId / inputDigest) is taken from the subscription cache, not from the caller.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          sessionId: { type: 'string', description: 'The session holding the interaction.' },
+          interactionId: { type: 'string', description: 'The interaction to answer.' },
+          decision: {
+            type: 'string',
+            enum: ['approve', 'deny'],
+            description: 'For a `decision` card. `deny` is also the sanctioned way to abandon a question.',
+          },
+          response: {
+            type: 'object',
+            properties: {
+              kind: { type: 'string', enum: ['answer'] },
+              answers: {
+                type: 'object',
+                additionalProperties: { type: 'string' },
+                description: 'Every question text mapped to its answer. Blank answers are refused.',
+              },
+            },
+            required: ['kind', 'answers'],
+            additionalProperties: false,
+            description: 'The structured answer form, required for a `question` card.',
+          },
+          commandId: {
+            type: 'string',
+            description: 'Optional idempotency id. Omit to have one generated; REUSE the same id to retry safely.',
+          },
+        },
+        required: ['device', 'sessionId', 'interactionId'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const resolved = this.#linkOr(requiredString(args, 'device'))
+        if (resolved.link === undefined) return resolved.verdict
+        const { connection, record } = resolved.link
+        const sessionId = requiredString(args, 'sessionId')
+        const interactionId = requiredString(args, 'interactionId')
+
+        const decision = optionalString(args['decision'])
+        const response = isRecord(args['response']) ? args['response'] : undefined
+        // TRIPLE parameter validation: exactly one answer form must be given,
+        // and it must be well-formed. Anything else is refused before the wire.
+        if (decision === undefined && response === undefined) {
+          return {
+            error: 'response-required',
+            message: 'provide either `decision` (approve|deny) or `response` ({kind:"answer", answers})',
+          } satisfies Record<string, unknown>
+        }
+        if (decision !== undefined && response !== undefined) {
+          return {
+            error: 'ambiguous-response',
+            message: 'provide either `decision` or `response`, not both',
+          } satisfies Record<string, unknown>
+        }
+        if (decision !== undefined && decision !== 'approve' && decision !== 'deny') {
+          return {
+            error: 'invalid-decision',
+            message: '`decision` accepts exactly "approve" or "deny"',
+          } satisfies Record<string, unknown>
+        }
+        if (response !== undefined) {
+          const answers = response['answers']
+          if (response['kind'] !== 'answer' || !isRecord(answers)) {
+            return {
+              error: 'invalid-response',
+              message: '`response` must be {kind:"answer", answers:{<question text>: <answer>}}',
+            } satisfies Record<string, unknown>
+          }
+        }
+
+        await this.#ensureSubscription(record.deviceId, sessionId)
+        const subscriptions = this.#deps.subs(record.deviceId)
+
+        // THE STALENESS TRIPLE COMES FROM THE CACHE. The interaction snapshot is
+        // primed from the real-time `interaction.updated` events, and — when the
+        // cache has never seen this interaction — from a single
+        // `agent.interactions.list` query. The CALLER never supplies these: it
+        // cannot know what the plugin has actually observed.
+        const snapshot = await this.#interactionSnapshot(connection, subscriptions, sessionId, interactionId)
+        if (snapshot === undefined) {
+          return {
+            error: 'unknown-interaction',
+            message: `no interaction ${interactionId} is known for session ${sessionId}`,
+          } satisfies Record<string, unknown>
+        }
+
+        return this.#command(connection, 'agent.interactions.respond', {
+          commandId: this.#commandId(args),
+          sessionId,
+          interactionId,
+          expectedRevision: snapshot.revision,
+          expectedExecutionId: snapshot.executionId,
+          inputDigest: snapshot.inputDigest,
+          ...(response === undefined ? { decision } : { response }),
+        })
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // ⑪ cherry_cancel
+  // -------------------------------------------------------------------------
+
+  #cancelTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_cancel',
+      description:
+        'Cancel a session\'s in-flight execution. `expectedExecutionId` is REQUIRED by the protocol ' +
+        'and is checked against the subscription cache\'s current active execution: pass the id a ' +
+        'previous result reported, and the call succeeds only while it is still the active run. A ' +
+        'divergence is refused in band with the id the cache actually holds, so a stale caller is ' +
+        'told what to re-read rather than cancelling the wrong execution.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          sessionId: { type: 'string', description: 'The session whose execution to cancel.' },
+          expectedExecutionId: {
+            type: 'string',
+            description:
+              'The execution to cancel. Required by the protocol; must match the cached active execution, ' +
+              'so the caller can only cancel a run it has actually observed.',
+          },
+          commandId: {
+            type: 'string',
+            description: 'Optional idempotency id. Omit to have one generated; REUSE the same id to retry safely.',
+          },
+        },
+        required: ['device', 'sessionId', 'expectedExecutionId'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const resolved = this.#linkOr(requiredString(args, 'device'))
+        if (resolved.link === undefined) return resolved.verdict
+        const { connection, record } = resolved.link
+        const sessionId = requiredString(args, 'sessionId')
+
+        await this.#ensureSubscription(record.deviceId, sessionId)
+        const subscriptions = this.#deps.subs(record.deviceId)
+
+        // Same SOURCE as respond's triple: the cached execution snapshot. The
+        // caller's own value is honoured only when it matches what the cache
+        // holds, because a divergence means one of the two has gone stale.
+        const cached = await this.#activeExecutionId(connection, subscriptions, sessionId)
+        const expectedExecutionId = cached
+        if (expectedExecutionId === undefined) {
+          return {
+            error: 'no-active-execution',
+            message: `session ${sessionId} has no in-flight execution to cancel`,
+          } satisfies Record<string, unknown>
+        }
+        const supplied = optionalString(args['expectedExecutionId'])
+        if (supplied !== undefined && supplied !== expectedExecutionId) {
+          return {
+            error: 'execution-mismatch',
+            expectedExecutionId,
+            supplied,
+            message:
+              `the cached active execution is ${expectedExecutionId}, not ${supplied}; re-read the ` +
+              'session before cancelling',
+          } satisfies Record<string, unknown>
+        }
+
+        return this.#command(connection, 'agent.executions.cancel', {
+          commandId: this.#commandId(args),
+          sessionId,
+          expectedExecutionId,
+        })
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Interactive-face plumbing
+  // -------------------------------------------------------------------------
+
   /**
-   * First-use ensure per session, cursorless by design (spec §3.5): a session
-   * with a live subscription is left alone, so the same-session re-subscribe
-   * CONFLICT the protocol forbids is never provoked.
+   * Issues one command and returns its RECEIPT verbatim.
+   *
+   * A receipt (`accepted`/`applied`/`rejected`/`interrupted`) is the peer's
+   * own record of a command and is handed back UNCHANGED — including its
+   * `error`, which is a receipt field, not a thrown RPC error. Transport and
+   * subscription failures still reject this call: the two surfaces stay
+   * distinct all the way to the caller (spec §6).
    */
+  async #command(
+    connection: DeviceConnection,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return (await connection.rpc.request(method, params)) as Record<string, unknown>
+  }
+
+  /**
+   * The commandId for this call. A caller-supplied id is honoured verbatim —
+   * that is what makes a RETRY reuse the same id (and what makes a differing
+   * body under the same id surface as the peer's IDEMPOTENCY_CONFLICT rather
+   * than being silently re-run). Otherwise a fresh uuid is generated.
+   */
+  #commandId(args: Record<string, unknown>): string {
+    return optionalString(args['commandId']) ?? randomUUID()
+  }
+
+  /** The subscription cache key for one session's revision/execution snapshot. */
+  #cacheKey(sessionId: string): string {
+    return sessionId
+  }
+
+  /** The subscription cache key for one interaction's staleness snapshot. */
+  #interactionKey(sessionId: string, interactionId: string): string {
+    return `${sessionId}\u0000${interactionId}`
+  }
+
+  /**
+   * The session's current idle revision, from the SUBSCRIPTION CACHE.
+   *
+   * Two sources, in this order:
+   *  1. the REAL-TIME event stream — a `session.updated` carries the peer's own
+   *     `idleRevision`, which is the freshest value the plugin can hold;
+   *  2. a baseline `agent.sessions.get`, used when the cache has nothing.
+   *
+   * The sent `expectedIdleRevision` must be a revision the peer recognises as
+   * current, so the baseline is mandatory rather than optional: guessing would
+   * earn a CONFLICT from a session that had merely moved on.
+   */
+  async #idleRevision(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+  ): Promise<string> {
+    const streamed = this.#streamedIdleRevision(subscriptions, sessionId)
+    if (streamed !== undefined) {
+      this.#revisionCache.set(this.#cacheKey(sessionId), streamed)
+      return streamed
+    }
+    const cached = this.#revisionCache.get(this.#cacheKey(sessionId))
+    if (cached !== undefined) return cached
+
+    const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
+      string,
+      unknown
+    >
+    const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+    const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
+    if (idle === undefined) {
+      throw new Error(`agent.sessions.get returned no idle revision for session ${sessionId}`)
+    }
+    this.#revisionCache.set(this.#cacheKey(sessionId), idle)
+    return idle
+  }
+
+  /** The newest idle/history revision the session's live events have carried. */
+  #streamedIdleRevision(subscriptions: SessionSubscriptions, sessionId: string): string | undefined {
+    let revision: string | undefined
+    for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      if (String(entry['kind'] ?? '') !== 'session.updated') continue
+      const payload = isRecord(entry['payload']) ? entry['payload'] : {}
+      revision =
+        optionalString(payload['idleRevision']) ??
+        optionalString(payload['historyRevision']) ??
+        revision
+    }
+    return revision
+  }
+
+  /**
+   * The cached ACTIVE execution id for a session.
+   *
+   * Same two sources as the idle revision: the live `execution.updated` stream
+   * first (a non-terminal status means the run is still in flight; a terminal
+   * one clears the cache), then a baseline `agent.sessions.get`. Shared by
+   * `cherry_cancel` and the responder's `expectedExecutionId` — ONE source, so
+   * the two can never disagree about what is running.
+   */
+  async #activeExecutionId(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+  ): Promise<string | undefined> {
+    const streamed = this.#streamedActiveExecution(subscriptions, sessionId)
+    if (streamed !== undefined) {
+      this.#executionCache.set(this.#cacheKey(sessionId), streamed)
+      return streamed
+    }
+    const observed = this.#executionCache.get(this.#cacheKey(sessionId))
+    if (observed !== undefined) return observed
+
+    const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
+      string,
+      unknown
+    >
+    const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+    const active = optionalString(session['activeExecutionId'])
+    if (active !== undefined) this.#executionCache.set(this.#cacheKey(sessionId), active)
+    return active
+  }
+
+  /**
+   * The live stream's verdict on the session's active execution: the newest
+   * `execution.updated`'s executionId while it is non-terminal, or undefined
+   * once it has settled (the run is over, so nothing is active).
+   */
+  #streamedActiveExecution(subscriptions: SessionSubscriptions, sessionId: string): string | undefined {
+    let active: string | undefined
+    for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      if (String(entry['kind'] ?? '') !== 'execution.updated') continue
+      const payload = isRecord(entry['payload']) ? entry['payload'] : {}
+      const executionId = optionalString(payload['executionId'])
+      const status = optionalString(payload['status'])
+      if (executionId === undefined || status === undefined) continue
+      active = (TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(status) ? undefined : executionId
+    }
+    return active
+  }
+
+  /**
+   * The cached interaction snapshot — the SOURCE of respond's staleness triple.
+   *
+   * Two sources, in this order:
+   *  1. the REAL-TIME `interaction.updated` stream, folded into the cache before
+   *     every lookup (spec §3.6: the soft terminal rides exactly these events);
+   *  2. ONE `agent.interactions.list` query, when the stream has never carried
+   *     this interaction. That path is not optional: an approval card the peer
+   *     persisted only after the turn ended never streams live, so the query is
+   *     the only way to discover it.
+   *
+   * The caller supplies NONE of these values — it cannot know what the plugin
+   * has actually observed.
+   */
+  async #interactionSnapshot(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+    interactionId: string,
+  ): Promise<{ revision: string; executionId: string; inputDigest: string } | undefined> {
+    // (1) Fold the live stream in first, so a freshly pushed interaction is
+    // answerable without a round trip.
+    for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      if (String(entry['kind'] ?? '') !== 'interaction.updated') continue
+      const payload = isRecord(entry['payload']) ? entry['payload'] : {}
+      if (optionalString(payload['interactionId']) !== interactionId) continue
+      this.#rememberInteraction(subscriptions, sessionId, payload)
+    }
+    const streamed = this.#interactionCache.get(this.#interactionKey(sessionId, interactionId))
+    if (streamed !== undefined) return streamed
+
+    // (2) The query fallback for a card that never streamed.
+    const page = await this.#aggregate(
+      connection,
+      'agent.interactions.list',
+      { sessionId },
+      (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      MAX_AGGREGATE_LIMIT,
+    )
+    for (const item of page.items) this.#rememberInteraction(subscriptions, sessionId, item)
+
+    return this.#interactionCache.get(this.#interactionKey(sessionId, interactionId))
+  }
+
+  /** Records one interaction's staleness snapshot from a wire view. */
+  #rememberInteraction(
+    _subscriptions: SessionSubscriptions,
+    sessionId: string,
+    raw: Record<string, unknown>,
+  ): void {
+    const interactionId = optionalString(raw['interactionId'])
+    const revision = optionalString(raw['revision'])
+    const executionId = optionalString(raw['executionId'])
+    const inputDigest = optionalString(raw['inputDigest'])
+    // A snapshot missing any of the three is not answerable: recording it would
+    // let `cherry_respond` send a half-complete staleness triple.
+    if (interactionId === undefined || revision === undefined || executionId === undefined) return
+    if (inputDigest === undefined) return
+    this.#interactionCache.set(this.#interactionKey(sessionId, interactionId), {
+      revision,
+      executionId,
+      inputDigest,
+    })
+    // A pending interaction also records the execution it belongs to, so a
+    // concurrent cancel can name the run the interaction is blocking.
+    this.#executionCache.set(this.#cacheKey(sessionId), executionId)
+  }
+
+  /**
+   * The session's current cursor, for a result that has to say where to resume.
+   * Read from the subscription cache without advancing the ACK cursor —
+   * waiters CONSUME, they do not acknowledge (controller ruling: ack stays the
+   * `cherry_events` delivery call site).
+   */
+  #cursorOf(subscriptions: SessionSubscriptions, sessionId: string): AgentCursor | undefined {
+    const result = subscriptions.read(sessionId)
+    return 'events' in result ? result.nextCursor : undefined
+  }
+
+  /**
+   * The waiter: parks until the session's EXECUTION reaches one of the four
+   * terminal states, an unanswered interaction makes the run a SOFT terminal,
+   * or the window elapses.
+   *
+   * The predicate covers the execution dimension ONLY. A command receipt's
+   * `interrupted` — where the command's outcome is undecided — is a different
+   * dimension and deliberately does NOT settle a wait (Task 13 asserts the two
+   * layers separately).
+   *
+   * Waiters never ack: they consume the projection and leave the peer's view
+   * untouched.
+   */
+  async #awaitRun(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+    options: { timeoutMs: number; startedAt: number; executionId?: string; commandId?: string },
+  ): Promise<Record<string, unknown>> {
+    const deadline = options.startedAt + options.timeoutMs
+    let latestExecutionId = options.executionId
+
+    for (;;) {
+      const observed = this.#observedState(subscriptions, sessionId)
+      if (observed.executionId !== undefined) latestExecutionId = observed.executionId
+
+      // SOFT TERMINAL first: the run cannot progress without the caller, so
+      // waiting longer would burn the window for nothing.
+      if (observed.pendingInteraction !== undefined) {
+        return {
+          status: 'awaiting-interaction' satisfies CherryRunStatus,
+          sessionId,
+          executionId: observed.executionId ?? options.executionId ?? null,
+          ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
+          interactionId: observed.pendingInteraction.interactionId,
+          kind: observed.pendingInteraction.kind,
+          summary: observed.pendingInteraction.summary,
+          questions: observed.pendingInteraction.questions,
+          cursor: this.#cursorOf(subscriptions, sessionId),
+        }
+      }
+
+      // HARD TERMINAL: one of the four execution states.
+      if (observed.terminalStatus !== undefined) {
+        return await this.#terminalResult(connection, subscriptions, sessionId, observed.terminalStatus, {
+          ...(observed.executionId === undefined ? {} : { executionId: observed.executionId }),
+          ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
+        })
+      }
+
+      const now = Date.now()
+      if (now >= deadline) {
+        // TIMEOUT IS NOT A FAILURE (spec §6): hand back what arrived, plus the
+        // cursor, so the caller can continue from exactly here.
+        return await this.#timeoutResult(connection, subscriptions, sessionId, {
+          timeoutMs: options.timeoutMs,
+          ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
+          ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
+        })
+      }
+
+      // Park on the session buffer: `waitFor` settles when the buffer advances
+      // past the cursor we have already consumed, and the poll bounds how long
+      // a MISSED wake can delay the next judgement pass.
+      const cursor = this.#cursorOf(subscriptions, sessionId)
+      await Promise.race([
+        subscriptions.waitFor(sessionId, cursor).catch(() => undefined),
+        sleep(Math.min(this.#waitPollMs, Math.max(1, deadline - now))),
+      ])
+    }
+  }
+
+  /**
+   * The session's cached execution/interaction state, as the real-time event
+   * stream has reported it.
+   *
+   * `terminalStatus` is the closed four-state set; the receipt dimension's
+   * `interrupted` never lands here.
+   */
+  #observedState(
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+  ): {
+    executionId?: string
+    terminalStatus?: string
+    pendingInteraction?: {
+      interactionId: string
+      kind: string
+      summary: string
+      questions: string[]
+    }
+  } {
+    const state: {
+      executionId?: string
+      terminalStatus?: string
+      pendingInteraction?: { interactionId: string; kind: string; summary: string; questions: string[] }
+    } = {}
+
+    // The records arrive through the subscriptions layer's session state; the
+    // engine reads them by replaying the buffer's event views, which is the
+    // only channel the layer exposes.
+    for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      const kind = String(entry['kind'] ?? '')
+      const payload = isRecord(entry['payload']) ? entry['payload'] : {}
+      if (kind === 'execution.updated') {
+        const executionId = optionalString(payload['executionId'])
+        if (executionId !== undefined) state.executionId = executionId
+        const status = optionalString(payload['status'])
+        if (status !== undefined && (TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(status)) {
+          state.terminalStatus = status
+        }
+      }
+      if (kind === 'interaction.updated') {
+        const interactionId = optionalString(payload['interactionId'])
+        const status = optionalString(payload['status'])
+        if (interactionId === undefined) continue
+        if (status !== 'pending') {
+          // Answered/expired: it stops being a soft terminal.
+          if (state.pendingInteraction?.interactionId === interactionId) state.pendingInteraction = undefined
+          continue
+        }
+        state.pendingInteraction = {
+          interactionId,
+          kind: optionalString(payload['kind']) ?? 'decision',
+          summary: String(payload['summary'] ?? ''),
+          questions: questionKeysOf(payload['input']),
+        }
+      }
+    }
+    return state
+  }
+
+  /**
+   * The session's buffered events as raw views, oldest first — read through the
+   * subscription layer's own `read` with NO cursor, so nothing is consumed and
+   * no waiter can disturb the delivery ack.
+   *
+   * This is the real-time view the soft-terminal predicate is defined over
+   * (spec §3.6: 「经实时 `interaction.updated` 入流」). It is deliberately NOT
+   * `projection()`, which carries checkpoint-rebuilt STATE rather than stream
+   * events and so has no notion of what arrived live.
+   */
+  #eventsOf(subscriptions: SessionSubscriptions, sessionId: string): Array<Record<string, unknown>> {
+    const result = subscriptions.read(sessionId)
+    if (!('events' in result)) return []
+    return result.events.map((event) => event as unknown as Record<string, unknown>)
+  }
+
+  /**
+   * The terminal aggregate: the run's status plus the assistant text the peer
+   * has by now, with `{ref}` parts resolved through the same externalized
+   * content walk `cherry_read` uses.
+   */
+  async #terminalResult(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+    status: string,
+    extra: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
+      string,
+      unknown
+    >
+    const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+    const messages = await this.#readTerminalMessages(connection, sessionId, session)
+    // The cache is refreshed from the terminal snapshot so a follow-up send
+    // does not have to re-read the session.
+    const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
+    if (idle !== undefined) this.#revisionCache.set(this.#cacheKey(sessionId), idle)
+
+    return {
+      status,
+      sessionId,
+      ...extra,
+      session,
+      text: aggregateAssistantText(messages),
+      messages,
+      cursor: this.#cursorOf(subscriptions, sessionId),
+    }
+  }
+
+  /**
+   * The timeout result: NOT a failure. Partial content read so far + the
+   * cursor to resume from.
+   */
+  async #timeoutResult(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+    extra: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
+      string,
+      unknown
+    >
+    const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+    const messages = await this.#readTerminalMessages(connection, sessionId, session)
+    return {
+      status: 'timeout' satisfies CherryRunStatus,
+      sessionId,
+      ...extra,
+      session,
+      text: aggregateAssistantText(messages),
+      messages,
+      cursor: this.#cursorOf(subscriptions, sessionId),
+    }
+  }
+
+  /**
+   * The session's assistant messages, read to completion with `{ref}` parts
+   * aggregated through `agent.content.read` — the SAME path `cherry_read` uses
+   * (spec §3.6: the terminal aggregate resolves externalized parts too).
+   */
+  async #readTerminalMessages(
+    connection: DeviceConnection,
+    sessionId: string,
+    session: Record<string, unknown>,
+  ): Promise<CherryReadMessage[]> {
+    const historyRevision = optionalString(session['historyRevision'])
+    if (historyRevision === undefined) return []
+
+    const page = await this.#aggregate(
+      connection,
+      'agent.messages.list',
+      { sessionId, historyRevision },
+      (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      MAX_AGGREGATE_LIMIT,
+    )
+
+    const messages: CherryReadMessage[] = []
+    for (const raw of page.items) {
+      messages.push(await this.#projectMessage(connection, sessionId, raw))
+    }
+    return messages
+  }
+
   async #ensureSubscription(deviceId: string, sessionId: string): Promise<void> {
     const subscriptions = this.#deps.subs(deviceId)
     if (subscriptions.activeSessions().includes(sessionId)) return
@@ -1110,4 +2235,79 @@ function readCursor(value: unknown): AgentCursor | undefined {
   const { sessionId, streamEpoch, seq } = value
   if (typeof sessionId !== 'string' || typeof streamEpoch !== 'string' || typeof seq !== 'string') return undefined
   return { sessionId, streamEpoch, seq }
+}
+
+/** A cancellable-free sleep, used only to bound a waiter's judgement cadence. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * The caller's wait window in ms, defaulting to {@link DEFAULT_WAIT_TIMEOUT_MS}.
+ *
+ * The default is a DEFAULT, never a ceiling (spec §3.6): a caller may raise or
+ * lower it freely, and the only floor is {@link MIN_WAIT_TIMEOUT_MS} — below
+ * that a "wait" would be a snapshot read wearing a wait's name.
+ */
+function waitTimeout(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_WAIT_TIMEOUT_MS
+  return Math.max(MIN_WAIT_TIMEOUT_MS, Math.floor(value))
+}
+
+/**
+ * The question TEXTS an interaction asks its answers to be keyed by.
+ *
+ * The protocol carries a question interaction's input as serialized JSON under
+ * `input.text` (or an externalized `input.ref`), with the shape
+ * `{questions: [{question, options, ...}]}`. A caller answering by question
+ * text should not have to parse that itself, so the texts are surfaced.
+ */
+function questionKeysOf(input: unknown): string[] {
+  const parsed = parseQuestionInput(input)
+  if (parsed === undefined) return []
+  return parsed
+}
+
+/** Extracts the ordered question texts from an interaction input, if any. */
+function parseQuestionInput(input: unknown): string[] | undefined {
+  if (!isRecord(input)) return undefined
+  let body: unknown
+  if (typeof input['text'] === 'string') {
+    try {
+      body = JSON.parse(input['text'])
+    } catch {
+      return undefined
+    }
+  } else if (isRecord(input['ref'])) {
+    // An externalized input is resolved through `agent.content.read` by the
+    // tool that needs the answers; the question list is best-effort here.
+    return undefined
+  } else {
+    body = input
+  }
+  if (!isRecord(body) || !Array.isArray(body['questions'])) return undefined
+  return body['questions']
+    .map((question) => (isRecord(question) ? optionalString(question['question']) : undefined))
+    .filter((question): question is string => question !== undefined)
+}
+
+/**
+ * The assistant text a terminal aggregate reports: every `assistant` message's
+ * text parts, in order, joined.
+ *
+ * `{ref}` parts are already resolved by {@link CherryToolEngine}'s
+ * `#projectMessage` (the externalized content walk), so this only has to
+ * concatenate what the read produced.
+ */
+function aggregateAssistantText(messages: CherryReadMessage[]): string {
+  const chunks: string[] = []
+  for (const message of messages) {
+    if (message.role !== 'assistant') continue
+    for (const part of message.parts) {
+      if (part.kind !== 'text') continue
+      if (part.content === '') continue
+      chunks.push(part.content)
+    }
+  }
+  return chunks.join('')
 }
