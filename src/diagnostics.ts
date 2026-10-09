@@ -164,7 +164,13 @@ export const CONTRACT_DIFFERENCES: readonly ContractDifference[] = [
 // Sanitized diagnostics (② / ③)
 // ---------------------------------------------------------------------------
 
-/** A device as the diagnostics report emits it: no credential field, ever. */
+/**
+ * A device as the diagnostics report emits it: no credential field, ever.
+ *
+ * `limits` are the peer-negotiated caps when the device has a live connection
+ * (see {@link DiagnosticsSources.connect}); they are omitted when there is
+ * none, rather than fabricated from the client-side fallbacks.
+ */
 export interface DiagnosticsDevice {
   deviceId: string
   displayName: string
@@ -177,6 +183,7 @@ export interface DiagnosticsDevice {
    * desktops apart in a bug report, not enough to be the pin itself.
    */
   desktopIdentity: string
+  limits?: EffectiveLimits
 }
 
 /** One session's LOCAL subscription bookkeeping. */
@@ -196,11 +203,18 @@ export interface DiagnosticsError {
   message: string
 }
 
-/** Counters the connection pool can report without exposing any payload. */
+/**
+ * Counters the connection pool can report without exposing any payload.
+ *
+ * There is deliberately NO `requests` key: the transport layer owns RPC
+ * accounting, and this report must not publish a differently-derived number
+ * under the name an operator would read as RPC volume. `connectionsBuilt` is
+ * what the assembly actually owns (see `AssemblyState.connectionsBuilt`).
+ */
 export interface DiagnosticsStats {
   connections: number
   sockets: number
-  requests: number
+  connectionsBuilt: number
   subscriptions: number
 }
 
@@ -243,6 +257,34 @@ export interface DiagnosticsSources {
   recentErrors?(): readonly DiagnosticsError[]
 }
 
+/**
+ * The character cap on one recent-error `message`.
+ *
+ * `recentErrors[].message` is the ONE free-text field the whitelist passes
+ * through, so it is bounded AT THE BOUNDARY rather than trusted: a future call
+ * site that hands over a peer-echoed payload (a protocol failure whose message
+ * quotes the offending body) must not be able to inflate a GET endpoint or
+ * smuggle unbounded text into a report an operator pastes into a bug tracker.
+ * 200 characters is enough for a protocol reason plus context.
+ */
+export const ERROR_MESSAGE_MAX = 200
+
+/** The marker appended when a message was cut, so a reader knows it is partial. */
+export const ERROR_MESSAGE_ELLIPSIS = '…[truncated]'
+
+/**
+ * Bounds one error message, KEEPING the ellipsis inside the cap.
+ *
+ * Exported because it is the unit the contract suite asserts directly: given a
+ * 10 000-character message it must return something at most
+ * {@link ERROR_MESSAGE_MAX} characters long that still starts with the original
+ * head, so an operator keeps the discriminating part of the reason.
+ */
+export function truncateErrorMessage(message: string): string {
+  if (message.length <= ERROR_MESSAGE_MAX) return message
+  return `${message.slice(0, ERROR_MESSAGE_MAX - ERROR_MESSAGE_ELLIPSIS.length)}${ERROR_MESSAGE_ELLIPSIS}`
+}
+
 /** The 12-hex digest that stands in for a raw pinned identity. */
 export function digestIdentity(identity: string): string {
   return createHash('sha256').update(identity).digest('hex').slice(0, 12)
@@ -255,8 +297,16 @@ export function digestIdentity(identity: string): string {
  * leave this function even though they are present on the input, and
  * `desktopIdentity` is replaced by its digest. The `state` is passed in rather
  * than read from the record because a record has no state — the projection does.
+ *
+ * `limits` are the hello-NEGOTIATED caps (or the conservative fallbacks), which
+ * are pure numbers with no credential in them and are exactly what an operator
+ * needs to judge whether a refusal was the peer's cap talking.
  */
-export function sanitizeDevice(record: DeviceRecord, state: DeviceState): DiagnosticsDevice {
+export function sanitizeDevice(
+  record: DeviceRecord,
+  state: DeviceState,
+  limits?: EffectiveLimits,
+): DiagnosticsDevice {
   return {
     deviceId: record.deviceId,
     displayName: record.displayName,
@@ -265,6 +315,16 @@ export function sanitizeDevice(record: DeviceRecord, state: DeviceState): Diagno
     hosts: [...record.hosts],
     port: record.port,
     desktopIdentity: digestIdentity(record.desktopIdentity),
+    ...(limits === undefined
+      ? {}
+      : {
+          limits: {
+            heartbeatMs: limits.heartbeatMs,
+            subscriptions: limits.subscriptions,
+            pageItems: limits.pageItems,
+            inFlightRequests: limits.inFlightRequests,
+          },
+        }),
   }
 }
 
@@ -283,7 +343,30 @@ function projectDevice(raw: unknown): DiagnosticsDevice {
     desktopIdentity: /^[0-9a-f]{12}$/.test(desktopIdentity)
       ? desktopIdentity
       : digestIdentity(desktopIdentity),
+    ...projectLimits(value['limits']),
   }
+}
+
+/**
+ * Re-projects the four numeric limit keys, dropping any foreign key that a
+ * caller's `limits` object might carry. A whitelist inside the whitelist: the
+ * shape is rebuilt field by field rather than spread, so a future addition to
+ * `EffectiveLimits` cannot arrive here unvetted.
+ */
+function projectLimits(raw: unknown): { limits?: EffectiveLimits } {
+  if (raw === null || typeof raw !== 'object') return {}
+  const value = raw as Record<string, unknown>
+  const limits: EffectiveLimits = {
+    heartbeatMs: numberOr(value['heartbeatMs'], 0),
+    subscriptions: numberOr(value['subscriptions'], 0),
+    pageItems: numberOr(value['pageItems'], 0),
+    inFlightRequests: numberOr(value['inFlightRequests'], 0),
+  }
+  return { limits }
+}
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
 /**
@@ -334,13 +417,15 @@ export function sanitizeDiagnostics(source: {
         ...(typeof value['deviceId'] === 'string' ? { deviceId: value['deviceId'] } : {}),
         ...(typeof value['sessionId'] === 'string' ? { sessionId: value['sessionId'] } : {}),
         reason: typeof value['reason'] === 'string' ? value['reason'] : 'INTERNAL',
-        message: typeof value['message'] === 'string' ? value['message'] : '',
+        // Bounded HERE, at the boundary, not merely by producer discipline:
+        // this is the only free-text field the whitelist passes through.
+        message: truncateErrorMessage(typeof value['message'] === 'string' ? value['message'] : ''),
       }
     }),
     stats: {
       connections: source.stats?.connections ?? 0,
       sockets: source.stats?.sockets ?? 0,
-      requests: source.stats?.requests ?? 0,
+      connectionsBuilt: source.stats?.connectionsBuilt ?? 0,
       subscriptions: source.stats?.subscriptions ?? 0,
     },
   }
@@ -372,12 +457,16 @@ export function buildDiagnostics(
 
   for (const record of records) {
     let state: DeviceState = 'offline'
+    let limits: EffectiveLimits | undefined
     try {
-      state = sources.connect(record.deviceId).state
+      const connection = sources.connect(record.deviceId)
+      state = connection.state
+      limits = connection.limits
     } catch {
       state = 'offline'
+      limits = undefined
     }
-    devices.push(sanitizeDevice(record, state))
+    devices.push(sanitizeDevice(record, state, limits))
   }
 
   try {

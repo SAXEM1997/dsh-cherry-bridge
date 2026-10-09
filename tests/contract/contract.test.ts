@@ -18,7 +18,13 @@ import {
   DEFAULT_RATE_BUDGET_PER_SECOND,
   resolveBridgeConfig,
 } from '../../src/index'
-import { CONTRACT_DIFFERENCES, buildDiagnostics, sanitizeDiagnostics } from '../../src/diagnostics'
+import {
+  CONTRACT_DIFFERENCES,
+  ERROR_MESSAGE_ELLIPSIS,
+  ERROR_MESSAGE_MAX,
+  buildDiagnostics,
+  sanitizeDiagnostics,
+} from '../../src/diagnostics'
 import { registerHttpApi } from '../../src/httpApi'
 import type {
   CherryHttpContext,
@@ -679,7 +685,7 @@ describe('③ diagnostics output is sanitized', () => {
     const report = buildDiagnostics({
       store,
       connect: () => ({ state: 'connected' as DeviceState, limits: { heartbeatMs: 20_000, subscriptions: 8, pageItems: 100, inFlightRequests: 16 } }),
-      stats: () => ({ connections: 1, sockets: 1, requests: 42, subscriptions: 0 }),
+      stats: () => ({ connections: 1, sockets: 1, connectionsBuilt: 42, subscriptions: 0 }),
       recentErrors: () => [
         { at: new Date().toISOString(), deviceId: 'dev-1', reason: 'RATE_LIMITED', message: 'slow down' },
       ],
@@ -689,7 +695,10 @@ describe('③ diagnostics output is sanitized', () => {
     expect(serialized).not.toContain('top-secret')
     expect(report.devices).toHaveLength(1)
     expect(report.devices[0]!.state).toBe('connected')
-    expect(report.stats.requests).toBe(42)
+    expect(report.stats.connectionsBuilt).toBe(42)
+    // The false-labelled key is gone for good: an operator must never read a
+    // socket-construction count as RPC volume.
+    expect(report.stats).not.toHaveProperty('requests')
     expect(report.recentErrors).toHaveLength(1)
     expect(report.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/)
   })
@@ -700,6 +709,69 @@ describe('③ diagnostics output is sanitized', () => {
     expect(report.devices).toEqual([])
     expect(report.stats.connections).toBe(0)
     expect(report.recentErrors).toEqual([])
+  })
+
+  it('caps an over-long error message at the boundary (F2)', () => {
+    // `recentErrors[].message` is the ONE free-text field the whitelist passes
+    // through, so it must be bounded by the EMITTER, not merely by producer
+    // discipline: a future call site handing over peer-echoed text must not be
+    // able to inflate this GET endpoint or smuggle unbounded text into a report.
+    const head = 'peer echoed: '
+    const long = head + 'x'.repeat(10_000)
+    const store = new DeviceStore(join(tempDir('cherry-diag-trunc-'), 'devices.json'))
+
+    const report = buildDiagnostics({
+      store,
+      connect: () => ({ state: 'offline' as DeviceState }),
+      recentErrors: () => [
+        { at: new Date().toISOString(), deviceId: 'dev-1', reason: 'INTERNAL', message: long },
+      ],
+    })
+
+    const message = report.recentErrors[0]!.message
+    expect(message.length).toBeLessThanOrEqual(ERROR_MESSAGE_MAX)
+    // The discriminating head survives; only the tail is cut.
+    expect(message.startsWith(head)).toBe(true)
+    expect(message.endsWith(ERROR_MESSAGE_ELLIPSIS)).toBe(true)
+    // A message already inside the cap is passed through UNTOUCHED — no marker
+    // on a value nobody cut.
+    const short = buildDiagnostics({
+      store,
+      connect: () => ({ state: 'offline' as DeviceState }),
+      recentErrors: () => [
+        { at: new Date().toISOString(), reason: 'RATE_LIMITED', message: 'slow down' },
+      ],
+    })
+    expect(short.recentErrors[0]!.message).toBe('slow down')
+  })
+
+  it('emits the hello-negotiated limits per device when a connection reports them (minor 3)', () => {
+    const store = new DeviceStore(join(tempDir('cherry-diag-limits-'), 'devices.json'))
+    store.upsert({
+      schemaVersion: 2,
+      deviceId: 'dev-1',
+      displayName: 'Desk Alpha',
+      hosts: ['127.0.0.1'],
+      port: 8765,
+      desktopIdentity: 'desktop-abc',
+      grants: ['agent'],
+      enabled: true,
+    })
+
+    const limits = { heartbeatMs: 25_000, subscriptions: 5, pageItems: 60, inFlightRequests: 6 }
+    const withLimits = buildDiagnostics({
+      store,
+      connect: () => ({ state: 'connected' as DeviceState, limits }),
+    })
+    expect(withLimits.devices[0]!.limits).toEqual(limits)
+
+    // A connection with nothing negotiated reports NO limits rather than
+    // fabricating the client-side fallbacks.
+    const withoutLimits = buildDiagnostics({
+      store,
+      connect: () => ({ state: 'connecting' as DeviceState }),
+    })
+    expect(withoutLimits.devices[0]).not.toHaveProperty('limits')
   })
 })
 
@@ -1217,16 +1289,57 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
       const report = sent.body as {
         devices: Array<{ deviceId: string; desktopIdentity: string }>
         config?: { rateBudgetPerSecond: number; perSessionCacheBytes: number }
-        stats: { connections: number }
+        stats: { connections: number; connectionsBuilt: number }
       }
       expect(report.devices.map((device) => device.deviceId)).toContain('dev-1')
       expect(report.devices[0]!.desktopIdentity).toMatch(/^[0-9a-f]{12}$/)
       // The effective config the assembly resolved (patch defaults, spec §8).
       expect(report.config).toEqual({ rateBudgetPerSecond: 32, perSessionCacheBytes: 2097152 })
       expect(report.stats.connections).toBeGreaterThanOrEqual(0)
+      // F1: the counter is published under what it MEASURES. An operator must
+      // never read a socket-construction count as RPC volume.
+      expect(report.stats).not.toHaveProperty('requests')
+      expect(report.stats.connectionsBuilt).toBeGreaterThanOrEqual(0)
     } finally {
       // Tear the plugin's seat down so the next test starts from a clean host.
       server.routes.clear()
     }
+  }, 20_000)
+
+  it('resets the error ring and the build counter on re-apply (minor 8)', async () => {
+    const index = await import('../../src/index')
+    const server = makeServer()
+    const ctx = {
+      inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
+        cb({ webServer: server, webRuntime: { trustedHosts: [] } })
+      },
+      effect(): void {},
+    }
+    const first = tempDir('cherry-reapply-1-')
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: first })
+
+    // Record one error the way the assembly does when a device drops.
+    index.noteError({
+      at: new Date().toISOString(),
+      deviceId: 'dev-stale',
+      reason: 'CONNECTION_OFFLINE',
+      message: 'device transitioned to offline',
+    })
+
+    const before = await getDiagnostics(server)
+    expect((before.body as { recentErrors: unknown[] }).recentErrors.length).toBeGreaterThan(0)
+
+    // A re-apply is a FRESH assembly: the previous run's error summaries and
+    // connection count describe a pool that no longer exists.
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-reapply-2-') })
+
+    const after = await getDiagnostics(server)
+    const report = after.body as {
+      recentErrors: Array<{ deviceId?: string }>
+      stats: { connectionsBuilt: number }
+    }
+    expect(report.recentErrors).toEqual([])
+    expect(report.stats.connectionsBuilt).toBe(0)
+    server.routes.clear()
   }, 20_000)
 })

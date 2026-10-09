@@ -16,6 +16,7 @@ import type {
   PairingProgressEvent,
 } from './httpApi'
 import type { DiagnosticsError } from './diagnostics'
+import { truncateErrorMessage } from './diagnostics'
 
 export const name = 'cherry-remote'
 
@@ -190,11 +191,22 @@ const RECENT_ERROR_LIMIT = 20
 /**
  * Records one error summary for the diagnostics endpoint.
  *
- * Exported for the assembly's own call sites; the message is truncated so a
- * peer that echoes a long payload into an error cannot inflate the report.
+ * TWO bounds, both real:
+ *
+ *  - the ring keeps at most {@link RECENT_ERROR_LIMIT} entries, and
+ *  - the `message` is truncated to {@link ERROR_MESSAGE_MAX} characters here
+ *    too, so an over-long string never enters memory in the first place. The
+ *    HTTP boundary applies the same cap again (`sanitizeDiagnostics`), which is
+ *    the one that actually protects the endpoint — this one is cheap
+ *    defense in depth.
+ *
+ * PRODUCER DISCIPLINE (not enforced by types): pass pre-redacted static context
+ * — a device id, a state name, a protocol reason. NEVER a peer-echoed payload:
+ * `message` is the only free-text field that reaches the report, and the
+ * truncation bounds its LENGTH, not its sensitivity.
  */
 export function noteError(entry: DiagnosticsError): void {
-  state.recentErrors.unshift(entry)
+  state.recentErrors.unshift({ ...entry, message: truncateErrorMessage(entry.message) })
   if (state.recentErrors.length > RECENT_ERROR_LIMIT) state.recentErrors.length = RECENT_ERROR_LIMIT
 }
 
@@ -513,7 +525,9 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
     diagnosticsStats: () => ({
       connections: state.connections.size,
       sockets: [...state.connections.values()].filter((connection) => connection.state === 'connected').length,
-      requests: state.connectionsBuilt,
+      // Published under the name of what it MEASURES: connections the pool has
+      // built. Never relabel it `requests` — that number is the transport's.
+      connectionsBuilt: state.connectionsBuilt,
       subscriptions: [...state.subscriptions.values()].reduce(
         (total, layer) => total + layer.activeSessions().length,
         0,
@@ -541,6 +555,13 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   state.rateBudgetPerSecond = bridgeConfig.rateBudgetPerSecond
   state.perSessionCacheBytes = bridgeConfig.perSessionCacheBytes
   state.store = new DeviceStore(join(dataDir, 'devices.json'))
+
+  // A re-apply is a fresh assembly: the previous run's error summaries and
+  // connection count describe a pool that no longer exists, so reporting them
+  // would attribute an old failure (or an old socket count) to the new
+  // deployment. Stats must only ever describe the CURRENT apply.
+  state.recentErrors.length = 0
+  state.connectionsBuilt = 0
 
   // IDEMPOTENCE (brief ③): a second apply — a reload — must REBIND, not stack.
   // Releasing the previous apply's registrations first is what keeps the host

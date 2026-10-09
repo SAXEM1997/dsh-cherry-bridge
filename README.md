@@ -113,10 +113,19 @@ curl 之类的非浏览器客户端，不是跨站页面）。
 
 汇总设备状态 / 连接统计 / 最近错误摘要，**并按 §5 脱敏规则处理**：
 
-- 可出：`deviceId`、显示名、状态、地址、端口、`sessionId`、`desktopIdentity` 的
-  **12 位摘要**、有效 limits、计数器、错误的 reason/message；
+- 可出：`deviceId`、显示名、状态、地址、端口、`desktopIdentity` 的 **12 位摘要**、
+  **hello 协商后的有效 limits**（`heartbeatMs`/`subscriptions`/`pageItems`/
+  `inFlightRequests`；无连接的设备**不报** limits，而不是拿客户端回退值冒充）、
+  `sessionId` 与会话游标、`stats` 计数器
+  （`connections`/`sockets`/`connectionsBuilt`/`subscriptions`）、
+  错误的 reason/message（**message 在端点边界被截断到 200 字符**，
+  见 `ERROR_MESSAGE_MAX`）；
 - 绝不出：`accessToken`、`tokenExpiresAt`、`invitationSecret`、原始
   `desktopIdentity`、消息文本与 part 文本。
+
+> `stats.connectionsBuilt` 是**连接池自上次 `apply` 以来构建过的连接数**，
+> 不是 RPC 请求量——请求计数归传输层所有，本端点不发布同名指标以免误读。
+> 计数器与错误环都在每次 `apply` 时清零：统计只描述**当前**这次装配。
 
 脱敏是**白名单投影**而非黑名单过滤：报告是逐字段新建的对象，因此日后往设备档案里
 新增的凭据字段会**按构造**被排除，而不依赖有人记得去更新一份拒绝清单。

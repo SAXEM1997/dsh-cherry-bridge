@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { DeviceRecord } from './deviceStore'
 import type { DeviceStore } from './deviceStore'
-import type { DeviceState } from './connection'
+import type { DeviceState, EffectiveLimits } from './connection'
 import { PairingError } from './pairing'
 import type { PairWithPayloadOptions } from './pairing'
 import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics'
@@ -111,6 +111,13 @@ export interface PairingProgressEvent {
 /** The subset of {@link DeviceConnection} this face consumes. */
 export interface ConnectionLike {
   readonly state: DeviceState
+  /**
+   * The peer-negotiated caps (hello values with the client's conservative
+   * fallbacks applied). Optional for the same reason `detach`/`evict` are: the
+   * M2 HTTP face's own tests drive a state-only stand-in, and a missing limits
+   * object must read as "not reported" rather than fail the diagnostics route.
+   */
+  readonly limits?: EffectiveLimits
   onState(cb: (state: DeviceState) => void): void
   /** Starts (or joins) the supervised lifecycle. */
   connect(): Promise<void> | unknown
@@ -751,10 +758,10 @@ function diagnosticsReport(route: RouteContext): unknown {
   return {
     ...buildDiagnostics({
       store: deps.store,
-      // A state projection, never the connection object: nothing but a state
-      // string can reach the report, so a live token cannot be serialized by
-      // accident.
-      connect: (deviceId) => ({ state: projectState(deviceById(deps, deviceId), deps.connect) }),
+      // A state projection, never the connection object: only the state string
+      // and the peer-negotiated numeric limits can reach the report, so a live
+      // token held by the connection cannot be serialized by accident.
+      connect: (deviceId) => deviceProjection(deps, deviceId),
       stats: () => safely(() => deps.diagnosticsStats?.(), {}),
       sessions: () => safely(() => deps.diagnosticsSessions?.(), []),
       recentErrors: () => safely(() => deps.diagnosticsErrors?.(), []),
@@ -763,6 +770,28 @@ function diagnosticsReport(route: RouteContext): unknown {
     // keys are numbers the plugin already logs, never a credential.
     ...(config === undefined ? {} : { config }),
     contractDifferences: CONTRACT_DIFFERENCES.map((entry) => ({ id: entry.id, title: entry.title })),
+  }
+}
+
+/**
+ * One device's diagnostics projection: the live state plus, when a connection
+ * actually exists, the limits the peer's hello negotiated.
+ *
+ * `limits` is read through its own guard because `connect` both RESOLVES and
+ * CREATES: a device whose connection cannot be built still has to appear in the
+ * report (as `offline`) rather than failing the whole endpoint.
+ */
+function deviceProjection(
+  deps: CherryHttpDeps,
+  deviceId: string,
+): { state: DeviceState; limits?: EffectiveLimits } {
+  const state = projectState(deviceById(deps, deviceId), deps.connect)
+  try {
+    const limits = deps.connect(deviceId).limits
+    return limits === undefined ? { state } : { state, limits }
+  } catch {
+    // An unbuildable connection has no negotiated limits to report.
+    return { state }
   }
 }
 
