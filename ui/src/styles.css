@@ -1,0 +1,232 @@
+/**
+ * The settings page's own styles.
+ *
+ * Hand-written CSS, no UI framework (ruling 6). The palette follows the DSH web
+ * client's dark-friendly aesthetic: it leans on `currentColor` and a few
+ * neutral surface variables so the page reads correctly on both a dark and a
+ * light shell, and the five state colours stay distinguishable (and are always paired
+ * with a text label — colour alone is never the status).
+ */
+.cherry-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 16px;
+  color: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.cherry-header h2 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+.cherry-panel {
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: 10px;
+  padding: 14px 16px;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.cherry-panel h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.cherry-hint {
+  margin: 4px 0;
+  opacity: 0.7;
+  font-size: 12px;
+}
+
+.cherry-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+/* --- pairing wizard ------------------------------------------------------ */
+
+.cherry-steps {
+  margin: 8px 0 12px;
+  padding-left: 20px;
+  opacity: 0.85;
+}
+
+.cherry-pair-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.cherry-pair-form textarea,
+.cherry-inline-form input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  color: inherit;
+  font: inherit;
+}
+
+.cherry-progress {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px dashed color-mix(in srgb, currentColor 25%, transparent);
+}
+
+.cherry-code {
+  margin-top: 10px;
+  padding: 12px;
+  border-radius: 8px;
+  text-align: center;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+}
+
+.cherry-code-digits {
+  display: block;
+  margin-top: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 26px;
+  letter-spacing: 0.3em;
+}
+
+.cherry-ok {
+  color: #3fb950;
+}
+
+.cherry-error {
+  color: #f85149;
+}
+
+/* --- device cards -------------------------------------------------------- */
+
+.cherry-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cherry-card {
+  border: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cherry-card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.cherry-card-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.cherry-state-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.cherry-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cherry-card-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.cherry-card-facts dt {
+  opacity: 0.6;
+}
+
+.cherry-card-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.cherry-inline-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  padding-top: 6px;
+  border-top: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
+}
+
+button {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- five-state light ---------------------------------------------------- */
+
+.cherry-state {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.cherry-state-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--cherry-state-color, #8b949e);
+  box-shadow: 0 0 6px var(--cherry-state-color, transparent);
+}
+
+.cherry-state[data-state='connected'] {
+  --cherry-state-color: #3fb950;
+}
+
+.cherry-state[data-state='connecting'] {
+  --cherry-state-color: #d29922;
+}
+
+.cherry-state[data-state='offline'] {
+  --cherry-state-color: #8b949e;
+}
+
+.cherry-state[data-state='disabled'] {
+  --cherry-state-color: #6e7681;
+}
+
+.cherry-state[data-state='identity-mismatch'] {
+  --cherry-state-color: #f85149;
+}
+
+.cherry-state[data-state='unknown'] {
+  --cherry-state-color: #484f58;
+}

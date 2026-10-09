@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cherry Studio 互联 — 开发预览</title>
+  </head>
+  <body>
+    <!--
+      Development harness only. The published artifact is `lib/client.js`, which
+      the DSH host loads through `window.__ModuleLoader__.load({ id, factory })`;
+      this page exists so `npm run dev:ui` can render the settings page in a
+      plain browser against a running host.
+    -->
+    <div id="root"></div>
+    <script type="module" src="/src/dev.tsx"></script>
+  </body>
+</html>

@@ -11,5 +11,6 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "tests", "vitest.config.ts", "tsdown.config.ts"]
+  "include": ["src", "tests", "vitest.config.ts", "tsdown.config.ts"],
+  "exclude": ["ui", "tests/unit/ui.test.ts", "tests/integration/clientBundle.test.ts"]
 }
