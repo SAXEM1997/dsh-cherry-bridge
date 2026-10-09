@@ -10,6 +10,8 @@ import type { SecureChannel } from '@cherrystudio/remote-transport'
 const DEFAULT_MAX_IN_FLIGHT = 8
 /** Default per-request timeout in milliseconds. */
 const DEFAULT_TIMEOUT_MS = 30_000
+/** Rejection message used once the channel can no longer carry responses. */
+const CHANNEL_CLOSED_MESSAGE = 'JSON-RPC channel closed'
 
 export interface JsonRpcClientOptions {
   /** Business requests allowed in flight at once; further calls queue. */
@@ -64,9 +66,15 @@ export class JsonRpcClient {
   private readonly pending = new Map<number, PendingRequest>()
   private readonly handlers: Array<(method: string, params: unknown) => void> = []
   private inFlight = 0
-  private readonly queue: Array<() => void> = []
+  private readonly queue: Array<(error?: Error) => void> = []
   private disposed = false
   private reading = false
+  /**
+   * Set once the channel is known dead. Kept separate from `disposed` because
+   * the two differ in who may still act: a closed channel is terminal for
+   * requests, while `disposed` is a deliberate local shutdown.
+   */
+  private closed = false
 
   constructor(channel: SecureChannel, opts: JsonRpcClientOptions = {}) {
     this.channel = channel
@@ -77,6 +85,9 @@ export class JsonRpcClient {
 
   request<T>(method: string, params: unknown, opts?: { timeoutMs?: number }): Promise<T> {
     if (this.disposed) return Promise.reject(new Error('JSON-RPC client disposed'))
+    // Fail fast once the channel is known dead: queueing onto it would only
+    // burn a full timeout before rejecting anyway.
+    if (this.closed) return Promise.reject(new Error(CHANNEL_CLOSED_MESSAGE))
 
     const id = this.nextId
     this.nextId += 1
@@ -94,9 +105,9 @@ export class JsonRpcClient {
     const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs
 
     return new Promise<T>((resolve, reject) => {
-      const send = (): void => {
-        if (this.disposed) {
-          reject(new Error('JSON-RPC client disposed'))
+      const send = (abortError?: Error): void => {
+        if (this.disposed || abortError !== undefined) {
+          reject(abortError ?? new Error('JSON-RPC client disposed'))
           return
         }
         // Register before writing: the response can land as soon as the write
@@ -127,12 +138,24 @@ export class JsonRpcClient {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.failAll('JSON-RPC client disposed')
+  }
+
+  /**
+   * Rejects every request that can no longer be answered — both those in flight
+   * and those still queued — with one structured error, and clears the queue so
+   * no queued request is silently dropped.
+   */
+  private failAll(message: string): void {
+    const error = new Error(message)
     for (const [, pending] of this.pending) {
       clearTimeout(pending.timer)
-      pending.reject(new Error('JSON-RPC client disposed'))
+      pending.reject(error)
     }
     this.pending.clear()
-    this.queue.length = 0
+    this.inFlight = 0
+    const queued = this.queue.splice(0, this.queue.length)
+    for (const send of queued) send(error)
   }
 
   /** Settles one pending request and releases its in-flight slot. */
@@ -176,6 +199,13 @@ export class JsonRpcClient {
         try {
           frame = await this.channel.read()
         } catch {
+          // The channel is dead: no response can ever arrive, so fail every
+          // outstanding request now instead of letting each burn its timeout.
+          // Skipped after dispose(), which has already rejected everything.
+          if (!this.disposed) {
+            this.closed = true
+            this.failAll(CHANNEL_CLOSED_MESSAGE)
+          }
           return
         }
         if (this.disposed) return

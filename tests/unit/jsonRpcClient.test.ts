@@ -33,7 +33,17 @@ const disposers: Array<() => Promise<void>> = []
 
 afterEach(async () => {
   while (disposers.length > 0) await disposers.pop()!()
+  vi.restoreAllMocks()
 })
+
+/**
+ * Silences the client's drop-and-warn output. The drop paths are asserted
+ * explicitly in tests ④/④b/⑤; everywhere else the warnings are noise that
+ * would otherwise leak into the test output.
+ */
+function silenceWarnings(): void {
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
+}
 
 /**
  * Loopback: an in-memory `ws` pair upgraded to a real Noise-XX SecureChannel on
@@ -44,6 +54,7 @@ async function openLoopback(opts?: {
   maxInFlight?: number
   timeoutMs?: number
 }): Promise<{ client: JsonRpcClient; peer: SecureChannel }> {
+  silenceWarnings()
   const wss = new WebSocketServer({ port: 0 })
   disposers.push(async () => {
     for (const client of wss.clients) client.terminate()
@@ -246,22 +257,66 @@ describe('JsonRpcClient', () => {
     expect(first).toHaveBeenLastCalledWith('agent.events', { events: [] })
   })
 
-  it('④ rejects the request promise when the peer sends a malformed response', async () => {
+  it('④ drops a malformed response that matches no branch (drop + warn)', async () => {
     const { client, peer } = await openLoopback()
 
     const handler = vi.fn()
     client.onNotification(handler)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-    // A frame whose id matches an in-flight request but which carries neither
-    // `result` nor `error`: it matches no branch and must be dropped, not crash.
-    const dangling = { jsonrpc: '2.0', id: 1 }
-    await peer.write(dangling)
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    // Step 3's third case: a frame with a valid `id` carrying neither `result`
+    // nor `error` matches none of the three branches, so it is dropped with a
+    // warning and never surfaced as a notification.
+    await peer.write({ jsonrpc: '2.0', id: 999 })
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith(
+        '[cherry-remote] dropped invalid JSON-RPC response',
+        expect.objectContaining({ id: 999 }),
+      )
+    })
     expect(handler).not.toHaveBeenCalled()
 
     // The dropped frame leaves the request unanswered, so it settles by timeout
     // instead of resolving or hanging forever.
     await expect(client.request('echo.never', {}, { timeoutMs: 100 })).rejects.toThrow()
+  })
+
+  it('④b drops an id-less response frame for an outstanding request', async () => {
+    const { client, peer } = await openLoopback()
+    const harness = new PeerHarness(peer)
+    harness.autoReply = false
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // The brief's case: a malformed response *missing its id*, while a request
+    // is genuinely outstanding.
+    const request = client.request('echo.malformed', {}, { timeoutMs: 30_000 })
+    await harness.waitForRequests(1)
+
+    const notification = vi.fn()
+    client.onNotification(notification)
+
+    // A response-shaped frame with no `id` is valid as neither a notification
+    // nor a response (both schemas reject it), so it is dropped with a warning
+    // and the outstanding request stays pending rather than resolving.
+    await peer.write({ jsonrpc: '2.0', result: { ok: true } })
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith(
+        '[cherry-remote] dropped invalid JSON-RPC notification',
+        expect.objectContaining({ result: { ok: true } }),
+      )
+    })
+    // It was NOT mistaken for a notification either.
+    expect(notification).not.toHaveBeenCalled()
+
+    // Still unanswered: closing the channel is what settles it (see test ⑧).
+    const settled = await Promise.race([
+      request.then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      new Promise((resolve) => setTimeout(() => resolve('pending'), 150)),
+    ])
+    expect(settled).toBe('pending')
   })
 
   it('⑤ rejects non-2.0 frames in both directions', async () => {
@@ -270,21 +325,29 @@ describe('JsonRpcClient', () => {
 
     const handler = vi.fn()
     client.onNotification(handler)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     // Inbound: a notification-shaped frame missing `jsonrpc: '2.0'` is invalid
-    // and must be dropped without reaching handlers or crashing the client.
+    // and must be dropped (with a warning) without reaching handlers.
     await peer.write({ method: 'future.thing', params: {} })
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith(
+        '[cherry-remote] dropped invalid JSON-RPC notification',
+        expect.objectContaining({ method: 'future.thing' }),
+      )
+    })
     expect(handler).not.toHaveBeenCalled()
 
-    // Outbound: the client validates its own envelope, so what it writes is
-    // always a well-formed 2.0 request even when params are omitted.
-    await expect(client.request('echo.ok', undefined)).resolves.toBeNull()
-    await harness.waitForRequests(1)
+    // Outbound: an invalid envelope is refused before it reaches the wire and
+    // consumes no in-flight slot. A non-string `method` fails the request
+    // schema, so `request` must reject rather than write the frame.
+    await expect(client.request(42 as unknown as string, {})).rejects.toThrow(/invalid/i)
 
-    const inbound = harness.requestFor('echo.ok')
-    expect(inbound.jsonrpc).toBe('2.0')
-    expect(inbound.params).toBeUndefined()
+    // A valid request still goes out, proving the refusal left the client usable.
+    await expect(client.request('echo.ok', { ok: true })).resolves.toEqual({ ok: true })
+
+    const written = harness.requests.map((frame) => frame.method)
+    expect(written).toEqual(['echo.ok'])
   })
 
   it('⑥ passes a known enum reason through verbatim but degrades an unknown one', async () => {
@@ -322,5 +385,63 @@ describe('JsonRpcClient', () => {
     // The client survives both paths and still serves further requests.
     await expect(client.request('known', {})).rejects.toBeInstanceOf(JsonRpcRequestError)
     expect(harness.requests).toHaveLength(3)
+  })
+
+  it('⑦ rejects both in-flight and queued requests on dispose', async () => {
+    const { client, peer } = await openLoopback({ maxInFlight: 2 })
+    const harness = new PeerHarness(peer)
+    // Stall every request so nothing settles on its own before dispose().
+    harness.autoReply = false
+
+    // Two fill the in-flight window; the rest can only be queued.
+    const inFlight = [client.request('echo.a', {}), client.request('echo.b', {})]
+    await harness.waitForRequests(2)
+
+    const queued = [
+      client.request('echo.c', {}),
+      client.request('echo.d', {}),
+      client.request('echo.e', {}),
+    ]
+
+    // Give the queue a chance to exist; none of these may reach the wire.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(harness.requests).toHaveLength(2)
+
+    client.dispose()
+
+    // Both cohorts reject — no request may hang forever until its 30s timeout.
+    const settled = await Promise.allSettled([...inFlight, ...queued])
+    expect(settled.map((entry) => entry.status)).toEqual([
+      'rejected',
+      'rejected',
+      'rejected',
+      'rejected',
+      'rejected',
+    ])
+    for (const entry of settled) {
+      expect((entry as PromiseRejectedResult).reason).toBeInstanceOf(Error)
+    }
+
+    // The queued requests were never written to the channel.
+    expect(harness.requests).toHaveLength(2)
+  })
+
+  it('⑧ rejects in-flight requests when the channel closes, then fails fast', async () => {
+    const { client, peer } = await openLoopback()
+    const harness = new PeerHarness(peer)
+    harness.autoReply = false
+
+    // A long timeout proves the rejection comes from the channel close and not
+    // from a timeout expiring.
+    const request = client.request('echo.pending', {}, { timeoutMs: 30_000 })
+    await harness.waitForRequests(1)
+
+    await peer.close()
+    await expect(request).rejects.toThrow(/^JSON-RPC channel closed$/)
+
+    // Once the channel is known dead, further calls fail fast with the same
+    // structured reason instead of queueing onto a channel that can never
+    // answer (which would surface as a confusing transport write error).
+    await expect(client.request('echo.after', {})).rejects.toThrow(/^JSON-RPC channel closed$/)
   })
 })
