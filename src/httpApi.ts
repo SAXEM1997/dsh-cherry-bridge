@@ -154,10 +154,17 @@ export interface CherryHttpDeps {
    * `enabled:false` (whose `connect()` short-circuits to `disabled` forever).
    */
   evict?(deviceId: string): void
-  /** Assembly channel: one device's state changed. */
-  onDeviceState(cb: (event: DeviceStateEvent) => void): void
-  /** Assembly channel: one pairing run advanced a stage. */
-  onPairingProgress(cb: (event: PairingProgressEvent) => void): void
+  /**
+   * Assembly channel: one device's state changed. Returns an optional
+   * DETACHER — `SseHub.dispose` must remove the callback it registered, because
+   * the listener set belongs to the assembly (which outlives one hub) and a
+   * hub that never detaches leaves its dead callbacks behind for every
+   * subsequent event to fan out to. A channel that has no detach support
+   * returns nothing, which is the pre-existing behaviour.
+   */
+  onDeviceState(cb: (event: DeviceStateEvent) => void): (() => void) | void
+  /** Assembly channel: one pairing run advanced a stage. Optional detacher. */
+  onPairingProgress(cb: (event: PairingProgressEvent) => void): (() => void) | void
 
   // --- M4 diagnostics (Task 13) -------------------------------------------
   //
@@ -166,7 +173,7 @@ export interface CherryHttpDeps {
   // source must read as "nothing reported" rather than as a failure. The
   // plugin assembly supplies them from the same pool the tool face uses.
 
-  /** Pool counters: connections, sockets, requests, subscriptions. */
+  /** Pool counters: connections, sockets, connectionsBuilt, subscriptions. */
   diagnosticsStats?(): Partial<DiagnosticsStats>
   /** Local per-session subscription bookkeeping (sessionId is whitelisted). */
   diagnosticsSessions?(): readonly SubscriptionStat[]
@@ -442,15 +449,26 @@ interface SseClient {
  */
 class SseHub {
   readonly #clients = new Set<SseClient>()
+  readonly #detachers: Array<() => void> = []
   #timer: ReturnType<typeof setInterval> | undefined
   #disposed = false
 
   constructor(private readonly deps: CherryHttpDeps) {}
 
-  /** Starts observing the assembly channels. Called once, after registration. */
+  /**
+   * Starts observing the assembly channels. Called once, after registration.
+   *
+   * Registering is not enough: the listener sets live on the ASSEMBLY, which
+   * outlives any one hub, so each detacher is kept and run in {@link dispose}.
+   * Without that, a re-apply (a new hub over the same assembly) accumulates one
+   * stale pair per cycle, and every later event fans out to hubs that are
+   * already closed.
+   */
   start(): void {
-    this.deps.onDeviceState((event) => this.publish('device-state', event))
-    this.deps.onPairingProgress((event) => this.publish('pairing-progress', event))
+    const detachDevice = this.deps.onDeviceState((event) => this.publish('device-state', event))
+    const detachPairing = this.deps.onPairingProgress((event) => this.publish('pairing-progress', event))
+    if (typeof detachDevice === 'function') this.#detachers.push(detachDevice)
+    if (typeof detachPairing === 'function') this.#detachers.push(detachPairing)
   }
 
   subscribe(req: HttpRequestLike, res: HttpResponseLike): void {
@@ -517,9 +535,18 @@ class SseHub {
     }
   }
 
-  /** Ends every live stream and stops the heartbeat. */
+  /** Ends every live stream, detaches the assembly listeners, stops the heartbeat. */
   dispose(): void {
     this.#disposed = true
+    // Detach FIRST: a listener that outlives the hub would keep publishing into
+    // a hub whose clients are already ended.
+    for (const detach of this.#detachers.splice(0)) {
+      try {
+        detach()
+      } catch (error) {
+        console.warn('[cherry-remote] sse listener detach failed', error)
+      }
+    }
     if (this.#timer !== undefined) {
       clearInterval(this.#timer)
       this.#timer = undefined
@@ -834,16 +861,17 @@ function deleteDevice(res: HttpResponseLike, route: RouteContext, deviceId: stri
     return
   }
   route.deps.store.remove(deviceId)
-  // The record is gone, but the connection is not ours to leak: tear down any
-  // live one so a removed device stops holding a socket. `detach` (not
-  // `connect`) is the right seam — the pool resolves an EXISTING connection
-  // and reports `undefined` when there is none, whereas `connect` would
-  // fabricate one for a record we just deleted. Failures here are not the
-  // browser's problem; the archive is already correct.
+  // The record is gone, but the connection is not ours to leak — in the pool OR
+  // on the wire. `evict` is the right seam and the ONLY one that does both: it
+  // REMOVES the pooled entry (closing its socket) rather than merely resolving
+  // it. `detach().close()` alone would close the socket but leave the dead
+  // DeviceConnection — still holding the removed record and its accessToken —
+  // sitting in the pool map until some later re-apply, inflating diagnostics
+  // and keeping the deleted device enumerable. `connect` is likewise wrong: it
+  // creates on miss, fabricating a connection for a record we just deleted.
+  // Failures here are not the browser's problem; the archive is already correct.
   try {
-    track(route.deps.detach?.(deviceId)?.close(), (error: unknown) => {
-      console.warn(`[cherry-remote] device ${deviceId} disconnect failed after removal`, error)
-    })
+    route.deps.evict?.(deviceId)
   } catch (error) {
     console.warn(`[cherry-remote] device ${deviceId} teardown failed after removal`, error)
   }

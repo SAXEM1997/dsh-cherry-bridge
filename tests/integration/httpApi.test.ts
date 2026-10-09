@@ -370,16 +370,15 @@ describe('① REST round-trip', () => {
         connectCalls.push(deviceId)
         return { ...dev, close: () => Promise.resolve() } as never
       },
-      // The pool resolves an EXISTING connection; DELETE must use this seam
-      // rather than `connect`, which would fabricate one for a deleted record.
-      detach: () =>
-        ({
-          ...dev,
-          close: () => {
-            closed.push('dev-1')
-            return Promise.resolve()
-          },
-        }) as never,
+      // The pool exposes TWO seams: `detach` only RESOLVES a live entry, while
+      // `evict` is the one that removes it AND closes its socket (see
+      // `index.ts`). DELETE must use the evicting one — `detach().close()`
+      // would close the socket but leave the dead connection pooled, and
+      // `connect` would fabricate one for a record it just deleted.
+      detach: () => ({ ...dev, close: () => Promise.resolve() }) as never,
+      evict: () => {
+        closed.push('dev-1')
+      },
     })
     store.upsert(record())
 
@@ -627,8 +626,12 @@ describe('③ SSE stream', () => {
     let pushState: ((event: { deviceId: string; state: DeviceState }) => void) | undefined
     mount({
       connect: () => dev as never,
-      onPairingProgress: (cb) => (pushPairing = cb),
-      onDeviceState: (cb) => (pushState = cb),
+      onPairingProgress: (cb) => {
+        pushPairing = cb
+      },
+      onDeviceState: (cb) => {
+        pushState = cb
+      },
     })
     store.upsert(record())
 
@@ -710,7 +713,11 @@ describe('③ SSE stream', () => {
 
   it('unsubscribes so a disconnected client receives no further frames', async () => {
     let push: ((event: { stage: string }) => void) | undefined
-    mount({ onPairingProgress: (cb) => (push = cb) })
+    mount({
+      onPairingProgress: (cb) => {
+        push = cb
+      },
+    })
 
     const res = new FakeResponse()
     const req = new FakeRequest(`${PREFIX}/events`, { host: HOST })
@@ -921,6 +928,57 @@ describe('⑥ lifecycle', () => {
     dispose = undefined
     expect(ctx.server.unregistered).toEqual([PREFIX])
   })
+  it('R9: dispose detaches the assembly listeners it registered', async () => {
+    // The assembly channels are sets that OUTLIVE one hub: they live on the
+    // module-level state, so a hub that registers without ever detaching leaves
+    // its callbacks — closing over the DEAD hub — in the set forever. Every
+    // re-apply then adds two more, and a later event fans out to all of them.
+    // The fake honours the channel's detacher exactly as `index.ts` does.
+    const deviceListeners = new Set<(event: unknown) => void>()
+    const pairingListeners = new Set<(event: unknown) => void>()
+    const channel = (set: Set<(event: unknown) => void>) => (cb: unknown) => {
+      const listener = cb as (event: unknown) => void
+      set.add(listener)
+      return () => {
+        set.delete(listener)
+      }
+    }
+    mount({
+      onDeviceState: channel(deviceListeners) as never,
+      onPairingProgress: channel(pairingListeners) as never,
+    })
+    expect(deviceListeners.size).toBe(1)
+    expect(pairingListeners.size).toBe(1)
+
+    dispose?.()
+    dispose = undefined
+
+    expect(deviceListeners.size).toBe(0)
+    expect(pairingListeners.size).toBe(0)
+  })
+
+  it('R5: DELETE drops the pool entry instead of leaving a closed connection behind', async () => {
+    // A REAL pool map, exactly like the assembly's `state.connections`: the two
+    // seams resolve it the way `index.ts` does — `detach` only LOOKS UP,
+    // `evict` REMOVES (and closes) — so leaving the eviction out leaves a closed
+    // DeviceConnection (still holding the record's accessToken) in the map.
+    const pool = new Map<string, ReturnType<typeof fakeConnection>>([['dev-1', fakeConnection('connected')]])
+    mount({
+      detach: (deviceId) => pool.get(deviceId) as never,
+      evict: (deviceId) => {
+        pool.delete(deviceId)
+      },
+    })
+    store.upsert(record())
+
+    const { status } = await call('/devices/dev-1', { method: 'DELETE' })
+
+    expect(status).toBe(204)
+    // The record is gone AND nothing is left pooling it.
+    expect(store.list()).toHaveLength(0)
+    expect([...pool.keys()]).toEqual([])
+  })
+
 })
 
 // ---------------------------------------------------------------------------

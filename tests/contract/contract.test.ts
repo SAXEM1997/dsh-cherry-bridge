@@ -1186,6 +1186,7 @@ describe('③ release configuration', () => {
     exports: Record<string, string>
     files: string[]
     scripts: Record<string, string>
+    engines?: { node?: string }
     dsh?: { client?: unknown; bundle?: { patch?: string } }
   }
 
@@ -1203,12 +1204,24 @@ describe('③ release configuration', () => {
     // `private: true` makes `npm publish` refuse outright.
     expect(manifest.private).toBe(false)
     expect(manifest.scripts['prepublishOnly']).toContain('build')
-    for (const entry of ['lib', 'src', 'ui', 'docs', 'cordis.patch.yml', 'README.md']) {
+    // The PUBLISH surface, narrow and explicit: the runtime (both build outputs
+    // + sources + the settings UI), the bundle patch, and the two documents a
+    // consumer needs. `dist` is tsdown's output and `lib` carries the client
+    // half — omitting either would publish a package the host cannot load.
+    for (const entry of ['lib', 'dist', 'src', 'ui', 'cordis.patch.yml', 'README.md']) {
       expect(manifest.files).toContain(entry)
     }
+    // The checklist is the one doc under `docs/` meant for consumers…
+    expect(manifest.files).toContain('docs/e2e-checklist.md')
+    // …while `docs/` itself must NOT be listed: it would drag the internal
+    // specs/plans (`docs/superpowers/**`) into the tarball.
+    expect(manifest.files).not.toContain('docs')
     // The client half is only reachable through this export; a `files` list
     // that dropped `lib` would publish a package the host cannot load.
     expect(manifest.exports['./client']).toBe('./lib/client.js')
+    // The plan's Tech Stack floor ("TypeScript (Node ≥22.18)"); a lower range
+    // would advertise support for a runtime the suite never exercises.
+    expect(manifest.engines?.node).toBe('>=22.18.0')
   })
 
   it('ships a cordis patch whose insert row and config match the spec §8 defaults', () => {

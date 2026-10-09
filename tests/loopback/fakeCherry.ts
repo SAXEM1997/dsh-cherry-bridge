@@ -240,8 +240,14 @@ export interface FakeAgentOptions {
    * RESOURCE_EXHAUSTED row (Task 13⑥), where the peer refuses the command while
    * the SESSION stays healthy. Distinct from the subscription dimension Task 7⑨
    * anchors on `agent.sessions.subscribe`.
+   *
+   * `'accepted'` answers the schema-legal QUEUED receipt: the peer has admitted
+   * the command but its run has not started yet, so an `executionId` is still
+   * present and the lifecycle follows on the event stream. It is neither
+   * `applied` nor a refusal — a client that treats it as terminal under an
+   * implicit `wait: true` hands back a non-terminal answer.
    */
-  sendOutcome?: 'applied' | 'busy' | 'target-unavailable' | 'resource-exhausted'
+  sendOutcome?: 'applied' | 'accepted' | 'busy' | 'target-unavailable' | 'resource-exhausted'
   /** Same injection for `agent.executions.cancel` (Task 9⑮ covers both verbs). */
   cancelOutcome?: 'applied' | 'target-unavailable'
   /**
@@ -860,6 +866,18 @@ export class FakeCherry {
   setRunDelay(ms: number | undefined): void {
     if (this.#options.agent === undefined) this.#options.agent = {}
     this.#options.agent.runDelayMs = ms
+  }
+
+  /**
+   * The assistant message the NEXT accepted run will persist. Mutable mid-life
+   * so a test can drive two consecutive runs on one session with DISTINCT
+   * replies — the real peer appends a fresh assistant message per run, so a
+   * client that re-reads the whole session history would re-deliver run 1's
+   * text as run 2's output.
+   */
+  setTerminalMessage(message: FakeMessageRecord | undefined): void {
+    if (this.#options.agent === undefined) this.#options.agent = {}
+    this.#options.agent.terminalMessage = message
   }
 
   /** The interaction view the peer currently serves, in fixture order. */
@@ -1991,7 +2009,6 @@ export class FakeCherry {
 
     const executionId = `exec-${randomUUID().slice(0, 8)}`
     this.#activeExecutionId = executionId
-    this.#appendTerminalMessage()
     const status = this.#agent().runTerminalStatus ?? 'completed'
     const messageId = this.#agent().runMessageId ?? this.#agent().terminalMessage?.messageId ?? 'msg-1'
 
@@ -2002,7 +2019,10 @@ export class FakeCherry {
     return {
       commandId: params['commandId'],
       method: 'agent.messages.send',
-      status: 'applied',
+      // `accepted` is the QUEUED receipt: admitted, not yet applied. The run
+      // still settles, so the caller's wait must continue rather than return
+      // this non-terminal receipt as the answer.
+      status: outcome === 'accepted' ? 'accepted' : 'applied',
       admittedAt: new Date().toISOString(),
       executionId,
     }
@@ -2268,6 +2288,11 @@ export class FakeCherry {
         : {}),
     }
     this.#executionUpdates.push({ executionId, status, messageId })
+    // The run's assistant message reaches the read fixtures exactly when the
+    // run SETTLES — the real peer persists it on completion, not on admission.
+    // Every settle path (direct, parked-then-answered, cancel) funnels through
+    // here, so the persistence timing has one home.
+    if (terminal) this.#appendTerminalMessage()
     this.#notify('agent.events', {
       sessionId,
       subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === sessionId)
@@ -2285,13 +2310,21 @@ export class FakeCherry {
    * The array is MATERIALIZED onto the options object when the fixture declared
    * none: `?? []` would push into a throwaway and silently serve an empty
    * message list, which is precisely the bug this face would otherwise hide.
+   *
+   * APPEND, never dedupe-by-id: the real peer persists a FRESH assistant
+   * message per run, and the session's `messages.list` serves the cumulative
+   * history. A fake that skipped the push when the id was already present made
+   * two consecutive runs on one session look like a single message — hiding the
+   * exact defect (a terminal aggregate summing the whole history and
+   * re-delivering run 1's reply as run 2's output) that a real session exposes.
+   * A fixture that wants a stable id across runs can still set `runMessageId`,
+   * but then its text is genuinely the same message and re-reading it is right.
    */
   #appendTerminalMessage(): void {
     const agent = this.#options.agent
     const message = agent?.terminalMessage
     if (agent === undefined || message === undefined) return
     agent.messages ??= []
-    if (agent.messages.some((entry) => entry.messageId === message.messageId)) return
     agent.messages.push(message)
   }
 

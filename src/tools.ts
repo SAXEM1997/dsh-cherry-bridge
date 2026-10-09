@@ -80,8 +80,16 @@ export interface CherryToolsContext {
 
 /**
  * One device as `cherry_devices` reports it. `state` is the connection's CLOSED
- * five-state set; a device with no live connection reports its stored `enabled`
- * flag as `disabled`, otherwise `offline` — answering never dials.
+ * five-state set; a disabled device reports `disabled` from its stored
+ * `enabled` flag without touching the pool, and an enabled one reports the
+ * pooled connection's live state.
+ *
+ * Answering DOES warm the pool: the row is read through `deps.connect`, the
+ * accepted resident-pool design — it resolves an existing connection and, on a
+ * miss, builds the (disconnected) one the assembly would have built anyway, so
+ * a listed device is also a primed one. The alternative — reporting `offline`
+ * for anything not currently pooled — would misreport a device the caller can
+ * immediately use.
  */
 export interface CherryDeviceView {
   deviceId: string
@@ -1440,9 +1448,16 @@ class CherryToolEngine {
           // The caller asked for the receipt only: hand it back untouched.
           return receipt
         }
-        if (receipt['status'] !== 'applied') {
+        if (receipt['status'] === 'rejected' || receipt['status'] === 'interrupted') {
           // A rejected receipt is the peer's final word on this command; there
-          // is no run to wait for.
+          // is no run to wait for. `interrupted` means the command's OUTCOME IS
+          // UNDETERMINED — a different dimension from the execution terminal
+          // set — so it is likewise an answer, never something to park on.
+          //
+          // `accepted` is deliberately NOT in this set: it is the schema-legal
+          // QUEUED status (the peer admitted the command, its run has not
+          // started yet), so an implicit `wait: true` must keep waiting for the
+          // terminal instead of handing back a non-terminal receipt.
           return receipt
         }
 
@@ -2258,6 +2273,9 @@ class CherryToolEngine {
         return await this.#terminalResult(connection, subscriptions, sessionId, observed.terminalStatus, {
           ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
           ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
+          // The run-scoped cut for the terminal aggregate: the message THIS run
+          // persisted, when the peer named one.
+          ...(observed.terminalMessageId === undefined ? {} : { terminalMessageId: observed.terminalMessageId }),
         })
       }
 
@@ -2331,6 +2349,7 @@ class CherryToolEngine {
   ): {
     executionId?: string
     terminalStatus?: string
+    terminalMessageId?: string
     pendingInteractions: Array<{
       interactionId: string
       kind: string
@@ -2341,6 +2360,7 @@ class CherryToolEngine {
     const state: {
       executionId?: string
       terminalStatus?: string
+      terminalMessageId?: string
       pendingInteractions: Array<{ interactionId: string; kind: string; summary: string; questions: string[] }>
     } = { pendingInteractions: [] }
 
@@ -2400,6 +2420,11 @@ class CherryToolEngine {
       if (awaited === undefined || executionId !== awaited) continue
       state.executionId = executionId
       state.terminalStatus = terminal ? status : undefined
+      // The terminal names the message THIS run persisted, which is the one
+      // boundary the terminal aggregate must cut at: the session's history is
+      // cumulative, so concatenating every assistant message would re-deliver
+      // a prior run's reply as this run's output.
+      if (terminal) state.terminalMessageId = optionalString(payload['messageId'])
     }
 
     // An awaited run that was ALREADY over when the wait began, with nothing
@@ -2412,7 +2437,9 @@ class CherryToolEngine {
       settledBeforeBaseline.has(awaited) &&
       pending.size === 0
     ) {
-      state.terminalStatus = this.#settledStatusOf(subscriptions, sessionId, awaited, options.baselineSeq)
+      const settled = this.#settledStatusOf(subscriptions, sessionId, awaited, options.baselineSeq)
+      state.terminalStatus = settled.status
+      state.terminalMessageId = settled.messageId
       state.executionId = awaited
     }
     state.pendingInteractions = [...pending.values()]
@@ -2420,7 +2447,7 @@ class CherryToolEngine {
   }
 
   /**
-   * The terminal status an execution settled on at or before the baseline, or
+   * The terminal an awaited execution settled on at or before the baseline, or
    * undefined when it never settled. Only consulted for an awaited execution
    * that was already over when the wait began — the "I am waiting on a run that
    * has already finished" case `cherry_wait` must answer rather than park on.
@@ -2430,8 +2457,8 @@ class CherryToolEngine {
     sessionId: string,
     executionId: string,
     baselineSeq: number,
-  ): string | undefined {
-    let settled: string | undefined
+  ): { status?: string; messageId?: string } {
+    let settled: { status?: string; messageId?: string } = {}
     for (const entry of this.#eventsOf(subscriptions, sessionId)) {
       if (String(entry['kind'] ?? '') !== 'execution.updated') continue
       const seq = Number(entry['seq'])
@@ -2440,7 +2467,7 @@ class CherryToolEngine {
       if (optionalString(payload['executionId']) !== executionId) continue
       const status = optionalString(payload['status'])
       if (status !== undefined && (TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(status)) {
-        settled = status
+        settled = { status, messageId: optionalString(payload['messageId']) }
       }
     }
     return settled
@@ -2480,9 +2507,19 @@ class CherryToolEngine {
   }
 
   /**
-   * The terminal aggregate: the run's status plus the assistant text the peer
-   * has by now, with `{ref}` parts resolved through the same externalized
-   * content walk `cherry_read` uses.
+   * The terminal aggregate: the run's status plus the assistant text THIS RUN
+   * produced, with `{ref}` parts resolved through the same externalized content
+   * walk `cherry_read` uses.
+   *
+   * `text` is RUN-SCOPED (spec §3.6: 「终态后聚合助手最终消息文本」). The session
+   * history is cumulative and the peer appends a FRESH assistant message per
+   * run, so concatenating every assistant message would re-deliver a prior
+   * run's reply on the second send of a reused session — the primary workflow.
+   * The cut is the terminal's own `messageId` when the peer named one (the
+   * waiter carries it from `execution.updated`); without that name the text
+   * falls back to the LAST assistant message, which is the run's reply under
+   * the protocol's append-per-run ordering. Either way the FULL `messages`
+   * array stays on the result as context.
    */
   async #terminalResult(
     connection: DeviceConnection,
@@ -2491,6 +2528,7 @@ class CherryToolEngine {
     status: string,
     extra: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    const { terminalMessageId, ...rest } = extra
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
       string,
       unknown
@@ -2505,9 +2543,9 @@ class CherryToolEngine {
     return {
       status,
       sessionId,
-      ...extra,
+      ...rest,
       session,
-      text: aggregateAssistantText(messages),
+      text: aggregateAssistantText(messages, typeof terminalMessageId === 'string' ? terminalMessageId : undefined),
       messages,
       cursor: this.#cursorOf(subscriptions, sessionId),
     }
@@ -2516,6 +2554,11 @@ class CherryToolEngine {
   /**
    * The timeout result: NOT a failure. Partial content read so far + the
    * cursor to resume from.
+   *
+   * Unlike the terminal aggregate the text here is NOT run-scoped: the run has
+   * not settled, so there is no terminal message to cut at, and the whole point
+   * of the timeout answer is to hand back the PARTIAL content produced so far
+   * (spec §3.6: 超时非失败返回部分内容+游标).
    */
   async #timeoutResult(
     connection: DeviceConnection,
@@ -2688,16 +2731,28 @@ function parseQuestionInput(input: unknown): string[] | undefined {
 }
 
 /**
- * The assistant text a terminal aggregate reports: every `assistant` message's
- * text parts, in order, joined.
+ * The assistant text a terminal aggregate reports: the awaited RUN's assistant
+ * message text parts, joined.
  *
  * `{ref}` parts are already resolved by {@link CherryToolEngine}'s
  * `#projectMessage` (the externalized content walk), so this only has to
  * concatenate what the read produced.
+ *
+ * The scope is what makes this correct on a REUSED session: the peer appends a
+ * fresh assistant message per run and `messages.list` serves the WHOLE
+ * cumulative history, so summing every assistant message would re-deliver run
+ * N-1's reply as run N's output. `terminalMessageId` — the message the awaited
+ * execution's terminal named — is the exact cut. When the peer named none, the
+ * LAST assistant message is the run's own reply under the protocol's
+ * append-per-run ordering, which still beats summing the history.
  */
-function aggregateAssistantText(messages: CherryReadMessage[]): string {
+function aggregateAssistantText(messages: CherryReadMessage[], terminalMessageId?: string): string {
+  const scoped =
+    terminalMessageId === undefined
+      ? lastAssistantMessage(messages)
+      : messages.filter((message) => message.messageId === terminalMessageId)
   const chunks: string[] = []
-  for (const message of messages) {
+  for (const message of scoped) {
     if (message.role !== 'assistant') continue
     for (const part of message.parts) {
       if (part.kind !== 'text') continue
@@ -2706,4 +2761,13 @@ function aggregateAssistantText(messages: CherryReadMessage[]): string {
     }
   }
   return chunks.join('')
+}
+
+/** The session's newest assistant message, as a one-element list (or empty). */
+function lastAssistantMessage(messages: CherryReadMessage[]): CherryReadMessage[] {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    if (message !== undefined && message.role === 'assistant') return [message]
+  }
+  return []
 }

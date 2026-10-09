@@ -513,11 +513,21 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
     // store record (see evictConnection for the four flows that need it).
     evict: evictConnection,
     subs: subsFor,
+    // Both channels return a DETACHER: the listener sets live on this assembly,
+    // not on the SSE hub that subscribes to them, so a hub cannot remove its
+    // callbacks unless the seam hands it the means to. Without this, every
+    // re-apply left one dead hub's pair behind (see `SseHub.start`/`dispose`).
     onDeviceState: (cb) => {
       state.deviceStateListeners.add(cb)
+      return () => {
+        state.deviceStateListeners.delete(cb)
+      }
     },
     onPairingProgress: (cb) => {
       state.pairingProgressListeners.add(cb)
+      return () => {
+        state.pairingProgressListeners.delete(cb)
+      }
     },
     // Diagnostics (Task 13): the SAME pool the tool face reads, projected onto
     // counters and identifiers only. Every source here is synchronous and

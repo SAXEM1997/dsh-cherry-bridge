@@ -1318,3 +1318,127 @@ describe('interactive tools: review regressions', () => {
     expect(elapsed).toBeLessThan(1_000)
   })
 })
+
+
+describe('final review: run-scoped terminal aggregate', () => {
+  it('R1: the SECOND send on a reused session reports ONLY its own run\'s reply', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('run-one-reply'),
+        runDelayMs: 10,
+      },
+    })
+
+    // Run 1 leaves its assistant message in the session history.
+    const first = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'one',
+      timeoutMs: 5_000,
+    })) as { status: string; text: string; messages: Array<{ messageId: string }> }
+    expect(first.status).toBe('completed')
+    expect(first.text).toBe('run-one-reply')
+
+    // The REAL peer appends a FRESH assistant message per run (a new
+    // messageId), unlike a fixture that reuses one id and so hides the bug:
+    // without a per-run cut, the second aggregate re-reads run 1's reply and
+    // hands it back as run 2's output.
+    rig.fake.setTerminalMessage({
+      messageId: 'm-assistant-2',
+      revision: '1',
+      role: 'assistant',
+      status: 'success',
+      parts: [{ kind: 'text', text: 'run-two-reply' }],
+    })
+
+    const second = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'two',
+      timeoutMs: 5_000,
+    })) as { status: string; text: string; messages: Array<{ messageId: string }> }
+
+    expect(second.status).toBe('completed')
+    // The headline text is THIS run's reply ONLY.
+    expect(second.text).toBe('run-two-reply')
+    expect(second.text).not.toContain('run-one-reply')
+    // The full history stays available as context, both messages present.
+    expect(second.messages.map((message) => message.messageId)).toEqual(['m-assistant', 'm-assistant-2'])
+  })
+
+  it('R1b: the two runs really do persist DISTINCT assistant messages', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('run-one-reply'),
+        runDelayMs: 10,
+      },
+    })
+
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'one', timeoutMs: 5_000 })
+    rig.fake.setTerminalMessage({
+      messageId: 'm-assistant-2',
+      revision: '1',
+      role: 'assistant',
+      status: 'success',
+      parts: [{ kind: 'text', text: 'run-two-reply' }],
+    })
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'two', timeoutMs: 5_000 })
+
+    // The divergence the fake used to hide: the real peer appends per run.
+    const page = (await rig.rawRequest('agent.messages.list', {
+      sessionId: 's-1',
+      historyRevision: '1',
+    })) as { items: Array<{ messageId: string }> }
+    expect(page.items.map((item) => item.messageId)).toEqual(['m-assistant', 'm-assistant-2'])
+  })
+})
+
+describe('final review: the receipt status enum', () => {
+  it('R4: a QUEUED `accepted` receipt still waits for the terminal instead of short-circuiting', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('accepted-run-reply'),
+        sendOutcome: 'accepted',
+        runDelayMs: 50,
+      },
+    })
+
+    // `accepted` is schema-legal and means QUEUED, not refused: the peer has
+    // admitted the command and the run's lifecycle follows on the event stream.
+    // Returning the receipt under an implicit `wait: true` would hand back a
+    // non-terminal answer — exactly what the caller asked NOT to get.
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'queued',
+      timeoutMs: 5_000,
+    })) as { status: string; text?: string; executionId?: string }
+
+    expect(result.status).toBe('completed')
+    expect(result.text).toBe('accepted-run-reply')
+    expect(result.executionId).toBeDefined()
+  })
+
+  it('R4b: a REJECTED receipt still short-circuits the wait', async () => {
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], sendOutcome: 'busy' },
+    })
+
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'nope',
+      timeoutMs: 5_000,
+    })) as { status: string; error?: { reason?: string } }
+
+    // No run exists, so there is nothing to wait for: the receipt IS the answer.
+    expect(result.status).toBe('rejected')
+    expect(result.error?.reason).toBe('CONFLICT')
+  })
+})

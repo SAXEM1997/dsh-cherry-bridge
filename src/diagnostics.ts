@@ -285,8 +285,18 @@ export function truncateErrorMessage(message: string): string {
   return `${message.slice(0, ERROR_MESSAGE_MAX - ERROR_MESSAGE_ELLIPSIS.length)}${ERROR_MESSAGE_ELLIPSIS}`
 }
 
-/** The 12-hex digest that stands in for a raw pinned identity. */
+/**
+ * The 12-hex digest that stands in for a raw pinned identity, or `'unknown'`
+ * when there is no identity to stand in for.
+ *
+ * The empty guard is not cosmetic: sha256('') is a FIXED, perfectly
+ * well-formed 12-hex string, so digesting an absent identity would publish
+ * something an operator reads as a real (if unusual) pin — and every
+ * identity-less device in the report would share it. `'unknown'` is outside
+ * the digest's own shape, so it cannot be mistaken for one.
+ */
 export function digestIdentity(identity: string): string {
+  if (identity === '') return 'unknown'
   return createHash('sha256').update(identity).digest('hex').slice(0, 12)
 }
 
@@ -339,10 +349,12 @@ function projectDevice(raw: unknown): DiagnosticsDevice {
     enabled: value['enabled'] === true,
     hosts: Array.isArray(value['hosts']) ? value['hosts'].map((host) => String(host)) : [],
     port: typeof value['port'] === 'number' ? value['port'] : 0,
-    // Either an already-digested value (12 hex) or a raw pin to be digested.
-    desktopIdentity: /^[0-9a-f]{12}$/.test(desktopIdentity)
-      ? desktopIdentity
-      : digestIdentity(desktopIdentity),
+    // Either an already-digested value (12 hex) or an explicit `unknown`, or a
+    // raw pin still to be digested.
+    desktopIdentity:
+      desktopIdentity === 'unknown' || /^[0-9a-f]{12}$/.test(desktopIdentity)
+        ? desktopIdentity
+        : digestIdentity(desktopIdentity),
     ...projectLimits(value['limits']),
   }
 }
