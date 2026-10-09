@@ -147,44 +147,75 @@ describe('SessionSubscriptions over a real loopback channel', () => {
 
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e2' } })
-    // Wait for BOTH notifications to land in the session buffer.
+    // Wait for BOTH notifications to land in the session buffer. The window
+    // start is seq 0 (the checkpoint descriptor's cursor), which is NOT
+    // servable, so the window is probed from seq 1.
     await waitFor(() => {
-      const read = rig.subs.read('s1', cursor('s1', 0))
+      const read = rig.subs.read('s1', cursor('s1', 1))
+      return 'events' in read && read.events.length === 1
+    }, 3_000, 'both events cached')
+
+    // A cursor strictly after the window start serves everything newer.
+    const first = rig.subs.read('s1', cursor('s1', 1))
+    expect('events' in first).toBe(true)
+    if (!('events' in first)) throw new Error('expected events')
+    expect(first.events.map((event) => event.kind)).toEqual(['execution.updated'])
+    expect(first.nextCursor.seq).toBe('2')
+
+    // A read with NO cursor returns the whole retained buffer.
+    const all = rig.subs.read('s1')
+    if (!('events' in all)) throw new Error('expected events')
+    expect(all.events).toHaveLength(2)
+    expect(all.nextCursor.seq).toBe('2')
+  })
+
+  it('② reports cursor-out-of-window BEFORE the window and AT the window start, but serves cursors strictly after it', async () => {
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+    // The subscribe answer is a checkpoint descriptor at seq 0, so this
+    // session's window start is 0 and the servable range is strictly after it.
+    expect(rig.fake.subscribeCalls[0]!.mode).toBe('checkpoint')
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e2' } })
+    await waitFor(() => {
+      const read = rig.subs.read('s1')
       return 'events' in read && read.events.length === 2
     }, 3_000, 'both events cached')
 
-    // Full read from the window start returns both events with a nextCursor.
-    const first = rig.subs.read('s1', cursor('s1', 0))
-    expect('events' in first).toBe(true)
-    if (!('events' in first)) throw new Error('expected events')
-    expect(first.events.map((event) => event.kind)).toEqual(['execution.updated', 'execution.updated'])
-    expect(first.nextCursor.seq).toBe('2')
+    // Face 1 — strictly BEFORE the window start: out of window.
+    expect(rig.subs.read('s1', cursor('s1', -1))).toEqual({ error: 'cursor-out-of-window' })
 
-    // A read from an EARLIER cursor returns the same full window (incremental
-    // semantics: everything after the cursor that is still cached).
-    const fromOne = rig.subs.read('s1', cursor('s1', 1))
-    if (!('events' in fromOne)) throw new Error('expected events')
-    expect(fromOne.events).toHaveLength(1)
-    expect(fromOne.nextCursor.seq).toBe('2')
+    // Face 2 — AT the window start: ALSO out of window (brief 「含窗口起点」).
+    // The servable replay range is strictly AFTER windowStart.
+    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+
+    // Face 3 — strictly AFTER the window start: servable, and returns exactly
+    // the events newer than the requested cursor.
+    const afterStart = rig.subs.read('s1', cursor('s1', 1))
+    if (!('events' in afterStart)) throw new Error('expected events')
+    expect(afterStart.events).toHaveLength(1)
+    expect((afterStart.events[0]!.payload as unknown as { executionId: string }).executionId).toBe('e2')
+    expect(afterStart.nextCursor.seq).toBe('2')
   })
 
-  it('② reports cursor-out-of-window for a cursor before the window AND at the window start', async () => {
+  it('②b reports cursor-out-of-window when the layer holds no provable continuity', async () => {
     const rig = await makeRig()
     await rig.subs.ensure('s1')
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await waitFor(() => {
-      const read = rig.subs.read('s1', cursor('s1', 0))
-      return 'events' in read && read.events.length === 1
+      const read = rig.subs.read('s1', cursor('s1', 1))
+      return 'events' in read && read.events.length === 0
     }, 3_000, 'first event cached')
 
-    // The window start is the oldest CACHED cursor being the first event's seq.
-    // A cursor strictly OLDER than the window is out of window.
-    expect(rig.subs.read('s1', cursor('s1', -1))).toEqual({ error: 'cursor-out-of-window' })
-    // And — per the brief's explicit 「含窗口起点」 — so is the window start
-    // when the layer has not retained it (epoch change / evicted prefix).
+    // A peer reset drops the subscription locally (and, per the peer's own
+    // `reset`, the whole replayable suffix with it). The re-subscribe lands in
+    // checkpoint mode at a NEW baseline, so a cursor from the PREVIOUS
+    // subscription can no longer be proven continuous and is out of window.
     rig.fake.pushResetRequired('s1')
+    await waitFor(() => rig.fake.subscriptions.length === 0, 3_000, 'peer-side reset')
     await rig.subs.ensure('s1')
-    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+    await waitFor(() => rig.subs.activeSessions().includes('s1'), 3_000, 're-subscribed')
+    expect(rig.subs.read('s1', cursor('s1', 1))).toEqual({ error: 'cursor-out-of-window' })
   })
 
   it('③ evicts the oldest session on the 9th subscription, closes it, and warns', async () => {
@@ -494,7 +525,7 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     await rig.subs.ensure('s1')
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await waitFor(() => {
-      const read = rig.subs.read('s1', cursor('s1', 0))
+      const read = rig.subs.read('s1')
       return 'events' in read && read.events.length === 1
     }, 3_000, 'event cached')
 
@@ -541,7 +572,7 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     await rig.subs.ensure('s1')
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await waitFor(() => {
-      const read = rig.subs.read('s1', cursor('s1', 0))
+      const read = rig.subs.read('s1')
       return 'events' in read && read.events.length === 1
     }, 3_000, 'event cached')
 

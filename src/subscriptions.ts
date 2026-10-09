@@ -27,9 +27,12 @@ const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 /** The peer's prepared-lease window, used to bound recovery-chain retries. */
 const DEFAULT_CHECKPOINT_MS = 300_000
 /**
- * How many full recovery chains one `ensure` may run. Each retry is a FRESH
- * subscribe + pagination + activate (a stale lease or stale pages are never
- * reused), so this only bounds pathological peer churn.
+ * LOCAL POLICY CONSTANT (the protocol specifies no such bound; accepted by the
+ * controller as a defensive limit). How many full recovery chains one `ensure`
+ * may run. Each retry is a FRESH subscribe + pagination + activate (a stale
+ * lease or stale pages are never reused), so this only bounds pathological peer
+ * churn — a peer that expires every lease surfaces its last error rather than
+ * looping forever. Not injectable: it is a safety bound, not a tuning knob.
  */
 const MAX_RECOVERY_ATTEMPTS = 4
 
@@ -206,12 +209,14 @@ export class SessionSubscriptions {
   /**
    * Reads buffered events newer than `fromCursor`.
    *
-   * Returns `{ error: 'cursor-out-of-window' }` when the requested cursor is
-   * older than the session's retention window start — the oldest position this
-   * layer can prove continuity from. That window start IS servable (a caller
-   * parked exactly on it gets everything newer); anything BEFORE it is not,
-   * because the events that would fill the gap are gone (spec §3.6). So a
-   * cursor AT the window start's predecessor is out of window.
+   * Returns `{ error: 'cursor-out-of-window' }` when the requested cursor is at
+   * or before the session's retention window start. The servable replay range
+   * is **strictly after** the window start (controller ruling; brief ②'s
+   * 「含窗口起点」): a caller parked exactly ON the window start is refused,
+   * because the window cannot prove what happened at that position — the layer
+   * only knows the position itself, not the event that produced it. Anything
+   * before the window start is refused for the same reason (spec §3.6), so the
+   * caller is told to rebuild a baseline rather than trust a partial window.
    */
   read(sessionId: string, fromCursor?: AgentCursor): ReadResult {
     const state = this.#sessions.get(sessionId)
@@ -224,8 +229,8 @@ export class SessionSubscriptions {
       const requested = Number(fromCursor.seq)
       // The window start is the oldest provable position: the subscription's
       // baseline while nothing has been dropped, advanced only when the cache
-      // evicts old events. It is servable; anything before it is not.
-      if (!Number.isFinite(requested) || requested < state.windowStart) {
+      // evicts old events. It is NOT servable — the range is strictly after it.
+      if (!Number.isFinite(requested) || requested <= state.windowStart) {
         return { error: 'cursor-out-of-window' }
       }
       const threshold = requested
