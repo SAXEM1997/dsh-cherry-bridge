@@ -39,9 +39,9 @@
 
 ### 2. `approval-card-not-realtime` — Approval cards are not delivered in real time by the real stream
 
-**真实对端行为**：审批/提问卡被**持久化**，通过 `agent.interactions.list` 读回；
-**不保证**以实时事件形式推送到 `agent.events` 流。因此 list 查询才是权威来源，
-流内事件只是加分项。
+**真实对端行为**：审批/提问卡被**持久化**，`agent.interactions.list` 是应答资格快照的
+**权威来源**；实时 `interaction.updated` 流是**加速器/保鲜器**——它让插件不必为每张卡都
+回查一次，但**不保证**送达，也不构成资格依据。任何一张卡都必须仅凭 list 快照可应答。
 
 **手动核验步骤**（与 `CONTRACT_DIFFERENCES[1].checklistStep` 同源）：
 
@@ -133,7 +133,7 @@ schema 已允许 `interrupted`，所以客户端**必须**处理，但当前服�
 ### C. 交互应答
 
 - [ ] 触发需审批/提问的工具调用，`cherry_wait` 在软终态提前返回并标注交互 kind。
-- [ ] `cherry_interactions` 列出待答项（已答项被客户端过滤掉）。
+- [ ] `cherry_interactions` 列出待答项（已答项被客户端过滤掉）；**资格以 `agent.interactions.list` 为准**——即使一张 `interaction.updated` 都没收到，列出的卡仍可 `cherry_respond` 成功（实时流只是加速器，不是资格依据）。
 - [ ] 批准（approve）→ 回执 `applied`，随后 `cherry_wait` 恢复等待到真实终态。
 - [ ] 提问卡缺键回答 → 回执 `rejected` + `CONFLICT`，**无部分提交**；对提问卡 approve → `CONFLICT`（"Question requires answers"）。
 - [ ] 拒绝（deny）→ 回执 `applied`，运行以 `cancelled` 收束。

@@ -113,13 +113,18 @@ export function resolveBridgeConfig(config: CherryBridgeConfig = {}): ResolvedBr
  * A configured positive number, or the fallback when absent/unusable.
  *
  * An ABSENT key is the documented default and says nothing; a key that is
- * PRESENT but unusable (`0`, `-1`, `NaN`, a string from a hand-edited config) is
- * a deployment mistake that silently changes behaviour, so it is warned about
- * by name rather than swallowed — the caller gets the fallback they would have
- * got anyway, plus the reason it was not their value.
+ * PRESENT but unusable (`null`, `0`, `-1`, `NaN`, a string from a hand-edited
+ * config) is a deployment mistake that silently changes behaviour, so it is
+ * warned about by name rather than swallowed — the caller gets the fallback they
+ * would have got anyway, plus the reason it was not their value.
+ *
+ * `null` is warned about rather than treated as absent, and that is a
+ * correction, not pedantry: a YAML key written as `rateBudgetPerSecond:` parses
+ * to `null`, and the operator who wrote that line believes they configured
+ * something. Only `undefined` — the key genuinely not being there — is silent.
  */
 function positive(key: string, value: unknown, fallback: number): number {
-  if (value === undefined || value === null) return fallback
+  if (value === undefined) return fallback
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     console.warn(
       `[cherry-remote] config "${key}" must be a positive number (got ${JSON.stringify(value)}); ` +
@@ -295,6 +300,10 @@ function connectionFor(deviceId: string): DeviceConnection {
   })
   state.connectionsBuilt += 1
   connection.onState((deviceState: DeviceState) => {
+    // INFO-LEVEL STATE TRANSITIONS (spec §5): an operator watching a link flapping
+    // needs the migration trail, and the ids are already whitelisted. No payload,
+    // no token — just who went where.
+    console.info(`[cherry-remote] device ${deviceId} state -> ${deviceState}`)
     // The event source (ruling 9): every transition reaches the SSE fan-out.
     publishDeviceState({ deviceId, state: deviceState })
     // Diagnostics (§5 「最近错误摘要」): landing in `offline` after having been up
@@ -441,6 +450,13 @@ function subsFor(deviceId: string): SessionSubscriptions {
     perSessionCacheBytes: state.perSessionCacheBytes,
   })
   state.subscriptions.set(deviceId, created)
+  // INFO (spec §5 「订阅建立」): the layer is announced with the cap it was
+  // actually built against — the peer-negotiated one, which is the number an
+  // operator needs when the peer starts refusing subscribes.
+  console.info(
+    `[cherry-remote] subscription layer established for ${deviceId} ` +
+      `(peer limit ${connection.limits.subscriptions})`,
+  )
   return created
 }
 
@@ -461,7 +477,17 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
   const subscriptions = state.subscriptions.get(deviceId)
   if (subscriptions === undefined) return
 
-  for (const sessionId of subscriptions.activeSessions()) {
+  const sessions = subscriptions.activeSessions()
+  // INFO (spec §5 「订阅建立与恢复」): the recovery line announces what it is
+  // about to re-ensure, once per link recovery rather than once per session.
+  // Ids only — a session id is whitelisted, an event payload is not.
+  if (sessions.length > 0) {
+    console.info(
+      `[cherry-remote] recovering ${sessions.length} subscription(s) for ${deviceId}: ${sessions.join(', ')}`,
+    )
+  }
+
+  for (const sessionId of sessions) {
     // The READ is inside the isolation too: it consults the layer's own state,
     // so a layer that throws here (a disposed or half-rebuilt one) must cost
     // only THIS session, not every session after it in the loop.
@@ -469,6 +495,10 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
       const result = subscriptions.read(sessionId)
       const cursor = 'events' in result ? result.nextCursor : undefined
       await subscriptions.ensure(sessionId, cursor)
+      console.info(
+        `[cherry-remote] subscription recovered for ${deviceId} session ${sessionId}` +
+          (cursor === undefined ? '' : ` at seq ${cursor.seq}`),
+      )
     } catch (error) {
       console.warn(`[cherry-remote] re-subscribing session ${sessionId} of ${deviceId} failed`, error)
     }
@@ -483,6 +513,19 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
 function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
   return {
     store: state.store,
+    /**
+     * The pairing seam, shared by `cherry_pair` and `POST /pair`.
+     *
+     * The HTTP face's `pair` signature is `PairWithPayloadOptions` — it names
+     * `identity` and `store` because that is what `pairWithPayload` takes — but
+     * THIS closure deliberately ignores both request fields and supplies the
+     * assembly's own state instead. That is the whole point of the seam: the
+     * local Ed25519 key and the device archive belong to the assembly, not to
+     * whoever invoked pairing, so a caller cannot pair with a different key or
+     * land the record in a different store. The fields are accepted (the type
+     * is the shared one) and overridden here, in one visible place, rather
+     * than being silently passed through.
+     */
     pair: async (request) => {
       const record = await pairWithPayload({
         identity: requireIdentity(),
@@ -543,15 +586,41 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
         0,
       ),
     }),
+    // The REAL cursor, read from the subscription layer's own state via its
+    // `cursorOf` accessor. The claim the report makes is "this session is
+    // subscribed AT this position", so the field is emitted only when the layer
+    // actually has one — a session whose layer was just installed and has not
+    // consumed anything still reports its baseline, which IS its cursor. There
+    // is deliberately no `?? {seq:'0'}` fallback: inventing a position would
+    // make the report read as a resume point that no layer ever held.
     diagnosticsSessions: () =>
       [...state.subscriptions.entries()].flatMap(([deviceId, layer]) =>
-        layer.activeSessions().map((sessionId) => ({ deviceId, sessionId, subscriptions: 1 })),
+        layer.activeSessions().map((sessionId) => {
+          const cursor = layer.cursorOf(sessionId)
+          return { deviceId, sessionId, subscriptions: 1, ...(cursor === undefined ? {} : { cursor }) }
+        }),
       ),
     diagnosticsErrors: () => [...state.recentErrors],
     diagnosticsConfig: () => ({
       rateBudgetPerSecond: state.rateBudgetPerSecond,
       perSessionCacheBytes: state.perSessionCacheBytes,
     }),
+    // A quarantined archive reaches the diagnostics ring through here. Every
+    // persisting route (PATCH, DELETE, and pairing's final write) refuses with
+    // the same structured body, and each of them reports the failure once — so
+    // an operator reading `GET /diagnostics` sees `ARCHIVE_QUARANTINED` with
+    // the two paths to look at, rather than a report that looks healthy because
+    // the unreadable archive reads as EMPTY.
+    onArchiveQuarantined: (error) => {
+      noteError({
+        at: new Date().toISOString(),
+        reason: 'ARCHIVE_QUARANTINED',
+        message:
+          `device archive ${error.file} is unreadable; it was preserved as ` +
+          `${error.corruptPath ?? `${error.file}.corrupt`} and the archive is READ-ONLY until that ` +
+          'file is moved aside',
+      })
+    },
   }
 }
 

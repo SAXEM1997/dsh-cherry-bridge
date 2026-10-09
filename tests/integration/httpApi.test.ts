@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DeviceStore } from '../../src/deviceStore'
+import { DeviceStore, QuarantinedArchiveError } from '../../src/deviceStore'
 import type { DeviceRecord } from '../../src/deviceStore'
 import { PairingError } from '../../src/pairing'
 import type { PairWithPayloadOptions } from '../../src/pairing'
@@ -491,10 +491,11 @@ describe('① REST round-trip', () => {
     expect(json).not.toHaveProperty('verificationCode')
 
     await vi.waitFor(() => {
-      const frames = res.events<{ stage: string; detail?: string }>('pairing-progress')
-      expect(frames[0]).toEqual({ stage: 'verification-code', detail: '424242' })
+      const frames = res.events<{ stage: string; detail?: string; claimId?: string }>('pairing-progress')
+      // Every frame carries the run's own handle, the same one the 202 returned.
+      expect(frames[0]).toEqual({ stage: 'verification-code', detail: '424242', claimId: json.claimId })
       // The run's terminal state follows the code on the same channel.
-      expect(frames[frames.length - 1]).toEqual({ stage: 'approved' })
+      expect(frames[frames.length - 1]).toEqual({ stage: 'approved', claimId: json.claimId })
     })
   })
 
@@ -518,6 +519,77 @@ describe('① REST round-trip', () => {
     expect(pending[0]!.opts.onStatus).not.toBe(pending[1]!.opts.onStatus)
 
     for (const run of pending) run.release()
+  })
+
+  it('tags every pairing-progress frame with its own claimId, so two concurrent runs cannot cross-talk', async () => {
+    // The 202 already hands the browser a `claimId`; the frames must carry the
+    // SAME handle, or a tab that started run #2 cannot tell run #1's stages —
+    // and, worse, run #1's 6-digit CODE — from its own. Two tabs pairing two
+    // different desktops at once is the ordinary case this protects.
+    const pending: Array<{ opts: PairWithPayloadOptions; release: () => void }> = []
+    mount({
+      pair: (opts) =>
+        new Promise<DeviceRecord>((resolve) => {
+          pending.push({ opts, release: () => resolve(record()) })
+        }),
+    })
+
+    const res = new FakeResponse()
+    await ctx.server.dispatch(new FakeRequest(`${PREFIX}/events`, { host: HOST }), res)
+
+    const first = await call('/pair', { method: 'POST', body: JSON.stringify({ payload: '{"v":2}' }) })
+    const second = await call('/pair', { method: 'POST', body: JSON.stringify({ payload: '{"v":2}' }) })
+    expect(first.json.claimId).not.toBe(second.json.claimId)
+    expect(pending).toHaveLength(2)
+
+    // Each run advances its own stages and shows its own code.
+    pending[0]!.opts.onStatus?.('validate')
+    pending[1]!.opts.onStatus?.('validate')
+    pending[0]!.opts.onStatus?.('waiting')
+    pending[0]!.opts.onVerificationCode('111111')
+    pending[1]!.opts.onVerificationCode('222222')
+    pending[0]!.release()
+    pending[1]!.release()
+
+    await vi.waitFor(() => {
+      expect(res.events<{ stage: string }>('pairing-progress').length).toBeGreaterThanOrEqual(6)
+    })
+
+    const frames = res.events<{ stage: string; detail?: string; claimId?: string }>('pairing-progress')
+    // EVERY frame is attributable, and only to one of the two runs.
+    for (const frame of frames) {
+      expect([first.json.claimId, second.json.claimId]).toContain(frame.claimId)
+    }
+
+    // Filtering by the first run's handle yields exactly the FIRST run's story:
+    // its stages, its code, its terminal — and nothing from run #2.
+    const mine = frames.filter((frame) => frame.claimId === first.json.claimId)
+    expect(mine.map((frame) => frame.stage)).toEqual(['validate', 'waiting', 'verification-code', 'approved'])
+    expect(mine.find((frame) => frame.stage === 'verification-code')!.detail).toBe('111111')
+
+    const theirs = frames.filter((frame) => frame.claimId === second.json.claimId)
+    expect(theirs.map((frame) => frame.stage)).toEqual(['validate', 'verification-code', 'approved'])
+    expect(theirs.find((frame) => frame.stage === 'verification-code')!.detail).toBe('222222')
+  })
+
+  it('tags a FAILED pairing run with the same claimId its 202 returned', async () => {
+    mount({
+      pair: () => Promise.reject(new PairingError('unreachable', 'no candidate address could complete pairing')),
+    })
+
+    const res = new FakeResponse()
+    await ctx.server.dispatch(new FakeRequest(`${PREFIX}/events`, { host: HOST }), res)
+
+    const { json } = await call('/pair', { method: 'POST', body: JSON.stringify({ payload: '{"v":2}' }) })
+
+    await vi.waitFor(() => {
+      expect(res.events<{ stage: string }>('pairing-progress')).toHaveLength(1)
+    })
+    // The failure verdict is scoped to the run that produced it too — otherwise
+    // a second tab's wizard would settle on the first tab's failure.
+    const [frame] = res.events<{ stage: string; claimId?: string }>('pairing-progress')
+    expect(frame!.stage).toBe('unreachable')
+    expect(frame!.claimId).toBe(json.claimId)
   })
 
   it('POST /pair rejects a malformed request body with a structured 400 before pairing starts', async () => {
@@ -868,6 +940,135 @@ describe('⑤ disable/enable flow', () => {
 })
 
 // ---------------------------------------------------------------------------
+// ⑦ GET /diagnostics: NEVER dials, reports only what a live connection knows
+// ---------------------------------------------------------------------------
+
+describe('⑦ diagnostics is a read, not a dial', () => {
+  /** A pool with the two seams the assembly exposes: `detach` looks up ONLY. */
+  function pool() {
+    const connections = new Map<
+      string,
+      ReturnType<typeof fakeConnection> & { limits?: { heartbeatMs: number; subscriptions: number; pageItems: number; inFlightRequests: number } }
+    >()
+    const dialed: string[] = []
+    const lookedUp: string[] = []
+    return {
+      connections,
+      dialed,
+      lookedUp,
+      deps: {
+        // The create-on-miss seam. Diagnostics must NEVER reach it.
+        connect: (deviceId: string) => {
+          dialed.push(deviceId)
+          const existing = connections.get(deviceId)
+          if (existing !== undefined) return existing as never
+          const created = fakeConnection('offline')
+          connections.set(deviceId, created)
+          return created as never
+        },
+        // The resolve-existing seam: a pure lookup, no construction.
+        detach: (deviceId: string) => {
+          lookedUp.push(deviceId)
+          return connections.get(deviceId) as never
+        },
+      },
+    }
+  }
+
+  it('reports NO limits for a device with no live connection and creates zero sockets', async () => {
+    const rig = pool()
+    // The record exists in the archive, but the pool is EMPTY: this device has
+    // never been reached by any other route.
+    mount(rig.deps)
+
+    const { status, json } = await call('/diagnostics')
+
+    expect(status).toBe(200)
+    expect(json.devices).toHaveLength(0)
+
+    store.upsert(record())
+    const second = await call('/diagnostics')
+    expect(second.status).toBe(200)
+    expect(second.json.devices).toHaveLength(1)
+    // The state comes from the store/enabled projection — honest "offline".
+    expect(second.json.devices[0]).toMatchObject({ deviceId: 'dev-1', state: 'offline', enabled: true })
+    // NO limits: there is no hello to have negotiated them, and fabricating the
+    // client's conservative fallbacks would report them as if they were agreed.
+    expect(second.json.devices[0]).not.toHaveProperty('limits')
+
+    // THE LOAD-BEARING ASSERTION: diagnostics never dialed. A create-on-miss
+    // seam here would have opened a socket to an offline device just because an
+    // operator asked for a health report.
+    expect(rig.dialed).toEqual([])
+    expect(rig.lookedUp).toEqual(['dev-1'])
+  })
+
+  it('reports the negotiated limits when a live connection exists, still without dialing', async () => {
+    const rig = pool()
+    const live = {
+      ...fakeConnection('connected'),
+      limits: { heartbeatMs: 15_000, subscriptions: 4, pageItems: 50, inFlightRequests: 3 },
+    }
+    rig.connections.set('dev-1', live)
+    mount(rig.deps)
+    store.upsert(record())
+
+    const { status, json } = await call('/diagnostics')
+
+    expect(status).toBe(200)
+    expect(json.devices[0]).toMatchObject({
+      deviceId: 'dev-1',
+      state: 'connected',
+      limits: { heartbeatMs: 15_000, subscriptions: 4, pageItems: 50, inFlightRequests: 3 },
+    })
+    // Still no dial: the live entry was RESOLVED, never built.
+    expect(rig.dialed).toEqual([])
+  })
+
+  it('a device that cannot be resolved at all is still reported as offline, never as a failure', async () => {
+    mount({
+      connect: () => {
+        throw new Error('the pool refuses to build this one')
+      },
+      detach: () => undefined,
+    })
+    store.upsert(record())
+
+    const { status, json } = await call('/diagnostics')
+    expect(status).toBe(200)
+    expect(json.devices[0]).toMatchObject({ deviceId: 'dev-1', state: 'offline' })
+    expect(json.devices[0]).not.toHaveProperty('limits')
+  })
+
+  it('reports a REAL cursor for a subscribed session, and none when the layer has not moved', async () => {
+    mount({
+      diagnosticsSessions: () => [
+        // The assembly's projection: the subscription layer's own state.
+        {
+          deviceId: 'dev-1',
+          sessionId: 's-cursor',
+          subscriptions: 1,
+          cursor: { sessionId: 's-cursor', streamEpoch: 'epoch-1', seq: '7' },
+        },
+        { deviceId: 'dev-1', sessionId: 's-fresh', subscriptions: 1 },
+      ],
+    })
+
+    const { status, json } = await call('/diagnostics')
+    expect(status).toBe(200)
+    const sessions = json.sessions as Array<{ sessionId: string; cursor?: { seq: string } }>
+    expect(sessions.find((entry) => entry.sessionId === 's-cursor')!.cursor).toEqual({
+      sessionId: 's-cursor',
+      streamEpoch: 'epoch-1',
+      seq: '7',
+    })
+    // A session with no reported cursor simply has no `cursor` field — the
+    // field is emitted when the layer HAS one, never invented as seq 0.
+    expect(sessions.find((entry) => entry.sessionId === 's-fresh')!).not.toHaveProperty('cursor')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // ⑥ registration/unregistration lifecycle (disposer)
 // ---------------------------------------------------------------------------
 
@@ -979,6 +1180,154 @@ describe('⑥ lifecycle', () => {
     expect([...pool.keys()]).toEqual([])
   })
 
+  it('R5b: DELETE evicts the connection BEFORE removing the archive entry', async () => {
+    // ORDER, not just occurrence. `cherry_unpair` documents this invariant and
+    // this route must match it: the other order leaves a window in which the
+    // record is gone but a socket still authenticated with the token it held is
+    // not. The window is invisible in the final state, so it is asserted by
+    // observing the archive AT THE MOMENT of eviction.
+    const observed: Array<{ when: string; devices: string[] }> = []
+    mount({
+      evict: () => {
+        observed.push({ when: 'evict', devices: store.list().map((entry) => entry.deviceId) })
+      },
+      detach: () => undefined,
+    })
+    store.upsert(record())
+
+    const { status } = await call('/devices/dev-1', { method: 'DELETE' })
+
+    expect(status).toBe(204)
+    // At eviction time the record was STILL in the archive: the socket is torn
+    // down first, and only then is the record (and its token) discarded.
+    expect(observed).toEqual([{ when: 'evict', devices: ['dev-1'] }])
+    expect(store.list()).toHaveLength(0)
+  })
+
+})
+
+// ---------------------------------------------------------------------------
+// ⑧ a QUARANTINED archive: every persisting route answers structurally
+// ---------------------------------------------------------------------------
+
+describe('⑧ quarantined archive', () => {
+  /**
+   * Builds a store over a deliberately unparsable archive, exactly as an
+   * operator's damaged `devices.json` would look. The FIRST read quarantines it
+   * (copying the bytes to `<file>.corrupt`) and poisons every later write.
+   */
+  function quarantinedStore(): { store: DeviceStore; file: string } {
+    const file = join(dataDir, 'devices.json')
+    writeFileSync(file, '{ this is not json', 'utf8')
+    const store = new DeviceStore(file)
+    // Prime the quarantine: `list` reads the archive and degrades to empty.
+    expect(store.list()).toEqual([])
+    return { store, file }
+  }
+
+  it('the REAL store really does quarantine and refuse to write (the premise)', () => {
+    // The premise the route mapping exists for, asserted on the real store: a
+    // damaged archive is preserved, served empty, and every write refuses —
+    // rather than being silently overwritten and losing every pairing.
+    const { store: poisoned, file } = quarantinedStore()
+
+    expect(existsSync(`${file}.corrupt`)).toBe(true)
+    expect(() => poisoned.upsert(record())).toThrow(QuarantinedArchiveError)
+  })
+
+  it('maps QuarantinedArchiveError to a structured 5xx naming the recovery, never a bare throw', async () => {
+    mount({
+      store: {
+        list: () => [record()],
+        resolve: () => record(),
+        remove: () => {
+          throw new QuarantinedArchiveError('/data/devices.json', new Error('bad json'), '/data/devices.json.corrupt')
+        },
+        upsert: () => {
+          throw new QuarantinedArchiveError('/data/devices.json', new Error('bad json'), '/data/devices.json.corrupt')
+        },
+      } as never,
+    })
+
+    // PATCH persists through `upsert`.
+    const patched = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ displayName: 'Renamed' }),
+    })
+    expect(patched.status).toBe(503)
+    expect(patched.json.error).toBe('archive-quarantined')
+    expect(patched.json.file).toBe('/data/devices.json')
+    expect(patched.json.corrupt).toBe('/data/devices.json.corrupt')
+    expect(patched.json.recovery).toMatch(/move it aside|restart/i)
+    expect(patched.json.message).toMatch(/READ-ONLY|unreadable/i)
+
+    // DELETE persists through `remove`.
+    const deleted = await call('/devices/dev-1', { method: 'DELETE' })
+    expect(deleted.status).toBe(503)
+    expect(deleted.json.error).toBe('archive-quarantined')
+  })
+
+  it('never leaks the raw error or a credential through the refusal', async () => {
+    mount({
+      store: {
+        list: () => [record()],
+        resolve: () => record(),
+        remove: () => {
+          throw new QuarantinedArchiveError('/data/devices.json', new Error('bad json'))
+        },
+        upsert: () => {
+          throw new QuarantinedArchiveError('/data/devices.json', new Error('bad json'))
+        },
+      } as never,
+    })
+
+    const { json, res } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ displayName: 'Renamed' }),
+    })
+    expect(json.error).toBe('archive-quarantined')
+    // The corrupt path falls back to `<file>.corrupt` when the copy failed, so
+    // the operator is never sent to a file that does not exist.
+    expect(json.corrupt).toBe('/data/devices.json.corrupt')
+    expect(res.body).not.toContain('super-secret-token')
+    expect(res.body).not.toContain('accessToken')
+  })
+
+  it('a pairing that cannot PERSIST its record ends on its own structured stage', async () => {
+    // Pairing's last step is the write. With a READ-ONLY archive the run fails
+    // there, after the peer has already approved — so the verdict has to reach
+    // the browser on the progress stream, and it must say what to do.
+    mount({
+      pair: async () => {
+        throw new QuarantinedArchiveError(
+          '/data/devices.json',
+          new Error('bad json'),
+          '/data/devices.json.corrupt',
+        )
+      },
+    })
+
+    const res = new FakeResponse()
+    await ctx.server.dispatch(new FakeRequest(`${PREFIX}/events`, { host: HOST }), res)
+
+    const { status, json } = await call('/pair', {
+      method: 'POST',
+      body: JSON.stringify({ payload: '{"v":2}' }),
+    })
+    expect(status).toBe(202)
+    expect(json.claimId).toBeDefined()
+
+    await vi.waitFor(() => {
+      expect(res.events<{ stage: string }>('pairing-progress')).toHaveLength(1)
+    })
+    const [frame] = res.events<{ stage: string; detail?: string; claimId?: string }>('pairing-progress')
+    expect(frame!.stage).toBe('archive-quarantined')
+    expect(frame!.claimId).toBe(json.claimId)
+    // Not the generic `pairing-failed`: the detail names the file to move.
+    expect(frame!.detail).toContain('/data/devices.json')
+    expect(frame!.detail).toContain('.corrupt')
+    expect(frame!.detail).toMatch(/move|aside/i)
+  })
 })
 
 // ---------------------------------------------------------------------------

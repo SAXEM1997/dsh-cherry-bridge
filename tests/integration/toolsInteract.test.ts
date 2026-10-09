@@ -31,6 +31,11 @@ import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from
 /** The protocol's own `text` ceiling, which `cherry_send` pre-validates. */
 const TEXT_LIMIT = 32_768
 
+/** A plain timer, used only to sequence an injection against a live run. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 // ---------------------------------------------------------------------------
 // Fake ctx.tools: a faithful stand-in for the host registry's `register`
 // ---------------------------------------------------------------------------
@@ -765,6 +770,44 @@ describe('interactive cherry tools over a real loopback channel', () => {
     )
     expect(error).toBeDefined()
     expect((error!.data as { reason?: string }).reason).toBe('IDEMPOTENCY_CONFLICT')
+    // The §6 HINT rides along on the message, so the caller is told the one
+    // thing that makes a retry work (a fresh id) instead of retrying the same
+    // body under the same id forever. The REASON and the structured data are
+    // untouched — only the prose grew.
+    expect(error!.message.toLowerCase()).toContain('regenerate the commandid')
+    expect(error!.message.toLowerCase()).toContain('never reuse')
+  })
+
+  it('⑪b the IDEMPOTENCY_CONFLICT hint never replaces the peer failure currency', async () => {
+    // The hint must not become a translation: a caller branching on
+    // `instanceof JsonRpcRequestError` and on `data.reason` must see exactly
+    // what the peer sent, for the hinted failure as much as any other.
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], terminalMessage: terminalMessage('ok') },
+    })
+
+    await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'first body',
+      commandId: 'cmd-currency',
+      wait: false,
+    })
+    const error = await rejectionOf(
+      rig.call('cherry_send', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        text: 'changed body',
+        commandId: 'cmd-currency',
+        wait: false,
+      }),
+    )
+
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error!.data as { reason?: string }).reason).toBe('IDEMPOTENCY_CONFLICT')
+    // The peer's own message survives as a PREFIX: the hint is appended, not
+    // substituted.
+    expect(error!.message).toMatch(/^Command body differs from the recorded command/)
   })
 
   // -------------------------------------------------------------------------
@@ -911,6 +954,98 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const terminal = rig.fake.executionUpdates.find((update) => update.status === 'interrupted')
     expect(terminal).toBeDefined()
     expect(terminal!.messageId).toBeDefined()
+  })
+
+  // -------------------------------------------------------------------------
+  // ⑯ a receipt with NO executionId: the waiter ADOPTS its run
+  // -------------------------------------------------------------------------
+
+  it('⑯ a send whose receipt carries no executionId still converges on ITS OWN terminal', async () => {
+    // `executionId` is SCHEMA-OPTIONAL on the receipt, so a peer may admit a
+    // command without naming the run. The waiter then has no id to attribute
+    // `execution.updated` events to — and a waiter that simply requires one
+    // parks until its timeout, reporting `timeout` for a run that finished.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        omitSendExecutionId: true,
+        // The terminal message MUST already be in the session history under the
+        // SAME id the terminal names: the run-scoped aggregate cuts at that id,
+        // so a mismatched fixture would report an empty text for reasons that
+        // have nothing to do with adoption.
+        terminalMessage: { ...terminalMessage('adopted run reply'), messageId: 'm-adopted' },
+        runMessageId: 'm-adopted',
+      },
+    })
+
+    const started = Date.now()
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'adopt my run',
+      // A long window: a waiter that never adopts parks here instead.
+      timeoutMs: 30_000,
+    })) as { status: string; executionId?: string; text?: string }
+    const elapsed = Date.now() - started
+
+    // The receipt really did omit the id, so the run had to be adopted.
+    const sent = rig.fake.commandCallsFor('agent.messages.send').at(-1)!
+    const receipt = rig.fake.receiptFor(String(sent['commandId']))!
+    expect(receipt['executionId']).toBeUndefined()
+
+    // The waiter converged on the ADOPTED run's terminal — not on a timeout and
+    // not on some other run's status.
+    expect(result.status).toBe('completed')
+    expect(elapsed).toBeLessThan(5_000)
+    const terminal = rig.fake.executionUpdates.at(-1)!
+    expect(terminal.status).toBe('completed')
+    expect(result.executionId).toBe(terminal.executionId)
+    // ...and the aggregate is the run's OWN message, proving the adopted id
+    // drove run-scoped text selection rather than a fallback.
+    expect(result.text).toBe('adopted run reply')
+  })
+
+  it('⑯b adoption is ONE-TIME: a later unrelated terminal does not steal the wait', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        omitSendExecutionId: true,
+        terminalMessage: terminalMessage('first run'),
+        runDelayMs: 250,
+      },
+    })
+
+    // Start the wait with no attributable id, then push an UNRELATED
+    // execution's terminal while the adopted run is still in flight. A waiter
+    // that re-adopts on every pass would report the intruder's status.
+    const pending = rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'adopt once',
+      timeoutMs: 30_000,
+    }) as Promise<{ status: string; executionId?: string }>
+
+    // Let the send's run start, then inject a competing terminal.
+    await sleep(80)
+    rig.fake.pushEvent('s-1', {
+      kind: 'execution.updated',
+      payload: {
+        executionId: 'exec-intruder',
+        status: 'failed',
+        messageId: 'm-intruder',
+        durable: true,
+        history: { messageRevision: '1', historyRevision: '1' },
+        error: { reason: 'INTERNAL', message: 'Intruder' },
+      },
+    })
+
+    const result = await pending
+    // The adopted run is the one this send started, and its terminal is the
+    // outcome — never the intruder's `failed`.
+    expect(result.status).toBe('completed')
+    expect(result.executionId).not.toBe('exec-intruder')
   })
 
   // -------------------------------------------------------------------------

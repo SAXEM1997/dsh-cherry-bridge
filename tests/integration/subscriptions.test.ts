@@ -167,6 +167,47 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     if (!('events' in all)) throw new Error('expected events')
     expect(all.events).toHaveLength(2)
     expect(all.nextCursor.seq).toBe('2')
+
+    // The layer reports what it did at INFO (spec §5). This session came up
+    // through the CHECKPOINT chain (the peer could not replay), so the recovery
+    // line is what appears — ids and positions only, never the subscriptionId
+    // or anything else the peer sent.
+    const info = consoleInfo.mock.calls.flat().map(String).join('\n')
+    expect(info).toContain('subscription recovered')
+    expect(info).toContain('s1')
+    expect(info).not.toContain(rig.fake.subscribeCalls[0]!.subscriptionId)
+  })
+
+  it('①c the windowStart/cursorOf accessors agree with what read() enforces', async () => {
+    // The two accessors replaced outside-in reconstruction: `cursorOf` is the
+    // resume point, `windowStart` is the retention boundary. They must agree
+    // with the verdict `read` actually returns, or a caller that trusts them
+    // would be sent to a cursor the layer then refuses.
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+
+    // Established at the checkpoint baseline (seq 0), before anything arrives.
+    expect(rig.subs.windowStart('s1')).toEqual(cursor('s1', 0))
+    expect(rig.subs.cursorOf('s1')).toEqual(cursor('s1', 0))
+    // Nothing is servable yet, so the boundary itself is refused — exactly what
+    // `windowStart` names.
+    expect(rig.subs.read('s1', rig.subs.windowStart('s1')!)).toEqual({ error: 'cursor-out-of-window' })
+
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
+    await waitFor(() => {
+      const read = rig.subs.read('s1')
+      return 'events' in read && read.events.length === 1
+    }, 3_000, 'the event cached')
+
+    // The cursor advanced; the window start did NOT (nothing was evicted).
+    expect(rig.subs.cursorOf('s1')).toEqual(cursor('s1', 1))
+    expect(rig.subs.windowStart('s1')).toEqual(cursor('s1', 0))
+    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+    expect('events' in rig.subs.read('s1', cursor('s1', 1))).toBe(true)
+
+    // An untracked session reports NEITHER, rather than a fabricated seq 0.
+    expect(rig.subs.cursorOf('never-subscribed')).toBeUndefined()
+    expect(rig.subs.windowStart('never-subscribed')).toBeUndefined()
   })
 
   it('② reports cursor-out-of-window BEFORE the window and AT the window start, but serves cursors strictly after it', async () => {
@@ -618,5 +659,67 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await parked
     expect(woken).toBe(true)
+  })
+
+  it('⑰ ignores a replayed LOWER seq per (sessionId, streamEpoch): the cursor never regresses and no waiter is woken', async () => {
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+
+    // Two in-order events establish the cursor at seq 2.
+    const first = rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
+    const second = rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e2' } })
+    expect(first.seq).toBe('1')
+    expect(second.seq).toBe('2')
+    await waitFor(() => {
+      const read = rig.subs.read('s1')
+      return 'events' in read && read.events.length === 2
+    }, 3_000, 'both events cached')
+    const before = rig.subs.read('s1')
+    if (!('events' in before)) throw new Error('expected events')
+    expect(before.nextCursor.seq).toBe('2')
+
+    // Park a waiter at the CURRENT position: a lower seq is not progress, so it
+    // must not settle — settling would tell the caller "something new arrived".
+    let woken = false
+    void rig.subs.waitFor('s1', cursor('s1', 2)).then(() => {
+      woken = true
+    })
+    await sleep(30)
+    expect(woken).toBe(false)
+
+    consoleWarn.mockClear()
+    // The peer re-delivers seq 1 (duplicate / out-of-order on a healthy stream).
+    rig.fake.replayEvent('s1', 1, { kind: 'execution.updated', payload: { executionId: 'e1-replayed' } })
+    await waitFor(
+      () => consoleWarn.mock.calls.flat().map(String).some((message) => /seq/i.test(message)),
+      3_000,
+      'the out-of-order warning',
+    )
+
+    // The replay is REFUSED, and it says so (never silently ignored).
+    const warnings = consoleWarn.mock.calls.flat().map(String)
+    expect(warnings.some((message) => /seq/i.test(message))).toBe(true)
+
+    // The cursor did not regress, and the stale event did not enter the buffer.
+    const after = rig.subs.read('s1')
+    if (!('events' in after)) throw new Error('expected events')
+    expect(after.nextCursor.seq).toBe('2')
+    expect(after.events).toHaveLength(2)
+    expect(
+      after.events.some(
+        (event) => (event.payload as unknown as { executionId?: string }).executionId === 'e1-replayed',
+      ),
+    ).toBe(false)
+
+    // ...and the parked waiter was left parked: a stale seq is not a wake.
+    await sleep(30)
+    expect(woken).toBe(false)
+
+    // A genuinely NEWER seq still wakes it, so the guard did not wedge the wait.
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e3' } })
+    await waitFor(() => woken, 3_000, 'the real wake after the stale replay')
+    const newest = rig.subs.read('s1')
+    if (!('events' in newest)) throw new Error('expected events')
+    expect(newest.nextCursor.seq).toBe('3')
   })
 })

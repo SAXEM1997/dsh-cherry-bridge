@@ -48,6 +48,7 @@ export function PairingWizard({
   const [busy, setBusy] = useState(false)
 
   const stage = progress?.stage
+  const frameClaimId = progress?.claimId
 
   useEffect(() => {
     // `progress` is reset by the app on `onSettled`, and a fresh run must never
@@ -56,6 +57,16 @@ export function PairingWizard({
       setCode(undefined)
       return
     }
+    // CLAIM SCOPING. The SSE stream is SHARED by every tab and every pairing
+    // run, so a frame belongs to this wizard only when its `claimId` is the one
+    // POST /pair returned to THIS wizard. Two tabs pairing two desktops at once
+    // is the ordinary case: without this filter the second tab would display
+    // the first tab's 6-digit code and settle on the first tab's verdict.
+    //
+    // A frame with NO claimId is one this add-on cannot prove is ours (a
+    // producer outside the pairing route), so it is ignored rather than
+    // trusted — the wizard only ever acts on frames it can attribute.
+    if (claimId === undefined || frameClaimId !== claimId) return
     if (stage === VERIFICATION_CODE_STAGE) {
       setCode(progress?.detail)
       return
@@ -67,7 +78,7 @@ export function PairingWizard({
       setBusy(false)
       onSettled?.()
     }
-  }, [stage, progress?.detail, onSettled])
+  }, [stage, frameClaimId, progress?.detail, claimId, onSettled])
 
   useEffect(() => {
     if (code === undefined) return undefined

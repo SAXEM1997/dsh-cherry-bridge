@@ -149,6 +149,18 @@ export interface CherryReadPart {
   revision: string
   /** The fully aggregated text (a `{ref}` part resolved and verified). */
   content: string
+  /**
+   * Present when this part's text could NOT be read: the peer refused the
+   * content read, or it could not be completed. `content` is then empty and
+   * this field carries the reason, so a caller can tell "there was no text"
+   * from "the text was there but unreadable" — a distinction the rest of the
+   * snapshot would otherwise hide. Absent means the text was read.
+   *
+   * An INTEGRITY failure (the bytes do not match the ref's digest) never
+   * degrades to this: it fails the whole read instead, because unverified
+   * content must not be presented as a partial success.
+   */
+  unavailable?: string
   state?: string
   toolName?: string
   toolCallId?: string
@@ -405,6 +417,72 @@ function failureReason(error: unknown): string | undefined {
   return undefined
 }
 
+/**
+ * One `{ref}`'s content could not be TRUSTED: the bytes served do not match the
+ * digest the ref advertises (or there was no digest to check against).
+ *
+ * A class rather than a message, because the callers act on the difference: a
+ * single unreadable part degrades to `unavailable` (see
+ * {@link CherryToolEngine} `#projectPart`), while an integrity failure must
+ * fail the WHOLE read — content that cannot be verified must never be reported
+ * as though it were complete. Matching on message text would break silently the
+ * first time the wording changed.
+ */
+class ContentIntegrityError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ContentIntegrityError'
+  }
+}
+
+/**
+ * Why one part's text is missing, as the `unavailable` field reports it.
+ *
+ * The peer's own reason is preferred (`NOT_FOUND`, `RESOURCE_EXHAUSTED`, ...)
+ * because it is the actionable half; an error with no protocol reason falls
+ * back to its message. Bounded so a peer-echoed string cannot inflate a tool
+ * result.
+ */
+function unavailableReason(error: unknown): string {
+  const reason = failureReason(error)
+  if (reason !== undefined) return reason
+  const message = error instanceof Error ? error.message : String(error)
+  return message.slice(0, 200)
+}
+
+/**
+ * The §6 recovery advice appended to the peer's `IDEMPOTENCY_CONFLICT`.
+ *
+ * The peer refused a `commandId` that is already in its ledger under a
+ * DIFFERENT body. That is not a transient failure and must never be retried
+ * as-is: the id is the identity of the command, so re-sending the changed body
+ * under it will be refused forever. The recovery is to REGENERATE the id for
+ * the new body (or re-send the ORIGINAL body to replay the original outcome).
+ */
+const IDEMPOTENCY_HINT =
+  'the peer already recorded this commandId with a different body; regenerate the commandId for ' +
+  'a retry whose parameters changed — never reuse an id with a different body (re-send the ' +
+  'ORIGINAL body to replay the original receipt).'
+
+/**
+ * Passes a command failure through UNCHANGED, except that `IDEMPOTENCY_CONFLICT`
+ * gets {@link IDEMPOTENCY_HINT} appended to its message.
+ *
+ * The error object itself is NOT replaced: the reason, the structured `data`
+ * and the {@link JsonRpcRequestError} identity all survive, so a caller that
+ * branches on the reason (and the existing suites that assert it) see exactly
+ * what the peer sent. Only `message` — the human-readable half — is extended.
+ * Mutating in place is deliberate: a re-wrap would cost the prototype and with
+ * it every `instanceof` check downstream.
+ */
+function withIdempotencyHint(error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  if (failureReason(error) !== 'IDEMPOTENCY_CONFLICT') return error
+  if (error.message.includes(IDEMPOTENCY_HINT)) return error
+  error.message = `${error.message} — ${IDEMPOTENCY_HINT}`
+  return error
+}
+
 function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
@@ -509,24 +587,39 @@ class CherryToolEngine {
   /** Poll cadence for the interactive waiters (see `DEFAULT_WAIT_POLL_MS`). */
   readonly #waitPollMs: number
   /**
-   * The subscription cache's latest IDLE revision per session — the source of
-   * `agent.messages.send`'s `expectedIdleRevision` (spec §4.2). A cold cache is
-   * baselined from `agent.sessions.get`, so the value sent is always one the
-   * peer itself reported.
+   * The subscription cache's latest IDLE revision per `<deviceId>\0<sessionId>`
+   * — the source of `agent.messages.send`'s `expectedIdleRevision` (spec §4.2).
+   * A cold cache is baselined from `agent.sessions.get`, so the value sent is
+   * always one the peer itself reported.
+   *
+   * The DEVICE component is load-bearing: this engine is one instance shared by
+   * every device in the pool, while a session id belongs to a peer. See
+   * {@link CherryToolEngine.#cacheKey}.
    */
   readonly #revisionCache = new Map<string, string>()
   /**
-   * The subscription cache's current ACTIVE execution per session — ONE source
-   * shared by `cherry_cancel`'s `expectedExecutionId` and `cherry_respond`'s
-   * staleness triple, so the two can never disagree about what is running.
+   * The subscription cache's current ACTIVE execution per `<deviceId>\0
+   * <sessionId>` — ONE source shared by `cherry_cancel`'s `expectedExecutionId`
+   * and `cherry_respond`'s staleness triple, so the two can never disagree
+   * about what is running. Device-scoped for the same reason as
+   * {@link CherryToolEngine.#revisionCache}: execution ids are the peer's, and
+   * a bare-sessionId key would let one desktop name another's run.
    */
   readonly #executionCache = new Map<string, string>()
   /**
-   * The subscription cache's interaction snapshots, keyed `<sessionId>
+   * The subscription cache's interaction snapshots, keyed `<deviceId>\0<sessionId>\0
    * <interactionId>`: the `expectedRevision`/`expectedExecutionId`/
-   * `inputDigest` triple `cherry_respond` sends. Fed by the real-time
-   * `interaction.updated` stream, and — for a card the peer persisted only
-   * after the turn ended — by an `agent.interactions.list` query.
+   * `inputDigest` triple `cherry_respond` sends.
+   *
+   * AUTHORITY (adjudicated): `agent.interactions.list` is the AUTHORITATIVE
+   * source for respond-eligibility snapshots — it is the peer's persisted,
+   * four-state view, and it is the path that makes a card the peer never
+   * streamed answerable at all. The real-time `interaction.updated` stream is
+   * an ACCELERATOR/FRESHENER: it refreshes this cache without a round trip, so
+   * the common case answers instantly, but nothing here may treat "not
+   * streamed" as "not answerable". {@link CherryToolEngine.#interactionSnapshot}
+   * implements exactly that order: fold the stream in first, then fall back to
+   * ONE list query.
    */
   readonly #interactionCache = new Map<
     string,
@@ -667,6 +760,13 @@ class CherryToolEngine {
       if (items.length >= ceiling) {
         // Which ceiling stopped it decides how the caller reads the result:
         // the caller's own limit, or the internal circuit-breaker.
+        //
+        // BOUNDARY (honest, not exact): `'limit'` is ALSO reported when the
+        // caller's limit lands exactly on the peer's last item — at that point
+        // the two cases are indistinguishable from here, because the walk
+        // stops before it ever learns whether a further page existed. The
+        // conservative reading is the right one for a caller: "there may be
+        // more" is safe to re-ask, whereas a false "complete" is not.
         return this.#truncated(items, aggregate <= bound ? 'limit' : 'safety-bound', cursor)
       }
       if (pages >= MAX_AGGREGATE_PAGES) {
@@ -1093,7 +1193,28 @@ class CherryToolEngine {
     if (typeof content['text'] === 'string') {
       text = content['text']
     } else if (isRecord(content['ref'])) {
-      text = await this.#readExternalized(connection, sessionId, content['ref'])
+      // PER-PART DEGRADATION (bounded failure). One `{ref}` the peer will not
+      // serve costs THIS part's text, not the whole snapshot: a read is a page
+      // of history, and a failed content pin (an expired lease, a transient
+      // fault) would otherwise make every other message in the same page
+      // unreachable. The part stays in the result with `unavailable` naming the
+      // fault, so the loss is VISIBLE rather than silent.
+      try {
+        text = await this.#readExternalized(connection, sessionId, content['ref'])
+      } catch (error) {
+        // An INTEGRITY failure is not degradable: see `#degradableReadFailure`.
+        if (!this.#degradableReadFailure(error)) throw error
+        return {
+          partId,
+          kind,
+          revision,
+          content: '',
+          unavailable: unavailableReason(error),
+          ...(typeof raw['state'] === 'string' ? { state: raw['state'] } : {}),
+          ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
+          ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
+        }
+      }
     } else {
       text = ''
     }
@@ -1107,6 +1228,33 @@ class CherryToolEngine {
       ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
       ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
     }
+  }
+
+  /**
+   * Whether one `{ref}` read failure may DEGRADE (the part is marked
+   * unavailable) rather than fail the whole `cherry_read`.
+   *
+   * The line is drawn at WHO COULD BE TRUSTED, not at how inconvenient the
+   * failure is:
+   *
+   *  - **Degradable** — the peer refused or could not complete the read: a
+   *    `NOT_FOUND` pin, a transient RPC failure, a non-advancing cursor. Nothing
+   *    was returned, so there is nothing to misreport; the honest report is
+   *    "this part's text could not be read", and the rest of the snapshot is
+   *    still exactly what the peer said it was.
+   *  - **NOT degradable — an INTEGRITY failure.** The peer DID answer and the
+   *    reassembled bytes do NOT match the digest the ref advertises. Those bytes
+   *    are provably not the content the ref describes, so degrading would hand
+   *    back a snapshot that looks complete while containing content the peer
+   *    never certified. That is worse than an error: the caller cannot tell it
+   *    apart from a good read. It keeps failing loudly.
+   *
+   * The discriminator is the DIGEST CHECK specifically, which is why
+   * {@link CherryToolEngine.#readExternalized} marks it: matching on message
+   * text would break the moment the wording changed.
+   */
+  #degradableReadFailure(error: unknown): boolean {
+    return !(error instanceof ContentIntegrityError)
   }
 
   /** Paginate `agent.content.read` over one `{ref}` and verify its sha256. */
@@ -1147,7 +1295,12 @@ class CherryToolEngine {
       }
       const next = slice['nextOffset']
       if (typeof next !== 'string' || next === offset) {
-        throw new Error(`agent.content.read for ${contentId} did not advance (offset ${offset})`)
+        // A walk that cannot progress leaves the content INCOMPLETE, and an
+        // incomplete content can never pass the digest check below — so this is
+        // the integrity class, not a degradable per-part miss.
+        throw new ContentIntegrityError(
+          `agent.content.read for ${contentId} did not advance (offset ${offset})`,
+        )
       }
       offset = next
     }
@@ -1155,7 +1308,11 @@ class CherryToolEngine {
     // certify it, so an incomplete walk is a hard failure rather than a
     // silently short read.
     if (!complete) {
-      throw new Error(
+      // Same class as the digest mismatch below, and for the same reason: the
+      // bytes on hand are not the whole content, so they cannot be certified.
+      // Returning them as a "partially available" part would be reporting
+      // unverified content as a partial success.
+      throw new ContentIntegrityError(
         `agent.content.read for ${contentId} did not reach eof within ${maxSlices} slice(s); refusing to aggregate a partial content`,
       )
     }
@@ -1163,11 +1320,16 @@ class CherryToolEngine {
     const bytes = Buffer.concat(chunks)
     const expected = sha ?? declaredSha
     if (expected === undefined) {
-      throw new Error(`agent.content.read for ${contentId} returned no sha256 to verify`)
+      // Not degradable either: nothing can verify these bytes, so reporting
+      // them as a partial part would be certifying the unverifiable.
+      throw new ContentIntegrityError(`agent.content.read for ${contentId} returned no sha256 to verify`)
     }
     const actual = createHash('sha256').update(bytes).digest('hex')
     if (actual !== expected) {
-      throw new Error(
+      // A DIGEST MISMATCH, marked as its own class: the caller must be able to
+      // tell "the peer would not serve this" (degradable, per-part) from "the
+      // peer served bytes that are not what it promised" (fatal for the read).
+      throw new ContentIntegrityError(
         `agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`,
       )
     }
@@ -1222,8 +1384,10 @@ class CherryToolEngine {
             message:
               `the requested cursor is at or before the cache window start for session ${sessionId}; ` +
               'use cherry_read to rebuild the baseline',
-            windowStart:
-              cursor === undefined ? null : this.#windowStart(subscriptions, sessionId, cursor),
+            // Reported even when the caller sent NO cursor: the verdict means
+            // the session's cache cannot serve a replay from a provable
+            // position, and the boundary is the actionable half of that answer.
+            windowStart: this.#windowStart(subscriptions, sessionId),
           } satisfies CherryCursorOutOfWindow
         }
 
@@ -1435,7 +1599,19 @@ class CherryToolEngine {
         // `expectedIdleRevision` comes from the CACHE's session snapshot. A cold
         // cache is baselined first (`sessions.get`), so the value is always the
         // peer's own current revision rather than a caller-supplied guess.
-        const expectedIdleRevision = await this.#idleRevision(connection, subscriptions, sessionId)
+        const expectedIdleRevision = await this.#idleRevision(connection, subscriptions, record.deviceId, sessionId)
+
+        // THE BASELINE IS TAKEN BEFORE THE COMMAND IS ISSUED, and that ordering
+        // is what makes a fast run observable at all. The waiter's baseline is
+        // the cut that decides which events belong to THIS run; taking it after
+        // the receipt would put a run that settled during the round trip on the
+        // wrong side of the cut, and the wait would then park out its whole
+        // window for a run that had already finished. (A peer with no
+        // `runDelayMs` really does settle that fast.)
+        //
+        // Nothing before this point can emit this run's events: the command has
+        // not been sent yet.
+        const baselineSeq = this.#newestSeq(subscriptions, sessionId)
 
         const receipt = await this.#command(connection, 'agent.messages.send', {
           commandId: this.#commandId(args),
@@ -1465,6 +1641,10 @@ class CherryToolEngine {
         return this.#awaitRun(connection, subscriptions, sessionId, {
           timeoutMs,
           startedAt: Date.now(),
+          // The cut taken BEFORE the send (see above). Passed explicitly so the
+          // waiter does not re-derive it from a buffer the fast run has already
+          // written into.
+          baselineSeq,
           executionId: typeof receipt['executionId'] === 'string' ? receipt['executionId'] : undefined,
           commandId: typeof receipt['commandId'] === 'string' ? receipt['commandId'] : undefined,
         })
@@ -1597,8 +1777,9 @@ class CherryToolEngine {
 
         // The REAL-TIME soft-terminal predicate reads this same view, so caching
         // it keeps a later `cherry_respond` from having to re-ask the peer.
-        const cache = this.#deps.subs(record.deviceId)
-        for (const item of page.items) this.#rememberInteraction(cache, sessionId, item)
+        // `agent.interactions.list` is the AUTHORITATIVE source (see the cache
+        // docblock): priming from it is what makes every listed card answerable.
+        for (const item of page.items) this.#rememberInteraction(record.deviceId, sessionId, item)
 
         return {
           items,
@@ -1721,7 +1902,13 @@ class CherryToolEngine {
         // cache has never seen this interaction — from a single
         // `agent.interactions.list` query. The CALLER never supplies these: it
         // cannot know what the plugin has actually observed.
-        const snapshot = await this.#interactionSnapshot(connection, subscriptions, sessionId, interactionId)
+        const snapshot = await this.#interactionSnapshot(
+          connection,
+          subscriptions,
+          record.deviceId,
+          sessionId,
+          interactionId,
+        )
         if (snapshot === undefined) {
           return {
             error: 'unknown-interaction',
@@ -1786,7 +1973,7 @@ class CherryToolEngine {
         // Same SOURCE as respond's triple: the cached execution snapshot. The
         // caller's own value is honoured only when it matches what the cache
         // holds, because a divergence means one of the two has gone stale.
-        const cached = await this.#activeExecutionId(connection, subscriptions, sessionId)
+        const cached = await this.#activeExecutionId(connection, subscriptions, record.deviceId, sessionId)
         const expectedExecutionId = cached
         if (expectedExecutionId === undefined) {
           return {
@@ -1944,6 +2131,15 @@ class CherryToolEngine {
         // socket — still authenticated with a token that is about to be
         // discarded — is not. Eviction resolves an EXISTING pooled connection
         // only, so an unpaired-but-never-dialed device is simply removed.
+        //
+        // THE ENGINE'S CACHES GO WITH IT, and they go FIRST for the same reason
+        // the socket does: everything cached under this deviceId describes a
+        // pairing that is about to stop existing. Leaving it behind would let a
+        // device paired afresh into the same slot inherit the previous
+        // pairing's idle revisions and execution ids, and would grow the maps
+        // for the lifetime of the process. The store record is untouched by
+        // this — the caches are pure derived state and can always be rebuilt.
+        this.#forgetDevice(record.deviceId)
         await this.#deps.evict(record.deviceId)
         this.#deps.store.remove(record.deviceId)
 
@@ -1968,13 +2164,24 @@ class CherryToolEngine {
    * `error`, which is a receipt field, not a thrown RPC error. Transport and
    * subscription failures still reject this call: the two surfaces stay
    * distinct all the way to the caller (spec §6).
+   *
+   * ONE exception, and it is a HINT rather than a translation: the peer's
+   * `IDEMPOTENCY_CONFLICT` — the same `commandId` re-used with a DIFFERENT body
+   * — carries the §6 recovery advice on the rethrown error (see
+   * {@link withIdempotencyHint}). The reason, the `data` and the failure
+   * currency are untouched; only the prose a caller reads grows the actionable
+   * half.
    */
   async #command(
     connection: DeviceConnection,
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    return (await connection.rpc.request(method, params)) as Record<string, unknown>
+    try {
+      return (await connection.rpc.request(method, params)) as Record<string, unknown>
+    } catch (error) {
+      throw withIdempotencyHint(error)
+    }
   }
 
   /**
@@ -1987,14 +2194,47 @@ class CherryToolEngine {
     return optionalString(args['commandId']) ?? randomUUID()
   }
 
-  /** The subscription cache key for one session's revision/execution snapshot. */
-  #cacheKey(sessionId: string): string {
-    return sessionId
+  /**
+   * The cache key for one session's revision/execution snapshot.
+   *
+   * DEVICE-SCOPED, and that is not defensive padding: this engine is
+   * ENGINE-GLOBAL (one instance serves every device the pool holds) while a
+   * `sessionId` is the PEER's identifier, not this plugin's. Two desktops can
+   * hand out the same session id, and a bare-sessionId key then injects the
+   * first device's `idleRevision`/`activeExecutionId` into the second device's
+   * commands — revisions and executions its peer has never issued. The `\u0000`
+   * separator makes the composite unambiguous (neither id may contain NUL).
+   */
+  #cacheKey(deviceId: string, sessionId: string): string {
+    return `${deviceId}\u0000${sessionId}`
   }
 
   /** The subscription cache key for one interaction's staleness snapshot. */
-  #interactionKey(sessionId: string, interactionId: string): string {
-    return `${sessionId}\u0000${interactionId}`
+  #interactionKey(deviceId: string, sessionId: string, interactionId: string): string {
+    return `${deviceId}\u0000${sessionId}\u0000${interactionId}`
+  }
+
+  /**
+   * Every cache key that belongs to one device, for eviction.
+   *
+   * A prefix match is safe because the device id is the FIRST component and the
+   * separator cannot appear inside an id: the only strings that start with
+   * `${deviceId}\u0000` are that device's own entries. Called when the device
+   * leaves the archive (`cherry_unpair`), so a re-paired device cannot inherit
+   * the previous pairing's snapshots and a long-lived process does not
+   * accumulate entries for devices that no longer exist.
+   */
+  #forgetDevice(deviceId: string): void {
+    const prefix = `${deviceId}\u0000`
+    for (const key of [...this.#revisionCache.keys()]) {
+      if (key.startsWith(prefix)) this.#revisionCache.delete(key)
+    }
+    for (const key of [...this.#executionCache.keys()]) {
+      if (key.startsWith(prefix)) this.#executionCache.delete(key)
+    }
+    for (const key of [...this.#interactionCache.keys()]) {
+      if (key.startsWith(prefix)) this.#interactionCache.delete(key)
+    }
   }
 
   /**
@@ -2012,14 +2252,15 @@ class CherryToolEngine {
   async #idleRevision(
     connection: DeviceConnection,
     subscriptions: SessionSubscriptions,
+    deviceId: string,
     sessionId: string,
   ): Promise<string> {
     const streamed = this.#streamedIdleRevision(subscriptions, sessionId)
     if (streamed !== undefined) {
-      this.#revisionCache.set(this.#cacheKey(sessionId), streamed)
+      this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), streamed)
       return streamed
     }
-    const cached = this.#revisionCache.get(this.#cacheKey(sessionId))
+    const cached = this.#revisionCache.get(this.#cacheKey(deviceId, sessionId))
     if (cached !== undefined) return cached
 
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
@@ -2031,7 +2272,7 @@ class CherryToolEngine {
     if (idle === undefined) {
       throw new Error(`agent.sessions.get returned no idle revision for session ${sessionId}`)
     }
-    this.#revisionCache.set(this.#cacheKey(sessionId), idle)
+    this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle)
     return idle
   }
 
@@ -2070,11 +2311,12 @@ class CherryToolEngine {
   async #activeExecutionId(
     connection: DeviceConnection,
     subscriptions: SessionSubscriptions,
+    deviceId: string,
     sessionId: string,
   ): Promise<string | undefined> {
     const streamed = this.#streamedActiveExecution(subscriptions, sessionId)
     if (streamed !== undefined) {
-      this.#executionCache.set(this.#cacheKey(sessionId), streamed)
+      this.#executionCache.set(this.#cacheKey(deviceId, sessionId), streamed)
       return streamed
     }
 
@@ -2085,11 +2327,11 @@ class CherryToolEngine {
     const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
     const active = optionalString(session['activeExecutionId'])
     if (active !== undefined) {
-      this.#executionCache.set(this.#cacheKey(sessionId), active)
+      this.#executionCache.set(this.#cacheKey(deviceId, sessionId), active)
       return active
     }
     // The peer says the session is idle: any cached id is stale by definition.
-    this.#executionCache.delete(this.#cacheKey(sessionId))
+    this.#executionCache.delete(this.#cacheKey(deviceId, sessionId))
     return undefined
   }
 
@@ -2128,6 +2370,7 @@ class CherryToolEngine {
   async #interactionSnapshot(
     connection: DeviceConnection,
     subscriptions: SessionSubscriptions,
+    deviceId: string,
     sessionId: string,
     interactionId: string,
   ): Promise<{ revision: string; executionId: string; inputDigest: string } | undefined> {
@@ -2137,9 +2380,9 @@ class CherryToolEngine {
       if (String(entry['kind'] ?? '') !== 'interaction.updated') continue
       const payload = isRecord(entry['payload']) ? entry['payload'] : {}
       if (optionalString(payload['interactionId']) !== interactionId) continue
-      this.#rememberInteraction(subscriptions, sessionId, payload)
+      this.#rememberInteraction(deviceId, sessionId, payload)
     }
-    const streamed = this.#interactionCache.get(this.#interactionKey(sessionId, interactionId))
+    const streamed = this.#interactionCache.get(this.#interactionKey(deviceId, sessionId, interactionId))
     if (streamed !== undefined) return streamed
 
     // (2) The query fallback for a card that never streamed.
@@ -2150,9 +2393,9 @@ class CherryToolEngine {
       (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       MAX_AGGREGATE_LIMIT,
     )
-    for (const item of page.items) this.#rememberInteraction(subscriptions, sessionId, item)
+    for (const item of page.items) this.#rememberInteraction(deviceId, sessionId, item)
 
-    return this.#interactionCache.get(this.#interactionKey(sessionId, interactionId))
+    return this.#interactionCache.get(this.#interactionKey(deviceId, sessionId, interactionId))
   }
 
   /**
@@ -2165,11 +2408,7 @@ class CherryToolEngine {
    * run and turn an idle session into a peer-side CONFLICT instead of the
    * in-band `no-active-execution`.
    */
-  #rememberInteraction(
-    _subscriptions: SessionSubscriptions,
-    sessionId: string,
-    raw: Record<string, unknown>,
-  ): void {
+  #rememberInteraction(deviceId: string, sessionId: string, raw: Record<string, unknown>): void {
     const interactionId = optionalString(raw['interactionId'])
     const revision = optionalString(raw['revision'])
     const executionId = optionalString(raw['executionId'])
@@ -2178,12 +2417,12 @@ class CherryToolEngine {
     // let `cherry_respond` send a half-complete staleness triple.
     if (interactionId === undefined || revision === undefined || executionId === undefined) return
     if (inputDigest === undefined) return
-    this.#interactionCache.set(this.#interactionKey(sessionId, interactionId), {
+    this.#interactionCache.set(this.#interactionKey(deviceId, sessionId, interactionId), {
       revision,
       executionId,
       inputDigest,
     })
-    if (raw['status'] === 'pending') this.#executionCache.set(this.#cacheKey(sessionId), executionId)
+    if (raw['status'] === 'pending') this.#executionCache.set(this.#cacheKey(deviceId, sessionId), executionId)
   }
 
   /**
@@ -2222,7 +2461,20 @@ class CherryToolEngine {
     connection: DeviceConnection,
     subscriptions: SessionSubscriptions,
     sessionId: string,
-    options: { timeoutMs: number; startedAt: number; executionId?: string; commandId?: string },
+    options: {
+      timeoutMs: number
+      startedAt: number
+      executionId?: string
+      commandId?: string
+      /**
+       * The run-scoping cut, when the caller already took it. `cherry_send`
+       * takes it BEFORE issuing its command, so a run that settles during the
+       * round trip is still on the observable side of the cut. Omitted (as
+       * `cherry_wait` does) means "take it now": a wait that did not cause the
+       * run has nothing earlier to cut at.
+       */
+      baselineSeq?: number
+    },
   ): Promise<Record<string, unknown>> {
     const deadline = options.startedAt + options.timeoutMs
     let latestExecutionId = options.executionId
@@ -2230,7 +2482,7 @@ class CherryToolEngine {
     // The fold below sees only events strictly after it, so a prior run's
     // terminal — still sitting in the cumulative buffer — can never speak for
     // this wait. Captured ONCE, so each pass is cheap and the cut never moves.
-    const baselineSeq = this.#newestSeq(subscriptions, sessionId)
+    const baselineSeq = options.baselineSeq ?? this.#newestSeq(subscriptions, sessionId)
 
     for (;;) {
       // The link is the precondition for EVERYTHING below: a closed connection
@@ -2244,6 +2496,11 @@ class CherryToolEngine {
         baselineSeq,
         ...(latestExecutionId === undefined ? {} : { awaitedExecutionId: latestExecutionId }),
       })
+      // STICKY ADOPTION: the first pass with no id lets `#observedState` adopt
+      // the first post-baseline run, and this assignment carries that id into
+      // every later pass (it is passed back down as `awaitedExecutionId`). From
+      // then on the cut is fixed: a LATER unrelated run cannot re-adopt and
+      // steal a wait that has already attached to a run.
       if (observed.executionId !== undefined) latestExecutionId = observed.executionId
 
       // SOFT TERMINAL first: ANY unanswered pending interaction means the run
@@ -2334,6 +2591,8 @@ class CherryToolEngine {
    *     a still-unanswered interaction is not history — it is exactly the soft
    *     terminal the waiter exists to report, so it must stay visible however
    *     long it has been pending.
+   *  3. **A wait with no id ADOPTS the first post-baseline run.** See
+   *     {@link CherryToolEngine.#adoptExecution}.
    *
    * `terminalStatus` is the closed four-state set; the receipt dimension's
    * `interrupted` never lands here.
@@ -2364,7 +2623,24 @@ class CherryToolEngine {
       pendingInteractions: Array<{ interactionId: string; kind: string; summary: string; questions: string[] }>
     } = { pendingInteractions: [] }
 
-    const awaited = options.awaitedExecutionId
+    // ADOPTION (rule 3). `awaitedExecutionId` is absent when the command
+    // receipt did not name the run it started — `executionId` is optional in
+    // the receipt schema, and the peer may legitimately omit it. Without an
+    // id, the fold below matches NOTHING, so the wait would park out its whole
+    // window and answer `timeout` for a run that finished long ago.
+    //
+    // The recovery is to take the first `execution.updated` that arrives AFTER
+    // this wait's baseline as the run this wait is about to observe. The
+    // baseline is what makes that safe: it is the same cut the terminal
+    // attribution uses, so an earlier run's events — still sitting in the
+    // cumulative buffer — can never be adopted. `#adoptExecution` is
+    // one-time and sticky in the caller, so a LATER unrelated run cannot steal
+    // a wait that has already attached to one.
+    const awaited = options.awaitedExecutionId ?? this.#adoptExecution(
+      subscriptions,
+      sessionId,
+      options.baselineSeq,
+    )
     // Keyed by interactionId: a later `interaction.updated` for the same
     // interaction REPLACES its entry, and a settled one REMOVES it — but only
     // its own, so an unrelated pending is never clobbered.
@@ -2417,6 +2693,8 @@ class CherryToolEngine {
       }
 
       // Post-baseline events of OTHER executions are not this wait's business.
+      // (`awaited` may have just been ADOPTED above, in which case it names the
+      // first post-baseline run and this predicate matches exactly it.)
       if (awaited === undefined || executionId !== awaited) continue
       state.executionId = executionId
       state.terminalStatus = terminal ? status : undefined
@@ -2444,6 +2722,37 @@ class CherryToolEngine {
     }
     state.pendingInteractions = [...pending.values()]
     return state
+  }
+
+  /**
+   * The execution a wait with NO id should attach to: the first
+   * `execution.updated` that arrived strictly after `baselineSeq`, or undefined
+   * when no run has appeared yet.
+   *
+   * This is the "receipt did not name the run" recovery (see
+   * {@link CherryToolEngine.#observedState}'s rule 3). The BASELINE is what
+   * makes it sound rather than a guess: an execution whose only events sit at or
+   * before the cut belongs to a run that was already under way when this wait
+   * began, so it cannot be the run this command is about to start.
+   *
+   * "First" means first in the buffer's own order — the buffer is append-ordered
+   * by construction, so this is the earliest post-baseline run, not whichever
+   * event happens to be newest.
+   */
+  #adoptExecution(
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+    baselineSeq: number,
+  ): string | undefined {
+    for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      if (String(entry['kind'] ?? '') !== 'execution.updated') continue
+      const seq = Number(entry['seq'])
+      if (Number.isFinite(seq) && seq <= baselineSeq) continue
+      const payload = isRecord(entry['payload']) ? entry['payload'] : {}
+      const executionId = optionalString(payload['executionId'])
+      if (executionId !== undefined) return executionId
+    }
+    return undefined
   }
 
   /**
@@ -2538,7 +2847,7 @@ class CherryToolEngine {
     // The cache is refreshed from the terminal snapshot so a follow-up send
     // does not have to re-read the session.
     const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
-    if (idle !== undefined) this.#revisionCache.set(this.#cacheKey(sessionId), idle)
+    if (idle !== undefined) this.#revisionCache.set(this.#cacheKey(connection.record.deviceId, sessionId), idle)
 
     return {
       status,
@@ -2620,35 +2929,22 @@ class CherryToolEngine {
   /**
    * The session's current cache window start, or null when it is untracked.
    *
-   * The subscriptions layer owns the boundary and exposes it only through
-   * `read`'s verdict, so the tool finds it honestly instead of reaching into
-   * private state: the servable range is strictly after the window start, so
-   * the start is the smallest seq `read` refuses. `read` is purely local (it
-   * never touches the channel), so probing it costs no RPC.
+   * The subscriptions layer OWNS this boundary and now exposes it directly
+   * (`windowStart(sessionId)`), so the tool reads it instead of rediscovering
+   * it. It used to reconstruct the value from the outside by probing `read`
+   * with candidate cursors, which was worse in every dimension: the probe
+   * compared seqs as NUMBERS while the verdict compares them numerically too,
+   * but it could not tell "below the window" apart from "wrong stream epoch",
+   * and it scanned upward one seq at a time before bisecting — so a session
+   * whose window start was far above 0 walked the whole interval. The comment
+   * there claimed a binary search; the bracketing loop was linear.
+   *
+   * `streamEpoch` is reported from the LAYER's current epoch rather than from
+   * the caller's stale cursor: the verdict is about what can be served NOW, and
+   * echoing a foreign epoch back would name a stream this session never had.
    */
-  #windowStart(subscriptions: SessionSubscriptions, sessionId: string, probe: AgentCursor): AgentCursor | null {
-    if (!subscriptions.activeSessions().includes(sessionId)) return null
-    const epoch = probe.streamEpoch
-    const servable = (seq: number): boolean =>
-      'events' in subscriptions.read(sessionId, { sessionId, streamEpoch: epoch, seq: String(seq) })
-
-    // Bracket an upper bound that IS servable, then binary-search the boundary.
-    // The window start can never exceed the newest delivered seq, which is what
-    // the caller's own cursor is at or behind, so this terminates quickly.
-    const ceiling = Number(probe.seq) + 1
-    let high = 0
-    while (!servable(high)) {
-      high += 1
-      if (high > ceiling) return null
-    }
-    let low = 0
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2)
-      if (servable(mid)) high = mid
-      else low = mid + 1
-    }
-    // `low` is servable and `low - 1` is not: the window start is `low - 1`.
-    return { sessionId, streamEpoch: epoch, seq: String(low - 1) }
+  #windowStart(subscriptions: SessionSubscriptions, sessionId: string): AgentCursor | null {
+    return subscriptions.windowStart(sessionId) ?? null
   }
 }
 

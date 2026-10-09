@@ -113,7 +113,16 @@ interface SessionState {
    * subscription started from, advanced whenever old events are dropped.
    */
   windowStart: number
-  /** Cursors a caller has already consumed; the oldest retained is the window start. */
+  /**
+   * The resolver queue behind {@link SessionSubscriptions.waitFor}: one entry
+   * per caller currently parked on this session, all settled together (and
+   * exactly once) by the next buffer advance, re-subscribe or disposal.
+   *
+   * This is NOT a cursor-retention list: nothing here records what a caller has
+   * consumed. Retention is {@link windowStart}'s job alone — the boundary
+   * advances when the byte budget drops old events, and `waitFor` compares the
+   * caller's threshold against the BUFFER, not against this queue.
+   */
   waiters: Waiter[]
   /**
    * Projection state rebuilt from a checkpoint, if this session was recovered
@@ -163,7 +172,20 @@ export class SessionSubscriptions {
   readonly #perSessionCacheBytes: number
   readonly #checkpointMs: number
   readonly #sessions = new Map<string, SessionState>()
-  /** Insertion order == LRU order (Map preserves it; re-insert to touch). */
+  /**
+   * Insertion order IS the eviction order, and it is SUBSCRIPTION recency, not
+   * USE recency. Read that literally: only `ensure` (a re-subscribe re-inserts
+   * the session at the MRU end) moves an entry. `read`, `ack`, `waitFor` and
+   * every notification leave the order untouched — a session that is read
+   * constantly but never re-subscribed is still the first eviction victim.
+   *
+   * That is a deliberate fit, not an oversight: the cap this LRU enforces is
+   * the PEER's subscription cap, and the resource being rationed is the live
+   * peer-side subscription. Sessions are long-lived and few (the cap defaults
+   * to 8), so "least recently established" tracks the least valuable slot
+   * closely enough; a true use-recency LRU would need a touch on every event
+   * and would evict a session the caller is actively reading from.
+   */
   #closed = false
 
   constructor(rpc: JsonRpcClient, opts: SessionSubscriptionsOptions = {}) {
@@ -179,6 +201,51 @@ export class SessionSubscriptions {
    */
   activeSessions(): string[] {
     return [...this.#sessions.keys()]
+  }
+
+  /**
+   * The session's CURRENT stream cursor — the newest position this layer knows
+   * is durable for it — or undefined when the session is untracked.
+   *
+   * A READ-ONLY VIEW OF STATE THE LAYER ALREADY OWNS, and the reason it is a
+   * public accessor rather than something each caller re-derives: two consumers
+   * were reconstructing it from the outside, and both got it subtly wrong.
+   *
+   *  - `GET /diagnostics` used to report sessions with NO cursor at all, so the
+   *    report claimed a subscription was live while omitting where it stood.
+   *  - `cherry_events`' out-of-window verdict used to PROBE for the boundary by
+   *    re-running `read` with candidate seqs. That probe could not even reach
+   *    the answer in general (it scanned upward one seq at a time) and it made
+   *    a read-only tool look like it was walking state.
+   *
+   * The window start is a DIFFERENT value and is exposed separately by
+   * {@link windowStart} — this one is where the session's cursor stands, which
+   * is what "resume from here" means.
+   */
+  cursorOf(sessionId: string): AgentCursor | undefined {
+    return this.#sessions.get(sessionId)?.cursor
+  }
+
+  /**
+   * The session's cache WINDOW START — the oldest position this layer can still
+   * serve — or undefined when the session is untracked.
+   *
+   * The servable replay range is STRICTLY AFTER this position (see
+   * {@link read} for why the boundary itself is refused), so this is exactly the
+   * value a `cursor-out-of-window` verdict reports as "the earliest cursor you
+   * could possibly resume from".
+   *
+   * Exposed because the layer is the only thing that knows it. Callers were
+   * previously expected to rediscover it by binary-searching `read`'s verdict
+   * from the outside, which is both wasteful and fragile: `read` also refuses
+   * for a mismatched session/epoch, so a probe cannot distinguish "below the
+   * window" from "wrong epoch" without more outside knowledge than a caller
+   * should need.
+   */
+  windowStart(sessionId: string): AgentCursor | undefined {
+    const state = this.#sessions.get(sessionId)
+    if (state === undefined) return undefined
+    return { sessionId, streamEpoch: state.cursor.streamEpoch, seq: String(state.windowStart) }
   }
 
   /**
@@ -199,6 +266,10 @@ export class SessionSubscriptions {
     // Re-subscribe path: release the old subscription before asking again.
     const existing = this.#sessions.get(sessionId)
     if (existing !== undefined) {
+      // INFO (spec §5): a re-ensure is a RECOVERY, and it is the interesting
+      // half of the trail — an operator seeing this repeatedly is watching a
+      // session that will not stay subscribed.
+      console.info(`[cherry-remote] re-subscribing session ${sessionId} (replacing its live subscription)`)
       await this.#closeSubscription(existing.subscriptionId)
       this.#rejectWaiters(existing, new Error(`session ${sessionId} re-subscribed`))
       this.#sessions.delete(sessionId)
@@ -231,6 +302,27 @@ export class SessionSubscriptions {
       // The window start is the oldest provable position: the subscription's
       // baseline while nothing has been dropped, advanced only when the cache
       // evicts old events. It is NOT servable — the range is strictly after it.
+      //
+      // DIVERGENCE FROM THE SPEC WORDING, deliberately (controller ruling in
+      // commit f2b852b): the spec says 「早于」 the window start is out of
+      // window, which reads as `requested < windowStart`. This implementation
+      // refuses AT the start too (`<=`), and the extra strictness is
+      // load-bearing rather than defensive:
+      //
+      //  - `windowStart` is the position of an event this layer did NOT retain
+      //    (a dropped oldest event) or the subscription's baseline, which was
+      //    never delivered over this stream at all. The layer knows the
+      //    POSITION and nothing about the event that occupied it, so it cannot
+      //    certify that the caller has seen it.
+      //  - Accepting `requested === windowStart` would return the events
+      //    strictly after it — a correct-looking but possibly EMPTY replay read
+      //    whose nextCursor is the window start itself. A caller that then
+      //    resumed from that nextCursor would be handed a stale, empty read
+      //    forever, having lost whatever the peer had already discarded.
+      //
+      // Refusing routes that caller to `cherry_read`'s baseline rebuild
+      // instead, which is the only honest recovery. The semantics are pinned by
+      // tests ② (face 2) and ⑤b, which assert the verdict AT the start.
       if (!Number.isFinite(requested) || requested <= state.windowStart) {
         return { error: 'cursor-out-of-window' }
       }
@@ -426,6 +518,13 @@ export class SessionSubscriptions {
       waiters: [],
       projection: [],
     })
+    // INFO (spec §5 「订阅建立」): established, in replay mode, at the baseline
+    // the peer confirmed. Ids/positions only — the descriptor's lease is not a
+    // secret, but nothing here needs to be more verbose than this.
+    console.info(
+      `[cherry-remote] subscription established for session ${sessionId} (replay from seq ` +
+        `${descriptor.fromCursor.seq}, high watermark ${descriptor.highWatermark.seq})`,
+    )
   }
 
   /**
@@ -548,6 +647,13 @@ export class SessionSubscriptions {
       waiters: [],
       projection: [...items],
     })
+    // INFO (spec §5 「订阅恢复」): recovered via the checkpoint chain — the path
+    // that only runs when the peer could NOT replay, so it is worth seeing.
+    console.info(
+      `[cherry-remote] subscription recovered for session ${sessionId} from checkpoint ` +
+        `${descriptor.checkpoint.checkpointId} (baseline seq ${descriptor.checkpoint.cursor.seq}, ` +
+        `${items.length} projection item(s))`,
+    )
   }
 
   /**
@@ -619,6 +725,25 @@ export class SessionSubscriptions {
   /**
    * `agent.events`: append to the session buffer, enforce the byte budget by
    * dropping the OLDEST events (logged), advance the cursor, then wake waiters.
+   *
+   * SEQ MONOTONICITY IS ENFORCED HERE, per (sessionId, streamEpoch). The peer is
+   * supposed to deliver each stream position exactly once and in order, and the
+   * layer's whole contract — `nextCursor`, `windowStart`, the waiter predicate —
+   * is expressed in terms of a cursor that only ever moves FORWARD. A duplicate
+   * or out-of-order batch (a replay race across a reconnect, a peer retry)
+   * would otherwise:
+   *
+   *  - move `state.cursor` BACKWARDS, so `read()`'s `nextCursor` regresses and a
+   *    caller resuming from it re-consumes events it already acked;
+   *  - append an event the caller has already seen, duplicating history;
+   *  - `#wakeWaiters` for a "new" event that is not new, so a parked waiter
+   *    re-judges state the caller has already processed.
+   *
+   * A NON-INCREASING seq is therefore refused with a warning (never silently),
+   * and — importantly — a batch that is wholly stale does not wake anyone. A
+   * batch that arrives with a mix is filtered event by event, so genuine
+   * progress inside the same notification is never lost. `windowStart` is not
+   * touched either: the position an event occupied is not being un-retained.
    */
   #onEvents(params: unknown): void {
     if (!isRecord(params)) {
@@ -647,20 +772,36 @@ export class SessionSubscriptions {
       return
     }
 
+    let appended = 0
     for (const raw of events) {
       if (!isRecord(raw)) continue
       const seq = String(raw['seq'] ?? '')
       if (seq === '') continue
+      // The monotonicity gate: strictly greater than the cursor, or refused.
+      // The comparison is NUMERIC — the protocol carries `seq` as a decimal
+      // string, and a lexicographic compare would call '9' > '10'.
+      const arrived = Number(seq)
+      const current = Number(state.cursor.seq)
+      if (!Number.isFinite(arrived) || (Number.isFinite(current) && arrived <= current)) {
+        console.warn(
+          `[cherry-remote] ignoring out-of-order agent.events for session ${sessionId}: seq ${seq} is ` +
+            `not newer than the stream cursor ${state.cursor.seq}; the session cursor never regresses`,
+        )
+        continue
+      }
       const cursor: AgentCursor = { sessionId, streamEpoch: state.cursor.streamEpoch, seq }
       const event = raw as unknown as AgentEvent
       const bytes = eventBytes(event)
       state.buffer.push({ cursor, event, bytes })
       state.bytes += bytes
       state.cursor = cursor
+      appended += 1
     }
 
     this.#trimToBudget(sessionId, state)
-    this.#wakeWaiters(state)
+    // Waking on a wholly stale batch would make a parked waiter re-judge state
+    // that has not moved; only real progress is a wake.
+    if (appended > 0) this.#wakeWaiters(state)
   }
 
   /**

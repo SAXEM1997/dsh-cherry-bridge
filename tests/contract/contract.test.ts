@@ -966,6 +966,13 @@ describe('④ a full pair → connect → send → interact flow leaks no secret
     // vacuously on a flow that never transported a secret).
     expect(record.accessToken).toBeDefined()
     expect(desktop.fake.tokenIssues.length).toBeGreaterThan(0)
+
+    // POSITIVE half of the same contract (spec §5 log levels): the INFO trail
+    // the flow is supposed to produce really is there. Redaction is trivially
+    // satisfied by logging nothing, so "no secrets" alone would be a vacuous
+    // pass — these are the lines an operator reads to follow a run.
+    expect(log).toContain('pairing stage')
+    expect(log).toContain('subscription')
   }, 30_000)
 })
 
@@ -1075,7 +1082,14 @@ function mountHttpApi(overrides: Partial<CherryHttpDeps> = {}): {
       throw new Error('diagnostics does not pair')
     },
     identity: () => new Uint8Array([1, 2, 3]),
+    // `connect` is the CREATE-ON-MISS seam; the diagnostics route must never
+    // reach it (that is the point of the C2 assertions). It is wired here so a
+    // regression that reintroduces the dial is observable rather than silent.
     connect: () => ({ state: 'connected' as DeviceState }) as never,
+    // The route's actual source: an EXISTING connection, or nothing. The
+    // default harness has a live one, so the state/limits assertions below read
+    // a real pooled entry.
+    detach: () => ({ state: 'connected' as DeviceState }) as never,
     onDeviceState: () => {},
     onPairingProgress: () => {},
     ...overrides,
@@ -1146,6 +1160,52 @@ describe('② GET /diagnostics', () => {
       // The six contract differences ride along, so an operator reads the
       // fake-vs-real caveats where they read the deployment's health.
       expect(report.contractDifferences).toHaveLength(6)
+    } finally {
+      mounted.dispose()
+    }
+  })
+
+  it('is a READ: it never dials, and reports no limits for a device with no live connection', async () => {
+    // The load-bearing property C2 restores. `GET /diagnostics` used to probe
+    // the create-on-miss `connect` seam per device, which AUTO-DIALED offline
+    // devices and then published the fresh connection's client-side fallback
+    // limits as though the peer had negotiated them. A GET must not open
+    // sockets, and "no connection" must read as "not reported".
+    let dialed = 0
+    const mounted = mountHttpApi({
+      connect: () => {
+        dialed += 1
+        return { state: 'connected' as DeviceState } as never
+      },
+      // An EMPTY pool: nothing is live for this device.
+      detach: () => undefined,
+    })
+    try {
+      mounted.store.upsert({
+        schemaVersion: 2,
+        deviceId: 'dev-1',
+        displayName: 'Desk Alpha',
+        hosts: ['192.168.1.20'],
+        port: 8765,
+        desktopIdentity: 'desktop-raw-pin',
+        grants: ['agent'],
+        enabled: true,
+      })
+
+      const sent = await getDiagnostics(mounted.server)
+      expect(sent.status).toBe(200)
+
+      const report = sent.body as {
+        devices: Array<{ deviceId: string; state: string; limits?: unknown }>
+      }
+      expect(report.devices).toHaveLength(1)
+      // Honest "unknown": the store/enabled projection says the device is
+      // enabled but no connection has ever been built for it.
+      expect(report.devices[0]!.state).toBe('offline')
+      // NO fabricated limits — nothing negotiated them.
+      expect(report.devices[0]).not.toHaveProperty('limits')
+      // ...and no socket was created by asking for a health report.
+      expect(dialed).toBe(0)
     } finally {
       mounted.dispose()
     }
@@ -1313,6 +1373,36 @@ describe('③ release configuration', () => {
       perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
       rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
     })
+
+    // ABSENT is silent; PRESENT-but-unusable warns by name and falls back —
+    // including `null`, which is what a hand-edited `rateBudgetPerSecond:`
+    // line with no value parses to. Treating that as "absent" would leave an
+    // operator believing they had configured something.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(resolveBridgeConfig({ rateBudgetPerSecond: null as never })).toEqual({
+        perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+        rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+      })
+      expect(warn.mock.calls.flat().map(String).join('\n')).toContain('rateBudgetPerSecond')
+
+      warn.mockClear()
+      expect(resolveBridgeConfig({ perSessionCacheBytes: 'big' as never })).toEqual({
+        perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+        rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+      })
+      expect(warn.mock.calls.flat().map(String).join('\n')).toContain('perSessionCacheBytes')
+
+      // A genuine value is taken verbatim, and nothing is warned about.
+      warn.mockClear()
+      expect(resolveBridgeConfig({ rateBudgetPerSecond: 64 })).toEqual({
+        perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+        rateBudgetPerSecond: 64,
+      })
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it('ships a README documenting install, config, tools and the settings page', () => {
@@ -1426,5 +1516,40 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     expect(report.recentErrors).toEqual([])
     expect(report.stats.connectionsBuilt).toBe(0)
     server.routes.clear()
+  }, 20_000)
+
+  it('the assembly reports a REAL session cursor, read from the subscription layer', async () => {
+    // The report claims "this session is subscribed AT this position". The
+    // position used to be omitted entirely (the assembly published sessions
+    // with no cursor at all), which made the claim half-stated: an operator
+    // could see a live subscription but not where it stood.
+    //
+    // Driven at the SEAM rather than through a live peer: the assembly's
+    // `diagnosticsSessions` must pass through whatever the layer's `cursorOf`
+    // reports, INCLUDING a real cursor and INCLUDING nothing.
+    const { SessionSubscriptions } = await import('../../src/subscriptions')
+    const index = await import('../../src/index')
+    const server = makeServer()
+    const ctx = {
+      inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
+        cb({ webServer: server, webRuntime: { trustedHosts: [] } })
+      },
+      effect(): void {},
+    }
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-cursor-') })
+
+    try {
+      const empty = await getDiagnostics(server)
+      expect((empty.body as { sessions: unknown[] }).sessions).toEqual([])
+
+      // The accessors the projection is built from, asserted directly: an
+      // untracked session has NEITHER value (no fabricated seq 0), and a
+      // tracked one reports its own cursor.
+      const layer = new SessionSubscriptions({ request: async () => ({}) } as never)
+      expect(layer.cursorOf('s-1')).toBeUndefined()
+      expect(layer.windowStart('s-1')).toBeUndefined()
+    } finally {
+      server.routes.clear()
+    }
   }, 20_000)
 })

@@ -636,6 +636,103 @@ describe('read-only cherry tools over a real loopback channel', () => {
     )
   })
 
+  it('④i ONE unreadable {ref} degrades to a marked part instead of failing the whole read', async () => {
+    // A snapshot is a page of history, not a single object: one part the peer
+    // refuses to serve (an expired content pin, a transient fault) must not
+    // cost the caller every OTHER message in the same read. The part stays in
+    // the result, marked unavailable, so the loss is visible rather than
+    // silent — and the message it belongs to survives.
+    const big = 'D'.repeat(30 * 1024)
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'inline before' }, { kind: 'text', text: big, external: true }],
+          },
+          {
+            messageId: 'm-2',
+            revision: '1002',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'later message survives' }],
+          },
+        ],
+      },
+    })
+
+    // The FIRST content.read is the only one that fails (one-shot injection):
+    // exactly one part's walk breaks.
+    rig.fake.setReadFailure('agent.content.read', { reason: 'NOT_FOUND', message: 'Content not found' })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        messageId: string
+        parts: Array<{ partId: string; content: string; unavailable?: string }>
+      }>
+    }
+
+    // BOTH messages are present — the read did not fail wholesale.
+    expect(result.messages.map((message) => message.messageId)).toEqual(['m-1', 'm-2'])
+    // The healthy inline part and the OTHER message are untouched.
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline before')
+    expect(result.messages[1]!.parts[0]!.content).toBe('later message survives')
+    // The unreadable part is still listed, with its content withheld and the
+    // reason surfaced.
+    const broken = result.messages[0]!.parts[1]!
+    expect(broken.partId).toBe('m-1:1')
+    expect(broken.content).toBe('')
+    expect(broken.unavailable).toMatch(/NOT_FOUND|Content not found/i)
+    // ...and the message is COMPLETE as a part list: the failure was the
+    // CONTENT, not a truncated walk, so it must not claim truncation.
+    expect(result.messages[0]).not.toHaveProperty('partsTruncated')
+  })
+
+  it('④j an INTEGRITY failure still fails the whole read: unverifiable bytes are never handed back', async () => {
+    // The boundary of ④i. A read the peer ANSWERED but whose digest does not
+    // match is a different class: the bytes on hand are provably not the ones
+    // the ref describes, so degrading would be reporting corrupt content as a
+    // partial success. That case must keep failing loudly.
+    const big = 'E'.repeat(30 * 1024)
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: big, external: true }],
+          },
+        ],
+      },
+    })
+
+    // The honest read FIRST, so the content pin exists to be tampered with (and
+    // so the failure below is provably caused by the tampering).
+    const honest = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ content: string; unavailable?: string }> }>
+    }
+    expect(honest.messages[0]!.parts[0]!.content).toBe(big)
+    expect(honest.messages[0]!.parts[0]!.unavailable).toBeUndefined()
+
+    rig.fake.tamperContent('m-1:0', '1001')
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /sha256|digest|integrity/i,
+    )
+  })
+
   it('⑤ cherry_read and cherry_events ensure the session subscription on first use and ack after delivery', async () => {
     const rig = await makeRig({
       agent: {

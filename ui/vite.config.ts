@@ -30,6 +30,15 @@ const here = dirname(fileURLToPath(import.meta.url))
 const packageName = 'dsh-cherry-bridge'
 
 /**
+ * Where `npm run dev:ui` forwards the plugin's API calls: the DSH host's web
+ * server, which owns the `/cherry-remote/api` prefix. Override with
+ * `CHERRY_DEV_HOST` when the host listens elsewhere (a non-default
+ * `--port`), rather than editing the page — the page itself never learns an
+ * absolute URL.
+ */
+const DEV_HOST_ORIGIN = process.env.CHERRY_DEV_HOST ?? 'http://127.0.0.1:23023'
+
+/**
  * The host loader envelope, matching the reference plugin's shape.
  *
  * There is deliberately no `Symbol.toStringTag` line here: vite's CJS output
@@ -72,6 +81,28 @@ export default defineConfig(({ mode }) => {
     root: here,
     plugins: [react()],
     define: isClientBundle ? { 'process.env.NODE_ENV': JSON.stringify('production') } : {},
+    // DEV-ONLY proxy (see `DEV_HOST_ORIGIN`): `npm run dev:ui` serves the page
+    // from vite's own port, but the page's API calls are RELATIVE and
+    // same-origin by construction (`/cherry-remote/api/...`). Without this the
+    // dev page would ask ITS OWN origin for the plugin's routes, get vite's 404
+    // and render an empty device list beside a dead SSE stream — the settings
+    // page is only exercisable against a host.
+    //
+    // Present only in the dev branch: the published bundle carries no proxy and
+    // makes no absolute request, so this cannot leak into a build.
+    server: isClientBundle
+      ? undefined
+      : {
+          proxy: {
+            '/cherry-remote/api': {
+              target: DEV_HOST_ORIGIN,
+              // SSE must not be buffered or the live device/pairing updates
+              // arrive in chunks instead of as they happen.
+              changeOrigin: false,
+              ws: false,
+            },
+          },
+        },
     build: isClientBundle
       ? {
           outDir: resolve(here, '..', 'lib'),

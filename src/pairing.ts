@@ -382,7 +382,16 @@ type GetResult =
 export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<DeviceRecord> {
   const payload = parsePayload(opts.payload)
   const onStatus = opts.onStatus ?? noop
-  onStatus('validate')
+  // INFO-LEVEL PROGRESS (spec §5): every stage transition is logged, so an
+  // operator watching a run that can take a minute can see where it is WITHOUT
+  // the tool result. Only the stage NAME and the payload's host list are
+  // recorded — never `invitationSecret`, the claim's verification code, or any
+  // token (those are exactly what the sanitization contract forbids).
+  const report = (stage: string): void => {
+    console.info(`[cherry-remote] pairing stage ${stage} (hosts: ${payload.hosts.join(', ')})`)
+    onStatus(stage)
+  }
+  report('validate')
 
   const supported = opts.supportedProtocolVersions ?? DEFAULT_SUPPORTED_PROTOCOL_VERSIONS
   // The real negotiation face: the offer is the intersection, and an empty
@@ -391,7 +400,7 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   const offered = payload.protocolVersions.filter((version) => supported.includes(version))
 
   const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
-  onStatus('connect')
+  report('connect')
 
   const failures: string[] = []
   for (const host of payload.hosts) {
@@ -410,7 +419,7 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
       continue
     }
     try {
-      const record = await claimAndAwait(temp.client, payload, offered, opts, onStatus)
+      const record = await claimAndAwait(temp.client, payload, offered, opts, report)
       destroy(temp)
       // `DeviceStore.upsert` persists and returns nothing, so the call returns
       // the very record it handed over — the persisted archive entry, not a
@@ -420,6 +429,15 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
     } catch (error) {
       destroy(temp)
       if (error instanceof PairingError) throw error
+      // MID-FLOW FALL-THROUGH (documented boundary): a NON-`PairingError` here
+      // is an unexpected fault on THIS candidate — not a verdict about the
+      // invitation. The walk therefore CONTINUES to the next candidate address,
+      // and if a later candidate reaches a real terminal state that verdict
+      // wins. Only if EVERY candidate fails does the walk end as `unreachable`;
+      // conversely an unexpected fault on the FIRST candidate followed by a
+      // peer `rejected` on the SECOND surfaces as `rejected`, not `unreachable`.
+      // That is deliberate: the peer's answer about the invitation outranks our
+      // own transport trouble, and it is the one the user can act on.
       failures.push(`${host}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
@@ -472,6 +490,8 @@ async function claimAndAwait(
     throw new PairingError('unreachable', 'peer returned a malformed pairing claim receipt')
   }
   onStatus('claim')
+  // The CODE is handed to the callback (which renders it for the human) and is
+  // deliberately NOT logged: it is the one secret a pairing run carries.
   opts.onVerificationCode(claim.verificationCode)
 
   onStatus('waiting')
@@ -486,10 +506,23 @@ async function claimAndAwait(
     }
 
     if (result.status === 'rejected') {
-      throw new PairingError('rejected', 'the desktop rejected this pairing request')
+      // GUIDANCE, not just a verdict (see the `expired` branch for the same
+      // rule): the refusal is most often a MISMATCH between the 6-digit code
+      // shown here and the one the user confirmed on the desktop, so the
+      // message says which two things to compare.
+      throw new PairingError(
+        'rejected',
+        'the desktop rejected this pairing request — verify that the 6-digit code shown on the ' +
+          'desktop side matches the code this harness displayed, then generate a fresh pairing ' +
+          'payload and try again',
+      )
     }
     if (result.status === 'expired') {
-      throw new PairingError('expired', 'the pairing invitation expired')
+      throw new PairingError(
+        'expired',
+        'the pairing invitation has expired — regenerate the pairing code in Cherry Studio (the ' +
+          'remote-access QR/payload) and retry',
+      )
     }
     if (result.status === 'approved') {
       return recordFrom(payload, result, deviceName)
@@ -498,7 +531,11 @@ async function claimAndAwait(
     // protection for a peer that never reaches a terminal state; the normal
     // expiry verdict is the PEER's own `expired` reply, carried above.
     if (Date.now() >= deadline) {
-      throw new PairingError('expired', 'the pairing invitation expired while waiting for approval')
+      throw new PairingError(
+        'expired',
+        'the pairing invitation expired while waiting for approval — regenerate the pairing code ' +
+          'in Cherry Studio and retry',
+      )
     }
     await sleep(interval)
   }

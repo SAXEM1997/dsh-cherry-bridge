@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { QuarantinedArchiveError } from './deviceStore'
 import type { DeviceRecord } from './deviceStore'
 import type { DeviceStore } from './deviceStore'
 import type { DeviceState, EffectiveLimits } from './connection'
@@ -8,10 +9,10 @@ import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics'
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics'
 
 /**
- * The plugin's same-origin HTTP face (spec §3.7, M2): device management REST
- * plus an SSE stream, mounted on the HOST web server's `/cherry-remote/api`
- * prefix. There is no dedicated port, no bootstrap file and no credential
- * channel — the settings page and this surface are same-origin by construction.
+ * The plugin's same-origin HTTP face (spec §3.7): device management REST plus
+ * an SSE stream, mounted on the HOST web server's `/cherry-remote/api` prefix.
+ * There is no dedicated port, no bootstrap file and no credential channel — the
+ * settings page and this surface are same-origin by construction.
  *
  * Two disciplines run through every route:
  *
@@ -22,6 +23,8 @@ import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './dia
  *  - **No route throws.** Every failure leaves as a structured JSON body, and
  *    the pairing verdicts stay distinguishable (`invalid-payload` is the
  *    client's 400; `unreachable`/`rejected`/`expired` are the peer's 502).
+ *    A QUARANTINED archive gets its own shape rather than the generic
+ *    `invalid-device` 400 — see {@link writeQuarantineRefusal}.
  *
  * Registration is lazy and headless-safe: `registerHttpApi` dynamically
  * injects `webServer`/`webRuntime` and degrades to a warning when the
@@ -102,10 +105,24 @@ export interface DeviceStateEvent {
   state: DeviceState
 }
 
-/** The `pairing-progress` SSE payload; `stage` is the pairing stage verbatim. */
+/**
+ * The `pairing-progress` SSE payload; `stage` is the pairing stage verbatim.
+ *
+ * `claimId` is the handle `POST /pair` already returned in its 202. It is on
+ * EVERY frame — including the terminal verdicts — because the stream is SHARED
+ * by every tab and every run: without it, a browser that has started its own
+ * pairing cannot tell its stages (and above all its 6-digit code) from another
+ * tab's, and would settle on a stranger's verdict. A client filters frames by
+ * the id its own 202 returned.
+ *
+ * Optional because the assembly channel is also driven by callers that are not
+ * a pairing run (a test rig, a future producer) — a frame with no id simply
+ * matches no wizard.
+ */
 export interface PairingProgressEvent {
   stage: string
   detail?: string
+  claimId?: string
 }
 
 /** The subset of {@link DeviceConnection} this face consumes. */
@@ -114,8 +131,11 @@ export interface ConnectionLike {
   /**
    * The peer-negotiated caps (hello values with the client's conservative
    * fallbacks applied). Optional for the same reason `detach`/`evict` are: the
-   * M2 HTTP face's own tests drive a state-only stand-in, and a missing limits
+   * HTTP face's own tests drive a state-only stand-in, and a missing limits
    * object must read as "not reported" rather than fail the diagnostics route.
+   *
+   * NOTE for the diagnostics route: a MISSING `limits` is the honest report
+   * when there is no live connection. It is never a reason to build one.
    */
   readonly limits?: EffectiveLimits
   onState(cb: (state: DeviceState) => void): void
@@ -127,7 +147,11 @@ export interface ConnectionLike {
 /** Everything the HTTP face needs from the assembly. */
 export interface CherryHttpDeps {
   store: DeviceStore
-  /** `pairWithPayload` (Task 6). The `cherry_pair` tool does not exist in M2. */
+  /**
+   * `pairWithPayload`, as the assembly exposes it. The HTTP face calls it for
+   * `POST /pair`; the `cherry_pair` TOOL reaches the same implementation
+   * through its own narrower seam, so the two faces cannot drift apart.
+   */
   pair: (opts: PairWithPayloadOptions) => Promise<DeviceRecord>
   /**
    * The local Ed25519 identity. A lazy accessor rather than raw bytes: the
@@ -135,11 +159,26 @@ export interface CherryHttpDeps {
    * only consumer, so reading it at request time keeps `apply` synchronous.
    */
   identity(): Uint8Array
+  /**
+   * Resolve (creating on first use) the pooled connection for a device.
+   *
+   * CREATE-ON-MISS, and that is load-bearing wherever it is used: the SSE
+   * snapshot and the device list both report a device the caller can use, so
+   * building the connection the assembly would build anyway is intentional
+   * there. It is exactly why `GET /diagnostics` must NOT use it — see
+   * {@link detach}.
+   */
   connect(deviceId: string): ConnectionLike
   /**
    * Resolves an ALREADY-CREATED connection, or undefined when the device has
-   * none. Used by DELETE, which must tear down a live socket without
-   * fabricating a connection for the record it is removing.
+   * none. A PURE LOOKUP: it never constructs, never dials, never schedules.
+   *
+   * Two callers, both because a miss must be an honest answer rather than a
+   * fabricated object:
+   *  - DELETE, which must tear down a live socket without fabricating a
+   *    connection for the record it is removing;
+   *  - `GET /diagnostics`, which must report only what a live connection
+   *    actually negotiated and must never auto-dial an offline device.
    */
   detach?(deviceId: string): ConnectionLike | undefined
   /**
@@ -181,6 +220,16 @@ export interface CherryHttpDeps {
   diagnosticsErrors?(): readonly DiagnosticsError[]
   /** Plan §8 config values, surfaced so an operator can see the effective knobs. */
   diagnosticsConfig?(): { rateBudgetPerSecond: number; perSessionCacheBytes: number }
+  /**
+   * Assembly channel: a persisting route hit a QUARANTINED archive.
+   *
+   * The refusal is already structured for the browser; this is how the
+   * diagnostics ring learns about it, so `GET /diagnostics` shows the operator
+   * what happened instead of leaving the report claiming a healthy (empty)
+   * deployment. Optional: a rig that does not wire it simply keeps the ring
+   * unchanged, which is the pre-existing behaviour.
+   */
+  onArchiveQuarantined?(error: QuarantinedArchiveError): void
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +341,44 @@ function writeJson(res: HttpResponseLike, status: number, value: unknown): void 
 /** Structured rejection: 403 for the fence, `{error}` for everything else. */
 function writeError(res: HttpResponseLike, status: number, error: string, message?: string): void {
   writeJson(res, status, message === undefined ? { error } : { error, message })
+}
+
+/**
+ * The quarantine refusal, as the browser and the operator see it.
+ *
+ * A damaged `devices.json` is not the request's fault and it is not something
+ * the browser can fix: the archive is READ-ONLY until a human moves the bad
+ * file aside. So the answer is a 503 with the two paths an operator actually
+ * needs — the archive, and the `<file>.corrupt` copy the plugin preserved —
+ * plus the recovery step in words. That is the whole point of giving this its
+ * own shape rather than letting it land in the generic `invalid-device` 400,
+ * which reads as "you sent something wrong" and is the opposite of the truth.
+ *
+ * Returns true when the error was a quarantine (and a response was written).
+ */
+function writeQuarantineRefusal(res: HttpResponseLike, route: RouteContext, error: unknown): boolean {
+  if (!(error instanceof QuarantinedArchiveError)) return false
+  // The operator-facing refusal and the diagnostics ring are told the same
+  // thing: the browser gets the structured body, the report gets the summary.
+  try {
+    route.deps.onArchiveQuarantined?.(error)
+  } catch (reportError) {
+    console.warn('[cherry-remote] reporting the quarantined archive failed', reportError)
+  }
+  writeJson(res, 503, {
+    error: 'archive-quarantined',
+    // The archive that could not be read, byte-for-byte still on disk.
+    file: error.file,
+    // The best-effort preservation copy; the SAME fallback the error's own
+    // message uses, so an operator is never sent to a file that does not exist
+    // merely because the copy could not be made.
+    corrupt: error.corruptPath ?? `${error.file}.corrupt`,
+    recovery:
+      'the device archive cannot be read and the plugin will not overwrite it; move the bad file ' +
+      'aside (then restart or re-apply the plugin) to resume device management',
+    message: error.message,
+  })
+  return true
 }
 
 const MAX_BODY_BYTES = 1024 * 1024
@@ -771,10 +858,15 @@ function listDevices(res: HttpResponseLike, route: RouteContext): void {
  * The `GET /diagnostics` body (spec §5).
  *
  * The aggregator in `src/diagnostics.ts` owns the redaction whitelist; this
- * function only supplies it with the live pool surfaces. `connect` is passed
- * as a state projection (not the connection object) so nothing but a state
- * string can escape into the report — a caller cannot accidentally serialize a
+ * function only supplies it with the live pool surfaces, as a state projection
+ * (not the connection object) so nothing but a state string and four numbers
+ * can escape into the report — a caller cannot accidentally serialize a
  * connection holding a live token.
+ *
+ * THE SEAM HANDED TO THE AGGREGATOR NEVER BUILDS A CONNECTION. The aggregator's
+ * `connect` is named for the pool's resolver, but here it resolves an EXISTING
+ * entry only (see {@link deviceProjection}): a GET must be a read, and a
+ * report that dials is both a surprise socket and a fabricated `limits`.
  *
  * The six contract differences ride along so an operator reads the fake-vs-real
  * caveats in the same place they read the health of the deployment.
@@ -802,23 +894,50 @@ function diagnosticsReport(route: RouteContext): unknown {
 
 /**
  * One device's diagnostics projection: the live state plus, when a connection
- * actually exists, the limits the peer's hello negotiated.
+ * actually EXISTS, the limits the peer's hello negotiated.
  *
- * `limits` is read through its own guard because `connect` both RESOLVES and
- * CREATES: a device whose connection cannot be built still has to appear in the
- * report (as `offline`) rather than failing the whole endpoint.
+ * A DIAGNOSTICS ENDPOINT MUST NOT HAVE SIDE EFFECTS, and `connect` is a
+ * side-effecting seam: it RESOLVES *and* CREATES on miss, so probing it here
+ * would auto-dial every offline device in the archive — an operator asking for a
+ * health report would be the thing that opens sockets — and would then publish
+ * the freshly built connection's conservative client FALLBACKS as if the peer
+ * had negotiated them.
+ *
+ * So `limits` is read through `detach` (resolve-EXISTING-only) and only through
+ * it. Consequences, both intended:
+ *  - a device with no pooled connection reports its state from the store/enabled
+ *    projection and carries NO `limits` field at all (absent means "not
+ *    reported", which is the truth — nothing has been negotiated);
+ *  - `detach` is optional on the deps contract, so a rig that supplies only
+ *    `connect` gets the no-limits shape rather than a fabricated one. Falling
+ *    back to `connect` would reinstate the dial.
  */
 function deviceProjection(
   deps: CherryHttpDeps,
   deviceId: string,
 ): { state: DeviceState; limits?: EffectiveLimits } {
-  const state = projectState(deviceById(deps, deviceId), deps.connect)
+  const record = deviceById(deps, deviceId)
+  const existing = safely(() => deps.detach?.(deviceId))
+  // The state comes from the EXISTING connection when there is one, and from
+  // the store/enabled projection otherwise — never from a connection built for
+  // this request.
+  const state = existing === undefined ? projectState(record, noDial) : safeState(existing, record)
+  const limits = existing?.limits
+  return limits === undefined ? { state } : { state, limits }
+}
+
+/** A resolver that never builds anything: the honest "no connection" report. */
+function noDial(deviceId: string): ConnectionLike {
+  throw new Error(`diagnostics does not build a connection for ${deviceId}`)
+}
+
+/** One already-existing connection's state, or the record's projection. */
+function safeState(connection: ConnectionLike, record: DeviceRecord): DeviceState {
+  if (!record.enabled) return 'disabled'
   try {
-    const limits = deps.connect(deviceId).limits
-    return limits === undefined ? { state } : { state, limits }
+    return connection.state
   } catch {
-    // An unbuildable connection has no negotiated limits to report.
-    return { state }
+    return 'offline'
   }
 }
 
@@ -860,20 +979,35 @@ function deleteDevice(res: HttpResponseLike, route: RouteContext, deviceId: stri
     writeError(res, 404, 'not-found', `no device ${deviceId}`)
     return
   }
-  route.deps.store.remove(deviceId)
-  // The record is gone, but the connection is not ours to leak — in the pool OR
-  // on the wire. `evict` is the right seam and the ONLY one that does both: it
-  // REMOVES the pooled entry (closing its socket) rather than merely resolving
-  // it. `detach().close()` alone would close the socket but leave the dead
-  // DeviceConnection — still holding the removed record and its accessToken —
-  // sitting in the pool map until some later re-apply, inflating diagnostics
-  // and keeping the deleted device enumerable. `connect` is likewise wrong: it
-  // creates on miss, fabricating a connection for a record we just deleted.
-  // Failures here are not the browser's problem; the archive is already correct.
+  // ORDER MATTERS, and it is the SAME invariant `cherry_unpair` documents:
+  // EVICT FIRST, then remove the record. `evict` resolves an EXISTING pooled
+  // connection only (never `connect`, which creates on miss and would fabricate
+  // one for a record being deleted), drops it from the pool AND closes its
+  // socket. The other order leaves a window in which the archive entry — and
+  // with it the accessToken — is gone while a socket still authenticated with
+  // that token is up, which is exactly the leak this teardown exists to prevent.
+  //
+  // The record is still present at this moment, which matters: the assembly's
+  // eviction reads it to dispose the device's subscription layer before closing
+  // the socket (so the peer is released cleanly rather than left to reap).
+  // Failures here are not the browser's problem; the archive edit below is what
+  // the caller asked for, and it still happens.
   try {
     route.deps.evict?.(deviceId)
   } catch (error) {
-    console.warn(`[cherry-remote] device ${deviceId} teardown failed after removal`, error)
+    console.warn(`[cherry-remote] device ${deviceId} teardown failed before removal`, error)
+  }
+  try {
+    route.deps.store.remove(deviceId)
+  } catch (error) {
+    // The record survives in the archive (the write refused), so the caller is
+    // told the truth: the removal did NOT happen. Same structured shape as
+    // PATCH's, so one client branch covers both.
+    if (writeQuarantineRefusal(res, route, error)) return
+    // Anything else is genuinely unexpected; still never a bare throw.
+    console.warn(`[cherry-remote] device ${deviceId} could not be removed`, error)
+    writeError(res, 500, 'internal-error', error instanceof Error ? error.message : String(error))
+    return
   }
   res.writeHead(204, { 'cache-control': 'no-store' })
   res.end()
@@ -919,6 +1053,10 @@ async function patchDevice(
   try {
     route.deps.store.upsert(next)
   } catch (error) {
+    // A QUARANTINE is mapped first and distinctly: it is not a bad request body
+    // (the 400 below), it is an archive a human has to repair, and the browser
+    // is told which two files and what to do.
+    if (writeQuarantineRefusal(res, route, error)) return
     writeError(res, 400, 'invalid-device', error instanceof Error ? error.message : String(error))
     return
   }
@@ -1027,8 +1165,12 @@ function track(result: unknown, onRejected: (error: unknown) => void): void {
  * the user is comparing the code against is already rendered.
  *
  * The pairing session is scoped to THIS request's callbacks, so a second
- * concurrent pairing (a second tab) cannot have its code shown in the first
- * tab's stream.
+ * concurrent pairing (a second tab) cannot INVOKE the first run's callbacks.
+ * That alone is not enough for the browser side, though: the SSE stream is
+ * shared, so every frame this run publishes also carries `claimId` — the same
+ * handle the 202 returned — and the wizard filters by its own. Callback
+ * scoping keeps the runs apart on the server; the id keeps them apart on the
+ * client.
  */
 async function startPairing(req: HttpRequestLike, res: HttpResponseLike, route: RouteContext): Promise<void> {
   let body: Record<string, unknown>
@@ -1055,26 +1197,57 @@ async function startPairing(req: HttpRequestLike, res: HttpResponseLike, route: 
   }
 
   const claimId = randomUUID()
+  // ONE publish site for this run: every frame it emits is stamped with its
+  // claimId, so no future stage can be added without the handle.
+  const publish = (stage: string, detail?: string): void => {
+    route.hub.publish('pairing-progress', { stage, ...(detail === undefined ? {} : { detail }), claimId })
+  }
 
   // Fire-and-forget: the claim id is returned before the first stage lands, so
   // the browser can subscribe to /events with a stable handle in hand.
   void (async () => {
     try {
       await route.deps.pair({
+        // `identity` and `store` are part of the shared `pairWithPayload`
+        // signature, so they are supplied for the SHAPE. The assembly's
+        // implementation deliberately OVERRIDES both with its own state — the
+        // key that signs the Noise handshake and the archive the record lands
+        // in belong to the plugin, never to the caller. See `assemblyDeps` in
+        // `src/index.ts`, which states that contract at the override site.
         identity: route.deps.identity(),
         payload,
         store: route.deps.store,
         ...(name === undefined ? {} : { name }),
         // The stage string is forwarded VERBATIM (contract note): no renaming,
         // no wrapping, no enumification between pairing and the wire.
-        onStatus: (stage) => route.hub.publish('pairing-progress', { stage }),
-        onVerificationCode: (code) => route.hub.publish('pairing-progress', { stage: 'verification-code', detail: code }),
+        onStatus: (stage) => publish(stage),
+        onVerificationCode: (code) => publish('verification-code', code),
       })
-      route.hub.publish('pairing-progress', { stage: 'approved' })
+      publish('approved')
     } catch (error) {
+      // A QUARANTINED archive is caught before the generic verdict: pairing
+      // ends by PERSISTING a record, so a read-only archive fails the run at
+      // its last step. `pairingVerdict` would report it as `pairing-failed`
+      // with the raw error text, which tells the user nothing about the file an
+      // operator has to move aside. Its own stage carries the same structured
+      // detail the PATCH/DELETE routes return.
+      if (error instanceof QuarantinedArchiveError) {
+        console.warn(`[cherry-remote] pairing ${claimId} could not persist: the archive is quarantined`)
+        try {
+          route.deps.onArchiveQuarantined?.(error)
+        } catch (reportError) {
+          console.warn('[cherry-remote] reporting the quarantined archive failed', reportError)
+        }
+        publish(
+          'archive-quarantined',
+          `device archive ${error.file} is unreadable; move ${error.corruptPath ?? `${error.file}.corrupt`} ` +
+            'aside (then restart or re-apply the plugin) to resume pairing',
+        )
+        return
+      }
       const verdict = pairingVerdict(error)
       console.warn(`[cherry-remote] pairing ${claimId} failed (${verdict.error}): ${verdict.message}`)
-      route.hub.publish('pairing-progress', { stage: verdict.error, detail: verdict.message })
+      publish(verdict.error, verdict.message)
     }
   })()
 

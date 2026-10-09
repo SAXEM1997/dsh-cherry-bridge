@@ -40,10 +40,19 @@ export interface DeviceStateEvent {
   state: DeviceState
 }
 
-/** The `pairing-progress` SSE payload; `stage` arrives verbatim from pairing. */
+/**
+ * The `pairing-progress` SSE payload; `stage` arrives verbatim from pairing.
+ *
+ * `claimId` identifies WHICH run produced the frame. The stream is shared by
+ * every tab, so a wizard must filter frames by the id its own `POST /pair`
+ * returned — otherwise a second tab would show the first tab's verification
+ * code and settle on the first tab's verdict. Optional because a frame is only
+ * stamped when it came from a pairing run.
+ */
 export interface PairingProgressEvent {
   stage: string
   detail?: string
+  claimId?: string
 }
 
 /**
@@ -72,7 +81,9 @@ export type PairingPhase = 'idle' | 'submitting' | 'waiting' | 'done' | 'failed'
  * `verdict.error` (src/httpApi.ts `startPairing`), and `PairingErrorKind` is
  * `invalid-payload | rejected | expired | unreachable`. Every one of them must
  * end the run, or the wizard sits in 'waiting' forever with a disabled submit
- * button. `pairing-failed` is the non-`PairingError` fallback verdict.
+ * button. `pairing-failed` is the non-`PairingError` fallback verdict, and
+ * `archive-quarantined` is the damaged-`devices.json` refusal — also a terminal
+ * state, since no retry can succeed until the file is moved aside.
  */
 export const TERMINAL_STAGES = [
   'approved',
@@ -81,6 +92,7 @@ export const TERMINAL_STAGES = [
   'unreachable',
   'invalid-payload',
   'pairing-failed',
+  'archive-quarantined',
 ] as const
 
 /** The single stage that ends a run successfully. */
@@ -89,18 +101,31 @@ export const APPROVED_STAGE = 'approved'
 /** The single stage that carries the 6-digit verification code (ruling). */
 export const VERIFICATION_CODE_STAGE = 'verification-code'
 
-/** Human labels for the progress stages the wizard narrates. */
+/**
+ * Human labels for the progress stages the wizard narrates.
+ *
+ * The three FAILURE labels carry the recovery step, not just the verdict: the
+ * user is standing in front of two windows, and "被拒绝" without "go compare the
+ * code" leaves them with nothing to do but retry blindly. The wording mirrors
+ * the server's own verdict messages (`src/pairing.ts`).
+ */
 export const STAGE_LABELS: Record<string, string> = {
   validate: '正在校验配对信息…',
   connect: '正在连接 Cherry Studio…',
   claim: '正在交换凭据…',
   waiting: '等待在 Cherry Studio 上确认…',
   'pairing-failed': '配对失败',
-  rejected: '配对被拒绝',
-  expired: '配对邀请已过期',
+  // Refused: the overwhelmingly common cause is a code mismatch, so the label
+  // names the comparison and the way out (a fresh payload).
+  rejected: '配对被拒绝——请核对桌面端显示的 6 位验证码是否与本页一致，并在 Cherry Studio 重新生成配对码后重试',
+  expired: '配对邀请已过期——请在 Cherry Studio 重新生成配对码后重试',
   // The everyday failure: the desktop is off, asleep, or off the network.
   unreachable: '无法连接 Cherry Studio，请确认桌面端已启动且与本机同网',
   'invalid-payload': '配对信息无效或已过期，请在 Cherry Studio 重新生成后重试',
+  // The plugin's own archive is unreadable: nothing here can fix it, and a
+  // retry will fail identically until an operator moves the bad file aside.
+  'archive-quarantined':
+    '设备档案无法读取（已保留为 .corrupt 副本）。请将该文件移开后重启或重新加载插件，再重试配对',
 }
 
 /** Human labels for the five states, shared by the light and the light's name. */

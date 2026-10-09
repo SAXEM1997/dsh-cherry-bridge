@@ -464,4 +464,60 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(error.kind).toBe('unreachable')
     expect(store.list()).toEqual([])
   }, 15_000)
+
+  // -------------------------------------------------------------------------
+  // INFO-level pairing progress (spec §5) — spy-tested for presence AND for the
+  // absence of the two secrets a pairing run carries.
+  // -------------------------------------------------------------------------
+
+  it('⑧ logs every pairing stage at INFO level without leaking the invitation secret or the code', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+    const payload = payloadFor(fakeInfo)
+    const invitationSecret = (JSON.parse(payload) as { invitationSecret: string }).invitationSecret
+
+    const record = await pair({ identity, store, payload })
+
+    const logged = consoleInfo.mock.calls.flat().map(String).join('\n')
+    // Every stage transition the run goes through is present, tagged as ours.
+    for (const stage of ['validate', 'connect', 'claim', 'waiting']) {
+      expect(logged, `stage ${stage} must be logged`).toContain(stage)
+    }
+    expect(logged).toContain('cherry-remote')
+
+    // The two secrets a pairing carries never reach the log: the invitation
+    // secret (from the payload) and the 6-digit verification code.
+    expect(invitationSecret.length).toBeGreaterThan(0)
+    expect(logged).not.toContain(invitationSecret)
+    const code = fakeInfo.fake.verificationCode
+    expect(code).toMatch(/^[0-9]{6}$/)
+    expect(logged).not.toContain(code)
+    // ...and the access token the approval returned is not there either.
+    expect(logged).not.toContain(record.accessToken!)
+  }, 15_000)
+
+  it('⑨ the expired verdict tells the user to regenerate the pairing code', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ pairingGetPendingPolls: 3, pairingDecision: 'expired' })
+    const store = await makeStore()
+
+    const error = await pairingError(pair({ identity, store, payload: payloadFor(fakeInfo) }))
+
+    expect(error.kind).toBe('expired')
+    expect(error.message.toLowerCase()).toContain('regenerate')
+  }, 15_000)
+
+  it('⑩ the rejected verdict tells the user to verify the 6-digit code on the desktop side', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ pairingDecision: 'rejected' })
+    const store = await makeStore()
+
+    const error = await pairingError(pair({ identity, store, payload: payloadFor(fakeInfo) }))
+
+    expect(error.kind).toBe('rejected')
+    const message = error.message.toLowerCase()
+    expect(message).toContain('6-digit')
+    expect(message).toContain('code')
+  }, 15_000)
 })

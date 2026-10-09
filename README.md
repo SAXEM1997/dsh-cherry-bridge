@@ -63,11 +63,11 @@ profile 手工加行等价于：
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。 |
-| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`）。 |
+| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后经 `agent.sessions.get` 回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。 |
-| `cherry_wait` | 只等待该会话在途执行到终态（不发送新消息）。 |
+| `cherry_wait` | 只等待该会话在途执行收敛（不发送新消息）。 |
 | `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。 |
 | `cherry_respond` | 应答交互卡：提问必须全量作答，审批走 `decision`。 |
 | `cherry_cancel` | 取消会话在途执行（`expectedExecutionId` 必填）。 |
@@ -76,6 +76,12 @@ profile 手工加行等价于：
 
 设备选择器（`device` 参数）接受**精确 `deviceId`** 或**唯一的显示名前缀**；前缀命中
 多项时返回结构化歧义错误，不会任选一个。
+
+`cherry_send(wait: true)` / `cherry_wait` 返回的 `status` 有 **7 个取值**：四个协议终态
+（`completed`/`failed`/`cancelled`/`interrupted`）之外，还有三个 waiter 自己的判定——
+`awaiting-interaction`（软终态：出现待答交互卡，运行仍活着）、`timeout`（窗口用尽，
+**不是失败**，返回已到达的部分内容与续读游标）、`idle`（`cherry_wait` 遇到没有在途执行
+的会话，立即返回当前快照）。
 
 ## 设置页（web client）
 
@@ -87,8 +93,11 @@ profile 手工加行等价于：
 - 配对向导：粘贴 payload → 展示 6 位验证码 → 展示终态；
 - 实时状态：设备状态与配对进度经同源 SSE 流（`/cherry-remote/api/events`）推送。
 
-开发时可单独跑 `npm run dev:ui`（`ui/` 下的 Vite 入口），或经 `ui/src/dev.tsx`
-对着一个真实 DSH 宿主的同源 `/cherry-remote/api` 调试。
+开发时可单独跑 `npm run dev:ui`（`ui/` 下的 Vite 入口）。**前提是同一个 DSH 宿主已在
+`http://127.0.0.1:23023` 运行**：该 dev server 只服务页面本身，页面调用的
+`/cherry-remote/api` 由 `ui/vite.config.ts` 里的 **dev-only 代理**转发到宿主（SSE 也走
+同一条代理，不被缓冲）。没有宿主时页面能渲染，但设备列表与事件流会报错。宿主在别的
+端口时用 `CHERRY_DEV_HOST=http://127.0.0.1:<port> npm run dev:ui` 覆盖，不必改代码。
 
 ## HTTP 面（同源）
 
@@ -101,7 +110,7 @@ profile 手工加行等价于：
 | `PATCH /cherry-remote/api/devices/:id` | 改显示名/启用状态/地址/端口（`hosts` 为**整体替换**）。 |
 | `DELETE /cherry-remote/api/devices/:id` | 移除设备并断开其连接。 |
 | `POST /cherry-remote/api/pair` | 启动一次配对，立即返回 `202 {claimId}`，进度走 SSE。 |
-| `GET /cherry-remote/api/events` | SSE：`device-state` / `pairing-progress`，含心跳。 |
+| `GET /cherry-remote/api/events` | SSE：`device-state` / `pairing-progress`（每帧带产生它的 `claimId`，含心跳）。 |
 | `GET /cherry-remote/api/diagnostics` | 运维诊断报告（见下）。 |
 
 **信任 fence**：每个路由在动手前都自行过一遍同源判定，四分支按序为
@@ -115,9 +124,12 @@ curl 之类的非浏览器客户端，不是跨站页面）。
 
 - 可出：`deviceId`、显示名、状态、地址、端口、`desktopIdentity` 的 **12 位摘要**、
   **hello 协商后的有效 limits**（`heartbeatMs`/`subscriptions`/`pageItems`/
-  `inFlightRequests`；无连接的设备**不报** limits，而不是拿客户端回退值冒充）、
-  `sessionId` 与会话游标、`stats` 计数器
-  （`connections`/`sockets`/`connectionsBuilt`/`subscriptions`）、
+  `inFlightRequests`；**只有存在活连接时才报**——本端点从不拨号，无连接的设备既不报
+  limits、也不会被顺手唤醒，而不是拿客户端回退值冒充）、
+  `sessionId` 与会话游标（游标取自订阅层当前状态，未订阅的会话没有该字段）、
+  `stats` 计数器（`connections`/`sockets`/`connectionsBuilt`/`subscriptions`）、
+  装配层解析出的**两个 `config` 键**
+  （`rateBudgetPerSecond`/`perSessionCacheBytes`，与日志里报的是同一组数字）、
   错误的 reason/message（**message 在端点边界被截断到 200 字符**，
   见 `ERROR_MESSAGE_MAX`）；
 - 绝不出：`accessToken`、`tokenExpiresAt`、`invitationSecret`、原始
@@ -135,8 +147,10 @@ curl 之类的非浏览器客户端，不是跨站页面）。
 分级约定（spec §5）：
 
 - **error** —— 连接失败 / 认证失败 / 协议错误；
-- **warn** —— 重连退避 / 缓存淘汰 / 限流退避；
+- **warn** —— 重连退避 / 缓存淘汰 / 订阅 LRU 驱逐；
 - **info** —— 配对进度 / 订阅建立与恢复 / 设备状态迁移。
+
+info 级只记**阶段名与标识符**（`deviceId`/`sessionId`/配对阶段），不记任何载荷。
 
 敏感字段（token、`invitationSecret`、`accessToken`、消息内容与 part 文本）**一律不入
 日志**；`deviceId`、`desktopIdentity` 摘要与 `sessionId` 可记。契约套件对一条完整的
@@ -149,6 +163,8 @@ npm test            # vitest 全量（含 tests/contract/）
 npm run typecheck   # 服务端 + UI 两侧
 npm run build       # tsdown → dist/index.mjs
 npm run build:client # vite → lib/client.js
+npm run dev:ui      # 设置页 dev server（需宿主在 127.0.0.1:23023 运行，见上）
+npm run prepublishOnly # 发布前钩子：build + build:client
 ```
 
 依赖 `@cherrystudio/remote-protocol@0.3.0` 与 `@cherrystudio/remote-transport@0.1.2`
@@ -156,6 +172,11 @@ npm run build:client # vite → lib/client.js
 `tests/contract/contract.test.ts` 以防 schema drift。契约套件同时逐条建模了「本仓库
 自环假对端」与「真实 Cherry Studio」的**六项行为差异**，并逐条对应
 [`docs/e2e-checklist.md`](docs/e2e-checklist.md) 中的人工核验步骤。
+
+> 说明：本仓库的 `tests/loopback/fakeCherry.ts` 是**测试内**的自环假对端，不是发布物；
+> 文档与代码注释中出现的 `Task N`、`spec §x`、`controller ruling`、`UltraReview` 等编号，
+> 指向本项目内部的 SDD 过程文档（设计/任务/审查记录），**不随包发布**——它们只是把
+> 「这条规则为什么长这样」的出处留在原处。
 
 发布前请走完 `docs/e2e-checklist.md`：Electron 端的人工批准无法 CI 化，真机流程
 （配对 / 发送 / 交互应答 / 断连恢复 / 多设备并存）必须人工过一遍。

@@ -248,6 +248,17 @@ export interface FakeAgentOptions {
    * implicit `wait: true` hands back a non-terminal answer.
    */
   sendOutcome?: 'applied' | 'accepted' | 'busy' | 'target-unavailable' | 'resource-exhausted'
+  /**
+   * OMIT the `executionId` from an accepted `agent.messages.send` receipt while
+   * the run still proceeds normally on the event stream.
+   *
+   * Models the peer that admits a command without naming the run it started.
+   * The receipt schema makes `executionId` optional, so this is legal wire
+   * shapes — and it is exactly the case a waiter must survive: it has no id to
+   * attribute `execution.updated` events to, so it has to ADOPT the first run
+   * that appears after its own baseline instead of parking until the timeout.
+   */
+  omitSendExecutionId?: boolean
   /** Same injection for `agent.executions.cancel` (Task 9⑮ covers both verbs). */
   cancelOutcome?: 'applied' | 'target-unavailable'
   /**
@@ -880,6 +891,19 @@ export class FakeCherry {
     this.#options.agent.terminalMessage = message
   }
 
+  /**
+   * Moves one session's `historyRevision` (and with it the `idleRevision` its
+   * summary reports while the session is idle).
+   *
+   * Used to model a peer that has MOVED ON since a client last looked — the
+   * only way to tell a cache that was refreshed from a cache that was reused.
+   */
+  setSessionRevision(sessionId: string, revision: string): void {
+    const session = (this.#options.agent?.sessions ?? []).find((entry) => entry.sessionId === sessionId)
+    if (session === undefined) throw new Error(`no session ${sessionId}`)
+    session.historyRevision = revision
+  }
+
   /** The interaction view the peer currently serves, in fixture order. */
   get interactions(): readonly FakeInteractionView[] {
     return this.#interactions.map((interaction) => this.#interactionView(interaction))
@@ -1015,6 +1039,28 @@ export class FakeCherry {
     subscription.phase = 'reset'
     this.#subscriptions.delete(subscription.subscriptionId)
     this.#notify('agent.subscriptions.resetRequired', { subscriptionId: subscription.subscriptionId, reason })
+  }
+
+  /**
+   * REPLAYS one already-emitted event to the live subscriber of `sessionId`,
+   * carrying its ORIGINAL (lower) seq — the peer-side fault of a duplicate or
+   * out-of-order delivery on an otherwise healthy stream.
+   *
+   * A real peer can do this across a reconnect/replay race even though it never
+   * rewinds its watermark, so the consumer MUST be the one that refuses to let
+   * `state.cursor` regress: accepting the stale batch would move the session's
+   * cursor BACKWARDS and re-deliver events the caller already consumed.
+   */
+  replayEvent(sessionId: string, seq: number, event: FakeAgentEvent): void {
+    for (const subscription of this.#subscriptions.values()) {
+      if (subscription.sessionId !== sessionId || subscription.phase !== 'active') continue
+      this.#notify('agent.events', {
+        subscriptionId: subscription.subscriptionId,
+        sessionId,
+        streamEpoch: this.#journalEpoch,
+        events: [{ kind: event.kind, seq: String(seq), payload: event.payload }],
+      })
+    }
   }
 
   /** Pushes an arbitrary notification — the unknown-method consumer-side probe. */
@@ -2024,7 +2070,10 @@ export class FakeCherry {
       // this non-terminal receipt as the answer.
       status: outcome === 'accepted' ? 'accepted' : 'applied',
       admittedAt: new Date().toISOString(),
-      executionId,
+      // `executionId` is SCHEMA-OPTIONAL, and a peer may legitimately omit it.
+      // The run is unaffected — only the caller's ability to attribute events
+      // by id is (see `omitSendExecutionId`).
+      ...(this.#agent().omitSendExecutionId === true ? {} : { executionId }),
     }
   }
 

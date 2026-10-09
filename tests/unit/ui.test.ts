@@ -29,8 +29,9 @@ import { describe, expect, it, afterEach, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createElement } from 'react'
 import type { ComponentProps, ComponentType } from 'react'
-import type { EventSourceLike } from '../../ui/src/types'
+import type { DeviceSummary, EventSourceLike } from '../../ui/src/types'
 import { App } from '../../ui/src/App'
+import { DeviceCard } from '../../ui/src/DeviceCard'
 import { inject, apply, SETTINGS_NAMESPACE, SETTINGS_SLOT } from '../../ui/src/main'
 import type { SlotRegistration, SlotsService } from '../../ui/src/main'
 
@@ -202,11 +203,14 @@ describe('pairing wizard', () => {
 
     // The code exists ONLY as this SSE frame (controller ruling).
     expect(screen.queryByText('482915')).toBeNull()
-    stream().emit({ event: 'pairing-progress', data: { stage: 'verification-code', detail: '482915' } })
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '482915', claimId: 'claim-7' },
+    })
     expect(await screen.findByText('482915')).toBeTruthy()
 
     // Terminal frame → the transient display goes away and the flow is done.
-    stream().emit({ event: 'pairing-progress', data: { stage: 'approved' } })
+    stream().emit({ event: 'pairing-progress', data: { stage: 'approved', claimId: 'claim-7' } })
     // Waited on the SETTLED state, not the instant after emit: the app clears
     // the progress frame once the run ends, so an assertion that only held
     // before the next render would be testing timing, not behaviour.
@@ -243,8 +247,12 @@ describe('pairing wizard', () => {
     // inverse — POSTing first — is asserted positionally in the ordering test.)
     await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-11' })]])
 
-    // The stream subscribes before the POST, so this frame is not replayed away.
-    stream().emit({ event: 'pairing-progress', data: { stage: 'verification-code', detail: '204816' } })
+    // The stream subscribes before the POST, so the frame is not replayed away.
+    // It carries THIS run's claim id, which is what makes it attributable.
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '204816', claimId: 'claim-11' },
+    })
     submitPayload()
 
     expect(await screen.findByText('204816')).toBeTruthy()
@@ -273,7 +281,10 @@ describe('pairing wizard', () => {
 
       // The everyday failure: the desktop is offline, and the verdict only ever
       // arrives on the stream.
-      stream().emit({ event: 'pairing-progress', data: { stage, detail: 'peer is offline' } })
+      stream().emit({
+        event: 'pairing-progress',
+        data: { stage, detail: 'peer is offline', claimId: 'claim-fail' },
+      })
 
       // The run ends, in user-facing copy rather than a raw stage string.
       const settled = await screen.findByText(new RegExp(label))
@@ -292,7 +303,67 @@ describe('pairing wizard', () => {
     })
   }
 
-  it('surfaces a validation refusal without leaving the wizard', async () => {    await renderWithDevice([
+  it('IGNORES another run\'s frames: a foreign claimId cannot show its code or settle this wizard', async () => {
+    // The stream is shared by every tab. A second tab pairing a different
+    // desktop publishes its own code and verdict on the SAME channel, and a
+    // wizard that trusted any frame would display a stranger's 6-digit code —
+    // the one number the user is supposed to compare against their own desktop
+    // — and then settle on the stranger's outcome.
+    await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-mine' })]])
+
+    submitPayload()
+    await screen.findByText('配对进行中')
+
+    // A foreign run's stages, code and terminal — all of them must be ignored.
+    stream().emit({ event: 'pairing-progress', data: { stage: 'validate', claimId: 'claim-theirs' } })
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '999999', claimId: 'claim-theirs' },
+    })
+    stream().emit({ event: 'pairing-progress', data: { stage: 'approved', claimId: 'claim-theirs' } })
+
+    // ...and an UNATTRIBUTED frame is ignored too: this wizard only acts on
+    // frames it can prove belong to its own run.
+    stream().emit({ event: 'pairing-progress', data: { stage: 'rejected' } })
+
+    // Still waiting, still showing nothing foreign.
+    expect(screen.queryByText('999999')).toBeNull()
+    expect(screen.queryByText('配对成功')).toBeNull()
+    expect(screen.getByText('配对进行中')).toBeTruthy()
+
+    // Its OWN code and terminal are honoured.
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '135790', claimId: 'claim-mine' },
+    })
+    expect(await screen.findByText('135790')).toBeTruthy()
+    stream().emit({ event: 'pairing-progress', data: { stage: 'approved', claimId: 'claim-mine' } })
+    expect(await screen.findByText('配对成功')).toBeTruthy()
+  })
+
+  it('tells the user how to recover from an expired and a rejected pairing', async () => {
+    // The two failure labels carry the RECOVERY step, not just the verdict: the
+    // user is standing in front of two windows with nothing else to go on.
+    for (const [stage, advice] of [
+      ['expired', /重新生成配对码/],
+      ['rejected', /6 位验证码/],
+    ] as const) {
+      cleanup()
+      await renderWithDevice([
+        ['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: `claim-${stage}` })],
+      ])
+      submitPayload()
+      await screen.findByText('配对进行中')
+
+      stream().emit({ event: 'pairing-progress', data: { stage, claimId: `claim-${stage}` } })
+
+      const settled = await screen.findByText(advice)
+      expect(settled).toBeTruthy()
+    }
+  })
+
+  it('surfaces a validation refusal without leaving the wizard', async () => {
+    await renderWithDevice([
       [
         'POST',
         '/cherry-remote/api/pair',
@@ -342,6 +413,70 @@ describe('device card status light', () => {
 })
 
 describe('device card actions', () => {
+  it('resyncs the editor drafts when the record changes underneath them', async () => {
+    // An external refresh (the app re-reads /devices after a pairing settles)
+    // replaces the card's record. The editors must show the SERVER's values:
+    // a stale box would write the old value back on the next save.
+    const { rerender } = render(
+      createElement(DeviceCard, {
+        device: { ...DEVICE, displayName: 'Old Name', hosts: ['10.0.0.1'], port: 1111 } as DeviceSummary,
+        state: 'connected' as const,
+        onSaved: () => {},
+        onRemoved: () => {},
+      }),
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '重命名' }))
+    const box = screen.getByLabelText('设备名称') as HTMLInputElement
+    expect(box.value).toBe('Old Name')
+
+    // The record changes while the editor is OPEN but NOT focused.
+    rerender(
+      createElement(DeviceCard, {
+        device: { ...DEVICE, displayName: 'New Name', hosts: ['10.0.0.9'], port: 2222 } as DeviceSummary,
+        state: 'connected' as const,
+        onSaved: () => {},
+        onRemoved: () => {},
+      }),
+    )
+    await waitFor(() => {
+      expect((screen.getByLabelText('设备名称') as HTMLInputElement).value).toBe('New Name')
+    })
+
+    // ...and the address editor too.
+    fireEvent.click(screen.getByRole('button', { name: '地址维护' }))
+    expect((screen.getByLabelText('主机地址') as HTMLInputElement).value).toBe('10.0.0.9')
+    expect((screen.getByLabelText('端口') as HTMLInputElement).value).toBe('2222')
+  })
+
+  it('does NOT clobber what the user is typing when a refresh lands mid-edit', async () => {
+    // The other half of the rule: while focus is inside the card, the user's
+    // in-progress draft outranks a background refresh.
+    const { rerender } = render(
+      createElement(DeviceCard, {
+        device: { ...DEVICE, displayName: 'Old Name' } as DeviceSummary,
+        state: 'connected' as const,
+        onSaved: () => {},
+        onRemoved: () => {},
+      }),
+    )
+    fireEvent.click(screen.getByRole('button', { name: '重命名' }))
+    const box = screen.getByLabelText('设备名称') as HTMLInputElement
+    box.focus()
+    fireEvent.change(box, { target: { value: 'half typed' } })
+
+    rerender(
+      createElement(DeviceCard, {
+        device: { ...DEVICE, displayName: 'Server Name' } as DeviceSummary,
+        state: 'connected' as const,
+        onSaved: () => {},
+        onRemoved: () => {},
+      }),
+    )
+
+    expect((screen.getByLabelText('设备名称') as HTMLInputElement).value).toBe('half typed')
+  })
+
   it('disables an enabled device through PATCH enabled:false', async () => {
     const { calls } = await renderWithDevice([
       ['PATCH', '/cherry-remote/api/devices/dev-1', jsonResponse(200, { ...DEVICE, enabled: false, state: 'disabled' })],
@@ -471,13 +606,16 @@ describe('sse driven state', () => {
   it('hides the transient code once its lifetime elapses', async () => {
     // Real timers with a short lifetime: fake timers cannot drive RTL's async
     // `waitFor`, and the lifetime is already injectable (ruling 7).
-    await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-3' })]], {
+    await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-lifetime' })]], {
       codeLifetimeMs: 80,
     })
 
     submitPayload()
     await screen.findByText('配对进行中')
-    stream().emit({ event: 'pairing-progress', data: { stage: 'verification-code', detail: '135790' } })
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '135790', claimId: 'claim-lifetime' },
+    })
     await screen.findByText('135790')
 
     await waitFor(() => {
