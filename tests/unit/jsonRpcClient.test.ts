@@ -117,8 +117,26 @@ async function openLoopback(opts?: {
   return { client, peer: peerChannel }
 }
 
-const isRequest = (value: any): boolean =>
-  typeof value === 'object' && value !== null && 'method' in value && 'id' in value
+/**
+ * An inbound peer frame as this harness consumes it. The client does not export
+ * its wire type, so the harness declares the precise shape it actually reads:
+ * the request envelope. `params` stays `unknown` because the assertions compare
+ * it structurally (`toEqual`) rather than reaching into it.
+ */
+interface PeerRequestFrame {
+  readonly jsonrpc: string
+  readonly id: number
+  readonly method: string
+  readonly params?: unknown
+}
+
+const isRequest = (value: unknown): value is PeerRequestFrame =>
+  typeof value === 'object' &&
+  value !== null &&
+  'method' in value &&
+  'id' in value &&
+  typeof (value as { method: unknown }).method === 'string' &&
+  typeof (value as { id: unknown }).id === 'number'
 
 /**
  * The single owner of the peer-side read loop. A channel delivers each frame to
@@ -126,12 +144,12 @@ const isRequest = (value: any): boolean =>
  * `peer.read()` calls would steal frames from each other.
  */
 class PeerHarness {
-  readonly requests: any[] = []
+  readonly requests: PeerRequestFrame[] = []
   readonly inFlight: string[] = []
   peakInFlight = 0
   /** When false, inbound requests are recorded but never answered. */
   autoReply = true
-  onRequest: ((frame: any) => void) | undefined
+  onRequest: ((frame: PeerRequestFrame) => void) | undefined
 
   constructor(private readonly peer: SecureChannel) {
     void this.loop()
@@ -139,7 +157,7 @@ class PeerHarness {
 
   private async loop(): Promise<void> {
     for (;;) {
-      let frame: any
+      let frame: unknown
       try {
         frame = await this.peer.read()
       } catch {
@@ -154,7 +172,7 @@ class PeerHarness {
     }
   }
 
-  reply(frame: any, body: { result?: unknown; error?: unknown }): void {
+  reply(frame: PeerRequestFrame, body: { result?: unknown; error?: unknown }): void {
     const index = this.inFlight.indexOf(frame.method)
     if (index !== -1) this.inFlight.splice(index, 1)
     void this.peer.write({ jsonrpc: '2.0', id: frame.id, ...body })
@@ -167,7 +185,7 @@ class PeerHarness {
     }, { timeout: timeoutMs })
   }
 
-  requestFor(method: string): any {
+  requestFor(method: string): PeerRequestFrame {
     const found = this.requests.find((frame) => frame.method === method)
     if (found === undefined) throw new Error(`no request observed for "${method}"`)
     return found

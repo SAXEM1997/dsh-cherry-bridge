@@ -262,6 +262,20 @@ function mount(overrides: Partial<CherryHttpDeps> = {}): FakeCtx {
   return ctx
 }
 
+/**
+ * `json` is deliberately `any` and is the ONE such escape in this file.
+ *
+ * It is the parsed body of a response under test, and this harness drives every
+ * route, so its shape differs per call and the ASSERTIONS are what pin it down
+ * (`expect(x.json.claimId).not.toBe(...)`, `expect(typeof x.json.error)`). The
+ * honest type would be a per-route union, or `Record<string, unknown>` plus 46
+ * narrowing rewrites at every call site. Both are behaviour-adjacent churn
+ * outside a module-resolution migration, so it is left as it was. It is
+ * PRE-EXISTING (bundler resolution never flagged it — `any` is explicit, not an
+ * error hole) and it is NOT part of the nodenext error set.
+ *
+ * TODO(types): replace with `Record<string, unknown>` and narrow per assertion.
+ */
 async function call(
   path: string,
   init: RequestInitLike = {},
