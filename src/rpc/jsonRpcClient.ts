@@ -12,6 +12,8 @@ const DEFAULT_MAX_IN_FLIGHT = 8
 const DEFAULT_TIMEOUT_MS = 30_000
 /** Rejection message used once the channel can no longer carry responses. */
 const CHANNEL_CLOSED_MESSAGE = 'JSON-RPC channel closed'
+/** Bounded number of schema issues quoted in one drop warning. */
+const ISSUE_LIMIT = 3
 
 export interface JsonRpcClientOptions {
   /** Business requests allowed in flight at once; further calls queue. */
@@ -50,6 +52,50 @@ function encodeFrame(value: unknown): unknown {
 }
 
 /**
+ * Bounded, payload-free description of a dropped frame.
+ *
+ * The drop paths fire on frames that FAILED validation, which is exactly the
+ * set of frames whose contents are least trustworthy — and a peer frame
+ * carries user content (chat text, tool arguments, file paths). Logging the
+ * frame itself would therefore publish arbitrary peer-supplied bytes at warn
+ * level, in a log an operator shares when filing a bug. What an operator
+ * actually needs is classification: which branch rejected it, the method name
+ * (a bounded identifier the remote controls, and the only part that routes the
+ * report), the request id when the frame carries one, and the schema path that
+ * failed. Everything else stays out.
+ */
+function describeFrame(value: unknown): string {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return `frame is ${value === null ? 'null' : Array.isArray(value) ? 'an array' : typeof value}`
+  }
+  const record = value as Record<string, unknown>
+  const parts: string[] = []
+  if (typeof record['method'] === 'string') parts.push(`method="${record['method']}"`)
+  if ('id' in record) parts.push(`id=${JSON.stringify(record['id'])}`)
+  return parts.length === 0 ? 'frame has no method or id' : parts.join(' ')
+}
+
+/** The zod issue paths of a failed parse, joined for one bounded log line. */
+function describeIssues(error: { issues: Array<{ path: PropertyKey[]; message: string }> }): string {
+  return error.issues
+    .slice(0, ISSUE_LIMIT)
+    .map((issue) => `${issue.path.map(String).join('.') || '<root>'}: ${issue.message}`)
+    .join('; ')
+}
+
+/**
+ * The full, payload-free drop warning: the branch that rejected the frame, its
+ * classification, and the validation-error path that explains the rejection.
+ */
+function dropWarning(
+  branch: string,
+  value: unknown,
+  error: { issues: Array<{ path: PropertyKey[]; message: string }> },
+): string {
+  return `[cherry-remote] dropped invalid JSON-RPC ${branch} (${describeFrame(value)}): ${describeIssues(error)}`
+}
+
+/**
  * JSON-RPC 2.0 client riding on a Noise-encrypted `SecureChannel`.
  *
  * The published transport package ships only a server, so this layer owns the
@@ -59,7 +105,13 @@ function encodeFrame(value: unknown): unknown {
  */
 export class JsonRpcClient {
   private readonly channel: SecureChannel
-  private readonly maxInFlight: number
+  /**
+   * Current admission cap. Mutable (unlike the other options) because the peer
+   * reports its own concurrent-request allowance in `connection.hello`, and the
+   * spec's half-the-report rule (§3.4) can only be honoured once that reply has
+   * been seen — which is after this client was constructed.
+   */
+  private maxInFlight: number
   private readonly defaultTimeoutMs: number
 
   private nextId = 0
@@ -135,6 +187,44 @@ export class JsonRpcClient {
     this.handlers.push(handler)
   }
 
+  /**
+   * Resizes the admission window: `n` is the new cap on requests that may be in
+   * flight at once. Only ADMISSIONS are affected — requests already in flight
+   * are never cancelled, re-queued, or rejected, because they have already been
+   * written to the peer and the peer counts arrivals, not intentions.
+   *
+   * Shrinking takes effect immediately for new admissions: with more requests
+   * in flight than the new cap, the queue simply drains back down to it before
+   * anything further is admitted. Growing the window drains the queue at once.
+   *
+   * The cap is floored at 1: a cap of 0 would queue every request forever with
+   * no event that could ever release one, which is a deadlock, not a limit.
+   */
+  updateMaxInFlight(n: number): void {
+    // A non-finite input carries no window width at all; ignore it rather than
+    // poisoning `maxInFlight` with NaN, which would make every comparison in
+    // `drainQueue` false and wedge the queue permanently.
+    if (!Number.isFinite(n)) return
+    this.maxInFlight = Math.max(1, Math.floor(n))
+    // Growing the window may have made room right now; shrinking admits nobody.
+    this.drainQueue()
+  }
+
+  /**
+   * Admits queued requests while the window has room.
+   *
+   * The bound is re-checked every iteration because `send()` is what increments
+   * `inFlight`, and it can also reject without incrementing (disposed or
+   * aborted), which must not spin this loop forever.
+   */
+  private drainQueue(): void {
+    while (this.queue.length > 0 && this.inFlight < this.maxInFlight) {
+      const before = this.inFlight
+      this.queue.shift()!()
+      if (this.inFlight === before) return
+    }
+  }
+
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
@@ -173,15 +263,20 @@ export class JsonRpcClient {
     pending.resolve(value)
   }
 
-  /** Removes bookkeeping for one id and admits the next queued request. */
+  /**
+   * Removes bookkeeping for one id and admits the next queued request, but only
+   * if the window has room. The room check is not redundant with the one in
+   * `request`: the cap can shrink while requests are in flight
+   * ({@link updateMaxInFlight}), and an unconditional admit here would let the
+   * shrunk window be refilled straight back to the old width.
+   */
   private release(id: number): void {
     const pending = this.pending.get(id)
     if (pending === undefined) return
     this.pending.delete(id)
     clearTimeout(pending.timer)
     this.inFlight -= 1
-    const next = this.queue.shift()
-    if (next !== undefined) next()
+    this.drainQueue()
   }
 
   /**
@@ -212,7 +307,13 @@ export class JsonRpcClient {
         try {
           this.dispatch(frame)
         } catch (error) {
-          console.warn('[cherry-remote] dropped malformed JSON-RPC frame', error)
+          // JSON.parse of a string frame is the only throw here; the frame
+          // itself is NOT logged (see `describeFrame`).
+          console.warn(
+            `[cherry-remote] dropped unparsable JSON-RPC frame (${
+              error instanceof Error ? error.message : String(error)
+            })`,
+          )
         }
       }
     })()
@@ -221,7 +322,7 @@ export class JsonRpcClient {
   private dispatch(frame: unknown): void {
     const value = typeof frame === 'string' ? (JSON.parse(frame) as unknown) : frame
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-      console.warn('[cherry-remote] dropped non-object JSON-RPC frame', value)
+      console.warn(`[cherry-remote] dropped non-object JSON-RPC frame (${describeFrame(value)})`)
       return
     }
 
@@ -233,7 +334,7 @@ export class JsonRpcClient {
     if (!hasId) {
       const parsed = jsonRpcNotificationSchema.safeParse(value)
       if (!parsed.success) {
-        console.warn('[cherry-remote] dropped invalid JSON-RPC notification', value)
+        console.warn(dropWarning('notification', value, parsed.error))
         return
       }
       const { method, params } = parsed.data
@@ -252,7 +353,7 @@ export class JsonRpcClient {
     if ('method' in record) {
       const parsed = jsonRpcRequestSchema.safeParse(value)
       if (!parsed.success) {
-        console.warn('[cherry-remote] dropped invalid JSON-RPC request', value)
+        console.warn(dropWarning('request', value, parsed.error))
         return
       }
       console.warn(
@@ -264,13 +365,14 @@ export class JsonRpcClient {
     // (c) Any other id-bearing frame → response.
     const parsed = jsonRpcResponseSchema.safeParse(value)
     if (!parsed.success) {
-      console.warn('[cherry-remote] dropped invalid JSON-RPC response', value)
+      console.warn(dropWarning('response', value, parsed.error))
       return
     }
     const response = parsed.data
     if (!('id' in response) || typeof response.id !== 'number') {
-      // String/null ids cannot come from this client's counter.
-      console.warn('[cherry-remote] dropped JSON-RPC response with unknown id', response.id)
+      // String/null ids cannot come from this client's counter. The id itself is
+      // omitted for the same reason the payload is: it is peer-supplied.
+      console.warn('[cherry-remote] dropped JSON-RPC response with unknown id')
       return
     }
     if ('error' in response) {

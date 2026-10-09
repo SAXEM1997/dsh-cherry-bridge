@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi, type MockInstance } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -16,6 +16,8 @@ vi.mock('node:fs', async (importOriginal) => {
     default: actual,
     fsyncSync: vi.fn((fd: number) => actual.fsyncSync(fd)),
     closeSync: vi.fn((fd: number) => actual.closeSync(fd)),
+    openSync: vi.fn((...args: Parameters<typeof actual.openSync>) => actual.openSync(...args)),
+    renameSync: vi.fn((...args: Parameters<typeof actual.renameSync>) => actual.renameSync(...args)),
     readFileSync: vi.fn((...args: Parameters<typeof actual.readFileSync>) =>
       actual.readFileSync(...args),
     ),
@@ -29,6 +31,14 @@ const SCHEMA_VERSION = 2
 const DEVICES_FILENAME = 'devices.json'
 
 const tempDirs: string[] = []
+
+beforeEach(() => {
+  // The store legitimately warns on every unreadable archive — including the
+  // first-run ENOENT that most tests trigger just by pointing at a fresh
+  // directory. Silence it globally so the suite output stays pristine; the
+  // tests that ASSERT on the warning re-spy inside themselves.
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
+})
 
 afterEach(async () => {
   vi.restoreAllMocks()
@@ -472,6 +482,88 @@ describe('DeviceStore write validation', () => {
 })
 
 describe('DeviceStore corruption handling', () => {
+  it('(F1) an atomic persist never opens the target file for in-place truncation', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    const open = vi.mocked(fs.openSync)
+
+    store.upsert(makeRecord())
+
+    // Structural: the archive is built beside the target and renamed over it,
+    // so NO path may open the target itself with a truncating 'w'.
+    const opensOnTarget = open.mock.calls.filter(
+      ([path, flags]) => path === file && (flags === 'w' || flags === 'w+'),
+    )
+    expect(opensOnTarget).toEqual([])
+
+    // The temp file is the one written, and it is gone once renamed.
+    expect(open.mock.calls.some(([path]) => path === `${file}.tmp`)).toBe(true)
+    await expect(readFile(`${file}.tmp`, 'utf8')).rejects.toThrow()
+    expect(await storeContains(file, makeRecord())).toBe(true)
+  })
+
+  it('(F1) quarantines a torn archive: empty view, .corrupt copy, writes REFUSED', async () => {
+    const file = await makeStoreFile()
+    const torn = '{"schemaVersion": 2, "devices": [{"deviceId": "dev-alpha"'
+    await writeFile(file, torn, 'utf8')
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const store = new DeviceStore(file)
+
+    // RF4 spirit preserved: the read degrades, it never takes the plugin down.
+    expect(store.list()).toEqual([])
+    expect(warn).toHaveBeenCalled()
+    expect(warn.mock.calls[0]?.[0]).toContain(file)
+
+    // The bad bytes were preserved verbatim before anything else happened.
+    expect(await readFile(`${file}.corrupt`, 'utf8')).toBe(torn)
+    // ...and the original is still there: quarantine COPIES, it never moves.
+    expect(await readFile(file, 'utf8')).toBe(torn)
+
+    // The poisoned store refuses to overwrite: losing every pairing silently
+    // is the failure mode this guard exists to prevent.
+    expect(() => store.upsert(makeRecord())).toThrow(/corrupt/i)
+    expect(() =>
+      store.upsert(makeRecord()),
+    ).toThrow(new RegExp(`${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.corrupt`))
+    expect(() => store.remove('dev-alpha')).toThrow(/corrupt/i)
+
+    // Both the poisoned archive and the quarantine copy are untouched.
+    expect(await readFile(file, 'utf8')).toBe(torn)
+    expect(await readFile(`${file}.corrupt`, 'utf8')).toBe(torn)
+  })
+
+  it('(F1) keeps serving an empty read-only view after quarantine until the file is moved aside', async () => {
+    const file = await makeStoreFile()
+    const torn = 'not json at all'
+    await writeFile(file, torn, 'utf8')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const store = new DeviceStore(file)
+    expect(store.list()).toEqual([])
+
+    // Address maintenance / manual repair: the operator moves the bad file
+    // aside and restores a good archive. A NEW store reads it normally.
+    await rm(file)
+    await writeFile(file, JSON.stringify({ schemaVersion: SCHEMA_VERSION, devices: [makeRecord()] }), 'utf8')
+    expect(new DeviceStore(file).list()).toEqual([makeRecord()])
+  })
+
+  it('(F1) ENOENT keeps the pinned first-run behaviour: empty, no quarantine, writes allowed', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+
+    // First run: no archive yet. An absent file is NOT corruption, so it must
+    // not be quarantined...
+    expect(store.list()).toEqual([])
+    await expect(readFile(`${file}.corrupt`, 'utf8')).rejects.toThrow()
+
+    // ...and it must not poison the store either: a first-run store writes.
+    store.upsert(makeRecord())
+    expect(store.list()).toEqual([makeRecord()])
+    expect((await readArchive(file)).devices).toEqual([makeRecord()])
+  })
+
   it('returns an empty store, does not throw, and warns when the file is corrupt (⑥ RF4)', async () => {
     const file = await makeStoreFile()
     await writeFile(file, '{ this is not json', 'utf8')
@@ -493,8 +585,18 @@ describe('DeviceStore corruption handling', () => {
     const store = new DeviceStore(file)
     expect(store.list()).toEqual([])
 
-    store.upsert(makeRecord())
-    expect(store.list()).toEqual([makeRecord()])
+    // The poisoned instance stays read-only even after the bad bytes are gone:
+    // re-checking the disk on every write would race an operator's repair, and
+    // a persisted flag is the only thing that cannot be fooled by a file that
+    // reappears mid-write. Recovery is a RESTART, not a silent retry.
+    await rm(file)
+    expect(() => store.upsert(makeRecord())).toThrow(/READ-ONLY/)
+    expect(store.list()).toEqual([])
+
+    // A fresh store (the restart) reads the repaired path normally.
+    const restarted = new DeviceStore(file)
+    restarted.upsert(makeRecord())
+    expect(restarted.list()).toEqual([makeRecord()])
     expect(await readArchive(file)).toEqual({
       schemaVersion: SCHEMA_VERSION,
       devices: [makeRecord()],
@@ -504,11 +606,14 @@ describe('DeviceStore corruption handling', () => {
 
   it('warns but does not throw when the archive disappeared (⑥ RF4)', async () => {
     const file = await makeStoreFile()
+    // Spied BEFORE the first read: the first-run read is exactly the path under
+    // test here, and letting its warning escape would leave stray stderr in the
+    // suite output (the store genuinely warns on every unreadable archive).
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     new DeviceStore(file).upsert(makeRecord())
 
     // Simulates the archive being deleted underneath a running plugin.
     await rm(file)
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     const store = new DeviceStore(file)
     expect(store.list()).toEqual([])

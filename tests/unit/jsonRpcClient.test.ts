@@ -266,12 +266,12 @@ describe('JsonRpcClient', () => {
 
     // Step 3's third case: a frame with a valid `id` carrying neither `result`
     // nor `error` matches none of the three branches, so it is dropped with a
-    // warning and never surfaced as a notification.
+    // warning and never surfaced as a notification. The warning carries the
+    // CLASSIFICATION (branch + id + schema path), never the payload (F2).
     await peer.write({ jsonrpc: '2.0', id: 999 })
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith(
-        '[cherry-remote] dropped invalid JSON-RPC response',
-        expect.objectContaining({ id: 999 }),
+        expect.stringMatching(/dropped invalid JSON-RPC response \(id=999\)/),
       )
     })
     expect(handler).not.toHaveBeenCalled()
@@ -297,12 +297,12 @@ describe('JsonRpcClient', () => {
 
     // A response-shaped frame with no `id` is valid as neither a notification
     // nor a response (both schemas reject it), so it is dropped with a warning
-    // and the outstanding request stays pending rather than resolving.
+    // and the outstanding request stays pending rather than resolving. The
+    // warning names the branch and the failing schema path, not the payload.
     await peer.write({ jsonrpc: '2.0', result: { ok: true } })
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith(
-        '[cherry-remote] dropped invalid JSON-RPC notification',
-        expect.objectContaining({ result: { ok: true } }),
+        expect.stringContaining('[cherry-remote] dropped invalid JSON-RPC notification'),
       )
     })
     // It was NOT mistaken for a notification either.
@@ -328,14 +328,16 @@ describe('JsonRpcClient', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     // Inbound: a notification-shaped frame missing `jsonrpc: '2.0'` is invalid
-    // and must be dropped (with a warning) without reaching handlers.
+    // and must be dropped (with a warning) without reaching handlers. The
+    // method name is classification and IS logged; the params are not.
     await peer.write({ method: 'future.thing', params: {} })
     await vi.waitFor(() => {
       expect(warn).toHaveBeenCalledWith(
-        '[cherry-remote] dropped invalid JSON-RPC notification',
-        expect.objectContaining({ method: 'future.thing' }),
+        expect.stringContaining('[cherry-remote] dropped invalid JSON-RPC notification'),
       )
     })
+    const dropMessages = warn.mock.calls.map((call) => call.map(String).join(' '))
+    expect(dropMessages.some((m) => m.includes('method="future.thing"'))).toBe(true)
     expect(handler).not.toHaveBeenCalled()
 
     // Outbound: an invalid envelope is refused before it reaches the wire and
@@ -424,6 +426,130 @@ describe('JsonRpcClient', () => {
 
     // The queued requests were never written to the channel.
     expect(harness.requests).toHaveLength(2)
+  })
+
+  it('⑨ (F2) never logs frame payloads on the drop paths, only classification', async () => {
+    const { client, peer } = await openLoopback()
+    const harness = new PeerHarness(peer)
+
+    const handler = vi.fn()
+    client.onNotification(handler)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // A sentinel that must never reach the log: peer frame payloads carry user
+    // content (chat text, tool arguments, file paths), and the drop paths fire
+    // precisely on frames we did NOT validate — so logging the value logs
+    // arbitrary attacker-shaped input at warn level.
+    const SENTINEL = 'SENTINEL-USER-CONTENT-2f4c1b'
+    const ID_SENTINEL = 'SENTINEL-ID-8a91de'
+
+    // (a) method-bearing drop: an id+method frame that fails the request schema.
+    // `method` is recorded (classification), `params` is not.
+    await peer.write({ jsonrpc: '2.0', id: ID_SENTINEL, method: 'echo.methody', params: SENTINEL })
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('dropped invalid JSON-RPC request'),
+      )
+    })
+
+    // (b) id-less drop that is neither a valid notification nor a response.
+    await peer.write({ jsonrpc: '2.0', result: SENTINEL })
+    // (c) non-object frame — the transport rejects primitives at the channel
+    // boundary, so this uses a JSON-encodable non-object instead.
+    await peer.write([SENTINEL])
+    // (d) notification that fails its schema (carrying the sentinel as text).
+    await peer.write({ jsonrpc: '2.0', method: 'echo.badparams', params: 42, extra: SENTINEL })
+
+    await vi.waitFor(() => {
+      expect(warn.mock.calls.length).toBeGreaterThanOrEqual(4)
+    })
+
+    // The sentinel appears in NO argument of ANY warn call.
+    const allArgs = warn.mock.calls.flat()
+    const flattened = allArgs.map((arg) => JSON.stringify(arg) ?? String(arg))
+    for (const entry of flattened) {
+      expect(entry).not.toContain(SENTINEL)
+    }
+
+    // Classification survived: the method name IS present for the method-bearing
+    // drop, because it is the one part of the frame the operator needs to route
+    // the report — and it is a bounded identifier, not payload.
+    const messages = warn.mock.calls.map((call) => call.map(String).join(' '))
+    expect(messages.some((m) => m.includes('echo.methody'))).toBe(true)
+
+    // The drop still happened: no notification reached a handler.
+    expect(handler).not.toHaveBeenCalled()
+    // ...and the client is unharmed.
+    await expect(client.request('echo.ok', { ok: true })).resolves.toEqual({ ok: true })
+  })
+
+  it('⑩ (F4) updateMaxInFlight resizes admissions without touching pending requests', async () => {
+    const { client, peer } = await openLoopback({ maxInFlight: 4 })
+    const harness = new PeerHarness(peer)
+    harness.autoReply = false
+
+    // Four in flight: the window is exactly full.
+    const inFlight = Array.from({ length: 4 }, (_, i) => client.request(`echo.${i}`, { i }))
+    await harness.waitForRequests(4)
+
+    // Shrinking takes effect for NEW admissions only: the four already-sent
+    // requests are untouched (no cancellation, no re-queue, no rejection), and
+    // nothing further leaves until the window has room.
+    client.updateMaxInFlight(2)
+    const queued = Array.from({ length: 3 }, (_, i) => client.request(`echo.q${i}`, { i }))
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(harness.requests).toHaveLength(4)
+
+    // Releasing one slot still cannot admit: 3 remain in flight, still above
+    // the new cap of 2. A cap-unaware release would refill the window to 4.
+    harness.reply(harness.requests[0], { result: { released: true } })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(harness.requests).toHaveLength(4)
+
+    // A second release brings in-flight to 2 == cap: still no room, because
+    // admitting here would put 3 on the wire.
+    harness.reply(harness.requests[1], { result: { released: true } })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(harness.requests).toHaveLength(4)
+
+    // The third release drops in-flight to 1 < 2, so exactly ONE queued request
+    // enters and the window is full again.
+    harness.reply(harness.requests[2], { result: { released: true } })
+    await harness.waitForRequests(5)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(harness.requests).toHaveLength(5)
+
+    await expect(inFlight[0]).resolves.toEqual({ released: true })
+
+    // Growing the window admits the rest of the queue immediately.
+    client.updateMaxInFlight(8)
+    await harness.waitForRequests(7)
+    // Answer everything still outstanding so the three queued requests settle.
+    for (const frame of harness.requests.slice(3)) harness.reply(frame, { result: { i: frame.id } })
+    await expect(Promise.all(queued)).resolves.toHaveLength(3)
+  })
+
+  it('⑪ (F4) updateMaxInFlight clamps a nonsensical cap to the admission floor of 1', async () => {
+    const { client, peer } = await openLoopback({ maxInFlight: 4 })
+    const harness = new PeerHarness(peer)
+    harness.autoReply = false
+
+    // Zero/negative/NaN must never wedge the client permanently (a cap of 0
+    // would queue every request forever); the floor is one admissible request.
+    client.updateMaxInFlight(0)
+
+    const request = client.request('echo.floor', {})
+    await harness.waitForRequests(1)
+    harness.reply(harness.requests[0], { result: { ok: true } })
+    await expect(request).resolves.toEqual({ ok: true })
+
+    // A non-finite cap must be IGNORED, not stored: NaN would make every
+    // `inFlight < maxInFlight` comparison false and wedge the queue forever.
+    client.updateMaxInFlight(Number.NaN)
+    const afterNaN = client.request('echo.after-nan', {})
+    await harness.waitForRequests(2)
+    harness.reply(harness.requests[1], { result: { ok: true } })
+    await expect(afterNaN).resolves.toEqual({ ok: true })
   })
 
   it('⑧ rejects in-flight requests when the channel closes, then fails fast', async () => {

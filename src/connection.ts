@@ -5,6 +5,7 @@ import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transpo
 import { remoteConnectPath } from '@cherrystudio/remote-protocol'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient'
 import { toRemoteSocket } from './rpc/wsAdapter'
+import { digestIdentity } from './diagnostics'
 import { urlHost } from './urlHost'
 import type { DeviceRecord } from './deviceStore'
 
@@ -84,7 +85,14 @@ export class DeviceUnavailableError extends Error {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_RATE_BUDGET_PER_SECOND = 32
-/** Business-request window: owned by the rpc layer, NOT re-limited here. */
+/**
+ * CEILING for the business-request window — not the window itself. The window
+ * is owned by the rpc layer and is sized from the peer's hello-reported
+ * `inFlightRequests` (spec §3.4「取回报一半」): see
+ * {@link businessWindowFor}. 8 is what the client uses either when the peer
+ * reports nothing (the fallback limit below) or when half its report exceeds
+ * this ceiling.
+ */
 const BUSINESS_MAX_IN_FLIGHT = 8
 const FALLBACK_LIMITS: EffectiveLimits = {
   heartbeatMs: 20_000,
@@ -197,6 +205,28 @@ class CancelledError extends Error {
   }
 }
 
+/**
+ * Every candidate host failed to dial (distinct from a single host failing
+ * while a later one succeeded). Carries the last per-host error as its message
+ * so the log still names a concrete socket failure.
+ */
+class AllHostsUnreachableError extends Error {
+  constructor(
+    readonly deviceId: string,
+    readonly hosts: readonly string[],
+    readonly lastError: Error,
+  ) {
+    super(`all candidate hosts unreachable (last: ${lastError.message})`)
+    this.name = 'AllHostsUnreachableError'
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+/** True when the attempt failed because NO candidate host could be dialed. */
+function isAllHostsUnreachable(error: unknown): error is AllHostsUnreachableError {
+  return error instanceof AllHostsUnreachableError
+}
+
 interface HelloResult {
   protocolVersion?: number
   limits?: Record<string, number>
@@ -230,6 +260,21 @@ function isPeerIdentityMismatch(error: unknown): boolean {
 /** Parses a positive finite number, or returns undefined for the fallback. */
 function positive(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+/**
+ * Sizes the business in-flight window from the peer's hello-reported
+ * `inFlightRequests`, per spec §3.4「取回报一半」: take HALF the allowance, so
+ * the client never saturates the peer's own concurrency budget and leaves room
+ * for the peer's other sessions.
+ *
+ * `BUSINESS_MAX_IN_FLIGHT` is the CEILING on the result, not a floor: a peer
+ * reporting 64 gets 8, not 32. The floor is 1, because a report of 1 would
+ * otherwise yield `floor(1/2) = 0` — a window that admits nothing and can never
+ * be released by anything, i.e. a permanent deadlock rather than a limit.
+ */
+function businessWindowFor(reportedInFlightRequests: number): number {
+  return Math.max(1, Math.min(BUSINESS_MAX_IN_FLIGHT, Math.floor(reportedInFlightRequests / 2)))
 }
 
 function defer<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
@@ -288,6 +333,12 @@ export class DeviceConnection {
   readonly #stateListeners = new Set<(state: DeviceState) => void>()
   /** Notification handlers, re-attached to every new client after a reconnect. */
   readonly #notificationHandlers = new Set<(method: string, params: unknown) => void>()
+  /**
+   * Subset of {@link #notificationHandlers} already attached to the CURRENT
+   * live client's listener list. Cleared whenever the link is torn down, since
+   * the next client starts with no listeners of its own.
+   */
+  readonly #attachedHandlers = new Set<(method: string, params: unknown) => void>()
   readonly #timers = new Map<TimerName, Timer>()
 
   #state: DeviceState = 'offline'
@@ -333,6 +384,19 @@ export class DeviceConnection {
     return this.#state
   }
 
+  /**
+   * Business-facing rpc facade.
+   *
+   * `dispose` is ALWAYS a local no-op, even when a client is live. Tearing down
+   * the live JsonRpcClient through this property would kill the connection's
+   * own housekeeping channel (heartbeat/refresh) and leave the supervisor
+   * believing it is `connected` with no way to notice — `close()` is the only
+   * supported teardown. Everything else is forwarded to the live client.
+   *
+   * `onNotification` is registry-owned: handlers are remembered for the whole
+   * lifecycle and re-attached on every reconnect, and an ALREADY-live client is
+   * attached to exactly once per handler.
+   */
   readonly #facade: JsonRpcClient = new Proxy({} as JsonRpcClient, {
     get: (_target, prop) => {
       if (prop === 'request') {
@@ -342,16 +406,25 @@ export class DeviceConnection {
       if (prop === 'onNotification') {
         return (handler: (method: string, params: unknown) => void) => {
           this.#notificationHandlers.add(handler)
-          // Also attach to a live client so registration works immediately;
-          // the registry keeps it across reconnects.
+          // Attach to a live client so registration works immediately, but only
+          // ONCE per handler: re-registering the same function must not
+          // double-deliver every notification for the current cycle. The
+          // registry is a Set, so a re-add is already a no-op there — the
+          // listener attach needs its own guard to match.
+          //
+          // With no live link this still records the handler as "attached",
+          // which is what makes the guard correct rather than merely harmless:
+          // #handshake attaches the WHOLE registry to every new client, so a
+          // handler registered while offline is covered by that pass and must
+          // not trigger a second attach now.
+          if (this.#attachedHandlers.has(handler)) return
           this.#link?.client.onNotification(handler)
+          this.#attachedHandlers.add(handler)
         }
       }
+      if (prop === 'dispose') return noop
       const link = this.#link
-      if (link === undefined) {
-        if (prop === 'dispose') return noop
-        return undefined
-      }
+      if (link === undefined) return undefined
       const value = Reflect.get(link.client, prop)
       return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(link.client) : value
     },
@@ -465,9 +538,19 @@ export class DeviceConnection {
     this.#cycle = defer<void>()
     if (!this.#running) return
     const delay = this.#backoffDelay()
+    // §6 「候选地址全部不可达」: when EVERY candidate host failed, the cause is
+    // usually a stale address (DHCP moved the desktop, or it switched network)
+    // rather than a transient outage, so the warn carries the actionable hint
+    // instead of just the last socket error. The backoff still retries — an
+    // address that comes back needs no operator at all.
+    const hint =
+      isAllHostsUnreachable(error)
+        ? ' — all candidate addresses were unreachable; if the desktop moved, update ' +
+          'them via the device card 地址维护 (address maintenance)'
+        : ''
     console.warn(
       `[cherry-remote] device ${this.record.deviceId} offline ` +
-        `(${error instanceof Error ? error.message : String(error)}); reconnecting in ${delay}ms`,
+        `(${error instanceof Error ? error.message : String(error)}); reconnecting in ${delay}ms${hint}`,
     )
     this.#setTimer('backoff', setTimeout(() => this.#tryEstablish(), delay))
   }
@@ -484,7 +567,16 @@ export class DeviceConnection {
    */
   async #establish(epoch: number): Promise<void> {
     this.#setState('connecting')
-    if (this.record.hosts.length === 0) throw new Error(`device ${this.record.deviceId} has no candidate hosts`)
+    // No candidates at all is the same §6 verdict as every candidate failing:
+    // the operator must maintain the addresses. Reported through the same error
+    // type so the hint fires identically.
+    if (this.record.hosts.length === 0) {
+      throw new AllHostsUnreachableError(
+        this.record.deviceId,
+        this.record.hosts,
+        new Error('the device record has no candidate hosts'),
+      )
+    }
 
     let lastError: Error = new Error(`device ${this.record.deviceId}: all candidate hosts unreachable`)
     for (const host of this.record.hosts) {
@@ -503,7 +595,7 @@ export class DeviceConnection {
       await this.#handshake(link, epoch)
       return
     }
-    throw lastError
+    throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, lastError)
   }
 
   async #dial(host: string, port: number, epoch: number): Promise<LiveLink> {
@@ -532,6 +624,17 @@ export class DeviceConnection {
     // Link-loss listeners: the ws close/error events are the primary
     // disconnect signal (spec §3.4); they carry the epoch so stale sockets
     // cannot tear down a newer link.
+    //
+    // ADJUDICATED WEAKENING: the close CODE is deliberately ignored here.
+    // 1011 (server error / rate termination) and 1013 (try again later, e.g.
+    // connection-count over limit) are the peer's AUTHORITATIVE session-level
+    // faces — it ends the whole session, never a single request — so every code
+    // takes the same offline → backoff → reconnect path. Differentiating them
+    // (e.g. a longer, Retry-After-aware backoff for 1013) is deliberately
+    // DEFERRED: it would need a per-code policy the protocol does not yet
+    // guarantee, and a uniform honest retry is strictly safer than guessing a
+    // longer one. The rate limiter still bounds the retry storm in the
+    // meantime, and ⑦ pins the uniform transition shape in both cases.
     ws.on('close', () => this.#onLinkLost(epoch, 'socket closed'))
     ws.on('error', () => this.#onLinkLost(epoch, 'socket error'))
 
@@ -590,6 +693,13 @@ export class DeviceConnection {
       inFlightRequests: positive(hello.limits?.['inFlightRequests']) ?? FALLBACK_LIMITS.inFlightRequests,
     }
 
+    // Size the admission window from the peer's OWN concurrency budget now that
+    // hello has reported it (spec §3.4「取回报一半」). The client was dialed with
+    // the built-in ceiling before the report existed; this narrows it. Requests
+    // already in flight are untouched — house calls share this window, and the
+    // hello/authenticate pair is exactly what is in flight at this instant.
+    link.client.updateMaxInFlight(businessWindowFor(this.#limits.inFlightRequests))
+
     let auth: AuthResult
     try {
       auth = await this.#authenticate(link)
@@ -610,18 +720,37 @@ export class DeviceConnection {
 
     this.#token = auth.accessToken
     this.#tokenExpiresAt = Date.parse(auth.expiresAt)
-    // Keep the live record fresh so the assembly can persist refreshed tokens.
+    // Mirrored onto the live record so the in-memory view agrees with the token
+    // actually in use — tools/diagnostics that read the record see the live one.
+    //
+    // It is NOT persisted: the assembly never writes the token back to the
+    // device archive, so a RESTART loses it and re-authenticates from scratch.
+    // That is deliberate (§3.4 treats the token as connection-scoped): a token
+    // on disk outlives the pairing state it was minted for, and the archive is
+    // the one file this plugin must be able to reason about across upgrades.
+    // The cost is one extra authenticate per start, which the peer charges to
+    // the same pairing it already approved.
     this.record.accessToken = auth.accessToken
     this.record.tokenExpiresAt = this.#tokenExpiresAt
     this.#refreshFirstFailureAt = undefined
     this.#pendingPings.clear()
     // Re-attach every notification subscriber to this cycle's client, so
-    // subscriptions (Tasks 7/9) survive reconnects transparently.
-    for (const handler of this.#notificationHandlers) link.client.onNotification(handler)
+    // subscriptions (Tasks 7/9) survive reconnects transparently. `#teardownLink`
+    // cleared the attached-set when the previous client died, so this repopulates
+    // it for the new one.
+    for (const handler of this.#notificationHandlers) {
+      link.client.onNotification(handler)
+      this.#attachedHandlers.add(handler)
+    }
     this.#startHeartbeat(epoch)
     this.#scheduleRefresh(epoch)
     this.#setState('connected')
-    console.info(`[cherry-remote] device ${this.record.deviceId} connected (${link.channel.remoteIdentity})`)
+    // The raw pinned identity is a credential-shaped value; the info log
+    // carries its 12-hex digest instead, matching the diagnostics policy
+    // (`digestIdentity`) so a pasted log line never publishes the full pin.
+    console.info(
+      `[cherry-remote] device ${this.record.deviceId} connected (${digestIdentity(link.channel.remoteIdentity)})`,
+    )
   }
 
   /**
@@ -701,6 +830,8 @@ export class DeviceConnection {
       const result = await this.#houseCall<RefreshResult>(link, 'connection.refresh', {})
       this.#token = result.accessToken
       this.#tokenExpiresAt = Date.parse(result.expiresAt)
+      // Live record only — refreshed tokens are NOT persisted either (see
+      // #handshake): a restart re-authenticates rather than reusing them.
       this.record.accessToken = result.accessToken
       this.record.tokenExpiresAt = this.#tokenExpiresAt
       this.#refreshFirstFailureAt = undefined
@@ -754,6 +885,9 @@ export class DeviceConnection {
     this.#clearTimer('refreshRetry')
     this.#pendingPings.clear()
     this.#refreshFirstFailureAt = undefined
+    // The client carrying these listeners is about to be disposed; the registry
+    // keeps the handlers for the next cycle, but nothing is attached any more.
+    this.#attachedHandlers.clear()
     if (link !== undefined) {
       link.client.dispose()
       void link.channel.close().catch(noop)

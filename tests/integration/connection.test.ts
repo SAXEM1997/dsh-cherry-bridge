@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
+import { createHash } from 'node:crypto'
 import type { ComponentLogger, Logger } from '@libp2p/interface'
 import {
   connectSecureChannel,
@@ -129,6 +130,41 @@ async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<voi
     if (predicate()) return
     if (Date.now() - started > timeoutMs) throw new Error('condition not met before timeout')
     await sleep(5)
+  }
+}
+
+/**
+ * Runs one business burst while POLLING the fake's live in-flight counter, and
+ * returns the burst's own peak.
+ *
+ * The fake exposes an all-time `maxInFlight`, but that counter also covers the
+ * handshake (hello and authenticate genuinely overlap on the peer), so it
+ * cannot answer "what did the BUSINESS window allow". Sampling the live
+ * counter across the burst does, and it is exactly the quantity F4's window
+ * sizing is about.
+ */
+async function burstConcurrency<T>(
+  fake: FakeCherry,
+  burst: () => Promise<T>,
+): Promise<{ results: T; peak: number }> {
+  // Let the handshake's last reply land and its in-flight slot clear before the
+  // baseline is taken: the peer decrements after writing, which can trail the
+  // client's `connect()` resolution by a tick.
+  await waitFor(() => fake.inFlight === 0)
+  let peak = 0
+  let sampling = true
+  const sampler = (async () => {
+    while (sampling) {
+      peak = Math.max(peak, fake.inFlight)
+      await sleep(1)
+    }
+  })()
+  try {
+    const results = await burst()
+    return { results, peak }
+  } finally {
+    sampling = false
+    await sampler
   }
 }
 
@@ -341,6 +377,199 @@ describe('DeviceConnection over a real loopback channel', () => {
     controller.abort()
     ws.close()
   })
+
+  it('⑥c (F4) sizes the business window to half the hello-reported inFlightRequests, capped at 8', async () => {
+    const identity = await createDeviceIdentity()
+    // The peer reports a concurrent-request allowance of 6; spec §3.4 says the
+    // client takes HALF of the reported allowance (6 → 3), and 8 stays a
+    // ceiling rather than a floor.
+    const fakeInfo = await makeFake({
+      requestDelayMs: 50,
+      hello: { heartbeatMs: 60_000, limits: { subscriptions: 5, pageItems: 60, inFlightRequests: 6 } },
+    })
+    // A high rate budget so PACING does not mask the window: with the default
+    // 32/s the ~36ms admission gap and the 50ms server delay alone keep the
+    // overlap low, and the test could not tell a 3-slot window from an 8-slot
+    // one. The window is what this test measures.
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), rateBudgetPerSecond: 1_000 })
+
+    await connection.connect()
+    expect(connection.limits.inFlightRequests).toBe(6)
+
+    // The handshake itself (hello + authenticate) runs concurrently on the
+    // peer, so the fake's all-time peak is not the business peak. Measure the
+    // burst alone: the client's window is 3, which — unlike the 8-slot default
+    // — is small enough that 10 concurrent 50ms requests must saturate it.
+    const burst = await burstConcurrency(fakeInfo.fake, () =>
+      Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          connection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `n${i}` }),
+        ),
+      ),
+    )
+
+    expect(burst.results).toHaveLength(10)
+    // Concurrency really happened, but the peer never saw more than half its
+    // reported allowance in flight at once. A window left at the 8-slot
+    // default would show a peak around 8 here.
+    expect(burst.peak).toBeGreaterThan(1)
+    expect(burst.peak).toBeLessThanOrEqual(3)
+  }, 10_000)
+
+  it('⑥d (F4) keeps the default report path at the ≤8 ceiling and floors a tiny report at 1', async () => {
+    const identity = await createDeviceIdentity()
+    // A peer reporting MORE than 16 must not raise the window above the
+    // client's own 8 ceiling (the peer's number is an allowance, not an
+    // instruction to saturate it).
+    const generous = await makeFake({
+      requestDelayMs: 50,
+      hello: { heartbeatMs: 60_000, limits: { inFlightRequests: 64 } },
+    })
+    // High budget so the rate limiter does not mask the window (see ⑥c).
+    const connection = makeConnection({ identity, record: recordFor(generous), rateBudgetPerSecond: 1_000 })
+    await connection.connect()
+    expect(connection.limits.inFlightRequests).toBe(64)
+
+    const burst = await burstConcurrency(generous.fake, () =>
+      Promise.all(
+        Array.from({ length: 12 }, (_, i) =>
+          connection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `g${i}` }),
+        ),
+      ),
+    )
+    expect(burst.results).toHaveLength(12)
+    expect(burst.peak).toBeGreaterThan(1)
+    expect(burst.peak).toBeLessThanOrEqual(8)
+
+    // A peer reporting 1 leaves floor(1/2) = 0, which would deadlock the client
+    // forever; the window floors at 1 so requests still flow, one at a time.
+    const tiny = await makeFake({
+      requestDelayMs: 50,
+      hello: { heartbeatMs: 60_000, limits: { inFlightRequests: 1 } },
+    })
+    const tinyConnection = makeConnection({ identity, record: recordFor(tiny), rateBudgetPerSecond: 1_000 })
+    await tinyConnection.connect()
+
+    const tinyBurst = await burstConcurrency(tiny.fake, () =>
+      Promise.all(
+        Array.from({ length: 4 }, (_, i) =>
+          tinyConnection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `t${i}` }),
+        ),
+      ),
+    )
+    expect(tinyBurst.results).toHaveLength(4)
+    // Serialised: the burst never overlaps, yet it does complete (no deadlock).
+    expect(tinyBurst.peak).toBe(1)
+  }, 15_000)
+
+  it('(F5c) the rpc facade dispose is a local no-op that never tears down a live client', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+
+    // The facade forwards everything to the live client — EXCEPT dispose: the
+    // live client is the connection's own housekeeping channel, and disposing
+    // it through the facade would kill heartbeat/refresh while the supervisor
+    // still reported `connected`.
+    connection.rpc.dispose()
+
+    // The connection is still fully functional: a business request round-trips.
+    await expect(connection.rpc.request('connection.ping', { nonce: 'after-dispose' })).resolves.toMatchObject(
+      { nonce: 'after-dispose' },
+    )
+    expect(connection.state).toBe('connected')
+
+    // And an actual close() still works afterwards.
+    await connection.close()
+    expect(connection.state).toBe('offline')
+  })
+
+  it('(F5c) re-registering the same notification handler does not double-deliver', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    const seen: string[] = []
+    const handler = (method: string): void => {
+      seen.push(method)
+    }
+
+    // Registered BEFORE connect (registry only) and again AFTER (also attaches).
+    connection.rpc.onNotification(handler)
+    await connection.connect()
+    connection.rpc.onNotification(handler)
+
+    fakeInfo.fake.pushNotification('agent.events', { events: [] })
+    await waitFor(() => seen.length >= 1)
+    await sleep(50)
+    // Exactly one delivery: the re-registration is a no-op, not a second attach.
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toBe('agent.events')
+  }, 10_000)
+
+  it('(F5b) logs the desktop identity as a 12-hex digest, never the raw pin', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    await connection.connect()
+
+    const infoMessages = consoleInfo.mock.calls.flat().map(String)
+    const connected = infoMessages.filter((m) => m.includes('connected'))
+    expect(connected.length).toBeGreaterThan(0)
+
+    // The raw pin must not appear anywhere in the connected line...
+    const pin = fakeInfo.desktopIdentity
+    for (const message of infoMessages) expect(message).not.toContain(pin)
+
+    // ...and the 12-hex digest that stands in for it must.
+    const digest = createHash('sha256').update(pin).digest('hex').slice(0, 12)
+    expect(connected.some((m) => m.includes(digest))).toBe(true)
+    expect(digest).toMatch(/^[0-9a-f]{12}$/)
+  })
+
+  it('(F5d) hints at 地址维护 address maintenance when every candidate host is unreachable', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    // Two candidate addresses, neither of which anything listens on: every host
+    // fails at dial time, which is the §6 「候选地址全部不可达」 verdict.
+    const record = recordFor(fakeInfo, { hosts: ['127.0.0.1', '127.0.0.2'], port: 1 })
+    const connection = makeConnection({ identity, record, backoffInitialMs: 40 })
+
+    await expect(connection.connect()).rejects.toThrow()
+    expect(connection.state).toBe('offline')
+
+    const warnMessages = consoleWarn.mock.calls.flat().map(String)
+    const offlineLine = warnMessages.find((m) => m.includes('offline') && m.includes('reconnecting'))
+    expect(offlineLine).toBeDefined()
+    // §6 copy: the operator needs the actionable next step, not just the error.
+    expect(offlineLine).toContain('地址维护')
+    expect(offlineLine).toMatch(/address maintenance/)
+    // The underlying socket failure is still named.
+    expect(offlineLine).toMatch(/127\.0\.0\.2:1|unreachable/)
+  })
+
+  it('(F5d) does not carry the address hint when the failure is not an all-hosts verdict', async () => {
+    const identity = await createDeviceIdentity()
+    // A REACHABLE peer that rejects authentication: the address is fine, so the
+    // address-maintenance hint would send the operator to the wrong repair. This
+    // is the terminal AuthRejected path, which must not gain the hint.
+    const fakeInfo = await makeFake({
+      authenticateFailure: { reason: 'GRANT_REVOKED', message: 'grant revoked on desktop' },
+    })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), backoffInitialMs: 30 })
+
+    await expect(connection.connect()).rejects.toThrow()
+    expect(connection.state).toBe('offline')
+
+    const allMessages = [...consoleWarn.mock.calls, ...consoleError.mock.calls].flat().map(String)
+    for (const message of allMessages) expect(message).not.toContain('地址维护')
+    // The terminal path keeps its own, DIFFERENT hint.
+    expect(allMessages.some((m) => m.includes('re-pair'))).toBe(true)
+  }, 10_000)
 
   it.each([1011, 1013] as const)('⑦ routes peer close %i through the same offline→backoff→reconnect path', async (code) => {
     const identity = await createDeviceIdentity()

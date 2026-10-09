@@ -1,13 +1,35 @@
 import {
   chmodSync,
   closeSync,
+  copyFileSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
   writeSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
+
+/**
+ * Crash-durable, corruption-safe archive of paired Cherry Studio desktop
+ * devices.
+ *
+ * Durability: the archive is one 0600 JSON file, and EVERY write is atomic —
+ * serialized into `<file>.tmp`, fsynced while still open, chmod'd, then
+ * `renameSync`d over the target. No code path truncates the target in place,
+ * so a crash, a full disk, or a kill at any instant leaves either the complete
+ * old archive or the complete new one.
+ *
+ * Safety: an archive that exists but cannot be READ is never silently treated
+ * as an empty one — that would let the next write destroy every pairing and
+ * stored token it held. It is copied to `<file>.corrupt`, served as an empty
+ * read-only view, and the store refuses further writes with
+ * {@link QuarantinedArchiveError} until an operator moves the bad file aside.
+ * Only ENOENT (first run, or an archive deleted underneath the plugin) degrades
+ * to a writable empty archive.
+ */
 
 /**
  * A paired Cherry Studio desktop device, as stored in the device archive.
@@ -233,9 +255,21 @@ function serializeArchive(devices: DeviceRecord[]): string {
  * only, and letting semantic rejections propagate.
  *
  * Graceful (empty archive + warning, never a throw):
- *  - a missing or unreadable file — first-run has no archive yet, and an
- *    archive deleted underneath the plugin must not take it down;
- *  - bytes that are not parsable JSON at all.
+ *  - a MISSING file (ENOENT) — first-run has no archive yet, and an archive
+ *    deleted underneath the plugin must not take it down. This is the one
+ *    read failure that leaves the store writable: there is nothing to lose.
+ *
+ * Quarantined (empty read-only view + warning, see {@link QuarantinedArchiveError}):
+ *  - any OTHER read failure (EACCES/EBUSY/EIO/…), and
+ *  - bytes that are not parsable JSON.
+ *
+ *  Both mean the same thing — bytes exist on disk that this build cannot read
+ *  — so neither may be treated as "empty". Degrading a corrupt archive to an
+ *  empty one and then overwriting it destroys every pairing and token in it,
+ *  unrecoverably. Instead the bad file is COPIED to `<file>.corrupt` (best
+ *  effort, the original is never moved or truncated), an empty read-only view
+ *  is served, and the store is poisoned so {@link DeviceStore} refuses to
+ *  write until an operator moves the bad file aside.
  *
  * Rejected (thrown to the caller), because a readable archive that declares
  * something this build cannot honour must never be silently discarded:
@@ -247,29 +281,109 @@ function readArchive(file: string): ArchiveFile | undefined {
   try {
     text = readFileSync(file, 'utf8')
   } catch (error) {
-    console.warn(`device archive ${file} could not be read; starting from an empty archive:`, error)
-    return undefined
+    if (isNotFound(error)) {
+      console.warn(`device archive ${file} could not be read; starting from an empty archive:`, error)
+      return undefined
+    }
+    throw new QuarantinedArchiveError(file, error)
   }
 
   let parsed: unknown
   try {
     parsed = JSON.parse(text)
   } catch (error) {
-    console.warn(`device archive ${file} is not valid JSON; starting from an empty archive:`, error)
-    return undefined
+    throw new QuarantinedArchiveError(file, error)
   }
 
   return parseArchive(parsed)
 }
 
+/** ENOENT is the only "there is nothing here yet" read failure. */
+function isNotFound(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === 'ENOENT'
+}
+
+/** A JSON error's message, for the operator-facing half of the throw. */
+function reasonOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 /**
- * Writes the archive and flushes it to disk.
+ * The structured write-refusal raised by an archive the store could not read.
  *
- * `mode` only applies when the file is created; overwriting an existing file
- * keeps its old permissions, so chmod explicitly afterwards (the same
- * discipline as the identity key). `fsync` follows the plan's write-path
- * requirement: a crash must not be able to acknowledge a pairing that never
- * reached the disk.
+ * It is deliberately NOT a plain {@link Error}: the assembly and the HTTP API
+ * distinguish "this device is unavailable" from "the archive must be repaired
+ * by hand", and the latter is only safe to report if the operator is told
+ * exactly which two files to look at. Nothing in this build ever deletes the
+ * two paths named here.
+ */
+export class QuarantinedArchiveError extends Error {
+  /** The archive that could not be read; still on disk, byte-for-byte. */
+  readonly file: string
+  /** The best-effort preservation copy, or `undefined` when the copy failed. */
+  readonly corruptPath: string | undefined
+  /** The underlying read/parse failure the quarantine was raised for. */
+  readonly cause: unknown
+
+  constructor(file: string, cause: unknown, corruptPath?: string) {
+    super(
+      `device archive ${file} is unreadable (${reasonOf(cause)}); it was preserved as ` +
+        `${corruptPath ?? `${file}.corrupt`} and the store is now READ-ONLY — refusing to ` +
+        'overwrite it, because that would destroy every pairing and stored token. Move the ' +
+        'bad file aside to resume writing.',
+    )
+    this.name = 'QuarantinedArchiveError'
+    this.file = file
+    this.corruptPath = corruptPath
+    this.cause = cause
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
+
+  /**
+   * The same failure, describing the preservation copy that was actually made.
+   * The read path can only name the path it WOULD copy to; the store re-raises
+   * with the path it DID, so an operator is never sent to a file that does not
+   * exist (the copy is best effort).
+   */
+  withCorruptPath(corruptPath: string | undefined): QuarantinedArchiveError {
+    return new QuarantinedArchiveError(this.file, this.cause, corruptPath)
+  }
+}
+
+/**
+ * Preserves an unreadable archive as `<file>.corrupt` (best effort — a failed
+ * copy must not mask the original problem) and returns the path it landed at.
+ */
+function quarantine(file: string): string | undefined {
+  const target = `${file}.corrupt`
+  try {
+    copyFileSync(file, target)
+    chmodSync(target, FILE_MODE)
+    return target
+  } catch (error) {
+    console.warn(`device archive ${file} could not be preserved as ${target}:`, error)
+    return undefined
+  }
+}
+
+/**
+ * Writes the archive atomically and flushes it to disk.
+ *
+ * The archive is serialized into `<file>.tmp`, fsynced, and only then renamed
+ * over the target. `renameSync` is atomic within one filesystem, so an observer
+ * (including the next process to start) sees either the whole old archive or
+ * the whole new one — never the truncated middle. Truncating the target in
+ * place is what turns a crash or a full disk into an unparsable archive, and
+ * that is exactly the destruction chain the quarantine path exists to stop.
+ *
+ * `mode` only applies when a file is created, and `rename` carries the temp
+ * file's own mode over to the target, so the temp file is chmod'd explicitly:
+ * both halves of the swap are 0600, and a pre-existing looser archive is
+ * re-tightened by the rename rather than left as it was.
+ *
+ * `fsync` follows the plan's write-path requirement: a crash must not be able
+ * to acknowledge a pairing that never reached the disk. The rename itself is
+ * what makes the *name* switch durable; the data was already flushed before it.
  *
  * File I/O is synchronous because the store's API is synchronous (per the
  * plan's Interfaces) — `list`/`resolve` consume the store directly.
@@ -277,30 +391,58 @@ function readArchive(file: string): ArchiveFile | undefined {
 function persistArchive(file: string, devices: DeviceRecord[]): void {
   mkdirSync(dirname(file), { recursive: true })
 
-  const fd = openSync(file, 'w', FILE_MODE)
+  const temp = `${file}.tmp`
+  const fd = openSync(temp, 'w', FILE_MODE)
   try {
     writeSync(fd, serializeArchive(devices), undefined, 'utf8')
     fsyncSync(fd)
   } finally {
     closeSync(fd)
   }
+  chmodSync(temp, FILE_MODE)
 
-  chmodSync(file, FILE_MODE)
+  try {
+    renameSync(temp, file)
+  } catch (error) {
+    // Never leave a half-written temp file behind for the next quarantine to
+    // trip over: the target is untouched, so dropping the temp is safe.
+    try {
+      unlinkSync(temp)
+    } catch {
+      // Best effort only — the rename failure below is the real error.
+    }
+    throw error
+  }
 }
 
 /**
  * Versioned archive of paired devices, persisted as one 0600 JSON file.
  *
+ * Crash durability: every write is atomic — serialized to `<file>.tmp`, fsynced,
+ * then renamed over the target — so a crash at any point leaves either the old
+ * archive or the new one, never a truncated one.
+ *
  * Reads are lazy and synchronous: the archive is loaded on first use and
  * migrated to {@link CURRENT_SCHEMA_VERSION} — written back only when the
  * stored version actually trails the current one, so re-reading a
- * current-version archive is a pure no-op. Writes persist immediately, and an
- * archive that cannot be read degrades to an empty one with a warning (while an
- * archive that reads but declares an unsupported schema is rejected loudly).
+ * current-version archive is a pure no-op. Writes persist immediately.
+ *
+ * Corruption is quarantined, never overwritten: a missing archive is an empty
+ * one (first run), but an archive that EXISTS and cannot be read or parsed is
+ * preserved as `<file>.corrupt`, served as an empty read-only view, and every
+ * subsequent write REFUSES with {@link QuarantinedArchiveError} until an
+ * operator moves the bad file aside. An archive that reads but declares an
+ * unsupported schema is rejected loudly instead (a throw from the read path).
  */
 export class DeviceStore {
   readonly #file: string
   #devices: DeviceRecord[] | undefined
+  /**
+   * Set when the archive on disk was unreadable and had to be quarantined.
+   * While set, {@link #persist} refuses to write — the whole point of the flag
+   * is that the bytes on disk are the only remaining copy of the pairings.
+   */
+  #quarantine: QuarantinedArchiveError | undefined
 
   constructor(file: string) {
     this.#file = file
@@ -336,7 +478,23 @@ export class DeviceStore {
   #load(): DeviceRecord[] {
     if (this.#devices !== undefined) return this.#devices
 
-    const archive = readArchive(this.#file)
+    let archive: ArchiveFile | undefined
+    try {
+      archive = readArchive(this.#file)
+    } catch (error) {
+      if (!(error instanceof QuarantinedArchiveError)) throw error
+      // Quarantine: preserve the bad bytes, then serve an empty READ-ONLY view.
+      // `list`/`resolve` keep working (RF4's spirit — a corrupt archive never
+      // takes the plugin down), but nothing may write over the evidence.
+      this.#quarantine = error.withCorruptPath(quarantine(error.file))
+      console.warn(
+        `device archive ${this.#file} is unreadable and was quarantined; serving an empty ` +
+          `read-only archive and refusing all writes until the bad file is moved aside:`,
+        error.cause,
+      )
+      archive = undefined
+    }
+
     // `parseArchive` is the exit of the read path: every entry has already been
     // migrated and asserted, so the loose on-disk type never reaches here.
     const devices: DeviceRecord[] = archive === undefined ? [] : archive.devices
@@ -352,6 +510,9 @@ export class DeviceStore {
   }
 
   #persist(devices: DeviceRecord[]): void {
+    // Checked BEFORE the memo is updated: a refused write must not leave the
+    // in-memory view claiming bytes that were never persisted.
+    if (this.#quarantine !== undefined) throw this.#quarantine
     this.#devices = devices
     persistArchive(this.#file, devices)
   }

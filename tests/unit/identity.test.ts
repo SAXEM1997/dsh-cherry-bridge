@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,7 +7,15 @@ import { loadOrCreateIdentity } from '../../src/identity'
 
 const dataDirs: string[] = []
 
+beforeEach(() => {
+  // A corrupt identity is traced on stderr by design (F3), and one test below
+  // exercises that path. Silence it globally so the suite output stays
+  // pristine; the test that ASSERTS on the trace re-spies inside itself.
+  vi.spyOn(console, 'error').mockImplementation(() => {})
+})
+
 afterEach(async () => {
+  vi.restoreAllMocks()
   while (dataDirs.length > 0) await rm(dataDirs.pop()!, { recursive: true, force: true })
 })
 
@@ -78,5 +86,50 @@ describe('loadOrCreateIdentity', () => {
 
     const reloaded = await loadOrCreateIdentity(dataDir)
     expect(reloaded.id).toBe(recovered.id)
+  })
+
+  it('(F3) traces a corrupt identity: error logged, original preserved, fresh key returned', async () => {
+    const dataDir = await makeDataDir()
+    const previous = await loadOrCreateIdentity(dataDir)
+
+    const corrupt = new TextEncoder().encode('this is not a protobuf ed25519 private key')
+    await writeFile(keyPath(dataDir), corrupt)
+    expect(() => deviceIdentityId(corrupt)).toThrow()
+
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const recovered = await loadOrCreateIdentity(dataDir)
+
+    // The regeneration is DESTRUCTIVE for every stored pairing (the desktop
+    // pins the old identity, so every authenticate will now be rejected). That
+    // consequence must be visible in the log, not silent — it is the operator's
+    // only clue that a whole round of re-pairing is about to be needed.
+    expect(error).toHaveBeenCalled()
+    const joined = error.mock.calls.flat().map(String).join(' | ')
+    expect(joined).toContain(keyPath(dataDir))
+    expect(joined).toMatch(/parse|corrupt|invalid/i)
+    expect(joined).toMatch(/re-approval|re-pair|re-approve/i)
+
+    // The original bytes survive as `<file>.corrupt`, byte-for-byte.
+    const preserved = new Uint8Array(await readFile(`${keyPath(dataDir)}.corrupt`))
+    expect(preserved).toEqual(corrupt)
+
+    // A fresh, working identity was still returned and is stable on reload.
+    expect(recovered.id).not.toBe(previous.id)
+    expect(recovered.id).toBe(deviceIdentityId(recovered.key))
+    const reloaded = await loadOrCreateIdentity(dataDir)
+    expect(reloaded.id).toBe(recovered.id)
+    expect(reloaded.key).toEqual(recovered.key)
+  })
+
+  it('(F3) does not quarantine or log for a genuinely absent key (normal first run)', async () => {
+    const dataDir = await makeDataDir()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const identity = await loadOrCreateIdentity(dataDir)
+
+    expect(identity.id).toBe(deviceIdentityId(identity.key))
+    // First run is not corruption: no error, no `.corrupt` file.
+    expect(error).not.toHaveBeenCalled()
+    await expect(readFile(`${keyPath(dataDir)}.corrupt`)).rejects.toThrow()
   })
 })
