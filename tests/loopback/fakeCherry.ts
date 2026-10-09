@@ -146,6 +146,14 @@ export interface FakeAgentOptions {
    */
   keepSubscriptionOnInjectedExpiry?: boolean
   /**
+   * PERSISTENT `CHECKPOINT_EXPIRED` injection: EVERY checkpoint face expires
+   * forever, so the submission can never converge. Unlike
+   * `failNextCheckpointCall` this does not consume itself — it is the anchor
+   * for "the client's retry budget is finite", where a layer without a real
+   * shared budget would loop forever.
+   */
+  alwaysExpireCheckpoints?: boolean
+  /**
    * Force `agent.sessions.subscribe` to answer with a checkpoint descriptor
    * regardless of the requested cursor — the "no usable replay" face used to
    * enter the recovery chain deterministically.
@@ -1194,11 +1202,16 @@ export class FakeCherry {
     this.#notify('agent.subscriptions.resetRequired', { subscriptionId: subscription.subscriptionId, reason })
   }
 
-  /** One-shot failure injection across the two checkpoint faces. */
+  /**
+   * Failure injection across the two checkpoint faces. `alwaysExpireCheckpoints`
+   * is PERSISTENT (never converges); `failNextCheckpointCall` is one-shot.
+   */
   #consumeInjectedCheckpointFailure(): void {
-    const failure = this.#failNextCheckpointCall
+    const failure = this.#agent().alwaysExpireCheckpoints
+      ? { reason: 'CHECKPOINT_EXPIRED', message: 'Preparation lease expired' }
+      : this.#failNextCheckpointCall
     if (failure === undefined) return
-    this.#failNextCheckpointCall = undefined
+    if (this.#agent().alwaysExpireCheckpoints !== true) this.#failNextCheckpointCall = undefined
     if (failure.reason === 'CHECKPOINT_EXPIRED' && this.#agent().keepSubscriptionOnInjectedExpiry !== true) {
       // The real peer's `activate` expiry branch calls `reset()`, which drops
       // the subscription and notifies `resetRequired` before throwing. The

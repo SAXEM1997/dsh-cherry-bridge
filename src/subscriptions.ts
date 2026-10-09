@@ -28,11 +28,15 @@ const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 const DEFAULT_CHECKPOINT_MS = 300_000
 /**
  * LOCAL POLICY CONSTANT (the protocol specifies no such bound; accepted by the
- * controller as a defensive limit). How many full recovery chains one `ensure`
- * may run. Each retry is a FRESH subscribe + pagination + activate (a stale
- * lease or stale pages are never reused), so this only bounds pathological peer
- * churn — a peer that expires every lease surfaces its last error rather than
- * looping forever. Not injectable: it is a safety bound, not a tuning knob.
+ * controller as a defensive limit). The SHARED retry budget for one `ensure`:
+ * it covers BOTH recoverable paths — the `RESOURCE_EXHAUSTED` evict-and-retry
+ * and the checkpoint-lease-expiry chain restart — and is threaded down through
+ * the recovery recursion rather than counted per call, so a nested restart
+ * cannot reset it. Each retry is a FRESH subscribe + pagination + activate (a
+ * stale lease or stale pages are never reused), so this only bounds
+ * pathological peer churn: a peer that expires every lease surfaces its last
+ * error rather than looping forever. Not injectable — it is a safety bound,
+ * not a tuning knob.
  */
 const MAX_RECOVERY_ATTEMPTS = 4
 
@@ -111,8 +115,6 @@ interface SessionState {
   windowStart: number
   /** Cursors a caller has already consumed; the oldest retained is the window start. */
   waiters: Waiter[]
-  /** True while a live peer subscription backs this entry. */
-  live: boolean
   /**
    * Projection state rebuilt from a checkpoint, if this session was recovered
    * that way. STATE, never stream events — it carries no stream cursor.
@@ -176,16 +178,16 @@ export class SessionSubscriptions {
    * re-ensure iterates exactly this list.
    */
   activeSessions(): string[] {
-    const active: string[] = []
-    for (const [sessionId, state] of this.#sessions) {
-      if (state.live) active.push(sessionId)
-    }
-    return active
+    return [...this.#sessions.keys()]
   }
 
   /**
-   * Guarantees a live subscription for `sessionId`, reusing the last cursor
-   * when the caller does not supply one so the peer can replay the gap.
+   * Guarantees a live subscription for `sessionId`.
+   *
+   * The resume cursor comes from the CALLER or not at all — there is no
+   * implicit reuse. Task 10's reconnect re-ensure passes the last cursor
+   * explicitly; Tasks 8/9's first-use ensure is cursorless by design and may
+   * therefore land in checkpoint mode.
    *
    * A same-session re-ensure is a SINGLE path: close the old peer subscription
    * FIRST (the peer flips it to `phase: 'reset'`, which is what makes the
@@ -196,14 +198,13 @@ export class SessionSubscriptions {
 
     // Re-subscribe path: release the old subscription before asking again.
     const existing = this.#sessions.get(sessionId)
-    if (existing !== undefined && existing.live) {
+    if (existing !== undefined) {
       await this.#closeSubscription(existing.subscriptionId)
-      existing.live = false
+      this.#rejectWaiters(existing, new Error(`session ${sessionId} re-subscribed`))
       this.#sessions.delete(sessionId)
     }
 
-    const resumeFrom = cursor ?? this.#sessions.get(sessionId)?.cursor
-    await this.#subscribeChain(sessionId, resumeFrom)
+    await this.#subscribeChain(sessionId, cursor)
   }
 
   /**
@@ -271,7 +272,7 @@ export class SessionSubscriptions {
    */
   async ack(sessionId: string, cursor?: AgentCursor): Promise<void> {
     const state = this.#sessions.get(sessionId)
-    if (state === undefined || !state.live) return
+    if (state === undefined) return
     const applied = cursor ?? state.cursor
     await this.#rpc.request('agent.subscriptions.ack', {
       subscriptionId: state.subscriptionId,
@@ -305,9 +306,8 @@ export class SessionSubscriptions {
   async dispose(): Promise<void> {
     if (this.#closed) return
     this.#closed = true
-    const ids = [...this.#sessions.values()].filter((state) => state.live).map((state) => state.subscriptionId)
+    const ids = [...this.#sessions.values()].map((state) => state.subscriptionId)
     for (const state of this.#sessions.values()) {
-      state.live = false
       const error = new Error('SessionSubscriptions disposed')
       for (const waiter of state.waiters.splice(0)) waiter.reject(error)
     }
@@ -321,14 +321,21 @@ export class SessionSubscriptions {
 
   /**
    * The ONE entry point that reaches the peer for a subscription, including
-   * the full checkpoint recovery chain. `RESOURCE_EXHAUSTED` is handled by
-   * evicting the LRU victim and retrying — the peer's cap is authoritative,
-   * so the local cache must make room rather than surfacing the error.
+   * the full checkpoint recovery chain.
+   *
+   * A SINGLE shared budget governs every recoverable retry here — the
+   * `RESOURCE_EXHAUSTED` evict-and-retry AND the checkpoint-lease-expiry chain
+   * restart. `attemptsLeft` is threaded through the recursion (rather than
+   * counted per call) precisely so a nested restart cannot reset the counter
+   * and loop forever: a peer that expires every lease is eventually given up
+   * on and its last `CHECKPOINT_EXPIRED` is surfaced.
    */
-  async #subscribeChain(sessionId: string, fromCursor: AgentCursor | undefined): Promise<void> {
-    let attempt = 0
+  async #subscribeChain(
+    sessionId: string,
+    fromCursor: AgentCursor | undefined,
+    attemptsLeft: number = MAX_RECOVERY_ATTEMPTS,
+  ): Promise<void> {
     for (;;) {
-      attempt += 1
       try {
         // Make room BEFORE asking (controller ruling 1): at the local cap, the
         // LRU victim is closed and the close is AWAITED, so the peer has
@@ -340,14 +347,16 @@ export class SessionSubscriptions {
           this.#installReplay(sessionId, descriptor)
           return
         }
-        await this.#runCheckpointChain(sessionId, descriptor)
+        await this.#runCheckpointChain(sessionId, descriptor, attemptsLeft)
         return
       } catch (error) {
         const reason = failureReason(error)
-        if (reason === 'RESOURCE_EXHAUSTED' && attempt <= MAX_RECOVERY_ATTEMPTS) {
+        if (reason === 'RESOURCE_EXHAUSTED' && attemptsLeft > 1) {
           // The peer's REAL cap sits below the advertised one (§6's
-          // subscription dimension): free a slot unconditionally and retry.
+          // subscription dimension): free a slot unconditionally and retry,
+          // spending one attempt from the shared budget.
           if (!(await this.#evictLru(sessionId))) throw error
+          attemptsLeft -= 1
           continue
         }
         throw error
@@ -415,7 +424,6 @@ export class SessionSubscriptions {
       bytes: 0,
       windowStart: Number(descriptor.highWatermark.seq),
       waiters: [],
-      live: true,
       projection: [],
     })
   }
@@ -433,48 +441,53 @@ export class SessionSubscriptions {
    * a fresh subscribe, fresh pagination, fresh activate. A stale lease or
    * stale pages are never reused. A cursor mismatch is the peer's CONFLICT and
    * is surfaced, never swallowed.
+   *
+   * `attemptsLeft` is the SHARED budget handed down from {@link #subscribeChain}
+   * and decremented on each lease-expiry restart, so a peer that expires every
+   * lease terminates with its last error instead of restarting forever.
    */
   async #runCheckpointChain(
     sessionId: string,
     descriptor: Extract<SubscribeDescriptor, { mode: 'checkpoint' }>,
+    attemptsLeft: number,
   ): Promise<void> {
     // The lease is peer-authoritative, so this is a LOCAL budget guard only:
     // the window the descriptor opened. It bounds how long one chain may spend
     // before the layer admits the lease is gone and forces a fresh subscribe,
     // rather than issuing reads the peer will only reject.
     const leaseDeadline = Date.now() + this.#checkpointMs
-    for (let attempt = 1; ; attempt += 1) {
-      try {
-        const items = await this.#readCheckpointPages(sessionId, descriptor)
-        await this.#rpc.request('agent.subscriptions.activate', {
-          subscriptionId: descriptor.subscriptionId,
-          // The DESCRIPTOR's cursor — never the pagination nextCursor.
-          appliedCursor: descriptor.checkpoint.cursor,
-        })
-        this.#installCheckpoint(sessionId, descriptor, items)
-        return
-      } catch (error) {
-        const reason = failureReason(error)
-        // Recover ONLY on an expired lease: either the peer said so, or this
-        // chain has provably outlived the descriptor's window (the local guard
-        // for a peer that stays silent). Anything else — notably a CONFLICT
-        // from a mismatched cursor — is surfaced, never swallowed.
-        const leaseGone = reason === 'CHECKPOINT_EXPIRED' || Date.now() > leaseDeadline
-        if (!leaseGone || attempt >= MAX_RECOVERY_ATTEMPTS) throw error
-        // The lease lapsed mid-chain. Release the dead prepared subscription
-        // FIRST: the peer refuses a second subscription for a session whose
-        // previous one is still on its books, so re-subscribing without this
-        // close would collide with CONFLICT instead of recovering. The whole
-        // chain then re-runs from a FRESH subscribe (fresh descriptor, fresh
-        // lease, fresh pages) — the expired lease and stale pages are never
-        // reused.
-        await this.#closeSubscription(descriptor.subscriptionId)
-        // Re-enter the TOP-level chain so the retry goes through the same
-        // cap/resource handling as a first subscription (it cannot bypass
-        // eviction or the RESOURCE_EXHAUSTED retry).
-        await this.#subscribeChain(sessionId, undefined)
-        return
-      }
+    try {
+      const items = await this.#readCheckpointPages(sessionId, descriptor)
+      await this.#rpc.request('agent.subscriptions.activate', {
+        subscriptionId: descriptor.subscriptionId,
+        // The DESCRIPTOR's cursor — never the pagination nextCursor.
+        appliedCursor: descriptor.checkpoint.cursor,
+      })
+      this.#installCheckpoint(sessionId, descriptor, items)
+      return
+    } catch (error) {
+      const reason = failureReason(error)
+      // Recover ONLY on an expired lease: either the peer said so, or this
+      // chain has provably outlived the descriptor's window (the local guard
+      // for a peer that stays silent). Anything else — notably a CONFLICT
+      // from a mismatched cursor — is surfaced, never swallowed. Exhausting
+      // the shared budget also surfaces (this error), which is what stops a
+      // peer that expires every lease from looping forever.
+      const leaseGone = reason === 'CHECKPOINT_EXPIRED' || Date.now() > leaseDeadline
+      if (!leaseGone || attemptsLeft <= 1) throw error
+      // The lease lapsed mid-chain. Release the dead prepared subscription
+      // FIRST: the peer refuses a second subscription for a session whose
+      // previous one is still on its books, so re-subscribing without this
+      // close would collide with CONFLICT instead of recovering. The whole
+      // chain then re-runs from a FRESH subscribe (fresh descriptor, fresh
+      // lease, fresh pages) — the expired lease and stale pages are never
+      // reused.
+      await this.#closeSubscription(descriptor.subscriptionId)
+      // Re-enter the TOP-level chain so the retry goes through the same
+      // cap/resource handling as a first subscription (it cannot bypass
+      // eviction or the RESOURCE_EXHAUSTED retry), spending one shared attempt.
+      await this.#subscribeChain(sessionId, undefined, attemptsLeft - 1)
+      return
     }
   }
 
@@ -533,7 +546,6 @@ export class SessionSubscriptions {
       bytes: 0,
       windowStart: Number(descriptor.checkpoint.cursor.seq),
       waiters: [],
-      live: true,
       projection: [...items],
     })
   }
@@ -579,13 +591,13 @@ export class SessionSubscriptions {
    */
   async #evictLru(protectedSessionId: string): Promise<boolean> {
     for (const [sessionId, state] of this.#sessions) {
-      if (sessionId === protectedSessionId || !state.live) continue
+      if (sessionId === protectedSessionId) continue
       // 「丢最旧并记录」: the eviction is logged, never silent.
       console.warn(
         `[cherry-remote] subscription limit (${this.#limit}) reached; evicting least-recently-used session ` +
           `${sessionId}`,
       )
-      state.live = false
+      // The entry is removed outright, so no `live` flag needs clearing.
       this.#rejectWaiters(state, new Error(`session ${sessionId} evicted by LRU`))
       this.#sessions.delete(sessionId)
       // AWAITED: the peer must observe the close before the next subscribe.
@@ -595,11 +607,9 @@ export class SessionSubscriptions {
     return false
   }
 
-  /** Live (peer-backed) subscription count. */
+  /** Live (peer-backed) subscription count — every entry is live. */
   #liveCount(): number {
-    let count = 0
-    for (const state of this.#sessions.values()) if (state.live) count += 1
-    return count
+    return this.#sessions.size
   }
 
   // -------------------------------------------------------------------------
@@ -655,9 +665,10 @@ export class SessionSubscriptions {
 
   /**
    * `agent.subscriptions.resetRequired`: the peer tore the subscription down
-   * (replay suffix lost, checkpoint lease lapsed, ...). The entry stays so the
-   * caller's next `ensure` can rebuild it — with a fresh subscribe, never by
-   * reusing the dead subscription.
+   * (replay suffix lost, checkpoint lease lapsed, ...). The session is dropped
+   * entirely — there is nothing to reuse, so the caller's next `ensure` must
+   * rebuild it from a FRESH subscribe (and, cursorless, will land in checkpoint
+   * mode). ⑤ pins this behaviour as intended.
    */
   #onResetRequired(params: unknown): void {
     if (!isRecord(params)) {
@@ -672,7 +683,7 @@ export class SessionSubscriptions {
         `[cherry-remote] subscription for session ${sessionId} reset by the peer ` +
           `(${String(params['reason'] ?? 'unspecified')}); re-subscribe required`,
       )
-      state.live = false
+      this.#rejectWaiters(state, new Error(`session ${sessionId} reset by the peer`))
       this.#sessions.delete(sessionId)
       return
     }

@@ -537,6 +537,26 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     expect(rig.subs.read('s1', cursor('other-session', 1))).toEqual({ error: 'cursor-out-of-window' })
   })
 
+  it('⑯ gives up after the shared retry budget when every checkpoint lease expires', async () => {
+    // The submission NEVER converges: every checkpoint face answers
+    // CHECKPOINT_EXPIRED forever. A layer whose retry budget is not really
+    // shared (or is reset by each nested restart) loops here indefinitely.
+    const rig = await makeRig({
+      agent: { forceCheckpointMode: true, checkpointMs: 300_000, alwaysExpireCheckpoints: true },
+    })
+
+    // The ensure must TERMINATE with the peer's error surfaced, not hang.
+    await expect(rig.subs.ensure('s1')).rejects.toMatchObject({ data: { reason: 'CHECKPOINT_EXPIRED' } })
+
+    // The chain gave up after the shared budget: the call counts are BOUNDED
+    // (one subscribe per attempt, no runaway), and nothing was installed.
+    expect(rig.fake.subscribeCalls.length).toBeLessThanOrEqual(4)
+    expect(rig.fake.activateCalls.filter((call) => call.ok)).toHaveLength(0)
+    expect(rig.subs.activeSessions()).toEqual([])
+    // Each restart released its dead prepared subscription before re-subscribing.
+    expect(rig.fake.closeCalls.length).toBe(rig.fake.subscribeCalls.length - 1)
+  })
+
   it('⑫ drops the OLDEST cached events when perSessionCacheBytes is exceeded, and warns', async () => {
     // A deliberately tiny LOCAL cache budget (2 KiB): whatever the real peer
     // streams, the third event must push the first one out.
