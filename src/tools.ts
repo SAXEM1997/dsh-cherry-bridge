@@ -4,12 +4,14 @@ import type { DeviceConnection, DeviceState } from './connection'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore'
 import { JsonRpcRequestError } from './rpc/jsonRpcClient'
 import type { ReadResult, SessionSubscriptions } from './subscriptions'
-import type { PairWithPayloadOptions } from './pairing'
+import { PairingError } from './pairing'
+import type { PairingErrorKind } from './pairing'
 import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
 
 /**
- * The plugin's tool face, part 1: the six READ-ONLY `cherry_*` tools plus the
- * registration framework Tasks 9/10 extend.
+ * The plugin's tool face: the complete fourteen-tool `cherry_*` family — six
+ * READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9) and two MANAGEMENT
+ * ones (Task 10) — plus the registration framework they all share.
  *
  * Three disciplines run through every tool:
  *
@@ -286,10 +288,92 @@ export interface CherryToolsDeps {
   connect(deviceId: string): DeviceConnection
   /** Per-device session subscriptions, sharing one LRU pool. */
   subs(deviceId: string): SessionSubscriptions
-  /** Task 9/10's pairing entry point; unused by the read-only tools. */
-  pair: (options: PairWithPayloadOptions) => Promise<unknown>
-  /** The local Ed25519 identity bytes; unused by the read-only tools. */
-  identity: Uint8Array
+  /**
+   * Task 10's pairing entry point (see {@link CherryPairRequest}).
+   *
+   * The LOCAL IDENTITY lives behind this seam rather than in the deps: the tool
+   * passes a payload and receives a record, and the key bytes — the assembly's
+   * own state, whose load is asynchronous — never enter the tool face. (The HTTP
+   * face names it for the same reason, and needs a lazy accessor: `apply` cannot
+   * await the key load.)
+   */
+  pair: (request: CherryPairRequest) => Promise<DeviceRecord>
+  /**
+   * Drop the pooled connection for a device, closing it. Resolves-existing-only:
+   * a device with no pooled entry must NOT have one fabricated, because the
+   * whole point of eviction is that the next `connect()` rebuilds from the
+   * CURRENT store record.
+   *
+   * REQUIRED, not an optimization (controller ruling 1): a pool that can only
+   * `connect`/`detach` silently reintroduces the disable→enable wedge — a
+   * `DeviceConnection` captures its record at construction, so a pooled
+   * instance can never observe an edited address or a flipped `enabled` flag.
+   *
+   * `cherry_unpair` is the other caller: it evicts (drop + close) and then
+   * removes the archive entry, so no live socket outlives its record.
+   */
+  evict(deviceId: string): void | Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// The management face's contracts (Task 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * One pairing run, as `cherry_pair` asks the assembly to perform it.
+ *
+ * Deliberately NARROWER than `PairWithPayloadOptions`: the tool states the
+ * payload and where to report the verification code and the progress stages,
+ * while `identity` and `store` — the assembly's own state, which the tool has no
+ * business naming — stay behind the seam.
+ */
+export interface CherryPairRequest {
+  /** The desktop's pairing payload (QR content / exported string). */
+  payload: string
+  /** Overrides the claimed device name (default: this machine's hostname). */
+  name?: string
+  /**
+   * Receives the 6-digit code the user compares on the desktop. The pairing
+   * cannot complete without it, so it reaches the caller before the terminal
+   * state, whatever that state turns out to be.
+   */
+  onVerificationCode: (code: string) => void
+  /**
+   * Coarse progress stages ('validate' | 'connect' | 'claim' | 'waiting'), for
+   * a caller that wants to narrate a run which can take a minute. The assembly
+   * bridges this to its pairing-progress fan-out (ruling 10).
+   */
+  onStatus?: (stage: string) => void
+}
+
+/**
+ * `cherry_pair`'s outcome.
+ *
+ * The pairing is a CONVERSATION with a human: every terminal state is an ANSWER
+ * the caller acts on, never a thrown error. `rejected` and `expired` are the
+ * peer's verdicts; `invalid-payload` and `unreachable` are this plugin's own
+ * (the payload never named a reachable desktop). All four still carry the
+ * verification code when one had already been surfaced — the code is exactly
+ * what the user is comparing when they decide.
+ */
+export interface CherryPairResult {
+  status: 'approved' | PairingErrorKind
+  /** The paired device id. Present only on `approved`: no other branch has one. */
+  device?: string
+  /** The name the desktop shows for this device. Present only on `approved`. */
+  displayName?: string
+  /** The 6-digit code, once the claim reached this device. */
+  verificationCode?: string
+  /** Why the pairing ended where it did (absent on `approved`). */
+  message?: string
+}
+
+/** `cherry_unpair`'s outcome. */
+export interface CherryUnpairResult {
+  device: string
+  displayName: string
+  /** Always true on a successful unpair; the shape lets a caller assert it. */
+  removed: true
 }
 
 interface ResolvedDevice {
@@ -360,7 +444,7 @@ export interface CherryToolEngineOptions {
 }
 
 /**
- * Registers the six read-only `cherry_*` tools on `ctx.tools`.
+ * Registers the whole `cherry_*` family on `ctx.tools`.
  *
  * The registration framework is deliberately thin because Tasks 9/10 extend it:
  * {@link defineCherryTool} is the ONE place a tool declaration is assembled, so
@@ -465,6 +549,9 @@ class CherryToolEngine {
       this.#interactionsTool(),
       this.#respondTool(),
       this.#cancelTool(),
+      // The management face (Task 10).
+      this.#pairTool(),
+      this.#unpairTool(),
     ]
   }
 
@@ -1709,6 +1796,147 @@ class CherryToolEngine {
           sessionId,
           expectedExecutionId,
         })
+      },
+    })
+  }
+
+  // -------------------------------------------------------------------------
+  // Management face (Task 10): pair / unpair
+  //
+  // Pairing is the one tool that talks to a desktop the plugin has NOT paired
+  // with yet, and the one whose terminal states are a HUMAN's decision. So it
+  // breaks the read face's two habits for a reason:
+  //
+  //  - **It never resolves a device.** The device does not exist until the
+  //    desktop approves; the payload is the address, and the tool's job is to
+  //    hand it to the pairing face.
+  //  - **Every pairing outcome is a RESULT, not a throw.** `rejected` and
+  //    `expired` are answers the caller acts on (retry, ask for a new QR code),
+  //    and the verification code has to survive them: it is what the user was
+  //    comparing when they decided.
+  // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // ⑫ cherry_pair
+  // -------------------------------------------------------------------------
+
+  #pairTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_pair',
+      description:
+        'Pair this harness with a Cherry Studio desktop from its pairing payload (the QR ' +
+        'content it shows). The 6-digit `verificationCode` the desktop displays is returned so ' +
+        'the user can confirm it matches. Every outcome is a RESULT, never an error: `status` is ' +
+        '"approved" (with the new device id), or the terminal "rejected"/"expired" verdict, or ' +
+        'this plugin\'s own "invalid-payload"/"unreachable". Pairing can take up to a minute — it ' +
+        'waits for the user to approve on the desktop.',
+      parameters: {
+        type: 'object',
+        properties: {
+          payload: {
+            type: 'string',
+            description: 'The pairing payload the desktop rendered into its QR code (a JSON string).',
+          },
+          name: {
+            type: 'string',
+            description:
+              'Optional display name for this device as the desktop will show it (default: this host\'s name).',
+          },
+        },
+        required: ['payload'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const payload = requiredString(args, 'payload')
+        const name = optionalString(args['name'])
+
+        // The code arrives mid-run (at `claim`), so it is captured here and
+        // folded into EVERY terminal answer below.
+        let verificationCode: string | undefined
+        const outcome: CherryPairResult = await this.#runPair({
+          payload,
+          ...(name === undefined ? {} : { name }),
+          onVerificationCode: (code) => {
+            verificationCode = code
+          },
+        })
+
+        return {
+          ...outcome,
+          ...(verificationCode === undefined ? {} : { verificationCode }),
+        }
+      },
+    })
+  }
+
+  /**
+   * Runs one pairing and maps its outcome onto {@link CherryPairResult}.
+   *
+   * The mapping is TOTAL over the pairing error currency: `PairingError.kind`
+   * IS the result's `status`, so no terminal state can be silently reclassified
+   * as success or swallowed. Anything that is NOT a `PairingError` is a real
+   * fault (a bug, or the identity not being loaded yet) and is rethrown — the
+   * tool has no honest in-band shape for "this should not have happened".
+   */
+  async #runPair(request: CherryPairRequest): Promise<CherryPairResult> {
+    try {
+      const record = await this.#deps.pair(request)
+      return {
+        status: 'approved',
+        device: record.deviceId,
+        displayName: record.displayName,
+      }
+    } catch (error) {
+      if (!(error instanceof PairingError)) throw error
+      return { status: error.kind, message: error.message }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // ⑬ cherry_unpair
+  // -------------------------------------------------------------------------
+
+  #unpairTool(): CherryToolDefinition {
+    return defineCherryTool({
+      name: 'cherry_unpair',
+      description:
+        'Forget a paired desktop: tear its connection down and delete it from the device ' +
+        'archive, so this harness no longer holds its access token. The `device` selector is ' +
+        'REQUIRED (an exact deviceId, or a unique display-name prefix); unpairing is permanent ' +
+        'and the device must be paired again from a fresh QR code.',
+      parameters: {
+        type: 'object',
+        properties: {
+          device: {
+            type: 'string',
+            description: 'Device selector: exact deviceId, or a unique display-name prefix.',
+          },
+        },
+        required: ['device'],
+        additionalProperties: false,
+      },
+      execute: async (args) => {
+        const selector = requiredString(args, 'device')
+        // The same selector discipline as every other tool (ruling ⑤): an
+        // ambiguous name is the structured candidate list, NOT a throw, and it
+        // must not tear anything down — the caller has not said which device.
+        const selected = this.#selectRecords(selector)
+        if (!Array.isArray(selected)) return selected
+        const record = selected[0]!
+
+        // ORDER MATTERS: evict (drop + close) BEFORE removing the archive entry.
+        // The other order leaves a window where the record is gone but its live
+        // socket — still authenticated with a token that is about to be
+        // discarded — is not. Eviction resolves an EXISTING pooled connection
+        // only, so an unpaired-but-never-dialed device is simply removed.
+        await this.#deps.evict(record.deviceId)
+        this.#deps.store.remove(record.deviceId)
+
+        return {
+          device: record.deviceId,
+          displayName: record.displayName,
+          removed: true,
+        } satisfies CherryUnpairResult
       },
     })
   }

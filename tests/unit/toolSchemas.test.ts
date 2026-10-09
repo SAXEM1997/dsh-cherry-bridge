@@ -4,14 +4,18 @@ import { registerCherryTools } from '../../src/tools'
 import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools'
 
 /**
- * Task 8⑧: literal JSON Schema validation for the six read-only tools this task
- * registers. Every assertion reads the schema the HOST registry would receive
- * (the definition's compiled `parameters`), so a tool whose declared schema
- * drifts from its documented contract fails here rather than at call time.
+ * Task 8⑧ + Task 10④: literal JSON Schema validation for the WHOLE `cherry_*`
+ * family. Every assertion reads the schema the HOST registry would receive (the
+ * definition's compiled `parameters`), so a tool whose declared schema drifts
+ * from its documented contract fails here rather than at call time.
  *
- * The 14-tool full-set assertion belongs to Task 10④; this suite pins exactly
- * the read-only set, so it SELECTS those definitions out of the registry Task 9
- * has since widened.
+ * Task 8 pinned the six read-only tools by SELECTING them out of a registry
+ * Task 9 had already widened. Task 10④ owns the full-set assertion, so the file
+ * now states the COMPLETE 14-tool contract in one place — the brief's §7-1
+ * 「工具参数 schema 校验」 — including the three parameters a caller cannot get
+ * wrong without the peer refusing the call: `cherry_respond`'s required
+ * `interactionId` with its `decision|response` exclusivity, `cherry_cancel`'s
+ * required `expectedExecutionId`, and `cherry_send`'s `text` ceiling.
  */
 
 const READ_TOOLS = [
@@ -22,6 +26,22 @@ const READ_TOOLS = [
   'cherry_read',
   'cherry_events',
 ] as const
+
+/** The interactive face (Task 9). */
+const INTERACTIVE_TOOLS = [
+  'cherry_create',
+  'cherry_send',
+  'cherry_wait',
+  'cherry_interactions',
+  'cherry_respond',
+  'cherry_cancel',
+] as const
+
+/** The management face (Task 10). */
+const MANAGEMENT_TOOLS = ['cherry_pair', 'cherry_unpair'] as const
+
+/** The complete `cherry_*` registry, in registration order. */
+const ALL_TOOLS = [...READ_TOOLS, ...INTERACTIVE_TOOLS, ...MANAGEMENT_TOOLS] as const
 
 /** The full registry, read-only tools first. */
 function registerAll(): CherryToolDefinition[] {
@@ -45,7 +65,9 @@ function registerAll(): CherryToolDefinition[] {
     pair: async () => {
       throw new Error('the schema suite never pairs')
     },
-    identity: new Uint8Array(),
+    evict: () => {
+      throw new Error('the schema suite never evicts')
+    },
   })
   return definitions
 }
@@ -66,8 +88,7 @@ function properties(definition: CherryToolDefinition): Record<string, Record<str
   return definition.parameters.properties as unknown as Record<string, Record<string, unknown>>
 }
 
-describe('tool parameter schemas: the six read-only tools', () => {
-  it('registers exactly the six read-only tools, each with a literal object-root schema', () => {
+describe('tool parameter schemas: the six read-only tools', () => {  it('registers exactly the six read-only tools, each with a literal object-root schema', () => {
     // Task 9 widened the registry; this suite's subject is its own six, which
     // Task 8 registers FIRST and in this order.
     const definitions = registerReadOnly()
@@ -153,5 +174,90 @@ describe('tool parameter schemas: the six read-only tools', () => {
         expect(keys).not.toContain(forbidden)
       }
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 10④: the full 14-tool set
+// ---------------------------------------------------------------------------
+
+describe('tool parameter schemas: the complete 14-tool registry (Task 10④)', () => {
+  it('registers exactly the fourteen `cherry_*` tools, in the order M3 documents them', () => {
+    expect(registerAll().map((definition) => definition.name)).toEqual([...ALL_TOOLS])
+  })
+
+  it('every one of the fourteen declares a literal, closed, object-root schema with a description', () => {
+    for (const definition of registerAll()) {
+      expect(definition.parameters.type).toBe('object')
+      expect(definition.parameters.additionalProperties).toBe(false)
+      expect(Object.keys(definition.parameters.properties).length).toBeGreaterThan(0)
+      expect(typeof definition.description).toBe('string')
+      expect(definition.description.length).toBeGreaterThan(0)
+      // The host validates `execute`'s return against `output.schema`, so a
+      // tool with no output contract could return anything at all.
+      expect(definition.output.schema).toBeDefined()
+      expect(typeof definition.output.render).toBe('function')
+    }
+  })
+
+  it('cherry_send requires device/sessionId/text and caps text at the protocol ceiling of 32768', () => {
+    const definition = toolOf('cherry_send')
+    expect(definition.parameters.required).toEqual(['device', 'sessionId', 'text'])
+    // 32768 is the protocol's `agent.messages.send.text` ceiling: the schema
+    // must state it so an over-long body is refused before the wire rather than
+    // round-tripped into a peer error.
+    expect(properties(definition)['text']).toMatchObject({ type: 'string', maxLength: 32_768 })
+  })
+
+  it('cherry_cancel REQUIRES expectedExecutionId: a cancel without a target is unrunnable', () => {
+    const definition = toolOf('cherry_cancel')
+    expect(definition.parameters.required).toEqual(['device', 'sessionId', 'expectedExecutionId'])
+    expect(properties(definition)['expectedExecutionId']).toMatchObject({ type: 'string' })
+  })
+
+  it('cherry_respond requires interactionId and offers decision|response as the two answer forms', () => {
+    const definition = toolOf('cherry_respond')
+    expect(definition.parameters.required).toEqual(['device', 'sessionId', 'interactionId'])
+    expect(properties(definition)['interactionId']).toMatchObject({ type: 'string' })
+    // The two forms are the protocol's own union branches: `decision` for a
+    // card, `response` for a question. Both are declared, and the tool refuses
+    // "neither" and "both" in band.
+    const decision = properties(definition)['decision']!
+    expect(decision['type']).toBe('string')
+    expect(decision['enum']).toEqual(['approve', 'deny'])
+    const response = properties(definition)['response']!
+    expect(response['type']).toBe('object')
+    expect(response['additionalProperties']).toBe(false)
+    expect(response['required']).toEqual(['kind', 'answers'])
+    expect((response['properties'] as Record<string, unknown>)['kind']).toMatchObject({
+      enum: ['answer'],
+    })
+  })
+
+  it('cherry_pair requires the payload and takes an optional device-name override', () => {
+    const definition = toolOf('cherry_pair')
+    expect(definition.parameters.required).toEqual(['payload'])
+    expect(Object.keys(properties(definition)).sort()).toEqual(['name', 'payload'])
+    expect(properties(definition)['payload']).toMatchObject({ type: 'string' })
+    expect(properties(definition)['name']).toMatchObject({ type: 'string' })
+  })
+
+  it('cherry_unpair requires the device selector: there is no "unpair everything"', () => {
+    const definition = toolOf('cherry_unpair')
+    expect(definition.parameters.required).toEqual(['device'])
+    expect(Object.keys(properties(definition))).toEqual(['device'])
+    expect(properties(definition)['device']).toMatchObject({ type: 'string' })
+  })
+
+  it('the interactive and management tools all carry the device selector, and only cherry_pair omits a list limit', () => {
+    // Every tool EXCEPT the two read-only management/listing entry points
+    // addresses a device; `cherry_pair` is the one that CREATES the pairing and
+    // `cherry_devices` the one that may list them all.
+    for (const name of [...INTERACTIVE_TOOLS, 'cherry_unpair'] as const) {
+      expect(properties(toolOf(name))['device']).toMatchObject({ type: 'string' })
+      expect(toolOf(name).parameters.required).toContain('device')
+    }
+    expect(toolOf('cherry_pair').parameters.required).not.toContain('device')
+    expect(toolOf('cherry_devices').parameters.required ?? []).not.toContain('device')
   })
 })

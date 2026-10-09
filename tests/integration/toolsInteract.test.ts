@@ -151,7 +151,9 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     pair: async () => {
       throw new Error('pairing is not exercised by the interactive suite')
     },
-    identity,
+    evict: () => {
+      throw new Error('the interactive suite never evicts')
+    },
   }
   registerCherryTools(ctx, deps, rigOptions.engine ?? {})
 

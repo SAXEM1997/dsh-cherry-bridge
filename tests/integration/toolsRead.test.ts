@@ -170,7 +170,9 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     pair: async () => {
       throw new Error('pairing is not exercised by the read-only suite')
     },
-    identity,
+    evict: () => {
+      throw new Error('the read-only suite never evicts')
+    },
   }
   registerCherryTools(ctx, deps, rigOptions.engine ?? {})
 
@@ -821,23 +823,25 @@ describe('read-only cherry tools over a real loopback channel', () => {
 })
 
 describe('read-only cherry tools: registration framework', () => {
-  it('registers exactly the six read-only tools this task owns, ahead of the interactive set', async () => {
+  it('registers exactly the six read-only tools this task owns, ahead of the rest of the family', async () => {
     const rig = await makeRig()
-    // Task 9 appends six INTERACTIVE tools to the same registry, so this task's
-    // claim is about the read-only PREFIX it owns — its order and its exact
-    // membership — not about being the whole registry. The full 14-tool set
-    // assertion belongs to Task 10④.
+    // Task 9 appends six INTERACTIVE tools and Task 10 two MANAGEMENT tools to
+    // the same registry, so this task's claim is about the read-only PREFIX it
+    // owns — its order and its exact membership — not about being the whole
+    // registry. The full 14-tool set assertion belongs to Task 10④.
     expect(rig.ctx.definitions.slice(0, READ_TOOL_NAMES.length).map((definition) => definition.name)).toEqual(
       READ_TOOL_NAMES,
     )
-    const interactive = rig.ctx.definitions.slice(READ_TOOL_NAMES.length).map((definition) => definition.name)
-    expect(interactive).toEqual([
+    const trailing = rig.ctx.definitions.slice(READ_TOOL_NAMES.length).map((definition) => definition.name)
+    expect(trailing).toEqual([
       'cherry_create',
       'cherry_send',
       'cherry_wait',
       'cherry_interactions',
       'cherry_respond',
       'cherry_cancel',
+      'cherry_pair',
+      'cherry_unpair',
     ])
   })
 
