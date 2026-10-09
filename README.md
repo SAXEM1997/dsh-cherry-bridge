@@ -147,7 +147,7 @@ curl 之类的非浏览器客户端，不是跨站页面）。
 ```bash
 npm test            # vitest 全量（含 tests/contract/）
 npm run typecheck   # 服务端 + UI 两侧
-npm run build       # tsdown → lib/
+npm run build       # tsdown → dist/index.mjs
 npm run build:client # vite → lib/client.js
 ```
 

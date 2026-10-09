@@ -15,7 +15,7 @@
     "node": ">=22.18.0"
   },
   "exports": {
-    ".": "./lib/index.js",
+    ".": "./dist/index.mjs",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },

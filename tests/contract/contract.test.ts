@@ -1219,6 +1219,11 @@ describe('③ release configuration', () => {
     // The client half is only reachable through this export; a `files` list
     // that dropped `lib` would publish a package the host cannot load.
     expect(manifest.exports['./client']).toBe('./lib/client.js')
+    // The server main entry must point at what `npm run build` actually
+    // emits (tsdown → dist/index.mjs); `lib/index.js` is produced by nothing,
+    // so a drift here publishes a dead main entry (final-review Disclosure A).
+    expect(manifest.exports['.']).toBe('./dist/index.mjs')
+    expect(manifest.files).toContain('dist')
     // The plan's Tech Stack floor ("TypeScript (Node ≥22.18)"); a lower range
     // would advertise support for a runtime the suite never exercises.
     expect(manifest.engines?.node).toBe('>=22.18.0')
