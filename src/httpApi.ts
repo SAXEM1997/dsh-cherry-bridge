@@ -133,6 +133,18 @@ export interface CherryHttpDeps {
    * fabricating a connection for the record it is removing.
    */
   detach?(deviceId: string): ConnectionLike | undefined
+  /**
+   * Drops the pooled connection for one device (closing it), so the next
+   * `connect()` reconstructs from the CURRENT store record.
+   *
+   * This is required, not an optimization: a `DeviceConnection` captures its
+   * `DeviceRecord` at construction and never re-reads it, so a pooled
+   * instance cannot observe an edited address or a flipped `enabled` flag.
+   * Without eviction, PATCH address maintenance silently keeps dialing the
+   * old address, and disable→enable reuses an instance still holding
+   * `enabled:false` (whose `connect()` short-circuits to `disabled` forever).
+   */
+  evict?(deviceId: string): void
   /** Assembly channel: one device's state changed. */
   onDeviceState(cb: (event: DeviceStateEvent) => void): void
   /** Assembly channel: one pairing run advanced a stage. */
@@ -741,6 +753,8 @@ async function patchDevice(
   }
 
   const previousEnabled = existing.enabled
+  const previousHosts = existing.hosts
+  const previousPort = existing.port
   const next: DeviceRecord = {
     ...existing,
     ...(patch.displayName === undefined ? {} : { displayName: patch.displayName }),
@@ -757,33 +771,36 @@ async function patchDevice(
     return
   }
 
-  // Enable/disable is a lifecycle change, not just a flag: a disabled device
-  // must drop its socket, and a re-enabled one must get a connection back.
-  // Order matters — the lifecycle call runs FIRST so the state read below (and
-  // the frame published with it) reflects the transition, not the stale state.
-  if (patch.enabled !== undefined && patch.enabled !== previousEnabled) {
-    let connection: ConnectionLike | undefined
+  // Address maintenance must reach the LIVE connection, and a disabled device
+  // must not keep one. Both need the pooled instance EVICTED: a
+  // `DeviceConnection` captures its record at construction, so a pooled
+  // instance would otherwise keep dialing the old address and keep seeing
+  // `enabled:false` after a re-enable (its `connect()` would short-circuit to
+  // `disabled` forever). Evicting drops the socket and forces the next
+  // `connect()` to rebuild from the record we just wrote.
+  const addressChanged =
+    (patch.hosts !== undefined && !sameHosts(patch.hosts, previousHosts)) ||
+    (patch.port !== undefined && patch.port !== previousPort)
+  const enabledChanged = patch.enabled !== undefined && patch.enabled !== previousEnabled
+
+  if (addressChanged) {
+    evict(route, deviceId)
+  }
+
+  if (enabledChanged) {
+    // Disable must NOT go through `connect`: that seam creates on miss, and
+    // building a connection for a device the user just disabled would bury an
+    // `enabled:false` capture in the pool — its `connect()` then short-circuits
+    // to `disabled` forever, wedging the device across a later re-enable.
+    hibernate(route, deviceId)
+  }
+
+  if (enabledChanged && patch.enabled) {
+    // Rebuild from the store record, which now carries `enabled:true`.
     try {
-      connection = route.deps.connect(deviceId)
+      track(route.deps.connect(deviceId).connect(), warnConnect(deviceId))
     } catch (error) {
-      console.warn(`[cherry-remote] device ${deviceId} connection lookup failed`, error)
-    }
-    if (connection !== undefined) {
-      // `connect()`/`close()` are async, but a collaborator may return a plain
-      // value, so the settlement hooks are attached defensively.
-      if (patch.enabled) {
-        try {
-          track(connection.connect(), warnConnect(deviceId))
-        } catch (error) {
-          console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error)
-        }
-      } else {
-        try {
-          track(connection.close(), warnConnect(deviceId))
-        } catch (error) {
-          console.warn(`[cherry-remote] device ${deviceId} disconnect failed`, error)
-        }
-      }
+      console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error)
     }
   }
 
@@ -808,6 +825,37 @@ async function patchDevice(
 function warnConnect(deviceId: string): (error: unknown) => void {
   return (error: unknown) => {
     console.warn(`[cherry-remote] device ${deviceId} lifecycle change failed`, error)
+  }
+}
+
+/** Order-sensitive host comparison: `hosts` is an ordered candidate list. */
+function sameHosts(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((host, index) => host === b[index])
+}
+
+/** Drops the pooled connection, closing any live socket first. */
+function evict(route: RouteContext, deviceId: string): void {
+  try {
+    route.deps.evict?.(deviceId)
+  } catch (error) {
+    console.warn(`[cherry-remote] device ${deviceId} eviction failed`, error)
+  }
+}
+
+/**
+ * Puts one device to sleep: drop its pooled connection and close the live
+ * socket, resolving an EXISTING instance only.
+ *
+ * The `detach` seam (never `connect`) is what makes this safe — `connect`
+ * creates on miss, so a disable would otherwise leave a fresh connection
+ * holding `enabled:false` in the pool.
+ */
+function hibernate(route: RouteContext, deviceId: string): void {
+  evict(route, deviceId)
+  try {
+    track(route.deps.detach?.(deviceId)?.close(), warnConnect(deviceId))
+  } catch (error) {
+    console.warn(`[cherry-remote] device ${deviceId} disconnect failed`, error)
   }
 }
 

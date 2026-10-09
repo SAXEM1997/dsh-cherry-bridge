@@ -126,6 +126,22 @@ function connectionFor(deviceId: string): ConnectionLike {
   return connection
 }
 
+/**
+ * Drops one pooled connection, closing it first so a stale socket cannot
+ * outlive its record. The next `connect()` builds a fresh instance from the
+ * current store record — the only way a `DeviceConnection` can observe an
+ * edited address or a re-enabled flag, since it captures its `DeviceRecord`
+ * at construction and never re-reads it.
+ */
+function evictConnection(deviceId: string): void {
+  const existing = state.connections.get(deviceId)
+  if (existing === undefined) return
+  state.connections.delete(deviceId)
+  void Promise.resolve(existing.close()).catch((error: unknown) => {
+    console.warn(`[cherry-remote] device ${deviceId} close failed during eviction`, error)
+  })
+}
+
 export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {}): void {
   const dataDir = resolveDataDir(config)
   state.store = new DeviceStore(join(dataDir, 'devices.json'))
@@ -145,9 +161,14 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
     // consumer, so the key is read when a payload is actually submitted.
     identity: requireIdentity,
     connect: connectionFor,
-    // DELETE tears down a LIVE connection only: resolving through the pool map
-    // (never `connectionFor`) keeps a removal from resurrecting a device.
+    // Resolve an EXISTING pooled connection without fabricating one. Used by
+    // DELETE (never resurrect the record being removed) and by the disable
+    // branch (a disabled device must not have a connection built for it).
     detach: (deviceId) => state.connections.get(deviceId),
+    // Drop a pooled entry so the next `connect()` reconstructs from the
+    // CURRENT store record — the fix for stale construction-time captures:
+    // PATCH address maintenance and disable→enable both need a fresh instance.
+    evict: evictConnection,
     onDeviceState: (cb) => {
       state.deviceStateListeners.add(cb)
     },

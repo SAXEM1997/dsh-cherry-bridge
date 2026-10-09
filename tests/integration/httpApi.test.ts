@@ -285,6 +285,9 @@ async function call(
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), 'cherry-http-'))
+  // `mount` resets this too; assembly tests drive the same dispatcher without
+  // mounting, so it must never be left undefined.
+  requests = []
   vi.spyOn(console, 'info').mockImplementation(() => {})
   vi.spyOn(console, 'warn').mockImplementation(() => {})
   vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -761,6 +764,27 @@ describe('④ PATCH address maintenance', () => {
     expect(badHosts.status).toBe(400)
     expect(store.list()[0]!.port).toBe(9000)
   })
+
+  it('evicts the pooled connection on an address change, but not on an unrelated edit', async () => {
+    const evicted: string[] = []
+    mount({ evict: (deviceId) => evicted.push(deviceId) })
+    store.upsert(record({ hosts: ['10.0.0.1'], port: 1234 }))
+
+    // A rename touches no address: the live connection stays as it is.
+    await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ displayName: 'Renamed' }) })
+    expect(evicted).toEqual([])
+
+    await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ hosts: ['10.0.0.1'] }) })
+    expect(evicted).toEqual([])
+
+    // A real address change drops the pooled instance so the next dial uses it.
+    await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ hosts: ['10.0.0.9'] }) })
+    expect(evicted).toEqual(['dev-1'])
+
+    evicted.length = 0
+    await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ port: 4321 }) })
+    expect(evicted).toEqual(['dev-1'])
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -905,7 +929,8 @@ describe('⑥ lifecycle', () => {
 
 describe('plugin assembly (index.ts apply)', () => {
   interface AssemblyCtx {
-    routes: Map<string, unknown>
+    /** The same FakeWebServer the unit-level tests drive, so `call` works. */
+    server: FakeWebServer
     effects: Array<() => void>
     dataDir: string
     injectable: boolean
@@ -914,24 +939,19 @@ describe('plugin assembly (index.ts apply)', () => {
   }
 
   function assemblyCtx(injectable = true): AssemblyCtx {
-    const routes = new Map<string, unknown>()
+    // The REAL index.apply registers through ctx.webServer, so the fake here
+    // is the same prefix table the rest of the suite dispatches through —
+    // otherwise the assembly path would only be reachable by bypassing it.
+    const server = new FakeWebServer()
     const effects: Array<() => void> = []
     return {
-      routes,
+      server,
       effects,
       dataDir,
       injectable,
       inject(_deps, cb) {
         if (!injectable) throw new Error('service "webServer" is not available')
-        cb({
-          webServer: {
-            register: (route: { path: string; handler: unknown }) => {
-              routes.set(route.path, route.handler)
-              return () => routes.delete(route.path)
-            },
-          },
-          webRuntime: { trustedHosts: [] },
-        })
+        cb({ webServer: server, webRuntime: { trustedHosts: [] } })
       },
       effect(cb) {
         effects.push(cb())
@@ -958,7 +978,7 @@ describe('plugin assembly (index.ts apply)', () => {
 
     index.apply(ctx as never, { dataDir })
 
-    expect(ctx.routes.has(PREFIX)).toBe(true)
+    expect(ctx.server.routes.has(PREFIX)).toBe(true)
     // The identity load is async by design (apply must stay synchronous), so
     // the 0600 key file appears shortly after apply returns.
     await vi.waitFor(() => {
@@ -967,7 +987,7 @@ describe('plugin assembly (index.ts apply)', () => {
 
     expect(ctx.effects).toHaveLength(1)
     ctx.effects[0]!()
-    expect(ctx.routes.size).toBe(0)
+    expect(ctx.server.routes.size).toBe(0)
   })
 
   it('does not adopt connections from a previous apply against another archive', async () => {
@@ -982,12 +1002,173 @@ describe('plugin assembly (index.ts apply)', () => {
     try {
       const second = assemblyCtx()
       expect(() => index.apply(second as never, { dataDir: secondDir })).not.toThrow()
-      expect(second.routes.has(PREFIX)).toBe(true)
+      expect(second.server.routes.has(PREFIX)).toBe(true)
       // The first plugin's route seat was replaced by its own teardown path.
       expect(first.effects).toHaveLength(1)
       first.effects[0]!()
     } finally {
       rmSync(secondDir, { recursive: true, force: true })
+    }
+  })
+
+  /** `call` defaults to the module-level ctx; point it at an assembly ctx. */
+  function callOn(assembly: AssemblyCtx) {
+    return (path: string, init: RequestInitLike = {}) => call(path, init, assembly.server)
+  }
+
+  it('rebuilds the connection so PATCH address maintenance reaches the dialer (F1a)', async () => {
+    const index = await import('../../src/index')
+    const { DeviceConnection } = await import('../../src/connection')
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+
+    const store = new DeviceStore(join(dataDir, 'devices.json'))
+    store.upsert(record({ hosts: ['127.0.0.1'], port: 1111 }))
+    await vi.waitFor(async () => {
+      expect(existsSync(join(dataDir, 'identity.key'))).toBe(true)
+    })
+
+    /** Every record a DeviceConnection was constructed with. */
+    const captured: Array<{ hosts: string[]; port: number; enabled: boolean }> = []
+    const spy = vi
+      .spyOn(DeviceConnection.prototype as unknown as { connect(): Promise<void> }, 'connect')
+      .mockImplementation(function (this: { record: DeviceRecord }) {
+        captured.push({ hosts: [...this.record.hosts], port: this.record.port, enabled: this.record.enabled })
+        return Promise.reject(new Error('no dial in this test'))
+      })
+
+    try {
+      const api = callOn(ctx)
+      // A read builds the pooled connection, capturing the ORIGINAL address.
+      await api('/devices')
+      expect(captured).toEqual([{ hosts: ['127.0.0.1'], port: 1111, enabled: true }])
+
+      // Address maintenance updates the record...
+      const patched = await api('/devices/dev-1', {
+        method: 'PATCH',
+        body: JSON.stringify({ hosts: ['10.9.9.9'], port: 7777 }),
+      })
+      expect(patched.status).toBe(200)
+      expect(patched.json).toMatchObject({ hosts: ['10.9.9.9'], port: 7777 })
+
+      // ...and the pooled instance is DROPPED, so the next read rebuilds from
+      // the new record. Without eviction the dialer keeps the old address.
+      await api('/devices')
+      expect(captured).toHaveLength(2)
+      expect(captured[1]).toEqual({ hosts: ['10.9.9.9'], port: 7777, enabled: true })
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('does not wedge a device at disabled across disable → enable (F1b)', async () => {
+    const index = await import('../../src/index')
+    const { DeviceConnection } = await import('../../src/connection')
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+
+    const store = new DeviceStore(join(dataDir, 'devices.json'))
+    store.upsert(record())
+    await vi.waitFor(async () => {
+      expect(existsSync(join(dataDir, 'identity.key'))).toBe(true)
+    })
+
+    /**
+     * Records that connections were built with. A connection built while the
+     * record said `enabled:false` would be permanently stuck: its `connect()`
+     * short-circuits on the captured flag.
+     */
+    const captured: Array<{ enabled: boolean }> = []
+    const spy = vi
+      .spyOn(DeviceConnection.prototype as unknown as { connect(): Promise<void> }, 'connect')
+      .mockImplementation(function (this: { record: DeviceRecord }) {
+        captured.push({ enabled: this.record.enabled })
+        // Model the real guard: a connection holding `enabled:false` reports
+        // `disabled` and rejects, exactly as DeviceConnection.connect does.
+        if (!this.record.enabled) return Promise.reject(new Error('device is disabled'))
+        return Promise.reject(new Error('no dial in this test'))
+      })
+
+    const api = callOn(ctx)
+    try {
+      await api('/devices')
+
+      const disabled = await api('/devices/dev-1', {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: false }),
+      })
+      expect(disabled.json).toMatchObject({ enabled: false, state: 'disabled' })
+
+      // No connection may have been BUILT for a disabled record: the disable
+      // branch resolves an existing instance rather than creating one.
+      expect(captured.every((entry) => entry.enabled)).toBe(true)
+
+      const enabled = await api('/devices/dev-1', {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: true }),
+      })
+      expect(enabled.json.enabled).toBe(true)
+      // The wedge: a pooled `enabled:false` instance would answer `disabled`
+      // forever. The rebuilt connection must leave that state.
+      expect(enabled.json.state).not.toBe('disabled')
+
+      const reopened = new FakeResponse()
+      await ctx.server.dispatch(new FakeRequest(`${PREFIX}/events`, { host: HOST }), reopened)
+      expect(reopened.events<{ state: string }>('device-state')[0]!.state).not.toBe('disabled')
+    } finally {
+      spy.mockRestore()
+    }
+  })
+
+  it('does not build a connection for a device disabled before any read (F1b, empty pool)', async () => {
+    const index = await import('../../src/index')
+    const { DeviceConnection } = await import('../../src/connection')
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+
+    const store = new DeviceStore(join(dataDir, 'devices.json'))
+    store.upsert(record())
+    await vi.waitFor(async () => {
+      expect(existsSync(join(dataDir, 'identity.key'))).toBe(true)
+    })
+
+    const captured: Array<{ enabled: boolean }> = []
+    const spy = vi
+      .spyOn(DeviceConnection.prototype as unknown as { connect(): Promise<void> }, 'connect')
+      .mockImplementation(function (this: { record: DeviceRecord }) {
+        captured.push({ enabled: this.record.enabled })
+        if (!this.record.enabled) return Promise.reject(new Error('device is disabled'))
+        return Promise.reject(new Error('no dial in this test'))
+      })
+
+    const api = callOn(ctx)
+    try {
+      // NO read first: the pool is EMPTY, which is the decisive condition.
+      // A create-on-miss disable branch would build a connection here and bury
+      // an `enabled:false` capture in the pool forever.
+      const disabled = await api('/devices/dev-1', {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: false }),
+      })
+      expect(disabled.json).toMatchObject({ enabled: false, state: 'disabled' })
+      expect(captured).toEqual([])
+
+      // The re-enable must dial from a record that says `enabled:true`. Under
+      // the wedge it would reuse the pooled disabled instance and answer
+      // `disabled` forever, with the connection never dialing again.
+      const enabled = await api('/devices/dev-1', {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: true }),
+      })
+      expect(enabled.json.enabled).toBe(true)
+      expect(enabled.json.state).not.toBe('disabled')
+      // The re-enable dials from a record that says `enabled:true` (the pool is
+      // rebuilt, so a fresh instance is constructed) — never from the disabled
+      // capture that caused the wedge.
+      expect(captured).toContainEqual({ enabled: true })
+      expect(captured[captured.length - 1]).toEqual({ enabled: true })
+    } finally {
+      spy.mockRestore()
     }
   })
 
@@ -997,7 +1178,7 @@ describe('plugin assembly (index.ts apply)', () => {
     const warn = vi.mocked(console.warn)
 
     expect(() => index.apply(ctx as never, { dataDir })).not.toThrow()
-    expect(ctx.routes.size).toBe(0)
+    expect(ctx.server.routes.size).toBe(0)
     expect(warn).toHaveBeenCalled()
   })
 })
