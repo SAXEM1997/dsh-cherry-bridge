@@ -1031,3 +1031,288 @@ describe('interactive cherry tools over a real loopback channel', () => {
     expect(consoleWarn).not.toHaveBeenCalled()
   })
 })
+
+/**
+ * Regression suite for the three defects the Task 9 review found. Each test
+ * reproduces the reviewer's exact probe, so a re-introduction fails here rather
+ * than silently returning a wrong answer.
+ */
+describe('interactive tools: review regressions', () => {
+  it('C1: a SECOND send on one session waits for ITS OWN terminal, not the first run\'s', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('ok'),
+        runDelayMs: 50,
+      },
+    })
+
+    // Run 1 finishes quickly, leaving a `completed` terminal in the buffer.
+    const first = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'one',
+      timeoutMs: 5_000,
+    })) as { status: string; executionId: string }
+    expect(first.status).toBe('completed')
+
+    // Run 2 is SLOW. A waiter reading the cumulative buffer's stale terminal
+    // returned `completed` in ~140ms here while run 2 was still in flight,
+    // reporting run 1's executionId.
+    rig.fake.setRunDelay(600)
+    const started = Date.now()
+    const second = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'two',
+      timeoutMs: 5_000,
+    })) as { status: string; executionId: string }
+    const elapsed = Date.now() - started
+
+    expect(second.status).toBe('completed')
+    // It waited for ITS OWN run…
+    expect(elapsed).toBeGreaterThanOrEqual(500)
+    // …and named its own execution, never the previous run's.
+    expect(second.executionId).not.toBe(first.executionId)
+    const runs = rig.fake.executionUpdates.filter((update) => update.status === 'completed')
+    expect(runs.map((update) => update.executionId)).toEqual([first.executionId, second.executionId])
+  })
+
+  it('C1b: cherry_wait does not adopt an OLD terminal still sitting in the buffer', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('ok'),
+        runDelayMs: 50,
+      },
+    })
+
+    // Run 1 settles, leaving its terminal in the cumulative buffer.
+    const first = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'one',
+      timeoutMs: 5_000,
+    })) as { executionId: string }
+
+    // Run 2 is in flight; a wait must park for run 2, not answer with run 1.
+    rig.fake.setRunDelay(600)
+    const send = rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'two',
+      timeoutMs: 5_000,
+    })
+    // Give the send time to be admitted, then wait on the session.
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const started = Date.now()
+    const waited = (await rig.call('cherry_wait', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      timeoutMs: 5_000,
+    })) as { status: string; executionId?: string }
+
+    expect(waited.status).toBe('completed')
+    expect(waited.executionId).not.toBe(first.executionId)
+    await send
+    expect(Date.now() - started).toBeGreaterThanOrEqual(300)
+  })
+
+  it('C1c: a FOREIGN execution\'s terminal arriving mid-wait does not settle it', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        // The session's own run is in flight and has NOT settled.
+        sessions: [{ ...SESSION, activeExecutionId: 'exec-mine' }],
+        terminalMessage: terminalMessage('ok'),
+      },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+
+    const waiting = rig.call('cherry_wait', { device: 'dev-A', sessionId: 's-1', timeoutMs: 3_000 })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    // A DIFFERENT execution's terminal lands while the wait is parked. The
+    // baseline alone cannot exclude it — it arrives AFTER the wait began — so
+    // only attribution to the awaited execution keeps this wait honest.
+    rig.fake.pushEvent('s-1', {
+      kind: 'execution.updated',
+      payload: {
+        executionId: 'exec-foreign',
+        status: 'completed',
+        messageId: 'm-assistant',
+        durable: true,
+        history: { messageRevision: '1', historyRevision: '1' },
+      },
+    })
+
+    const raced = await Promise.race([
+      waiting.then((value) => value as { status: string; executionId?: string }),
+      new Promise<{ status: string }>((resolve) => setTimeout(() => resolve({ status: 'STILL-WAITING' }), 800)),
+    ])
+
+    // The foreign terminal must NOT be adopted…
+    expect(raced.status).toBe('STILL-WAITING')
+
+    // …and the wait still resolves correctly once its OWN run settles.
+    rig.fake.pushEvent('s-1', {
+      kind: 'execution.updated',
+      payload: {
+        executionId: 'exec-mine',
+        status: 'completed',
+        messageId: 'm-assistant',
+        durable: true,
+        history: { messageRevision: '1', historyRevision: '1' },
+      },
+    })
+    const settled = (await waiting) as { status: string; executionId?: string }
+    expect(settled.status).toBe('completed')
+    expect(settled.executionId).toBe('exec-mine')
+  })
+
+  it('I2: a SETTLED interaction never poisons the execution cache', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        // The session is IDLE; only an already-approved card is on record.
+        interactions: [decisionInteraction({ interactionId: 'i-old', status: 'approved', executionId: 'exec-old' })],
+      },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+
+    // Listing (which records the card) must not make the idle session look busy.
+    const listed = (await rig.call('cherry_interactions', {
+      device: 'dev-A',
+      sessionId: 's-1',
+    })) as { items: unknown[] }
+    expect(listed.items).toEqual([])
+
+    const cancel = (await rig.call('cherry_cancel', { device: 'dev-A', sessionId: 's-1' })) as {
+      error?: string
+    }
+    // The in-band verdict, NOT the peer's rejected CONFLICT for a dead run…
+    expect(cancel.error).toBe('no-active-execution')
+    // …and nothing was ever sent for it.
+    expect(rig.fake.commandCallsFor('agent.executions.cancel')).toHaveLength(0)
+  })
+
+  it('I2b: the peer\'s LIVE execution outranks a stale cached one', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION, activeExecutionId: 'exec-live' }],
+        // A stale card names a DIFFERENT execution than the live one.
+        interactions: [questionInteraction({ interactionId: 'i-stale', executionId: 'exec-stale' })],
+      },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+    await rig.call('cherry_interactions', { device: 'dev-A', sessionId: 's-1' })
+
+    // A caller holding the CORRECT live id must be accepted, not told it is wrong.
+    const result = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      expectedExecutionId: 'exec-live',
+    })) as { status?: string; error?: string; expectedExecutionId?: string }
+
+    expect(result.error).toBeUndefined()
+    expect(result.status).toBe('applied')
+    const calls = rig.fake.commandCallsFor('agent.executions.cancel')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!['expectedExecutionId']).toBe('exec-live')
+  })
+
+  it('I2c: a settled interaction itself never SEEDS the active-execution cache', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        // The peer is IDLE. A settled card on record must not make it look busy.
+        sessions: [SESSION],
+        interactions: [decisionInteraction({ interactionId: 'i-old', status: 'denied', executionId: 'exec-old' })],
+      },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+    await rig.call('cherry_interactions', { device: 'dev-A', sessionId: 's-1' })
+
+    const refused = (await rig.call('cherry_cancel', { device: 'dev-A', sessionId: 's-1' })) as {
+      error?: string
+    }
+    expect(refused.error).toBe('no-active-execution')
+    // No wire call at all — the refusal is in band, not the peer's CONFLICT.
+    expect(rig.fake.commandCallsFor('agent.executions.cancel')).toHaveLength(0)
+  })
+
+  it('I3: with two pendings, answering the SECOND still soft-terminals on the FIRST', async () => {
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], activeExecutionId: 'exec-live' },
+    })
+
+    // Prime the subscription FIRST: the peer only delivers events to an ACTIVE
+    // subscription, so a push before this would be dropped rather than tested.
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+
+    // Both pendings arrive LIVE — the real-time stream the soft-terminal
+    // predicate is defined over — before the wait starts.
+    rig.fake.pushEvent('s-1', {
+      kind: 'interaction.updated',
+      payload: {
+        interactionId: 'i-first',
+        revision: '2',
+        executionId: 'exec-live',
+        toolCallId: 'call-first',
+        status: 'pending',
+        summary: 'First question',
+        kind: 'question',
+        inputDigest: 'a'.repeat(64),
+        input: { text: JSON.stringify({ questions: [{ question: 'First question', options: [{ label: 'ok' }] }] }) },
+      },
+    })
+    rig.fake.pushEvent('s-1', {
+      kind: 'interaction.updated',
+      payload: {
+        interactionId: 'i-second',
+        revision: '3',
+        executionId: 'exec-live',
+        toolCallId: 'call-second',
+        status: 'pending',
+        summary: 'Second question',
+        kind: 'question',
+        inputDigest: 'b'.repeat(64),
+        input: { text: JSON.stringify({ questions: [{ question: 'Second question', options: [{ label: 'ok' }] }] }) },
+      },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+
+    // Settle the SECOND (the later-registered one); the FIRST stays pending.
+    rig.fake.pushEvent('s-1', {
+      kind: 'interaction.updated',
+      payload: {
+        interactionId: 'i-second',
+        revision: '4',
+        executionId: 'exec-live',
+        toolCallId: 'call-second',
+        status: 'approved',
+        summary: 'Second question',
+        kind: 'question',
+        inputDigest: 'b'.repeat(64),
+      },
+    })
+
+    const started = Date.now()
+    const waited = (await rig.call('cherry_wait', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      timeoutMs: 2_000,
+    })) as { status: string; interactionId?: string; pendingInteractions?: Array<{ interactionId: string }> }
+    const elapsed = Date.now() - started
+
+    // A single-slot record lost `i-first` here and parked to the full timeout.
+    expect(waited.status).toBe('awaiting-interaction')
+    expect(waited.interactionId).toBe('i-first')
+    expect(waited.pendingInteractions?.map((entry) => entry.interactionId)).toEqual(['i-first'])
+    expect(elapsed).toBeLessThan(1_000)
+  })
+})

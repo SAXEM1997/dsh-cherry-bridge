@@ -847,6 +847,16 @@ export class FakeCherry {
     return this.#executionUpdates
   }
 
+  /**
+   * How long an accepted run takes to settle. Mutable mid-flight so a test can
+   * make the FIRST run quick and a LATER one slow on the same session — the
+   * shape that exposes a waiter reading a prior run's terminal.
+   */
+  setRunDelay(ms: number | undefined): void {
+    if (this.#options.agent === undefined) this.#options.agent = {}
+    this.#options.agent.runDelayMs = ms
+  }
+
   /** The interaction view the peer currently serves, in fixture order. */
   get interactions(): readonly FakeInteractionView[] {
     return this.#interactions.map((interaction) => this.#interactionView(interaction))

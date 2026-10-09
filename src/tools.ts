@@ -1807,13 +1807,22 @@ class CherryToolEngine {
   }
 
   /**
-   * The cached ACTIVE execution id for a session.
+   * The session's ACTIVE execution id, from the most authoritative source
+   * available — in this order:
    *
-   * Same two sources as the idle revision: the live `execution.updated` stream
-   * first (a non-terminal status means the run is still in flight; a terminal
-   * one clears the cache), then a baseline `agent.sessions.get`. Shared by
-   * `cherry_cancel` and the responder's `expectedExecutionId` — ONE source, so
-   * the two can never disagree about what is running.
+   *  1. the live `execution.updated` stream (a non-terminal status means the run
+   *     is still in flight; a terminal one means nothing is);
+   *  2. the PEER's current `agent.sessions.get` snapshot, which is the ground
+   *     truth about what is running right now;
+   *  3. the local cache, and only as a value the peer CONFIRMS — a cached id the
+   *     peer no longer reports is dropped rather than returned.
+   *
+   * The cache deliberately does NOT outrank the peer (I2): a stale entry would
+   * otherwise become the `execution-mismatch` authority, refusing a caller that
+   * holds the CORRECT live id and telling it the wrong one.
+   *
+   * Shared by `cherry_cancel` and the responder's `expectedExecutionId` — ONE
+   * source, so the two can never disagree about what is running.
    */
   async #activeExecutionId(
     connection: DeviceConnection,
@@ -1825,8 +1834,6 @@ class CherryToolEngine {
       this.#executionCache.set(this.#cacheKey(sessionId), streamed)
       return streamed
     }
-    const observed = this.#executionCache.get(this.#cacheKey(sessionId))
-    if (observed !== undefined) return observed
 
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
       string,
@@ -1834,8 +1841,13 @@ class CherryToolEngine {
     >
     const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
     const active = optionalString(session['activeExecutionId'])
-    if (active !== undefined) this.#executionCache.set(this.#cacheKey(sessionId), active)
-    return active
+    if (active !== undefined) {
+      this.#executionCache.set(this.#cacheKey(sessionId), active)
+      return active
+    }
+    // The peer says the session is idle: any cached id is stale by definition.
+    this.#executionCache.delete(this.#cacheKey(sessionId))
+    return undefined
   }
 
   /**
@@ -1900,7 +1912,16 @@ class CherryToolEngine {
     return this.#interactionCache.get(this.#interactionKey(sessionId, interactionId))
   }
 
-  /** Records one interaction's staleness snapshot from a wire view. */
+  /**
+   * Records one interaction's staleness snapshot from a wire view.
+   *
+   * A PENDING interaction also refreshes the session's active-execution cache,
+   * because the run it blocks is by definition still in flight. A SETTLED
+   * (approved/denied/expired) one deliberately does NOT: its execution may have
+   * finished long ago, and recording it would make `cherry_cancel` name a dead
+   * run and turn an idle session into a peer-side CONFLICT instead of the
+   * in-band `no-active-execution`.
+   */
   #rememberInteraction(
     _subscriptions: SessionSubscriptions,
     sessionId: string,
@@ -1919,9 +1940,7 @@ class CherryToolEngine {
       executionId,
       inputDigest,
     })
-    // A pending interaction also records the execution it belongs to, so a
-    // concurrent cancel can name the run the interaction is blocking.
-    this.#executionCache.set(this.#cacheKey(sessionId), executionId)
+    if (raw['status'] === 'pending') this.#executionCache.set(this.#cacheKey(sessionId), executionId)
   }
 
   /**
@@ -1956,31 +1975,45 @@ class CherryToolEngine {
   ): Promise<Record<string, unknown>> {
     const deadline = options.startedAt + options.timeoutMs
     let latestExecutionId = options.executionId
+    // THE BASELINE: the newest seq already in the buffer when this wait began.
+    // The fold below sees only events strictly after it, so a prior run's
+    // terminal — still sitting in the cumulative buffer — can never speak for
+    // this wait. Captured ONCE, so each pass is cheap and the cut never moves.
+    const baselineSeq = this.#newestSeq(subscriptions, sessionId)
 
     for (;;) {
-      const observed = this.#observedState(subscriptions, sessionId)
+      const observed = this.#observedState(subscriptions, sessionId, {
+        baselineSeq,
+        ...(latestExecutionId === undefined ? {} : { awaitedExecutionId: latestExecutionId }),
+      })
       if (observed.executionId !== undefined) latestExecutionId = observed.executionId
 
-      // SOFT TERMINAL first: the run cannot progress without the caller, so
-      // waiting longer would burn the window for nothing.
-      if (observed.pendingInteraction !== undefined) {
+      // SOFT TERMINAL first: ANY unanswered pending interaction means the run
+      // cannot progress without the caller, so waiting longer would burn the
+      // window for nothing. The report names the OLDEST such interaction, which
+      // is the deterministic one to answer first.
+      const pending = observed.pendingInteractions[0]
+      if (pending !== undefined) {
         return {
           status: 'awaiting-interaction' satisfies CherryRunStatus,
           sessionId,
           executionId: observed.executionId ?? options.executionId ?? null,
           ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
-          interactionId: observed.pendingInteraction.interactionId,
-          kind: observed.pendingInteraction.kind,
-          summary: observed.pendingInteraction.summary,
-          questions: observed.pendingInteraction.questions,
+          interactionId: pending.interactionId,
+          kind: pending.kind,
+          summary: pending.summary,
+          questions: pending.questions,
+          // Every interaction still awaiting an answer, so a caller that wants
+          // to drain them all does not have to re-list.
+          pendingInteractions: observed.pendingInteractions,
           cursor: this.#cursorOf(subscriptions, sessionId),
         }
       }
 
-      // HARD TERMINAL: one of the four execution states.
+      // HARD TERMINAL: one of the four execution states, FOR THIS EXECUTION.
       if (observed.terminalStatus !== undefined) {
         return await this.#terminalResult(connection, subscriptions, sessionId, observed.terminalStatus, {
-          ...(observed.executionId === undefined ? {} : { executionId: observed.executionId }),
+          ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
           ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
         })
       }
@@ -2008,63 +2041,151 @@ class CherryToolEngine {
   }
 
   /**
-   * The session's cached execution/interaction state, as the real-time event
+   * The session's observed execution/interaction state, as the real-time event
    * stream has reported it.
+   *
+   * Two scoping rules make this correct across CONSECUTIVE runs on one session
+   * (the session buffer is cumulative and an ack does not shrink it, so a naive
+   * replay would re-see every prior run's terminal):
+   *
+   *  1. **A terminal is attributed to its own execution.** `terminalStatus` is
+   *     reported ONLY for `awaitedExecutionId`; every other execution's terminal
+   *     is ignored. This is the fix for the stale-terminal bug — a second send
+   *     on one session must not read the FIRST run's `completed` and return
+   *     while its own run is still in flight.
+   *  2. **Only terminals are cut at the baseline; pendings never are.** The
+   *     baseline excludes an execution that settled BEFORE this wait began, but
+   *     a still-unanswered interaction is not history — it is exactly the soft
+   *     terminal the waiter exists to report, so it must stay visible however
+   *     long it has been pending.
    *
    * `terminalStatus` is the closed four-state set; the receipt dimension's
    * `interrupted` never lands here.
+   *
+   * `pendingInteractions` is a SET, not a slot: the soft-terminal predicate is
+   * "ANY unanswered pending interaction" (spec §3.6), so two pendings where the
+   * later-registered settles first must leave the earlier one visible.
    */
   #observedState(
     subscriptions: SessionSubscriptions,
     sessionId: string,
+    options: { baselineSeq: number; awaitedExecutionId?: string },
   ): {
     executionId?: string
     terminalStatus?: string
-    pendingInteraction?: {
+    pendingInteractions: Array<{
       interactionId: string
       kind: string
       summary: string
       questions: string[]
-    }
+    }>
   } {
     const state: {
       executionId?: string
       terminalStatus?: string
-      pendingInteraction?: { interactionId: string; kind: string; summary: string; questions: string[] }
-    } = {}
+      pendingInteractions: Array<{ interactionId: string; kind: string; summary: string; questions: string[] }>
+    } = { pendingInteractions: [] }
 
-    // The records arrive through the subscriptions layer's session state; the
-    // engine reads them by replaying the buffer's event views, which is the
-    // only channel the layer exposes.
+    const awaited = options.awaitedExecutionId
+    // Keyed by interactionId: a later `interaction.updated` for the same
+    // interaction REPLACES its entry, and a settled one REMOVES it — but only
+    // its own, so an unrelated pending is never clobbered.
+    const pending = new Map<
+      string,
+      { interactionId: string; kind: string; summary: string; questions: string[] }
+    >()
+    // The baseline decides ONLY whether an execution terminal is in scope. An
+    // execution that had already settled when the wait began belongs to an
+    // earlier run; one that settles after it is this wait's answer.
+    const settledBeforeBaseline = new Set<string>()
+
     for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      const seq = Number(entry['seq'])
+      const beforeBaseline = !Number.isFinite(seq) || seq <= options.baselineSeq
+
       const kind = String(entry['kind'] ?? '')
       const payload = isRecord(entry['payload']) ? entry['payload'] : {}
-      if (kind === 'execution.updated') {
-        const executionId = optionalString(payload['executionId'])
-        if (executionId !== undefined) state.executionId = executionId
-        const status = optionalString(payload['status'])
-        if (status !== undefined && (TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(status)) {
-          state.terminalStatus = status
-        }
-      }
+
       if (kind === 'interaction.updated') {
         const interactionId = optionalString(payload['interactionId'])
         const status = optionalString(payload['status'])
         if (interactionId === undefined) continue
         if (status !== 'pending') {
-          // Answered/expired: it stops being a soft terminal.
-          if (state.pendingInteraction?.interactionId === interactionId) state.pendingInteraction = undefined
+          pending.delete(interactionId)
           continue
         }
-        state.pendingInteraction = {
+        // A pending interaction is NOT history: it stays a soft terminal
+        // regardless of when it arrived.
+        pending.set(interactionId, {
           interactionId,
           kind: optionalString(payload['kind']) ?? 'decision',
           summary: String(payload['summary'] ?? ''),
           questions: questionKeysOf(payload['input']),
-        }
+        })
+        continue
+      }
+
+      if (kind !== 'execution.updated') continue
+      const executionId = optionalString(payload['executionId'])
+      const status = optionalString(payload['status'])
+      if (executionId === undefined || status === undefined) continue
+      const terminal = (TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(status)
+
+      // Record every pre-baseline settlement, whichever execution it belongs to:
+      // it identifies a run that is already over.
+      if (beforeBaseline) {
+        if (terminal) settledBeforeBaseline.add(executionId)
+        continue
+      }
+
+      // Post-baseline events of OTHER executions are not this wait's business.
+      if (awaited === undefined || executionId !== awaited) continue
+      state.executionId = executionId
+      state.terminalStatus = terminal ? status : undefined
+    }
+
+    // An awaited run that was ALREADY over when the wait began, with nothing
+    // pending, is not something to park on: report the terminal it settled on.
+    // (Guarded by the pending set: a live interaction outranks a prior terminal,
+    // because the run it belongs to is still answerable.)
+    if (
+      state.terminalStatus === undefined &&
+      awaited !== undefined &&
+      settledBeforeBaseline.has(awaited) &&
+      pending.size === 0
+    ) {
+      state.terminalStatus = this.#settledStatusOf(subscriptions, sessionId, awaited, options.baselineSeq)
+      state.executionId = awaited
+    }
+    state.pendingInteractions = [...pending.values()]
+    return state
+  }
+
+  /**
+   * The terminal status an execution settled on at or before the baseline, or
+   * undefined when it never settled. Only consulted for an awaited execution
+   * that was already over when the wait began — the "I am waiting on a run that
+   * has already finished" case `cherry_wait` must answer rather than park on.
+   */
+  #settledStatusOf(
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+    executionId: string,
+    baselineSeq: number,
+  ): string | undefined {
+    let settled: string | undefined
+    for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+      if (String(entry['kind'] ?? '') !== 'execution.updated') continue
+      const seq = Number(entry['seq'])
+      if (Number.isFinite(seq) && seq > baselineSeq) continue
+      const payload = isRecord(entry['payload']) ? entry['payload'] : {}
+      if (optionalString(payload['executionId']) !== executionId) continue
+      const status = optionalString(payload['status'])
+      if (status !== undefined && (TERMINAL_EXECUTION_STATUSES as readonly string[]).includes(status)) {
+        settled = status
       }
     }
-    return state
+    return settled
   }
 
   /**
@@ -2076,11 +2197,28 @@ class CherryToolEngine {
    * (spec §3.6: 「经实时 `interaction.updated` 入流」). It is deliberately NOT
    * `projection()`, which carries checkpoint-rebuilt STATE rather than stream
    * events and so has no notion of what arrived live.
+   *
+   * `seq` is preserved on each view — {@link CherryToolEngine.#observedState}
+   * needs it to cut the fold at a baseline.
    */
   #eventsOf(subscriptions: SessionSubscriptions, sessionId: string): Array<Record<string, unknown>> {
     const result = subscriptions.read(sessionId)
     if (!('events' in result)) return []
     return result.events.map((event) => event as unknown as Record<string, unknown>)
+  }
+
+  /**
+   * The newest stream seq the session buffer holds — the baseline a waiter
+   * captures at its start, so its fold sees only events that arrive AFTER it.
+   */
+  #newestSeq(subscriptions: SessionSubscriptions, sessionId: string): number {
+    const events = this.#eventsOf(subscriptions, sessionId)
+    let newest = 0
+    for (const entry of events) {
+      const seq = Number(entry['seq'])
+      if (Number.isFinite(seq) && seq > newest) newest = seq
+    }
+    return newest
   }
 
   /**
