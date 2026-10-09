@@ -104,11 +104,25 @@ export interface CherryAmbiguousDevice {
   candidates: string[]
 }
 
-/** A page-aggregating result: the items plus how much of the aggregate is here. */
+/** Why an aggregate stopped before the peer said it was done. */
+export type CherryTruncationReason =
+  /** The caller's `limit` was reached with more items available. */
+  | 'limit'
+  /** The safety circuit-breaker tripped; the peer still had pages to serve. */
+  | 'safety-bound'
+
+/** A page-aggregating result: the items plus how completely they were read. */
 export interface CherryPage<T> {
   items: T[]
-  /** True when the aggregate stopped at the caller's limit with more available. */
+  /** True when the aggregate stopped before the peer ran out. */
   truncated: boolean
+  /**
+   * Present exactly when `truncated` is true: WHY the walk stopped. A truncated
+   * result is never silent — the caller always learns that content was left.
+   */
+  truncationReason?: CherryTruncationReason
+  /** The cursor to resume from, present only on a non-limit truncation. */
+  nextCursor?: string
 }
 
 /** `cherry_events`' structured window verdict (spec §6: cursor-out-of-window). */
@@ -137,6 +151,13 @@ export interface CherryReadMessage {
   role: string
   status: string
   parts: CherryReadPart[]
+  /**
+   * Present only when this message's parts could NOT all be read: the safety
+   * circuit-breaker stopped the walk. Absent means the part list is complete.
+   */
+  partsTruncated?: CherryTruncationReason
+  /** The `parts.list` cursor to resume this message's part walk from. */
+  partsResumeCursor?: string
 }
 
 /** The two-level `cherry_read` snapshot. */
@@ -144,6 +165,8 @@ export interface CherryReadSnapshot {
   session: Record<string, unknown>
   messages: CherryReadMessage[]
   truncated: boolean
+  /** The MESSAGE-walk truncation reason, when `truncated` is true. */
+  truncationReason?: CherryTruncationReason
 }
 
 // ---------------------------------------------------------------------------
@@ -152,12 +175,26 @@ export interface CherryReadSnapshot {
 
 /** The protocol's single-page hard cap, used only as the pre-hello ceiling. */
 const PAGE_ITEMS_FALLBACK = 100
-/** The largest aggregate a caller may ask for; the per-page clamp still applies. */
+/** The largest MESSAGE aggregate a caller may ask for; the per-page clamp still applies. */
 const MAX_AGGREGATE_LIMIT = 1000
 /** One `agent.content.read` slice is capped at the protocol's `remoteLimits.contentBytes`. */
 const CONTENT_READ_MAX_BYTES = 24 * 1024
-/** Guard against a peer that never reports `nextCursor: null`. */
-const MAX_PAGES = 10_000
+/**
+ * CIRCUIT-BREAKER for the parts walk (a local policy bound, NOT a protocol
+ * limit — the protocol caps nothing at 1000 parts). A message's parts are read
+ * to COMPLETION, so this exists only to stop a peer that never terminates its
+ * pagination. Tripping it is SURFACED (`partsTruncated` + `partsOmitted`),
+ * never silent, so a caller can always tell a complete part list from a
+ * circuit-broken one. Injectable for tests.
+ */
+const DEFAULT_PARTS_SAFETY_BOUND = 10_000
+/**
+ * CIRCUIT-BREAKER for one `{ref}`'s content walk, used only when the ref
+ * carries no usable `byteLength`. The ref's declared length normally derives
+ * the bound exactly; this is the fallback for a malformed ref, and exceeding it
+ * FAILS the read rather than returning a partial (unverifiable) content.
+ */
+const DEFAULT_CONTENT_SLICE_BOUND = 4_096
 
 /**
  * Externalized part content is read in ≤24 KiB slices and the WHOLE content's
@@ -233,6 +270,16 @@ function jsonRender(_args: unknown, value: unknown): ToolContentBlock[] {
 // Registration
 // ---------------------------------------------------------------------------
 
+/** Local policy knobs (never protocol values); all optional. */
+export interface CherryToolEngineOptions {
+  /**
+   * Circuit-breaker for one message's part walk. Omitted uses
+   * {@link DEFAULT_PARTS_SAFETY_BOUND}. Exists so a test can prove the bound
+   * surfaces instead of truncating silently.
+   */
+  partsSafetyBound?: number
+}
+
 /**
  * Registers the six read-only `cherry_*` tools on `ctx.tools`.
  *
@@ -240,7 +287,11 @@ function jsonRender(_args: unknown, value: unknown): ToolContentBlock[] {
  * {@link defineCherryTool} is the ONE place a tool declaration is assembled, so
  * those tasks add mutating tools without touching the host seam.
  */
-export function registerCherryTools(ctx: CherryToolsContext, deps: CherryToolsDeps): () => void {
+export function registerCherryTools(
+  ctx: CherryToolsContext,
+  deps: CherryToolsDeps,
+  options: CherryToolEngineOptions = {},
+): () => void {
   const tools = ctx.tools
   if (tools === undefined) {
     // Headless deployments have no tool registry. Degrade to a warning rather
@@ -249,7 +300,7 @@ export function registerCherryTools(ctx: CherryToolsContext, deps: CherryToolsDe
     return () => {}
   }
 
-  const engine = new CherryToolEngine(deps)
+  const engine = new CherryToolEngine(deps, options)
   const disposers = engine.definitions().map((definition) => tools.register(definition))
   return () => {
     for (const dispose of disposers) dispose()
@@ -278,9 +329,19 @@ function defineCherryTool(definition: {
  */
 class CherryToolEngine {
   readonly #deps: CherryToolsDeps
+  /**
+   * Circuit-breaker for the parts walk. A LOCAL policy value, injectable so a
+   * test can drive the bound low enough to prove that tripping it SURFACES
+   * rather than silently truncating.
+   */
+  readonly #partsSafetyBound: number
 
-  constructor(deps: CherryToolsDeps) {
+  constructor(deps: CherryToolsDeps, options: CherryToolEngineOptions = {}) {
     this.#deps = deps
+    this.#partsSafetyBound = Math.max(
+      1,
+      Math.floor(options.partsSafetyBound ?? DEFAULT_PARTS_SAFETY_BOUND),
+    )
   }
 
   definitions(): CherryToolDefinition[] {
@@ -359,12 +420,18 @@ class CherryToolEngine {
   // -------------------------------------------------------------------------
 
   /**
-   * Walks pages until the caller's aggregate `limit` is reached or the peer
-   * runs out, clamping EVERY page to the negotiated `pageItems`.
+   * Walks pages until `limit` items are collected or the peer runs out,
+   * clamping EVERY page to the negotiated `pageItems`.
    *
    * The clamp is the whole point: `limit: 150` means "at most 150 items
    * total", never "ask the peer for 150 in one page" — the protocol's
    * single-page cap is a hard wire limit the plugin cannot override.
+   *
+   * `limit` is a CALLER contract, and reaching it is reported as
+   * `truncationReason: 'limit'`. `safetyBound` is different in kind: it is an
+   * internal circuit-breaker against a peer that never terminates, and tripping
+   * it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the resume
+   * cursor) — a walk never stops early and reports success.
    */
   async #aggregate<T>(
     connection: DeviceConnection,
@@ -372,38 +439,51 @@ class CherryToolEngine {
     params: Record<string, unknown>,
     extract: (page: Record<string, unknown>) => { items: T[]; nextCursor: unknown },
     limit: number,
+    safetyBound: number = MAX_AGGREGATE_LIMIT,
   ): Promise<CherryPage<T>> {
     const pageItems = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK))
+    // `limit` may be Infinity (a walk with NO caller bound), so the two
+    // ceilings are intersected rather than maxed: the effective stop is
+    // whichever binds first, and Infinity simply never binds.
     const aggregate = Math.max(1, Math.floor(limit))
+    const bound = Math.max(1, Math.floor(safetyBound))
+    const ceiling = Math.min(aggregate, bound)
     const items: T[] = []
     let cursor: string | undefined
-    let truncated = false
 
-    for (let page = 0; page < MAX_PAGES; page += 1) {
-      const remaining = aggregate - items.length
-      if (remaining <= 0) {
-        truncated = true
-        break
+    for (;;) {
+      if (items.length >= ceiling) {
+        // Which ceiling stopped it decides how the caller reads the result:
+        // the caller's own limit, or the internal circuit-breaker.
+        return this.#truncated(items, aggregate <= bound ? 'limit' : 'safety-bound', cursor)
       }
       const request: Record<string, unknown> = {
         ...params,
         // The per-page clamp: never more than one page's worth, whatever the
         // remaining aggregate says.
-        limit: Math.min(remaining, pageItems),
+        limit: Math.min(ceiling - items.length, pageItems),
       }
       if (cursor !== undefined) request['cursor'] = cursor
       const result = (await connection.rpc.request(method, request)) as Record<string, unknown>
       const extracted = extract(result)
       for (const item of extracted.items) {
-        if (items.length >= aggregate) break
+        if (items.length >= ceiling) break
         items.push(item)
       }
       const next = extracted.nextCursor
-      if (next === null || next === undefined) break
+      if (next === null || next === undefined) return { items, truncated: false }
       cursor = String(next)
     }
+  }
 
-    return { items, truncated }
+  /** A stopped aggregate, always carrying why it stopped and where to resume. */
+  #truncated<T>(items: T[], reason: CherryTruncationReason, cursor: string | undefined): CherryPage<T> {
+    return {
+      items,
+      truncated: true,
+      truncationReason: reason,
+      ...(cursor === undefined ? {} : { nextCursor: cursor }),
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -554,7 +634,12 @@ class CherryToolEngine {
           },
           aggregateLimit(args['limit']),
         )
-        return { items: page.items, systemWorkspace, truncated: page.truncated }
+        return {
+          items: page.items,
+          systemWorkspace,
+          truncated: page.truncated,
+          ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
+        }
       },
     })
   }
@@ -702,7 +787,12 @@ class CherryToolEngine {
     for (const raw of page.items) {
       messages.push(await this.#projectMessage(connection, sessionId, raw))
     }
-    return { session, messages, truncated: page.truncated }
+    return {
+      session,
+      messages,
+      truncated: page.truncated,
+      ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
+    }
   }
 
   /** One message: list ALL its parts under the message's OWN revision, then aggregate. */
@@ -713,16 +803,18 @@ class CherryToolEngine {
   ): Promise<CherryReadMessage> {
     const messageId = String(raw['messageId'] ?? '')
     const revision = String(raw['revision'] ?? '')
-    // A message's parts are read to COMPLETION (not caller-bounded): a partial
-    // part list would silently drop content from the snapshot, so the aggregate
-    // ceiling here is the protocol maximum, walked page by page under the same
-    // per-page clamp every other read obeys.
+    // A message's parts are read to COMPLETION: the caller's `limit` bounds
+    // MESSAGES, so any part budget here would drop content from the snapshot.
+    // The walk therefore runs until the peer reports `nextCursor: null`, with
+    // `DEFAULT_PARTS_SAFETY_BOUND` as a pure circuit-breaker against a peer that
+    // never terminates — and tripping it is reported, never silent.
     const page = await this.#aggregate(
       connection,
       'agent.parts.list',
       { sessionId, messageId, messageRevision: revision },
       (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-      MAX_AGGREGATE_LIMIT,
+      Number.POSITIVE_INFINITY,
+      this.#partsSafetyBound,
     )
 
     const parts: CherryReadPart[] = []
@@ -735,6 +827,15 @@ class CherryToolEngine {
       role: String(raw['role'] ?? ''),
       status: String(raw['status'] ?? ''),
       parts,
+      // A circuit-broken part list advertises itself, with the cursor to resume
+      // from: the caller can see that this message is incomplete and where to
+      // continue, so content is never dropped silently.
+      ...(page.truncated
+        ? {
+            partsTruncated: page.truncationReason ?? 'safety-bound',
+            ...(page.nextCursor === undefined ? {} : { partsResumeCursor: page.nextCursor }),
+          }
+        : {}),
     }
   }
 
@@ -784,11 +885,19 @@ class CherryToolEngine {
     const contentId = String(ref['contentId'] ?? '')
     const revision = String(ref['revision'] ?? '')
     const declaredSha = typeof ref['sha256'] === 'string' ? ref['sha256'] : undefined
+    // The advertised byte length bounds the walk honestly: the peer declares it
+    // on the ref, so a read that needs more slices than the content can hold is
+    // a peer fault, not a reason to return a partial (and unverifiable) value.
+    const declaredBytes = Number(ref['byteLength'])
+    const maxSlices = Number.isSafeInteger(declaredBytes)
+      ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES))
+      : DEFAULT_CONTENT_SLICE_BOUND
 
     const chunks: Uint8Array[] = []
     let offset = '0'
     let sha: string | undefined
-    for (let page = 0; page < MAX_PAGES; page += 1) {
+    let complete = false
+    for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
       const slice = (await connection.rpc.request('agent.content.read', {
         sessionId,
         contentId,
@@ -799,12 +908,23 @@ class CherryToolEngine {
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
       chunks.push(new Uint8Array(Buffer.from(data, 'base64')))
       if (typeof slice['sha256'] === 'string') sha = slice['sha256']
-      if (slice['eof'] === true) break
+      if (slice['eof'] === true) {
+        complete = true
+        break
+      }
       const next = slice['nextOffset']
       if (typeof next !== 'string' || next === offset) {
         throw new Error(`agent.content.read for ${contentId} did not advance (offset ${offset})`)
       }
       offset = next
+    }
+    // A partial content is never returned: the digest check below could not
+    // certify it, so an incomplete walk is a hard failure rather than a
+    // silently short read.
+    if (!complete) {
+      throw new Error(
+        `agent.content.read for ${contentId} did not reach eof within ${maxSlices} slice(s); refusing to aggregate a partial content`,
+      )
     }
 
     const bytes = Buffer.concat(chunks)

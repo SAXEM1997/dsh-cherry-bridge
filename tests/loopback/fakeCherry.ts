@@ -440,6 +440,8 @@ export class FakeCherry {
    * against the real desktop.
    */
   #contentDigests = new Map<string, string>()
+  /** Deliberately FALSE `byteLength` declarations (see `understateContentLength`). */
+  #contentByteOverrides = new Map<string, number>()
 
   constructor(options: FakeCherryOptions = {}) {
     this.#options = options
@@ -677,6 +679,16 @@ export class FakeCherry {
     const key = `${contentId}:${revision}`
     if (!this.#contentBytes.has(key)) throw new Error(`no externalized content ${key}`)
     this.#contentBytes.set(key, new TextEncoder().encode(replacement))
+  }
+
+  /**
+   * Under-declare one `{ref}`'s `byteLength` — the peer-side lie that makes a
+   * length-derived slice budget too small to ever reach `eof`. Models a peer
+   * whose declared content size cannot be trusted. Callable BEFORE the part is
+   * projected (the pins are created lazily on first projection).
+   */
+  understateContentLength(contentId: string, revision: string, declaredBytes: number): void {
+    this.#contentByteOverrides.set(`${contentId}:${revision}`, declaredBytes)
   }
 
   /** The current journal watermark cursor for a session. */
@@ -1498,12 +1510,13 @@ export class FakeCherry {
     // survives re-listing the parts.
     const pinned = this.#contentBytes.has(key)
     const advertised = this.#contentDigests.get(key) ?? digest
+    const declaredBytes = this.#contentByteOverrides.get(key) ?? bytes.length
     const content = external
       ? {
           ref: {
             contentId: partId,
             revision,
-            byteLength: String(bytes.length),
+            byteLength: String(declaredBytes),
             mediaType: 'text/plain',
             sha256: advertised,
           },

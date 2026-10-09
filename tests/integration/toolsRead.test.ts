@@ -7,7 +7,12 @@ import { DeviceStore } from '../../src/deviceStore'
 import { DeviceConnection, DeviceUnavailableError } from '../../src/connection'
 import { SessionSubscriptions } from '../../src/subscriptions'
 import { registerCherryTools } from '../../src/tools'
-import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools'
+import type {
+  CherryToolDefinition,
+  CherryToolEngineOptions,
+  CherryToolsContext,
+  CherryToolsDeps,
+} from '../../src/tools'
 import { FakeCherry } from '../loopback/fakeCherry'
 import type { FakeCherryOptions } from '../loopback/fakeCherry'
 
@@ -101,6 +106,8 @@ interface RigOptions {
   connection?: { rateBudgetPerSecond?: number; rpcTimeoutMs?: number }
   /** Skip `connect()` so the device stays offline (the §6 offline face). */
   skipConnect?: boolean
+  /** Local policy knobs (e.g. a low parts circuit-breaker) for the engine. */
+  engine?: CherryToolEngineOptions
 }
 
 async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions = {}): Promise<Rig> {
@@ -165,7 +172,7 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     },
     identity,
   }
-  registerCherryTools(ctx, deps)
+  registerCherryTools(ctx, deps, rigOptions.engine ?? {})
 
   if (rigOptions.skipConnect !== true) {
     await connect('dev-A').connect()
@@ -401,10 +408,12 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(texts).toContain(big)
   })
 
-  it('④c cherry_read paginates a message\'s parts to completion under the per-page clamp', async () => {
-    // 150 parts on one message: a single bounded page would silently drop a
-    // third of the snapshot, so the part list must be walked to completion.
-    const parts = Array.from({ length: 150 }, (_unused, index) => ({
+  it('④c cherry_read paginates a message\'s parts to COMPLETION across 3 peer pages', async () => {
+    // 60 parts on one message, and the peer pages at 20 — three real pages. A
+    // part walk bounded by the plugin's own tool-limit constant would drop a
+    // third of the snapshot while claiming completion, so every part must
+    // arrive and the result must NOT advertise truncation.
+    const parts = Array.from({ length: 60 }, (_unused, index) => ({
       kind: 'text' as const,
       text: `part-${index}`,
     }))
@@ -414,22 +423,92 @@ describe('read-only cherry tools over a real loopback channel', () => {
           { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
         ],
         messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
-        maxPageSize: 50,
+        maxPageSize: 20,
       },
     })
 
     const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
-      messages: Array<{ parts: Array<{ content: string }> }>
+      messages: Array<{ parts: Array<{ content: string }>; partsTruncated?: string }>
     }
-    expect(result.messages[0]!.parts).toHaveLength(150)
-    expect(result.messages[0]!.parts[0]!.content).toBe('part-0')
-    expect(result.messages[0]!.parts[149]!.content).toBe('part-149')
+    // EVERY part arrives, in order, with no silent loss.
+    expect(result.messages[0]!.parts).toHaveLength(60)
+    expect(result.messages[0]!.parts.map((part) => part.content)).toEqual(
+      parts.map((_part, index) => `part-${index}`),
+    )
+    // The message is complete, so nothing claims otherwise.
+    expect(result.messages[0]!.partsTruncated).toBeUndefined()
 
     const calls = rig.fake.readCallsFor('agent.parts.list')
     expect(calls).toHaveLength(3)
     for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
-    expect(calls[1]!['cursor']).toBe('50')
-    expect(calls[2]!['cursor']).toBe('100')
+    expect(calls[0]!['cursor']).toBeUndefined()
+    expect(calls[1]!['cursor']).toBe('20')
+    expect(calls[2]!['cursor']).toBe('40')
+  })
+
+  it('④d a tripped parts circuit-breaker is SURFACED with a resume cursor, never silently truncated', async () => {
+    // The peer keeps serving pages; the plugin's safety bound is the only thing
+    // that can stop the walk. Tripping it must be visible in the result — the
+    // failure mode this replaces was a silent, wrongly-labelled truncation.
+    const parts = Array.from({ length: 60 }, (_unused, index) => ({
+      kind: 'text' as const,
+      text: `part-${index}`,
+    }))
+    const rig = await makeRig(
+      {
+        agent: {
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+          ],
+          messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
+          maxPageSize: 20,
+        },
+      },
+      // Drive the breaker low enough to trip on the second page.
+      { engine: { partsSafetyBound: 25 } },
+    )
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ content: string }>; partsTruncated?: string; partsResumeCursor?: string }>
+    }
+
+    // The partial read is ADMITTED: the reason and the resume point are both
+    // present, so content is never dropped without the caller knowing.
+    expect(result.messages[0]!.parts).toHaveLength(25)
+    expect(result.messages[0]!.partsTruncated).toBe('safety-bound')
+    // The resume cursor is the peer's next-page offset, i.e. the 26th part —
+    // exactly where the walk stopped, not where its last page began.
+    expect(result.messages[0]!.partsResumeCursor).toBe('25')
+    // It stopped at the breaker, not at the peer's end of data.
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBeLessThan(3)
+  })
+
+  it('④e a {ref} whose content walk cannot reach eof fails rather than returning a partial value', async () => {
+    // A ref that under-declares its byteLength derives too small a slice budget,
+    // so the walk cannot reach `eof`. A partial (unverifiable) content must be a
+    // hard failure, never a silently short aggregation.
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'D'.repeat(30 * 1024), external: true }],
+          },
+        ],
+      },
+    })
+    // Shrink the declared length so one slice can never cover the content.
+    rig.fake.understateContentLength('m-1:0', '1001', 1)
+
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /did not reach eof|partial content/i,
+    )
   })
 
   it('④b cherry_read verifies the sha256 of an aggregated {ref} and refuses tampered bytes', async () => {
