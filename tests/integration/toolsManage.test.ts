@@ -1070,7 +1070,302 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     }
   }, 30_000)
 
-  it('③l degrades to a warning instead of failing when ctx.tools is absent', async () => {
+  it('③p warns by name and falls back when a config key is present but unusable (review F4)', async () => {
+    const index = await import('../../src/index')
+
+    // ABSENT keys are the documented defaults and say nothing.
+    consoleWarn.mockClear()
+    expect(index.resolveBridgeConfig({})).toEqual({
+      rateBudgetPerSecond: 32,
+      perSessionCacheBytes: 2 * 1024 * 1024,
+    })
+    expect(consoleWarn).not.toHaveBeenCalled()
+
+    // A key that IS present but unusable is a deployment mistake: the caller
+    // still gets the fallback, but must learn why their value was ignored
+    // rather than watching behaviour silently diverge from their config.
+    for (const bad of [0, -1, Number.NaN, 'many' as unknown as number]) {
+      consoleWarn.mockClear()
+      const resolved = index.resolveBridgeConfig({ rateBudgetPerSecond: bad })
+      expect(resolved.rateBudgetPerSecond).toBe(32)
+      expect(consoleWarn).toHaveBeenCalledWith(expect.stringContaining('rateBudgetPerSecond'))
+    }
+
+    // A usable value is honoured and says nothing.
+    consoleWarn.mockClear()
+    expect(index.resolveBridgeConfig({ rateBudgetPerSecond: 7, perSessionCacheBytes: 4096 })).toEqual({
+      rateBudgetPerSecond: 7,
+      perSessionCacheBytes: 4096,
+    })
+    expect(consoleWarn).not.toHaveBeenCalled()
+  })
+
+  it('③q claims the pool entries synchronously, so an eviction cannot steal a fresh layer (review F2)', async () => {
+    const index = await import('../../src/index')
+    const { DeviceConnection } = await import('../../src/connection')
+    const fakeInfo = await makeFake()
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+
+    /** Every DeviceConnection the assembly constructed, in order. */
+    const built: DeviceConnection[] = []
+    const closed: DeviceConnection[] = []
+    const connectSpy = vi
+      .spyOn(DeviceConnection.prototype as unknown as { connect(): Promise<void> }, 'connect')
+      .mockImplementation(function (this: DeviceConnection) {
+        built.push(this)
+        return Promise.resolve()
+      })
+    const closeSpy = vi
+      .spyOn(DeviceConnection.prototype as unknown as { close(): Promise<void> }, 'close')
+      .mockImplementation(function (this: DeviceConnection) {
+        closed.push(this)
+        return Promise.resolve()
+      })
+
+    try {
+      const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
+      // `connect` is stubbed to resolve, so the first read both builds and
+      // reports the pooled instance as connected.
+      await vi.waitFor(
+        async () => {
+          await devices.execute({})
+          expect(built.length).toBeGreaterThanOrEqual(1)
+        },
+        5_000,
+      )
+      const stale = built[0]!
+
+      // The HTTP face's address maintenance evicts FIRE-AND-FORGET when the
+      // address actually changes: the eviction runs its synchronous prefix and
+      // then yields at its first `await`. That yield is the window an eviction
+      // which read its maps AFTERWARD would fall into.
+      const patched = new FakeResponse()
+      await ctx.server.dispatch(
+        new FakeRequest(`${PREFIX}/devices/dev-A`, {
+          method: 'PATCH',
+          host: HOST,
+          body: JSON.stringify({ hosts: ['10.9.9.9'], port: 7777 }),
+        }),
+        patched,
+      )
+      expect(patched.status).toBe(200)
+
+      // Inside that window a FRESH connection is installed: the next read
+      // rebuilds the pool the eviction just dropped.
+      await vi.waitFor(
+        async () => {
+          await devices.execute({})
+          expect(built.length).toBeGreaterThanOrEqual(2)
+        },
+        5_000,
+      )
+      const fresh = built[1]!
+      expect(fresh).not.toBe(stale)
+
+      // The eviction must have claimed the OLD entry up front. A late map read
+      // would find the FRESH instance instead and close it — silently killing a
+      // connection nobody asked to drop, whose socket is in active use.
+      await vi.waitFor(
+        () => {
+          expect(closed).toContain(stale)
+        },
+        5_000,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      expect(closed).not.toContain(fresh)
+    } finally {
+      connectSpy.mockRestore()
+      closeSpy.mockRestore()
+    }
+  }, 30_000)
+
+  it('③r isolates a failing session in the recovery loop from the rest (review F3)', async () => {
+    const index = await import('../../src/index')
+    const { SessionSubscriptions } = await import('../../src/subscriptions')
+    const fakeInfo = await makeFake({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'A', historyRevision: '1' },
+          { sessionId: 's-2', agentId: 'agent-1', workspaceId: 'ws-1', title: 'B', historyRevision: '1' },
+        ],
+      },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    await connectPool(ctx, fakeInfo)
+
+    // Two sessions subscribed, so the recovery loop has more than one to walk.
+    const read = ctx.tools.definitions.find((definition) => definition.name === 'cherry_read')!
+    await read.execute({ device: 'dev-A', sessionId: 's-1' })
+    await read.execute({ device: 'dev-A', sessionId: 's-2' })
+    expect(fakeInfo.fake.subscribeCalls).toHaveLength(2)
+
+    // The FIRST session's `read` throws. The recovery line promises per-session
+    // isolation, so the SECOND must still be re-subscribed — an isolated read
+    // would abort the loop and silently leave it unsubscribed.
+    const original = SessionSubscriptions.prototype.read
+    type ReadArgs = Parameters<typeof original>
+    const readSpy = vi
+      .spyOn(SessionSubscriptions.prototype, 'read')
+      .mockImplementation(function (this: InstanceType<typeof SessionSubscriptions>, ...args: ReadArgs) {
+        if (args[0] === 's-1') throw new Error('boom')
+        return original.apply(this, args)
+      })
+
+    try {
+      fakeInfo.fake.injectClose(1000)
+      await vi.waitFor(
+        () => {
+          const recovered = fakeInfo.fake.subscribeCalls.filter((call) => call.sessionId === 's-2')
+          expect(recovered.length).toBeGreaterThanOrEqual(2)
+        },
+        10_000,
+      )
+      // The failing session was reported, not swallowed.
+      expect(consoleWarn).toHaveBeenCalledWith(
+        expect.stringContaining('re-subscribing session s-1'),
+        expect.anything(),
+      )
+    } finally {
+      readSpy.mockRestore()
+    }
+  }, 30_000)
+
+  it('③s rejects a parked waiter on teardown instead of leaving it to time out (review F1)', async () => {
+    const index = await import('../../src/index')
+    const fakeInfo = await makeFake({
+      agent: {
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'S',
+            historyRevision: '1',
+            // The session has a run IN FLIGHT, so `cherry_wait` parks on it
+            // rather than answering `idle` at once.
+            activeExecutionId: 'exec-1',
+          },
+        ],
+      },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    await connectPool(ctx, fakeInfo)
+
+    const wait = ctx.tools.definitions.find((definition) => definition.name === 'cherry_wait')!
+    // A LONG window: the waiter can only settle early if the teardown rejects
+    // it. If the subscription layer is not disposed, this hangs for 120s.
+    let settled: 'pending' | 'rejected' | 'resolved' = 'pending'
+    const parked = wait
+      .execute({ device: 'dev-A', sessionId: 's-1', timeoutMs: 120_000 })
+      .then(
+        () => {
+          settled = 'resolved'
+        },
+        () => {
+          settled = 'rejected'
+        },
+      )
+
+    // Give it a moment to actually park on the subscription buffer.
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(settled).toBe('pending')
+
+    // TEARDOWN: the assembly's disposer must dispose the subscription layer so
+    // the parked waiter is rejected NOW rather than when its window expires.
+    const teardown = ctx.effects[0]!()
+    await Promise.resolve(teardown).catch(() => undefined)
+
+    // The PEER-side proof that the layer was really disposed: `dispose()`
+    // releases every live peer subscription. A teardown that only cleared the
+    // assembly's maps (the F1 defect) leaves this log empty — the waiter would
+    // then be released by the connection's close alone, which is a different,
+    // accidental mechanism and leaves the peer holding subscriptions.
+    expect(fakeInfo.fake.closeCalls.length).toBeGreaterThanOrEqual(1)
+
+    await vi.waitFor(
+      () => {
+        expect(settled).not.toBe('pending')
+      },
+      5_000,
+    )
+    await parked.catch(() => undefined)
+    expect(settled).toBe('rejected')
+  }, 30_000)
+
+  it('③t disposes the subscription layer on a re-apply too (review F1)', async () => {
+    const index = await import('../../src/index')
+    const fakeInfo = await makeFake({
+      agent: {
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'S',
+            historyRevision: '1',
+            activeExecutionId: 'exec-1',
+          },
+        ],
+      },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    await connectPool(ctx, fakeInfo)
+
+    const wait = ctx.tools.definitions.find((definition) => definition.name === 'cherry_wait')!
+    let settled: 'pending' | 'rejected' | 'resolved' = 'pending'
+    const parked = wait.execute({ device: 'dev-A', sessionId: 's-1', timeoutMs: 120_000 }).then(
+      () => {
+        settled = 'resolved'
+      },
+      () => {
+        settled = 'rejected'
+      },
+    )
+    await new Promise((resolve) => setTimeout(resolve, 200))
+    expect(settled).toBe('pending')
+
+    // A RE-APPLY drains the previous pool; the parked waiter belongs to the
+    // pool being drained and must be rejected with it.
+    index.apply(ctx as never, { dataDir })
+    // Peer-side proof again: the re-apply released the live subscription rather
+    // than merely dropping the assembly's reference to it.
+    await vi.waitFor(
+      () => {
+        expect(fakeInfo.fake.closeCalls.length).toBeGreaterThanOrEqual(1)
+      },
+      5_000,
+    )
+    await vi.waitFor(
+      () => {
+        expect(settled).not.toBe('pending')
+      },
+      5_000,
+    )
+    await parked.catch(() => undefined)
+    expect(settled).toBe('rejected')
+  }, 30_000)
+
+  it('③o degrades to a warning instead of failing when ctx.tools is absent', async () => {
     const index = await import('../../src/index')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)

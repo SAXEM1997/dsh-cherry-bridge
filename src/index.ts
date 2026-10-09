@@ -102,14 +102,29 @@ export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 /** Applies the documented fallbacks to the plugin config's numeric keys. */
 export function resolveBridgeConfig(config: CherryBridgeConfig = {}): ResolvedBridgeConfig {
   return {
-    rateBudgetPerSecond: positive(config.rateBudgetPerSecond, DEFAULT_RATE_BUDGET_PER_SECOND),
-    perSessionCacheBytes: positive(config.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES),
+    rateBudgetPerSecond: positive('rateBudgetPerSecond', config.rateBudgetPerSecond, DEFAULT_RATE_BUDGET_PER_SECOND),
+    perSessionCacheBytes: positive('perSessionCacheBytes', config.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES),
   }
 }
 
-/** A configured positive number, or the fallback when absent/unusable. */
-function positive(value: unknown, fallback: number): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback
+/**
+ * A configured positive number, or the fallback when absent/unusable.
+ *
+ * An ABSENT key is the documented default and says nothing; a key that is
+ * PRESENT but unusable (`0`, `-1`, `NaN`, a string from a hand-edited config) is
+ * a deployment mistake that silently changes behaviour, so it is warned about
+ * by name rather than swallowed — the caller gets the fallback they would have
+ * got anyway, plus the reason it was not their value.
+ */
+function positive(key: string, value: unknown, fallback: number): number {
+  if (value === undefined || value === null) return fallback
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    console.warn(
+      `[cherry-remote] config "${key}" must be a positive number (got ${JSON.stringify(value)}); ` +
+        `falling back to ${fallback}`,
+    )
+    return fallback
+  }
   return value
 }
 
@@ -274,27 +289,75 @@ function connectionFor(deviceId: string): DeviceConnection {
  *
  * The device's subscription layer goes with it: it is bound to the socket's rpc
  * facade and its peer-negotiated cap, so keeping it would leave the next
- * connection's notifications routed into a stale LRU pool.
+ * connection's notifications routed into a stale LRU pool. BOTH entries are
+ * claimed in the synchronous prefix below, which is what makes that promise
+ * hold for fire-and-forget callers too.
  */
 async function evictConnection(deviceId: string): Promise<void> {
-  const existing = state.connections.get(deviceId)
-  if (existing !== undefined) {
-    state.connections.delete(deviceId)
-    try {
-      await existing.close()
-    } catch (error) {
-      console.warn(`[cherry-remote] device ${deviceId} close failed during eviction`, error)
-    }
-  }
+  // BOTH map entries are claimed SYNCHRONOUSLY, before the first `await`, and
+  // that is load-bearing twice over:
+  //
+  //  1. `DeviceConnection.close()` contains no `await`, so awaiting it still
+  //     yields a microtask. Reading the subscription map after that yield let a
+  //     caller which clears the maps synchronously right after a
+  //     fire-and-forget eviction (the re-apply and teardown paths) empty them
+  //     first: the subscription phase then found nothing and `dispose()` was
+  //     NEVER called, leaving parked waiters to hang out their whole timeout.
+  //  2. A layer installed during that gap (a fresh connect racing the eviction)
+  //     would otherwise be stolen by this eviction and disposed as though it
+  //     were the stale one. Claiming the entry up front means we only ever
+  //     dispose the instance THIS eviction owns.
+  const connection = state.connections.get(deviceId)
+  if (connection !== undefined) state.connections.delete(deviceId)
   const subscriptions = state.subscriptions.get(deviceId)
+  if (subscriptions !== undefined) state.subscriptions.delete(deviceId)
+
   if (subscriptions !== undefined) {
-    state.subscriptions.delete(deviceId)
+    // The subscription layer goes FIRST: it releases the peer subscriptions over
+    // the still-live socket, and it rejects any parked waiter. Closing the
+    // connection first would make every `agent.subscriptions.close` fail with
+    // the offline fail-fast, leaving the peer to reap the subscriptions on its
+    // own and the release path noisy.
     try {
       await subscriptions.dispose()
     } catch (error) {
       console.warn(`[cherry-remote] device ${deviceId} subscription dispose failed`, error)
     }
   }
+  if (connection !== undefined) {
+    try {
+      await connection.close()
+    } catch (error) {
+      console.warn(`[cherry-remote] device ${deviceId} close failed during eviction`, error)
+    }
+  }
+}
+
+/**
+ * Evicts EVERY pooled device, as one awaited group.
+ *
+ * The key snapshot is taken synchronously and each eviction claims its own map
+ * entries in the same turn, so no entry can be missed and the maps are empty by
+ * the time the first `await` yields — there is deliberately no `clear()` here.
+ * That matters for both bulk callers:
+ *
+ *  - the re-apply path (a reload with a different data dir) drops the previous
+ *    archive's pool, and
+ *  - the `ctx.effect` teardown releases it on plugin disable/unload.
+ *
+ * Both used to fire-and-forget the evictions and then `clear()` the maps, which
+ * raced each eviction's subscription phase: `dispose()` never ran and parked
+ * `cherry_wait` waiters were left to hang out their full timeout.
+ *
+ * A failure on one device never blocks the rest — each eviction already isolates
+ * its own errors.
+ */
+async function evictAllConnections(): Promise<void> {
+  const deviceIds = [...state.connections.keys()]
+  for (const deviceId of [...state.subscriptions.keys()]) {
+    if (!deviceIds.includes(deviceId)) deviceIds.push(deviceId)
+  }
+  await Promise.all(deviceIds.map((deviceId) => evictConnection(deviceId)))
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +408,12 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
   if (subscriptions === undefined) return
 
   for (const sessionId of subscriptions.activeSessions()) {
-    const result = subscriptions.read(sessionId)
-    const cursor = 'events' in result ? result.nextCursor : undefined
+    // The READ is inside the isolation too: it consults the layer's own state,
+    // so a layer that throws here (a disposed or half-rebuilt one) must cost
+    // only THIS session, not every session after it in the loop.
     try {
+      const result = subscriptions.read(sessionId)
+      const cursor = 'events' in result ? result.nextCursor : undefined
       await subscriptions.ensure(sessionId, cursor)
     } catch (error) {
       console.warn(`[cherry-remote] re-subscribing session ${sessionId} of ${deviceId} failed`, error)
@@ -428,9 +494,13 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // Re-apply (a reload with a different data dir) must not adopt connections
   // bound to the previous archive: drop them so the pool is rebuilt against the
   // records that actually exist now.
-  for (const deviceId of [...state.connections.keys()]) void evictConnection(deviceId)
-  state.connections.clear()
-  state.subscriptions.clear()
+  //
+  // The evictions run as ONE awaited group rather than fire-and-forget followed
+  // by a `clear()`. `evictConnection` claims both map entries synchronously, so
+  // draining the keys first and awaiting the group is what guarantees
+  // `SessionSubscriptions.dispose()` actually runs on this path — a bare
+  // `clear()` used to race it and leave parked `cherry_wait` waiters hanging.
+  void evictAllConnections()
 
   const deps = assemblyDeps()
   // `registerHttpApi` owns the headless degradation (warn + skip) and the route
@@ -438,7 +508,10 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   state.disposers.push(registerHttpApi(ctx, deps))
   state.disposers.push(registerCherryTools(ctx, deps))
 
-  // `ctx.effect` ties the teardown to plugin disable/unload.
+  // `ctx.effect` ties the teardown to plugin disable/unload. The disposer
+  // RETURNS the teardown promise: a host that awaits it (or a test) can order
+  // against the sockets actually being down and the waiters actually rejected,
+  // instead of racing a microtask.
   ctx.effect?.(() => () => {
     for (const dispose of state.disposers.splice(0)) {
       try {
@@ -447,11 +520,9 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
         console.warn('[cherry-remote] releasing the assembly failed', error)
       }
     }
-    for (const deviceId of [...state.connections.keys()]) void evictConnection(deviceId)
-    state.connections.clear()
-    state.subscriptions.clear()
     state.deviceStateListeners.clear()
     state.pairingProgressListeners.clear()
+    return evictAllConnections()
   })
 
   void loadOrCreateIdentity(dataDir).then(

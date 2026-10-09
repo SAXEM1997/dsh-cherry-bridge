@@ -2194,6 +2194,14 @@ class CherryToolEngine {
    *
    * Waiters never ack: they consume the projection and leave the peer's view
    * untouched.
+   *
+   * A wait can also end because the LINK went away — the plugin was torn down,
+   * the device was unpaired, or the connection closed. That is not a timeout and
+   * not a terminal state: the run's outcome is simply unknowable, so the wait
+   * FAILS FAST with the established {@link DeviceUnavailableError} rather than
+   * parking out its whole window. Without this check a torn-down pool's parked
+   * waiter would sit for the full timeout (120s by default), because `waitFor`'s
+   * rejection — the disposal signal — is deliberately swallowed below.
    */
   async #awaitRun(
     connection: DeviceConnection,
@@ -2210,6 +2218,13 @@ class CherryToolEngine {
     const baselineSeq = this.#newestSeq(subscriptions, sessionId)
 
     for (;;) {
+      // The link is the precondition for EVERYTHING below: a closed connection
+      // cannot deliver the event this wait exists to see, so continuing would
+      // only delay the caller's discovery that the run is unobservable.
+      if (connection.state !== 'connected') {
+        throw new DeviceUnavailableError(connection.record.deviceId, connection.state)
+      }
+
       const observed = this.#observedState(subscriptions, sessionId, {
         baselineSeq,
         ...(latestExecutionId === undefined ? {} : { awaitedExecutionId: latestExecutionId }),
@@ -2260,11 +2275,26 @@ class CherryToolEngine {
       // Park on the session buffer: `waitFor` settles when the buffer advances
       // past the cursor we have already consumed, and the poll bounds how long
       // a MISSED wake can delay the next judgement pass.
+      //
+      // The rejection path is SWALLOWED deliberately — a `waitFor` rejection
+      // normally means the buffer moved or the session was re-subscribed, and
+      // the next pass re-judges from the fresh state. But it must still be
+      // THROTTLED, and that fallback is the whole reason this is not a bare
+      // `.catch()` on the race: `waitFor` rejects SYNCHRONOUSLY once the layer
+      // no longer tracks the session (the disposal path clears its map), so a
+      // race that settled instantly on that rejection would spin the loop with
+      // no sleep at all — burning the heap rather than the clock. A rejecting
+      // wake therefore falls back to a full poll interval before the next pass.
       const cursor = this.#cursorOf(subscriptions, sessionId)
-      await Promise.race([
-        subscriptions.waitFor(sessionId, cursor).catch(() => undefined),
-        sleep(Math.min(this.#waitPollMs, Math.max(1, deadline - now))),
+      const pollMs = Math.min(this.#waitPollMs, Math.max(1, deadline - now))
+      const woke = await Promise.race([
+        subscriptions.waitFor(sessionId, cursor).then(
+          () => true,
+          () => false,
+        ),
+        sleep(pollMs).then(() => true),
       ])
+      if (!woke) await sleep(pollMs)
     }
   }
 
