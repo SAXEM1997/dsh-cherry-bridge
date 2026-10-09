@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -56,6 +57,45 @@ import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from
  */
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
+
+/**
+ * The three files a git-spec install must be able to load, one per `exports`
+ * target plus the declaration half of the root entry (E1-1). All three are git
+ * IGNORED build outputs: nothing in a clean clone produces them until a build
+ * runs, which is exactly the failure this list guards.
+ */
+const CLONE_PACK_ARTIFACTS = ['dist/index.mjs', 'dist/index.d.mts', 'lib/client.js'] as const
+
+/** Run a command in `cwd`, returning stdout; a non-zero exit throws loudly. */
+function run(command: string, args: string[], cwd: string): string {
+  // npm's cache AND its log directory are redirected out of `$HOME`: under a
+  // sandboxed runner or a read-only home, npm fails outright when it cannot
+  // write `/root/.npm/_logs`, which would surface as an unrelated and very
+  // confusing failure of the pack gate below.
+  return execFileSync(command, args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      npm_config_cache: '/tmp/npmcache-cherry',
+      npm_config_logs_dir: '/tmp/npmcache-cherry/_logs',
+    },
+  })
+}
+
+/**
+ * Clone THIS repository into `target`.
+ *
+ * `--no-hardlinks` forces a real copy: a hardlinked clone would share inodes
+ * with the working checkout, and the point of the exercise is that the clone
+ * starts from TRACKED CONTENT ONLY — no `dist/`, no `lib/`, no `node_modules/`.
+ */
+function runGitClone(source: string, target: string): void {
+  execFileSync('git', ['clone', '--quiet', '--no-hardlinks', source, target], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+}
 
 const fakes: FakeCherry[] = []
 const connections: DeviceConnection[] = []
@@ -1269,6 +1309,84 @@ describe('② GET /diagnostics', () => {
 // ③ Release configuration: the dsh manifest, the bundle patch, the file list
 // ---------------------------------------------------------------------------
 
+/**
+ * Parse the `config` mapping of one row out of `cordis.patch.yml`.
+ *
+ * E1-6 needs the patch's VALUES, not a regex over its text. This is a
+ * purpose-built reader for the constrained subset the document is allowed to
+ * use — a top-level `insert:` sequence of `- id:` rows, each with scalar keys
+ * and an optional nested `config:` mapping of scalars — rather than a general
+ * YAML parser, because pulling a YAML dependency in to read a fixed-shape file
+ * would widen the dependency surface the audit is trying to shrink.
+ *
+ * It is deliberately STRICT: an indentation or scalar shape it does not
+ * recognise throws, so a document it cannot read fails the test loudly instead
+ * of silently yielding an empty config that trivially "equals" nothing.
+ */
+function parsePatchInsert(text: string, id: string): { config: Record<string, number | string | boolean> } {
+  const rawLines = text.split('\n')
+  let currentId: string | undefined
+  let inConfig = false
+  let configIndent = -1
+  let found: Record<string, number | string | boolean> | undefined
+
+  for (const raw of rawLines) {
+    const withoutComment = raw.replace(/(^|\s)#.*$/, '')
+    if (withoutComment.trim() === '') continue
+    const indent = withoutComment.length - withoutComment.trimStart().length
+    const line = withoutComment.trim()
+
+    if (inConfig && indent > configIndent) {
+      const separator = line.indexOf(':')
+      if (separator < 0) throw new Error(`patch reader: not a key/value line: ${line}`)
+      const key = line.slice(0, separator).trim()
+      const value = scalar(line.slice(separator + 1).trim())
+      found![key] = value
+      continue
+    }
+    inConfig = false
+
+    const rowId = /^- id:\s*(\S+)$/.exec(line)
+    if (rowId !== null) {
+      currentId = stripQuotes(rowId[1]!)
+      continue
+    }
+    if (line === 'config:') {
+      if (currentId !== id) continue
+      inConfig = true
+      configIndent = indent
+      found = {}
+      continue
+    }
+    if (indent === 0) {
+      // A new top-level key — the `insert:` block has ended.
+      currentId = undefined
+      continue
+    }
+    if (indent < configIndent) currentId = undefined
+  }
+
+  if (found === undefined) throw new Error(`patch reader: no row with a config for id ${id}`)
+  return { config: found }
+}
+
+/** A YAML scalar in the subset the patch is allowed to use. */
+function scalar(raw: string): number | string | boolean {
+  const value = stripQuotes(raw)
+  if (value === 'true') return true
+  if (value === 'false') return false
+  if (/^-?\d+$/.test(value)) return Number(value)
+  return value
+}
+
+function stripQuotes(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed.length >= 2 && ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"')))) {
+    return trimmed.slice(1, -1)
+  }
+  return trimmed
+}
+
 describe('③ release configuration', () => {
   const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
     name: string
@@ -1289,6 +1407,74 @@ describe('③ release configuration', () => {
     expect(manifest.dsh?.bundle?.patch).toBe('./cordis.patch.yml')
     expect(Object.keys(manifest.dsh ?? {}).sort()).toEqual(['bundle', 'client'])
   })
+
+  it('carries a `prepare` hook, so a git-spec install builds both entry points (E1-1)', () => {
+    // UltraReview R2 E1-1 (P0): `files` lists `lib` and `dist`, and BOTH are
+    // gitignored+untracked build outputs. `prepublishOnly` is a PUBLISH-only
+    // lifecycle hook — npm does NOT run it for `npm install <git-url>` or for a
+    // pack taken from a clean clone, so the tarball built from a clone carried
+    // 27 files with ZERO `dist/` and ZERO `lib/`, and the host died on
+    // `MissingClientBundleError` when it tried to load `./client`.
+    //
+    // `prepare` is the hook npm runs on BOTH paths: a git-dependency install
+    // (`npm install <git-url>`) and a local `npm install` in a checkout. On
+    // publish, `prepublishOnly` runs first and `prepare` follows; both are
+    // idempotent builds of the same inputs, so the double run is harmless.
+    expect(manifest.scripts['prepare']).toBeDefined()
+    expect(manifest.scripts['prepare']).toContain('build')
+    expect(manifest.scripts['prepare']).toContain('build:client')
+    // The publish hook keeps its own job; `prepare` supplements, never replaces.
+    expect(manifest.scripts['prepublishOnly']).toBeDefined()
+  })
+
+  it('packs BOTH entry points from a clean clone — the real git-install gate (E1-1)', async () => {
+    // The assertion above is the SHAPE; this is the GATE. A clean clone has no
+    // `dist/` and no `lib/` (both are gitignored), so it reproduces exactly what
+    // a git-spec install packs. Build in the clone, then pack it: the tarball
+    // must carry the three artifacts the two `exports` targets resolve to.
+    //
+    // The clone lives in `os.tmpdir()` and is removed in `finally`, so a pack
+    // tarball can never leak into this repository.
+    const clone = mkdtempSync(join(tmpdir(), 'cherry-clone-pack-'))
+    try {
+      runGitClone(repoRoot, clone)
+      // Precondition: the clone really is clean — no build output travelled
+      // with it. Without this the test could pass off artifacts copied by git.
+      expect(existsSync(join(clone, 'dist'))).toBe(false)
+      expect(existsSync(join(clone, 'lib'))).toBe(false)
+
+      // `npm install` runs `prepare` -> build + build:client. `--ignore-scripts`
+      // is deliberately NOT passed: running `prepare` is the behaviour under
+      // test.
+      run('npm', ['install', '--no-audit', '--no-fund'], clone)
+
+      // The artifacts exist in the clone...
+      for (const artifact of CLONE_PACK_ARTIFACTS) {
+        expect(existsSync(join(clone, artifact))).toBe(true)
+      }
+
+      // ...and the TARBALL carries them. `npm pack` writes the tarball into the
+      // clone's own cwd, never into this repo.
+      //
+      // `--json` output is NOT pure JSON here: `pack` re-runs `prepare`, and
+      // tsdown writes its banner to stdout, ahead of the report. Take the
+      // report from the first `[`/`{` onward rather than assuming a clean
+      // stream — the assertions below are what must be strict, not the parser.
+      const packed = run('npm', ['pack', '--dry-run', '--json'], clone)
+      const jsonAt = Math.min(
+        ...[packed.indexOf('['), packed.indexOf('{')].filter((at) => at >= 0),
+      )
+      const entries = Object.values(
+        JSON.parse(packed.slice(jsonAt)) as Record<string, { files: Array<{ path: string }> }>,
+      )
+      const paths = new Set(entries.flatMap((entry) => entry.files.map((file) => file.path)))
+      for (const artifact of CLONE_PACK_ARTIFACTS) {
+        expect([...paths]).toContain(artifact)
+      }
+    } finally {
+      rmSync(clone, { recursive: true, force: true })
+    }
+  }, 900_000)
 
   it('declares the publish fields a release needs', () => {
     expect(manifest.name).toBe('dsh-cherry-bridge')
@@ -1343,13 +1529,21 @@ describe('③ release configuration', () => {
     // were not supplied, and inventing them would publish false metadata.
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
       repository?: { type?: string; url?: string }
-      publishConfig?: { access?: string }
+      publishConfig?: { access?: string; registry?: string }
     }
     expect(pkg.repository).toEqual({
       type: 'git',
       url: 'https://gitlab.ai.isv.iridesc.cn:23000/zyx/cherry-dsh-bridge',
     })
-    expect(pkg.publishConfig).toEqual({ access: 'public' })
+    // E1-2: `access` alone leaves the TARGET registry to whichever mirror the
+    // publishing machine happens to have configured — the lockfile pins
+    // npmjs.org while the ambient registry here is npmmirror, so the same
+    // commit would publish to different places on different machines. The
+    // registry is now part of the manifest.
+    expect(pkg.publishConfig).toEqual({
+      access: 'public',
+      registry: 'https://registry.npmjs.org/',
+    })
     // The gap is recorded, not silently tolerated as a future regression.
     expect(pkg).not.toHaveProperty('author')
     expect(pkg).not.toHaveProperty('homepage')
@@ -1361,8 +1555,23 @@ describe('③ release configuration', () => {
     expect(patch).toContain('- insert:')
     expect(patch).toContain('id: cherry-remote')
     expect(patch).toContain("name: 'dsh-cherry-bridge'")
-    expect(patch).toMatch(/perSessionCacheBytes:\s*2097152/)
-    expect(patch).toMatch(/rateBudgetPerSecond:\s*32/)
+
+    // E1-6: string containment (`patch` matching /rateBudgetPerSecond:\s*32/)
+    // is satisfiable by a document that does not actually SAY 32 — a trailing
+    // comment, a second row, a nested key, or `32` inside a longer number all
+    // pass a regex while the assembled config differs. Parse the document and
+    // compare the VALUES to the exported assembly defaults instead.
+    const inserted = parsePatchInsert(patch, 'cherry-remote')
+    expect(inserted.config).toEqual({
+      perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+      rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+    })
+    // Exactly the documented keys — a value added here is a config surface the
+    // README's table does not describe.
+    expect(Object.keys(inserted.config).sort()).toEqual([
+      'perSessionCacheBytes',
+      'rateBudgetPerSecond',
+    ])
 
     // The documented values must equal the assembly's own fallbacks: the patch
     // does NOT merge, so a drift here would silently change behaviour whenever

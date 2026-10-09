@@ -10,7 +10,8 @@
     "url": "https://gitlab.ai.isv.iridesc.cn:23000/zyx/cherry-dsh-bridge"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "keywords": [
     "dsh",
@@ -53,15 +54,17 @@
     "build:client": "vite build --mode client --config ui/vite.config.ts",
     "dev:ui": "vite --config ui/vite.config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.ui.json",
+    "prepare": "npm run build && npm run build:client",
     "prepublishOnly": "npm run build && npm run build:client"
   },
   "dependencies": {
     "@cherrystudio/remote-protocol": "0.3.0",
     "@cherrystudio/remote-transport": "0.1.2",
     "ws": "8.22.0",
-    "zod": "^4.3.4"
+    "zod": "4.3.4"
   },
   "devDependencies": {
+    "@libp2p/interface": "3.3.0",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^26.6.4",

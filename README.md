@@ -164,14 +164,30 @@ npm run typecheck   # 服务端 + UI 两侧
 npm run build       # tsdown → dist/index.mjs
 npm run build:client # vite → lib/client.js
 npm run dev:ui      # 设置页 dev server（需宿主在 127.0.0.1:23023 运行，见上）
+npm run prepare     # git 安装/本地 install 钩子：build + build:client
 npm run prepublishOnly # 发布前钩子：build + build:client
 ```
+
+> `dist/` 与 `lib/` 都是 git 忽略的**构建产物**。`prepublishOnly` 只在 `npm publish`
+> 时运行，`npm install <git-url>` 或对克隆目录打包都**不会**触发它——那样的 tarball
+> 里既没有 `dist/index.mjs` 也没有 `lib/client.js`，宿主加载 `./client` 时会直接以
+> `MissingClientBundleError` 失败。因此发布物由 `prepare` 钩子构建：git 依赖安装与
+> 本地 install 都会运行它；发布时 `prepublishOnly` 先跑、`prepare` 随后再跑一次，
+> 两者是同一份输入的幂等构建，重复执行无害。`tests/contract/contract.test.ts` 里的
+> 「clean clone → pack」用例是这条的**闸门**：它克隆本仓库、跑 `prepare`、打包，
+> 断言 tarball 内确实含 `dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`。
 
 依赖 `@cherrystudio/remote-protocol@0.3.0` 与 `@cherrystudio/remote-transport@0.1.2`
 以**精确版本**固定（无 `^`），并有测试断言锁死——升级时必须重跑
 `tests/contract/contract.test.ts` 以防 schema drift。契约套件同时逐条建模了「本仓库
 自环假对端」与「真实 Cherry Studio」的**六项行为差异**，并逐条对应
 [`docs/e2e-checklist.md`](docs/e2e-checklist.md) 中的人工核验步骤。
+
+> `zod` 是**运行时**依赖，不是可删的死依赖：本包的 `dist` 把
+> `@cherrystudio/remote-protocol` 作为 external，而该协议的运行时产物处处 `import
+> zod`（peer `^4.3.4`，其自身 dev pin 为 4.3.4）。把它降级为 devDependency 或移除，
+> 都会让协议包在运行时加载 schema 失败。这里精确钉在 `4.3.4`——即 peer 区间下界，
+> 也是协议包的测试基线。
 
 > 说明：本仓库的 `tests/loopback/fakeCherry.ts` 是**测试内**的自环假对端，不是发布物；
 > 文档与代码注释中出现的 `Task N`、`spec §x`、`controller ruling`、`UltraReview` 等编号，

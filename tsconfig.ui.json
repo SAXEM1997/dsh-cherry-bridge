@@ -16,7 +16,14 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-    "types": ["node", "vitest/globals"],
+    // `vitest/globals` is deliberately NOT listed. Vitest's `globals` is off
+    // (the default, and not enabled in `vitest.config.ts`), so the runner
+    // injects no `describe`/`it`/`expect` at runtime. Declaring the types
+    // anyway would make a bare `describe(...)` TYPECHECK cleanly and then crash
+    // the moment the suite ran — a green compile in front of a dead test. The
+    // tests import their helpers from 'vitest' explicitly, which is what the
+    // runner actually provides.
+    "types": ["node"],
     "jsx": "react-jsx",
     "strict": true,
     "verbatimModuleSyntax": true,

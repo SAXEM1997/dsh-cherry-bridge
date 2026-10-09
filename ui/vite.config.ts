@@ -96,8 +96,19 @@ export default defineConfig(({ mode }) => {
           proxy: {
             '/cherry-remote/api': {
               target: DEV_HOST_ORIGIN,
-              // SSE must not be buffered or the live device/pairing updates
-              // arrive in chunks instead of as they happen.
+              // `changeOrigin` MUST stay false, and the load-bearing reason is
+              // the host's same-origin fence, not streaming. The fence admits a
+              // request only when the attached `Origin` and the `Host` header
+              // name the SAME authority (`new URL(origin).host === host` in
+              // `src/httpApi.ts`). The browser sends `Origin: <vite origin>`;
+              // with `changeOrigin: false` the proxy forwards vite's own Host
+              // too, so the two agree and the fence admits. With
+              // `changeOrigin: true` the proxy would rewrite Host to the DSH
+              // host's authority while Origin stayed vite's — the comparison
+              // fails, every request is answered 403, and the dev page dies
+              // with an empty device list. (Secondary: SSE must not be
+              // buffered, or live device/pairing updates arrive in chunks
+              // instead of as they happen.)
               changeOrigin: false,
               ws: false,
             },
