@@ -1,5 +1,5 @@
 import type { AddressInfo } from 'node:net'
-import { randomUUID } from 'node:crypto'
+import { randomInt, randomUUID } from 'node:crypto'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { ComponentLogger, Logger } from '@libp2p/interface'
 import {
@@ -9,7 +9,7 @@ import {
   RemoteSocketStream,
 } from '@cherrystudio/remote-transport'
 import type { SecureChannel } from '@cherrystudio/remote-transport'
-import { connectionMethods } from '@cherrystudio/remote-protocol'
+import { connectionMethods, pairingMethods } from '@cherrystudio/remote-protocol'
 import { agentAuthorizationSchema } from '@cherrystudio/remote-protocol/agent'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter'
 
@@ -55,6 +55,11 @@ export interface FakeCherryOptions {
   refreshFailure?: FakeFailure
   /** Accept pings but never answer them (silence-timeout exercises). */
   dropPings?: boolean
+  /**
+   * Interface the ws server binds (default 127.0.0.1). Set '::1' to exercise
+   * the IPv6 candidate path, which needs a bare-or-bracketed IPv6 authority.
+   */
+  bindHost?: string
   /** Artificial per-request delay; requests stay counted as in-flight while waiting. */
   requestDelayMs?: number
   /**
@@ -63,6 +68,19 @@ export interface FakeCherryOptions {
    * rejection), mirroring the real desktop's session-level enforcement.
    */
   rateLimitPerSecond?: number
+  /**
+   * Terminal state `pairing.get` settles on. `undefined` (default) keeps
+   * answering `pending` forever, which is what a real invitation does until the
+   * user acts or the invitation expires.
+   */
+  pairingDecision?: 'approved' | 'rejected' | 'expired'
+  /** Number of `pairing.get` calls answered `pending` before the decision. */
+  pairingGetPendingPolls?: number
+  /**
+   * Capability domains the approved `pairing.get` branch grants (default
+   * ['agent']). An empty array models a desktop that approved nothing usable.
+   */
+  approvedGrants?: readonly string[]
 }
 
 interface IssuedToken {
@@ -75,11 +93,16 @@ interface LiveConnection {
   socket: WebSocket
   channel: SecureChannel
   controller: AbortController
+  /** Set once `connection.hello` confirmed the prelude offer, like the peer's. */
+  hello: boolean
 }
 
 const noop = (): void => {}
 const DEFAULT_PROTOCOL_VERSIONS = [1]
 const JSON_RPC_ERROR_CODE = 1000
+/** The invitation lifetime the real desktop uses (protocol `invitationMs`). */
+const INVITATION_MS = 120_000
+const CLAIM_ID = 'claim-1'
 
 /** A callable libp2p logger: noise/inbound streams invoke it as `log('msg')`. */
 function makeLogger(name: string): Logger {
@@ -99,10 +122,14 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Inbound params schemas come from the real protocol package so the fake
- * rejects malformed requests exactly like the real desktop face. Methods the
- * fake adds later (agent.*, pairing.*) are not in this table and pass through.
+ * rejects malformed requests exactly like the real desktop face. Methods
+ * whose face has not been added yet (agent.*) are not in this table and pass
+ * through unvalidated.
  */
-const methodSchemas = connectionMethods(agentAuthorizationSchema) as unknown as Record<
+const methodSchemas = {
+  ...connectionMethods(agentAuthorizationSchema),
+  ...pairingMethods(agentAuthorizationSchema),
+} as unknown as Record<
   string,
   { params: { safeParse: (input: unknown) => { success: boolean } } }
 >
@@ -154,8 +181,19 @@ export class FakeCherry {
   #maxInFlight = 0
   #lastHelloProtocolVersions: number[] | undefined
   #helloEchoMatchesOffer = false
+  #offeredVersionsAtHello: readonly number[] = []
   #tokenIssues: IssuedToken[] = []
   #refreshCalls: number[] = []
+
+  // Pairing face observation (Task 6).
+  #claimPeerIdentity: string | undefined
+  #verificationCode: string | undefined
+  #expiresAt: string | undefined
+  #approvedDeviceId: string | undefined
+  #issuedAccessToken: string | undefined
+  #approvedTokenExpiresAt: string | undefined
+  #getStates: string[] = []
+  #lastClaim: Record<string, unknown> | undefined
 
   constructor(options: FakeCherryOptions = {}) {
     this.#options = options
@@ -220,6 +258,14 @@ export class FakeCherry {
     return this.#helloEchoMatchesOffer
   }
 
+  /**
+   * Versions the peer actually received in the Noise prelude of the most
+   * recent connection — the wire truth about what was offered.
+   */
+  get offeredVersionsAtHello(): readonly number[] {
+    return this.#offeredVersionsAtHello
+  }
+
   get helloCount(): number {
     return this.#methodCounts.get('connection.hello') ?? 0
   }
@@ -236,6 +282,11 @@ export class FakeCherry {
     return this.#methodCounts.get('connection.ping') ?? 0
   }
 
+  /** Arrivals of any method, by exact name (pairing face and future faces). */
+  methodCount(method: string): number {
+    return this.#methodCounts.get(method) ?? 0
+  }
+
   /** Server-side record of every token issued (authenticate and refresh alike). */
   get tokenIssues(): readonly IssuedToken[] {
     return this.#tokenIssues
@@ -246,9 +297,52 @@ export class FakeCherry {
     return this.#refreshCalls
   }
 
+  /** The 6-digit code handed to the claiming device (undefined before a claim). */
+  get verificationCode(): string | undefined {
+    return this.#verificationCode
+  }
+
+  /** The invitation expiry the claim reported, ISO-8601. */
+  get claimExpiresAt(): string | undefined {
+    return this.#expiresAt
+  }
+
+  /** The access-token expiry bundled into the approved `pairing.get` reply. */
+  get approvedTokenExpiresAt(): string | undefined {
+    return this.#approvedTokenExpiresAt
+  }
+
+  /** The device id `pairing.get` hands out on the approved branch. */
+  get approvedDeviceId(): string | undefined {
+    return this.#approvedDeviceId
+  }
+
+  /** The access token bundled into the approved `pairing.get` reply. */
+  get issuedAccessToken(): string | undefined {
+    return this.#issuedAccessToken
+  }
+
+  /** Every `pairing.get` reply status, in arrival order. */
+  get getStates(): readonly string[] {
+    return this.#getStates
+  }
+
+  /** Params of the last `pairing.claim`, exactly as the peer received them. */
+  get lastClaimDeviceName(): string | undefined {
+    return this.#lastClaim?.['deviceName'] as string | undefined
+  }
+
+  get lastClaimPlatform(): string | undefined {
+    return this.#lastClaim?.['platform'] as string | undefined
+  }
+
+  get lastClaimCapabilities(): readonly string[] | undefined {
+    return this.#lastClaim?.['capabilities'] as readonly string[] | undefined
+  }
+
   async start(): Promise<{ host: string; port: number }> {
     const identity = await this.#identity
-    const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+    const server = new WebSocketServer({ host: this.#options.bindHost ?? '127.0.0.1', port: 0 })
     this.#server = server
     server.on('connection', (socket) => {
       this.#socketCount += 1
@@ -301,7 +395,7 @@ export class FakeCherry {
     })
       .then((channel) => {
         this.#connectionCount += 1
-        const live: LiveConnection = { socket, channel, controller }
+        const live: LiveConnection = { socket, channel, controller, hello: false }
         this.#live.push(live)
         void this.#serve(live)
       })
@@ -382,13 +476,25 @@ export class FakeCherry {
         return this.#handleRefresh()
       case 'connection.ping':
         return { nonce: params['nonce'], serverTime: new Date().toISOString() }
+      case 'pairing.claim':
+        return this.#handlePairingClaim(params, live)
+      case 'pairing.get':
+        return this.#handlePairingGet(params, live)
       default:
         throw new FakeRpcError({ reason: 'NOT_FOUND', message: `unknown method ${method}` })
     }
   }
 
+  /** The real desktop's gate: pairing/authenticate require a confirmed hello. */
+  #requireHello(live: LiveConnection): void {
+    if (!live.hello) {
+      throw new FakeRpcError({ reason: 'INVALID_CONNECTION_STATE', message: 'Hello is required' })
+    }
+  }
+
   #handleHello(live: LiveConnection): Record<string, unknown> {
     const offered = [...live.channel.offeredVersions]
+    this.#offeredVersionsAtHello = offered
     const echoed = this.#lastHelloProtocolVersions
     // Ruling: the peer compares the hello echo against the prelude offer
     // INDEX BY INDEX (length and position). Set equality is not enough — a
@@ -401,6 +507,7 @@ export class FakeCherry {
         message: 'hello protocolVersions must equal the handshake offer element-wise',
       })
     }
+    live.hello = true
     const hello = this.#options.hello ?? {}
     return {
       protocolVersion: live.channel.protocolVersion,
@@ -440,6 +547,70 @@ export class FakeCherry {
     }
     this.#tokenIssues.push(issued)
     return issued
+  }
+
+  /**
+   * `pairing.claim` — the minimal claim face: while the claim is held it is
+   * SCOPED TO ITS CLAIMING PEER (ruling 5), so a second, unauthenticated
+   * connection to the same pairing invitation cannot claim it.
+   *
+   * The receipt carries ONLY claimId/verificationCode/expiresAt, exactly like
+   * the real desktop: device identity and grants come from the approved
+   * `pairing.get` branch alone.
+   */
+  #handlePairingClaim(params: Record<string, unknown>, live: LiveConnection): Record<string, unknown> {
+    // The real desktop answers INVALID_CONNECTION_STATE without a confirmed
+    // hello; the pairing client must therefore run the hello face too.
+    this.#requireHello(live)
+    const claimedBy = this.#claimPeerIdentity
+    if (claimedBy !== undefined && claimedBy !== live.channel.remoteIdentity) {
+      throw new FakeRpcError({ reason: 'CONFLICT', message: 'Invitation already claimed' })
+    }
+    this.#claimPeerIdentity = live.channel.remoteIdentity
+    this.#lastClaim = { ...params }
+    this.#verificationCode ??= String(randomInt(1_000_000)).padStart(6, '0')
+    this.#expiresAt ??= new Date(Date.now() + INVITATION_MS).toISOString()
+    return {
+      claimId: CLAIM_ID,
+      verificationCode: this.#verificationCode,
+      expiresAt: this.#expiresAt,
+    }
+  }
+
+  /**
+   * `pairing.get` — `pending` for `pairingGetPendingPolls` calls, then the
+   * configured terminal state. The approved branch is the ONLY source of
+   * deviceId/grants/accessToken.
+   */
+  #handlePairingGet(params: Record<string, unknown>, live: LiveConnection): Record<string, unknown> {
+    this.#requireHello(live)
+    if (params['claimId'] !== CLAIM_ID) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'unknown claimId' })
+    }
+    this.#getStates.push('pending')
+    const decision = this.#options.pairingDecision
+    const pendingPolls = this.#options.pairingGetPendingPolls ?? 0
+    if (decision === undefined || this.#getStates.length <= pendingPolls) return { status: 'pending' }
+    if (decision !== 'approved') {
+      this.#getStates[this.#getStates.length - 1] = decision
+      return { status: decision }
+    }
+    this.#getStates[this.#getStates.length - 1] = 'approved'
+    this.#approvedDeviceId ??= `dev-${randomUUID()}`
+    const token = this.#issueToken()
+    this.#issuedAccessToken = token.token
+    this.#approvedTokenExpiresAt = new Date(token.expiresAt).toISOString()
+    const grants = (this.#options.approvedGrants ?? ['agent']).map((domain) => ({
+      domain,
+      grantId: `grant-${domain}`,
+    }))
+    return {
+      status: 'approved',
+      deviceId: this.#approvedDeviceId,
+      authorization: { grants },
+      accessToken: token.token,
+      expiresAt: this.#approvedTokenExpiresAt,
+    }
   }
 
   #countArrival(method: string): void {
