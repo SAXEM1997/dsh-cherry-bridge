@@ -5,6 +5,13 @@
   "private": false,
   "description": "DeepSeek Harness plugin bridging to Cherry Studio desktop instances over remote transport",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://gitlab.ai.isv.iridesc.cn:23000/zyx/cherry-dsh-bridge"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -15,7 +22,10 @@
     "node": ">=22.18.0"
   },
   "exports": {
-    ".": "./dist/index.mjs",
+    ".": {
+      "types": "./dist/index.d.mts",
+      "default": "./dist/index.mjs"
+    },
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -48,7 +58,7 @@
   "dependencies": {
     "@cherrystudio/remote-protocol": "0.3.0",
     "@cherrystudio/remote-transport": "0.1.2",
-    "ws": "^8.22.0",
+    "ws": "8.22.0",
     "zod": "^4.3.4"
   },
   "devDependencies": {

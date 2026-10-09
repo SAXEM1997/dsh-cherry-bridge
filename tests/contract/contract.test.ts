@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -790,6 +790,36 @@ describe('⑤ the pinned protocol versions', () => {
     }
   })
 
+  it('pins `ws` exactly too, and the lockfile agrees with npmjs.org', () => {
+    // F4 (UltraReview): the two protocol packages are exact pins because a peer
+    // version drift changes wire behaviour. `ws` carries the SAME risk — it is
+    // the transport's WebSocket face — so it follows the same philosophy rather
+    // than sitting on a `^` range that lets a minor bump in silently.
+    const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>
+    }
+    const declared = manifest.dependencies?.['ws']
+    expect(declared).toBe('8.22.0')
+    expect(declared!.startsWith('^')).toBe(false)
+    expect(declared!.startsWith('~')).toBe(false)
+    expect(declared).toMatch(/^\d+\.\d+\.\d+$/)
+
+    // The refreshed lockfile must carry the exact pin in its root dependency
+    // row — a hand-edited manifest with a stale lockfile is the drift this
+    // catches — and must still resolve everything from the public registry.
+    const lock = JSON.parse(readFileSync(join(repoRoot, 'package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { dependencies?: Record<string, string> }>
+    }
+    expect(lock.packages?.['']?.dependencies?.['ws']).toBe('8.22.0')
+
+    const text = readFileSync(join(repoRoot, 'package-lock.json'), 'utf8')
+    for (const match of text.matchAll(/"resolved":\s*"(https?:\/\/[^/"]+)/g)) {
+      expect(match[1]).toBe('https://registry.npmjs.org')
+    }
+    // No host-machine or vendor-internal registry leaked into the lockfile.
+    expect(text).not.toMatch(/iridesc|localhost|127\.0\.0\.1:\d+|192\.168\.\d+\.\d+:\d+/)
+  })
+
   it('the INSTALLED packages really are those versions (the pin is not aspirational)', async () => {
     for (const [name, version] of [
       ['@cherrystudio/remote-protocol', '0.3.0'],
@@ -1183,7 +1213,8 @@ describe('③ release configuration', () => {
   const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
     name: string
     private: boolean
-    exports: Record<string, string>
+    /** Either a bare target string or a conditioned object (F2 adds `types`). */
+    exports: Record<string, string | Record<string, string>>
     files: string[]
     scripts: Record<string, string>
     engines?: { node?: string }
@@ -1219,14 +1250,50 @@ describe('③ release configuration', () => {
     // The client half is only reachable through this export; a `files` list
     // that dropped `lib` would publish a package the host cannot load.
     expect(manifest.exports['./client']).toBe('./lib/client.js')
-    // The server main entry must point at what `npm run build` actually
-    // emits (tsdown → dist/index.mjs); `lib/index.js` is produced by nothing,
-    // so a drift here publishes a dead main entry (final-review Disclosure A).
-    expect(manifest.exports['.']).toBe('./dist/index.mjs')
+    // The server entry is a CONDITIONED export (F2): the runtime target plus a
+    // `types` condition. Without the latter a bundler consumer resolving the
+    // package under `moduleResolution: bundler`/`node16` sees no declaration
+    // for the root entry and reports TS7016 (implicit `any`) — the type half of
+    // the published contract was simply unreachable.
+    //
+    // F2: the declared types target is what `npm run build` actually emits
+    // (tsdown → dist/index.d.mts), so it is asserted on disk, not just in the
+    // manifest — a `dts: false` regression would otherwise ship the condition
+    // pointing at nothing (final-review Disclosure A, same class as the main
+    // entry drift).
+    expect(manifest.exports['.']).toEqual({
+      types: './dist/index.d.mts',
+      default: './dist/index.mjs',
+    })
+    expect(existsSync(join(repoRoot, 'dist', 'index.d.mts'))).toBe(true)
+    expect(existsSync(join(repoRoot, 'dist', 'index.mjs'))).toBe(true)
+    // The emitter keeps producing declarations, so the condition cannot rot.
+    const tsdown = readFileSync(join(repoRoot, 'tsdown.config.ts'), 'utf8')
+    expect(tsdown).toMatch(/dts:\s*true/)
     expect(manifest.files).toContain('dist')
     // The plan's Tech Stack floor ("TypeScript (Node ≥22.18)"); a lower range
     // would advertise support for a runtime the suite never exercises.
     expect(manifest.engines?.node).toBe('>=22.18.0')
+  })
+
+  it('declares the F9 publish metadata (repository + publishConfig)', () => {
+    // F9 (UltraReview): npm shows a package's provenance and licence alongside
+    // it; a missing `repository` makes the artifact unattributable. The
+    // `author`/`homepage`/`bugs` fields are deliberately NOT asserted — they
+    // were not supplied, and inventing them would publish false metadata.
+    const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
+      repository?: { type?: string; url?: string }
+      publishConfig?: { access?: string }
+    }
+    expect(pkg.repository).toEqual({
+      type: 'git',
+      url: 'https://gitlab.ai.isv.iridesc.cn:23000/zyx/cherry-dsh-bridge',
+    })
+    expect(pkg.publishConfig).toEqual({ access: 'public' })
+    // The gap is recorded, not silently tolerated as a future regression.
+    expect(pkg).not.toHaveProperty('author')
+    expect(pkg).not.toHaveProperty('homepage')
+    expect(pkg).not.toHaveProperty('bugs')
   })
 
   it('ships a cordis patch whose insert row and config match the spec §8 defaults', () => {

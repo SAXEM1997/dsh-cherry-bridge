@@ -1,4 +1,15 @@
 {
+  // The SERVER project: `src/**` (the Node half), the tests that run in the
+  // Node environment, and the root config files. Its counterpart is
+  // `tsconfig.ui.json`, which owns the UI environment (DOM libs + the JSX
+  // transform). The split exists because `lib`/`jsx`/`types` are per-PROJECT
+  // settings: compiling the UI files here would resolve `document`, `window`
+  // and `react/jsx-runtime` against a lib set that deliberately lacks them.
+  //
+  // `npm run typecheck` runs BOTH projects, so every file is checked exactly
+  // once — the two `include`/`exclude` sets are proven to partition
+  // `tests/**/*.test.ts` by `tests/unit/projectCoverage.test.ts`. Change one
+  // side and that test fails rather than letting a file go unchecked.
   "compilerOptions": {
     "target": "ES2023",
     "module": "ESNext",
@@ -12,5 +23,13 @@
     "noEmit": true
   },
   "include": ["src", "tests", "vitest.config.ts", "tsdown.config.ts"],
-  "exclude": ["ui", "tests/unit/ui.test.ts", "tests/integration/clientBundle.test.ts"]
+  // `ui/**` and the two UI-environment tests belong to tsconfig.ui.json (see
+  // its header); `_research/**` is a vendored upstream checkout, not this
+  // plugin's source, so it is neither built nor typechecked here.
+  "exclude": [
+    "ui",
+    "tests/unit/ui.test.ts",
+    "tests/integration/clientBundle.test.ts",
+    "_research"
+  ]
 }

@@ -1,4 +1,16 @@
 {
+  // The UI project: the settings page (`ui/**`) and the two tests that must run
+  // in a UI environment — `tests/unit/ui.test.ts` (jsdom + testing-library) and
+  // `tests/integration/clientBundle.test.ts` (it loads the built bundle in a
+  // browser-shaped VM). Its counterpart is `tsconfig.json`; the split is
+  // load-bearing because this project adds the DOM libs and `jsx: react-jsx`,
+  // and the server project deliberately excludes exactly these files so each is
+  // checked by exactly one project (see `tests/unit/projectCoverage.test.ts`).
+  //
+  // `ui/src/dev.tsx` is intentionally INCLUDED, not excluded: it typechecks
+  // today, and it is the only consumer of the dev-only `ui/index.html` harness
+  // — excluding it would let the harness rot silently against the components it
+  // renders (the dev page is not covered by the client bundle build).
   "compilerOptions": {
     "target": "ES2023",
     "module": "ESNext",

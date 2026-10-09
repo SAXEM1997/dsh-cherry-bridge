@@ -48,6 +48,26 @@ const loaderFooter = `\t\treturn module.exports;
 
 export default defineConfig(({ mode }) => {
   const isClientBundle = mode === 'client'
+
+  if (isClientBundle) {
+    // MANDATORY, and NOT the same thing as the `define` below.
+    //
+    // vite decides `isProduction` from `process.env.NODE_ENV` at BUILD TIME and
+    // picks the JSX transform accordingly: production emits
+    // `require("react/jsx-runtime")`, anything else emits
+    // `require("react/jsx-dev-runtime")` plus `jsxDEV` call sites. The host's
+    // module seed carries `react/jsx-runtime` and NO dev runtime, so a dev-mode
+    // build loads fine in a test stub and then throws `Cannot find module` in
+    // the settings page — which is exactly how F1 shipped.
+    //
+    // `define` only substitutes output text; it does NOT steer the transform.
+    // And the value cannot be inherited: a vitest worker runs with
+    // `NODE_ENV=test` and the suite rebuilds this artifact through
+    // `execFileSync`, so the test path, a dev shell and CI all disagree.
+    // Setting it here is the one place that covers every entry point.
+    process.env.NODE_ENV = 'production'
+  }
+
   return {
     root: here,
     plugins: [react()],

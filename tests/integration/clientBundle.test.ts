@@ -84,12 +84,41 @@ type RequireLog = string[]
  * bundle destructures at load time.
  */
 /**
+ * The host's OWN client-module seed: the complete set of specifiers the host
+ * module loader can resolve for a client bundle.
+ *
+ * This is a TRANSCRIPT of the real host seed (9 modules), not a design choice.
+ * The stub below mirrors it exactly and must never be a superset: masking a
+ * specifier here would let a bundle that the host cannot load pass the smoke
+ * test. `react/jsx-dev-runtime` in particular was stubbed away while the build
+ * emitted a dev-transform bundle, and the settings page threw on the host —
+ * F1 of the UltraReview. Adding a module here is a HOST change, not a test
+ * change, and the subset assertion below makes any new external fail loudly.
+ */
+const HOST_SEED_SPECIFIERS = [
+  'react',
+  'react/jsx-runtime',
+  'react-dom',
+  'react-dom/client',
+  '@deepseek-ai/cordis',
+  'dsh-client-store',
+  'dsh-client-ui-slots',
+  'dsh-client-ui-primitives',
+  'dsh-client-ui-dockkit',
+] as const
+
+/**
  * The host-`require` stand-in for the externalized React family.
  *
  * Keyed by the specifier the bundle actually asks for. The bundle resolves
- * `react` and the automatic JSX runtime (`react/jsx-runtime`, or the dev
- * variant); `react-dom` is listed for completeness but is not expected, since
- * the shell owns the DOM root and renders this bundle's component.
+ * `react` and — in a production build — the automatic JSX runtime
+ * (`react/jsx-runtime`); `react-dom` is listed for completeness but is not
+ * expected, since the shell owns the DOM root and renders this bundle's
+ * component.
+ *
+ * There is deliberately NO `react/jsx-dev-runtime` branch: the host seed has no
+ * such module, so a bundle that requires it fails against the real loader, and
+ * this stub must reproduce that failure rather than paper over it.
  */
 function reactFamilyStub(specifier: string): unknown | undefined {
   if (specifier === 'react') {
@@ -103,8 +132,8 @@ function reactFamilyStub(specifier: string): unknown | undefined {
       useState: (initial: unknown) => [typeof initial === 'function' ? (initial as () => unknown)() : initial, () => {}],
     }
   }
-  if (specifier === 'react/jsx-runtime' || specifier === 'react/jsx-dev-runtime') {
-    return { jsx: () => ({}), jsxs: () => ({}), Fragment: () => ({}), jsxDEV: () => ({}) }
+  if (specifier === 'react/jsx-runtime') {
+    return { jsx: () => ({}), jsxs: () => ({}), Fragment: () => ({}) }
   }
   if (specifier === 'react-dom' || specifier === 'react-dom/client') {
     return { createRoot: () => ({ render: () => {}, unmount: () => {} }) }
@@ -224,6 +253,59 @@ describe('client bundle (build smoke)', () => {
     // artifact assertion above from regressing unnoticed.
     const config = readFileSync(resolve(repoRoot, 'ui', 'vite.config.ts'), 'utf8')
     expect(config).toContain("external: [/^react")
+  })
+
+  // ---------------------------------------------------------------------------
+  // F1 (UltraReview) — the artifact must use the PRODUCTION JSX runtime
+  // ---------------------------------------------------------------------------
+
+  it('requires the production JSX runtime, never the dev transform', () => {
+    // The host seed has `react/jsx-runtime` and NO `react/jsx-dev-runtime`: a
+    // bundle built with the dev transform throws `Cannot find module
+    // "react/jsx-dev-runtime"` at load, and the settings page never renders.
+    //
+    // The build selects the transform from `process.env.NODE_ENV` AT BUILD TIME
+    // (vite derives `isProduction` from it; the `define` below only substitutes
+    // output text). Any non-production value — including vitest's own `test`,
+    // which this suite's `beforeAll` rebuild inherits — used to select the dev
+    // transform. So the assertion is on the quoted require the loader will
+    // serve, not on a hyphenated filename that appears in both variants.
+    const source = readFileSync(bundlePath, 'utf8')
+    expect(source).not.toContain('require("react/jsx-dev-runtime")')
+    expect(source).not.toContain('react/jsx-dev-runtime')
+    // No `jsxDEV` call sites either: that is what the dev transform emits.
+    expect(source).not.toContain('jsxDEV')
+    // The production runtime is present, so the assertion above cannot pass on
+    // a bundle that mysteriously emitted no JSX at all.
+    expect(source).toContain('require("react/jsx-runtime")')
+    expect(source).toContain('jsx')
+  })
+
+  it('builds the client bundle in production mode whatever NODE_ENV the caller has', () => {
+    // The config must set NODE_ENV itself rather than inherit it: the suite's
+    // `beforeAll` runs `npm run build:client` from a vitest process (NODE_ENV =
+    // `test`), a maintainer may build from a dev shell, and CI may export a
+    // different value. A config-level assignment is the only fix that covers
+    // the `execFileSync` path as well as a direct `vite build`.
+    const config = readFileSync(resolve(repoRoot, 'ui', 'vite.config.ts'), 'utf8')
+    expect(config).toMatch(/process\.env\.NODE_ENV\s*=\s*'production'/)
+  })
+
+  it('requires nothing the host seed cannot resolve (require-set ⊆ seed)', () => {
+    // THE transcript assertion: whatever the bundle asks `require` for, the
+    // host must have it. Any NEW external specifier fails here rather than
+    // surfacing as a runtime `Cannot find module` on a user's host.
+    const { requires } = loadBundle()
+    expect(requires.length).toBeGreaterThan(0)
+
+    const seed = new Set<string>(HOST_SEED_SPECIFIERS)
+    const unresolvable = [...new Set(requires)].filter((specifier) => !seed.has(specifier))
+    expect(unresolvable).toEqual([])
+
+    // F3: the exact posture after F1 — `react` plus the production JSX runtime,
+    // and NOT `react-dom` (the shell owns the DOM root).
+    expect([...new Set(requires)].sort()).toEqual(['react', 'react/jsx-runtime'])
+    expect(new Set(requires).has('react-dom')).toBe(false)
   })
 
   it('exports the slots service dependency and an apply function', () => {
