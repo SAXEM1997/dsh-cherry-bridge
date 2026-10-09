@@ -140,6 +140,9 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
  * only as a cross-check against the archive, never to drive migration, version
  * rejection, or a version-less default of its own.
  *
+ * A version-less entry is the legacy (v1) shape, valid only inside a
+ * schemaVersion-1 archive; under any newer archive it is rejected.
+ *
  * `archiveVersion` is always a version this build understands, because
  * {@link parseArchive} rejects unknown archive versions before reaching here.
  */
@@ -158,6 +161,17 @@ function parseRecord(raw: unknown, archiveVersion: number): DeviceRecord {
     throw new Error(
       'device archive entry has no schemaVersion and an incomplete field set; ' +
         'only a complete field set may be read as a legacy (v1) entry',
+    )
+  }
+
+  // A version-less entry is the legacy (v1) shape, and that shape is only valid
+  // inside a schemaVersion-1 archive. The store's own writes never produce this
+  // combination, so reaching it means the file was hand-edited or corrupted; it
+  // is rejected rather than silently migrated up.
+  if (declared === undefined && archiveVersion > 1) {
+    throw new Error(
+      'device archive entry has no schemaVersion but its archive is schemaVersion ' +
+        `${archiveVersion}; legacy (v1) entries are only valid inside a schemaVersion-1 archive`,
     )
   }
 

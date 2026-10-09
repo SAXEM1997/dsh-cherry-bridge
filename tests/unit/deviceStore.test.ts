@@ -319,25 +319,100 @@ describe('DeviceStore schema migration', () => {
     )
   })
 
-  it('migrates a version-less entry by the ARCHIVE version, not its own (F2)', async () => {
+  it('rejects a version-less entry inside a current-version archive, accurately (F2-r2)', async () => {
     const file = await makeStoreFile()
     const { schemaVersion: _current, ...fields } = makeRecord()
-    // Archive says v1; the entries carry no version of their own. The archive is
-    // the single migration authority, so the entries are migrated with it.
-    await writeArchive(file, [fields], 1)
+    // The legacy (version-less) shape is only valid inside a v1 archive; the
+    // store's own writes never produce this combination, so reaching it means
+    // hand-editing or external corruption. Rejected, not silently migrated up.
+    await writeArchive(file, [fields], SCHEMA_VERSION)
+    const before = await readFile(file, 'utf8')
 
-    expect(new DeviceStore(file).list()).toEqual([makeRecord()])
-    expect(await readArchive(file)).toEqual({
-      schemaVersion: SCHEMA_VERSION,
-      devices: [makeRecord()],
-    })
+    // The message must name what actually went wrong: NOT
+    // "unsupported schemaVersion undefined", which names a value the entry
+    // never declared.
+    expect(() => new DeviceStore(file).list()).toThrow(
+      /entry has no schemaVersion but its archive is schemaVersion 2/,
+    )
+    // Rejected before the migration loop: the archive is left untouched.
+    expect(await readFile(file, 'utf8')).toBe(before)
+    expect((await readArchive(file)).schemaVersion).toBe(SCHEMA_VERSION)
   })
 
-  it('accepts an entry that agrees with its archive version (F2)', async () => {
+  it('accepts a version-less entry that agrees with its archive version (F2)', async () => {
     const file = await makeStoreFile()
     await writeArchive(file, [makeRecord()], SCHEMA_VERSION)
 
     expect(new DeviceStore(file).list()).toEqual([makeRecord()])
+  })
+
+  it('covers the whole archive-version/entry-version matrix (F2-r2)', async () => {
+    const { schemaVersion: _current, ...versionless } = makeRecord()
+    const { port: _port, ...incomplete } = versionless
+
+    const cases: {
+      name: string
+      archiveVersion: number
+      entry: unknown
+      expect: 'migrates' | 'throws'
+      message?: RegExp
+    }[] = [
+      {
+        name: 'archive 1 + version-less complete',
+        archiveVersion: 1,
+        entry: versionless,
+        expect: 'migrates',
+      },
+      {
+        name: 'archive 1 + version-less incomplete',
+        archiveVersion: 1,
+        entry: incomplete,
+        expect: 'throws',
+        message: /incomplete field set/,
+      },
+      {
+        name: 'archive 2 + declared 2',
+        archiveVersion: SCHEMA_VERSION,
+        entry: makeRecord(),
+        expect: 'migrates',
+      },
+      {
+        name: 'archive 2 + declared other',
+        archiveVersion: SCHEMA_VERSION,
+        entry: makeRecord({ schemaVersion: 1 }),
+        expect: 'throws',
+        message: /entry declares schemaVersion 1 but its archive is schemaVersion 2/,
+      },
+      {
+        name: 'archive 2 + version-less',
+        archiveVersion: SCHEMA_VERSION,
+        entry: versionless,
+        expect: 'throws',
+        message: /entry has no schemaVersion but its archive is schemaVersion 2/,
+      },
+      {
+        name: 'archive 99',
+        archiveVersion: 99,
+        entry: makeRecord({ schemaVersion: 99 }),
+        expect: 'throws',
+        message: /archive declares schemaVersion 99/,
+      },
+    ]
+
+    for (const testCase of cases) {
+      const file = await makeStoreFile()
+      await writeArchive(file, [testCase.entry], testCase.archiveVersion)
+      const before = await readFile(file, 'utf8')
+      const store = new DeviceStore(file)
+
+      if (testCase.expect === 'migrates') {
+        expect(store.list(), testCase.name).toEqual([makeRecord()])
+      } else {
+        expect(() => store.list(), testCase.name).toThrow(testCase.message)
+        // Every rejection happens before any migration write-back.
+        expect(await readFile(file, 'utf8'), testCase.name).toBe(before)
+      }
+    }
   })
 })
 
@@ -364,6 +439,35 @@ describe('DeviceStore write validation', () => {
     const store = new DeviceStore(await makeStoreFile())
 
     expect(() => store.upsert(makeRecord({ schemaVersion: 1 }))).toThrow(/schemaVersion 1/)
+  })
+
+  it('enforces every required key at runtime, not just the token pair (addendum)', async () => {
+    // `DeviceRecord`'s required keys are a compile-time contract only; a caller
+    // reaching upsert from JS or through a cast can still omit one. Every
+    // missing key is rejected before it can reach the archive, which is what
+    // keeps the anomalous version-less-inside-v2 shape out of the store's own
+    // writes (only hand-edited files can produce it).
+    const requiredKeys = [
+      'schemaVersion',
+      'deviceId',
+      'displayName',
+      'hosts',
+      'port',
+      'desktopIdentity',
+      'grants',
+      'enabled',
+    ] as const
+
+    for (const key of requiredKeys) {
+      const file = await makeStoreFile()
+      const store = new DeviceStore(file)
+      const incomplete = makeRecord() as unknown as Record<string, unknown>
+      delete incomplete[key]
+
+      expect(() => store.upsert(incomplete as unknown as DeviceRecord), key).toThrow(key)
+      // Nothing was persisted: a rejected write never touches the archive.
+      await expect(readFile(file, 'utf8'), key).rejects.toThrow()
+    }
   })
 })
 
