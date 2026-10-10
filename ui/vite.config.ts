@@ -74,6 +74,14 @@ export default defineConfig(({ mode }) => {
     // `NODE_ENV=test` and the suite rebuilds this artifact through
     // `execFileSync`, so the test path, a dev shell and CI all disagree.
     // Setting it here is the one place that covers every entry point.
+    //
+    // ASSUMPTION: one build per process. `vite build` (what `build:client`
+    // runs) is one process per invocation, so the assignment below is applied
+    // before that build's transform starts. A PROGRAMMATIC caller that invokes
+    // `build()` repeatedly in a single process — e.g. with a different `mode`
+    // after this one — is NOT covered: this config factory runs once per
+    // `defineConfig` resolution and would leave NODE_ENV pinned for every
+    // subsequent build in that process. The CLI path is the only supported one.
     process.env.NODE_ENV = 'production'
   }
 
@@ -119,14 +127,14 @@ export default defineConfig(({ mode }) => {
           outDir: resolve(here, '..', 'lib'),
           emptyOutDir: false,
           // The host loads this file as a classic script through the module
-          // loader, so it must be one self-contained IIFE — no code splitting,
-          // no shared chunks, no hashed asset names.
+          // loader, so it must be one self-contained CJS chunk (ModuleLoader
+          // factory envelope) — no code splitting, no shared chunks, no hashed
+          // asset names.
           cssCodeSplit: false,
           minify: false,
           sourcemap: false,
           lib: {
             entry: resolve(here, 'src', 'main.tsx'),
-            name: '__CherryRemoteClient',
             // CJS, not IIFE: external specifiers must become `require("react")`
             // calls against the LOADER's resolver. An IIFE emits bare
             // identifiers (`(function(exports, react) {...})`) that resolve to
@@ -134,7 +142,6 @@ export default defineConfig(({ mode }) => {
             // `require` exactly this way.
             formats: ['cjs'],
             fileName: () => 'client.js',
-            cssFileName: 'client',
           },
           rollupOptions: {
             // Every React entry point, externalized so the shell's single copy is
@@ -148,7 +155,7 @@ export default defineConfig(({ mode }) => {
             // and a second React internal to go with it. `/^react/` covers
             // `react`, `react/jsx-runtime`, `react/jsx-dev-runtime` and any
             // `react-dom` subpath.
-            external: [/^react/],
+            external: [/^react$/, /^react\//],
             output: {
               banner: loaderBanner,
               footer: loaderFooter,

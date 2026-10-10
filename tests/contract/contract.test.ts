@@ -60,9 +60,9 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 /**
  * The three files a git-spec install must be able to load, one per `exports`
- * target plus the declaration half of the root entry (E1-1). All three are git
- * IGNORED build outputs: nothing in a clean clone produces them until a build
- * runs, which is exactly the failure this list guards.
+ * target plus the declaration half of the root entry (E1-1). Since R3 F1-1 they
+ * are COMMITTED build outputs: they travel with the clone, so nothing has to
+ * build before pack.
  */
 const CLONE_PACK_ARTIFACTS = ['dist/index.mjs', 'dist/index.d.mts', 'lib/client.js'] as const
 
@@ -88,8 +88,9 @@ function run(command: string, args: string[], cwd: string): string {
  * Clone THIS repository into `target`.
  *
  * `--no-hardlinks` forces a real copy: a hardlinked clone would share inodes
- * with the working checkout, and the point of the exercise is that the clone
- * starts from TRACKED CONTENT ONLY — no `dist/`, no `lib/`, no `node_modules/`.
+ * with the working checkout. The clone still starts from TRACKED CONTENT ONLY —
+ * that is the point, and since R3 F1-1 the three build artifacts ARE tracked
+ * content (see `CLONE_PACK_ARTIFACTS`), while `node_modules/` is not.
  */
 function runGitClone(source: string, target: string): void {
   execFileSync('git', ['clone', '--quiet', '--no-hardlinks', source, target], {
@@ -1323,9 +1324,14 @@ describe('② GET /diagnostics', () => {
  * recognise throws, so a document it cannot read fails the test loudly instead
  * of silently yielding an empty config that trivially "equals" nothing.
  */
-function parsePatchInsert(text: string, id: string): { config: Record<string, number | string | boolean> } {
+function parsePatchInsert(
+  text: string,
+  id: string,
+): { id: string; name?: string; config: Record<string, number | string | boolean> } {
   const rawLines = text.split('\n')
   let currentId: string | undefined
+  let currentName: string | undefined
+  let currentRow: string | undefined
   let inConfig = false
   let configIndent = -1
   let found: Record<string, number | string | boolean> | undefined
@@ -1349,6 +1355,15 @@ function parsePatchInsert(text: string, id: string): { config: Record<string, nu
     const rowId = /^- id:\s*(\S+)$/.exec(line)
     if (rowId !== null) {
       currentId = stripQuotes(rowId[1]!)
+      currentName = undefined
+      if (currentId === id) currentRow = currentId
+      continue
+    }
+    // The row's `name` is a SIBLING scalar of `config`, at the same indent as
+    // the `- id:` that opened the row. Captured for the id/name contract below.
+    const rowName = /^-? ?name:\s*(.+)$/.exec(line)
+    if (rowName !== null && currentId !== undefined && indent > 0) {
+      currentName = stripQuotes(rowName[1]!)
       continue
     }
     if (line === 'config:') {
@@ -1361,13 +1376,16 @@ function parsePatchInsert(text: string, id: string): { config: Record<string, nu
     if (indent === 0) {
       // A new top-level key — the `insert:` block has ended.
       currentId = undefined
+      currentRow = undefined
       continue
     }
     if (indent < configIndent) currentId = undefined
   }
 
   if (found === undefined) throw new Error(`patch reader: no row with a config for id ${id}`)
-  return { config: found }
+  return currentName === undefined
+    ? { id: currentRow!, config: found }
+    : { id: currentRow!, name: currentName, config: found }
 }
 
 /** A YAML scalar in the subset the patch is allowed to use. */
@@ -1396,6 +1414,7 @@ describe('③ release configuration', () => {
     files: string[]
     scripts: Record<string, string>
     engines?: { node?: string }
+    packageManager?: string
     dsh?: { client?: unknown; bundle?: { patch?: string } }
   }
 
@@ -1408,62 +1427,63 @@ describe('③ release configuration', () => {
     expect(Object.keys(manifest.dsh ?? {}).sort()).toEqual(['bundle', 'client'])
   })
 
-  it('carries a `prepare` hook, so a git-spec install builds both entry points (E1-1)', () => {
-    // UltraReview R2 E1-1 (P0): `files` lists `lib` and `dist`, and BOTH are
-    // gitignored+untracked build outputs. `prepublishOnly` is a PUBLISH-only
-    // lifecycle hook — npm does NOT run it for `npm install <git-url>` or for a
-    // pack taken from a clean clone, so the tarball built from a clone carried
-    // 27 files with ZERO `dist/` and ZERO `lib/`, and the host died on
-    // `MissingClientBundleError` when it tried to load `./client`.
+  it('COMMITS both entry points and drops `prepare` (R3 F1-1)', () => {
+    // UltraReview R2 E1-1 (P0) shipped a `prepare` hook so a git install built
+    // `dist/` + `lib/` on the way in. R3 F1-1 re-ruled that: `prepare` also runs
+    // for a plain `npm install` in a checkout, and `npm install --omit=dev`
+    // PRUNES the devDependencies first — so `prepare` died on a missing
+    // `tsdown`/`vite` (exit 127) and the install failed outright. The
+    // smallest-correct fix is the one the reference plugin already uses: ship
+    // the build output as TRACKED CONTENT and keep no install-time hook at all.
     //
-    // `prepare` is the hook npm runs on BOTH paths: a git-dependency install
-    // (`npm install <git-url>`) and a local `npm install` in a checkout. On
-    // publish, `prepublishOnly` runs first and `prepare` follows; both are
-    // idempotent builds of the same inputs, so the double run is harmless.
-    expect(manifest.scripts['prepare']).toBeDefined()
-    expect(manifest.scripts['prepare']).toContain('build')
-    expect(manifest.scripts['prepare']).toContain('build:client')
-    // The publish hook keeps its own job; `prepare` supplements, never replaces.
+    // The tracked-artifact half is enforced on DISK by the clone/pack gate
+    // below and by git itself; here the manifest must simply not reintroduce a
+    // hook that only works when `node_modules` is complete.
+    expect(manifest.scripts['prepare']).toBeUndefined()
+    // The publish hook keeps its own job — and, since F1-4, is also the quality
+    // gate: artifacts can no longer be regenerated by an install, so the publish
+    // path is where "the committed output is current" is re-established.
     expect(manifest.scripts['prepublishOnly']).toBeDefined()
+    expect(manifest.scripts['prepublishOnly']).toContain('typecheck')
+    expect(manifest.scripts['prepublishOnly']).toContain('test')
+    expect(manifest.scripts['prepublishOnly']).toContain('build')
+    expect(manifest.scripts['prepublishOnly']).toContain('build:client')
   })
 
-  it('packs BOTH entry points from a clean clone — the real git-install gate (E1-1)', async () => {
-    // The assertion above is the SHAPE; this is the GATE. A clean clone has no
-    // `dist/` and no `lib/` (both are gitignored), so it reproduces exactly what
-    // a git-spec install packs. Build in the clone, then pack it: the tarball
-    // must carry the three artifacts the two `exports` targets resolve to.
+  it('packs BOTH entry points from a clean clone that ALREADY carries them (E1-1 / R3 F1-1)', () => {
+    // The assertion above is the SHAPE; this is the GATE. `dist/` and `lib/` are
+    // no longer gitignored: a clone carries the artifacts as tracked content, so
+    // the properties a git-spec install depends on are "the clone has them" and
+    // "the tarball has them" — with NO install and NO build in the loop. That is
+    // what closes `npm install --omit=dev`, which is exactly the path the
+    // removed `prepare` hook used to break.
     //
-    // The clone lives in `os.tmpdir()` and is removed in `finally`, so a pack
+    // The clone lives in `os.tmpdir()` and is removed in `finally`, so the pack
     // tarball can never leak into this repository.
     const clone = mkdtempSync(join(tmpdir(), 'cherry-clone-pack-'))
     try {
       runGitClone(repoRoot, clone)
-      // Precondition: the clone really is clean — no build output travelled
-      // with it. Without this the test could pass off artifacts copied by git.
-      expect(existsSync(join(clone, 'dist'))).toBe(false)
-      expect(existsSync(join(clone, 'lib'))).toBe(false)
 
-      // `npm install` runs `prepare` -> build + build:client. `--ignore-scripts`
-      // is deliberately NOT passed: running `prepare` is the behaviour under
-      // test.
-      run('npm', ['install', '--no-audit', '--no-fund'], clone)
+      // Precondition: the clone really is a TRACKED-CONTENT-ONLY checkout — no
+      // `node_modules/` travelled with it, so nothing in the assertions below
+      // can have been produced by an install.
+      expect(existsSync(join(clone, 'node_modules'))).toBe(false)
 
-      // The artifacts exist in the clone...
+      // THE F1-1 PROPERTY: the clean clone already contains all three artifacts.
       for (const artifact of CLONE_PACK_ARTIFACTS) {
         expect(existsSync(join(clone, artifact))).toBe(true)
       }
 
-      // ...and the TARBALL carries them. `npm pack` writes the tarball into the
-      // clone's own cwd, never into this repo.
+      // ...and the TARBALL carries them, straight out of the clone. `npm pack`
+      // writes the tarball into the clone's own cwd, never into this repo.
       //
-      // `--json` output is NOT pure JSON here: `pack` re-runs `prepare`, and
-      // tsdown writes its banner to stdout, ahead of the report. Take the
-      // report from the first `[`/`{` onward rather than assuming a clean
-      // stream — the assertions below are what must be strict, not the parser.
-      const packed = run('npm', ['pack', '--dry-run', '--json'], clone)
-      const jsonAt = Math.min(
-        ...[packed.indexOf('['), packed.indexOf('{')].filter((at) => at >= 0),
-      )
+      // `--ignore-scripts` is passed deliberately: the tarball's content must
+      // not depend on any lifecycle hook running. That is the whole point of the
+      // fix — a pack from a checkout with a pruned or absent `node_modules` must
+      // still ship a loadable package, and it is precisely what would have
+      // failed before.
+      const packed = run('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], clone)
+      const jsonAt = Math.min(...[packed.indexOf('['), packed.indexOf('{')].filter((at) => at >= 0))
       const entries = Object.values(
         JSON.parse(packed.slice(jsonAt)) as Record<string, { files: Array<{ path: string }> }>,
       )
@@ -1502,6 +1522,12 @@ describe('③ release configuration', () => {
     // for the root entry and reports TS7016 (implicit `any`) — the type half of
     // the published contract was simply unreachable.
     //
+    // F1-4 (R3): `./package.json` carries the SAME object shape, so every
+    // subpath is consistently conditioned rather than one string and one object.
+    // `default` still resolves to the manifest itself — that is the property
+    // consumers actually read.
+    expect(manifest.exports['./package.json']).toEqual({ default: './package.json' })
+    //
     // F2: the declared types target is what `npm run build` actually emits
     // (tsdown → dist/index.d.mts), so it is asserted on disk, not just in the
     // manifest — a `dts: false` regression would otherwise ship the condition
@@ -1520,6 +1546,11 @@ describe('③ release configuration', () => {
     // The plan's Tech Stack floor ("TypeScript (Node ≥22.18)"); a lower range
     // would advertise support for a runtime the suite never exercises.
     expect(manifest.engines?.node).toBe('>=22.18.0')
+    // F1-7a (R3): the toolchain is pinned by declaration, not by whatever npm
+    // the maintainer happens to have. `package.json` scripts and the lockfile
+    // are both produced by a specific npm, and its lockfile format is what the
+    // suite's clone/pack gate replays.
+    expect(manifest.packageManager).toBe('npm@10.9.9')
   })
 
   it('declares the F9 publish metadata (repository + publishConfig)', () => {
@@ -1555,7 +1586,6 @@ describe('③ release configuration', () => {
     expect(patch).toContain('- insert:')
     expect(patch).toContain('id: cherry-remote')
     expect(patch).toContain("name: 'dsh-cherry-bridge'")
-
     // E1-6: string containment (`patch` matching /rateBudgetPerSecond:\s*32/)
     // is satisfiable by a document that does not actually SAY 32 — a trailing
     // comment, a second row, a nested key, or `32` inside a longer number all
@@ -1566,7 +1596,24 @@ describe('③ release configuration', () => {
       perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
       rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
     })
-    // Exactly the documented keys — a value added here is a config surface the
+    // F1-2 (R3): the row's `id` and `name` are NOT decoration — the host's
+    // `applyEntryPatches` only ever APPENDS these top-level insert rows, and its
+    // `declaredRows` / bundle-in-use test matches `row.id` against
+    // `entry.options.id` AND `row.name` against `entry.options.name`. A row
+    // missing either field is silently skipped: no error, no assembly, and a
+    // plugin that simply never loads.
+    //
+    // So `id` must be exactly the plugin `name` this package exports (the
+    // composition entry id), and `name` must be the npm package name. Both are
+    // asserted against their live sources rather than restated as literals, so
+    // a rename on either side fails HERE instead of silently un-assembling the
+    // plugin in every profile that carries this bundle.
+    const pluginExport = readFileSync(join(repoRoot, 'src', 'index.ts'), 'utf8')
+    const exportedName = /export\s+const\s+name\s*=\s*'([^']+)'/.exec(pluginExport)
+    expect(exportedName).not.toBeNull()
+    expect(inserted.id).toBe(exportedName![1])
+    expect(inserted.name).toBe(manifest.name)
+    expect(inserted.name).toBe('dsh-cherry-bridge')    // Exactly the documented keys — a value added here is a config surface the
     // README's table does not describe.
     expect(Object.keys(inserted.config).sort()).toEqual([
       'perSessionCacheBytes',

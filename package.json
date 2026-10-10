@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": false,
+  "packageManager": "npm@10.9.9",
   "description": "DeepSeek Harness plugin bridging to Cherry Studio desktop instances over remote transport",
   "license": "MIT",
   "repository": {
@@ -28,7 +29,9 @@
       "default": "./dist/index.mjs"
     },
     "./client": "./lib/client.js",
-    "./package.json": "./package.json"
+    "./package.json": {
+      "default": "./package.json"
+    }
   },
   "dsh": {
     "client": {
@@ -54,8 +57,7 @@
     "build:client": "vite build --mode client --config ui/vite.config.ts",
     "dev:ui": "vite --config ui/vite.config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.ui.json",
-    "prepare": "npm run build && npm run build:client",
-    "prepublishOnly": "npm run build && npm run build:client"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run build:client"
   },
   "dependencies": {
     "@cherrystudio/remote-protocol": "0.3.0",
@@ -65,7 +67,6 @@
   },
   "devDependencies": {
     "@libp2p/interface": "3.3.0",
-    "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@types/node": "^26.6.4",
     "@types/react": "^18.3.31",
@@ -76,7 +77,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tsdown": "^0.23.0",
-    "typescript": "^7.0.2",
+    "typescript": "~7.0.2",
     "vite": "^8.3.4",
     "vitest": "^5.0.3"
   }

@@ -167,18 +167,19 @@ npm run typecheck   # 服务端 + UI 两侧
 npm run build       # tsdown → dist/index.mjs
 npm run build:client # vite → lib/client.js
 npm run dev:ui      # 设置页 dev server（需宿主在 127.0.0.1:23023 运行，见上）
-npm run prepare     # git 安装/本地 install 钩子：build + build:client
-npm run prepublishOnly # 发布前钩子：build + build:client
+npm run prepublishOnly # 发布前闸门：typecheck + test + build + build:client
 ```
 
-> `dist/` 与 `lib/` 都是 git 忽略的**构建产物**。`prepublishOnly` 只在 `npm publish`
-> 时运行，`npm install <git-url>` 或对克隆目录打包都**不会**触发它——那样的 tarball
-> 里既没有 `dist/index.mjs` 也没有 `lib/client.js`，宿主加载 `./client` 时会直接以
-> `MissingClientBundleError` 失败。因此发布物由 `prepare` 钩子构建：git 依赖安装与
-> 本地 install 都会运行它；发布时 `prepublishOnly` 先跑、`prepare` 随后再跑一次，
-> 两者是同一份输入的幂等构建，重复执行无害。`tests/contract/contract.test.ts` 里的
-> 「clean clone → pack」用例是这条的**闸门**：它克隆本仓库、跑 `prepare`、打包，
-> 断言 tarball 内确实含 `dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`。
+> **`dist/` 与 `lib/` 是随仓库提交的构建产物，不是 gitignore 的输出。** 改完 `src/`
+> 或 `ui/` 后必须重跑 `npm run build && npm run build:client` 再提交，否则提交里的产物
+> 就是旧的。这里**没有** `prepare` 钩子：`prepare` 在 `npm install` 时也会跑，而
+> `npm install --omit=dev` 会先剪掉 devDependencies，钩子随即因找不到 `tsdown`/`vite`
+> 而失败（127）——整个安装被拖挂。产物入库后 git 安装、`--omit=dev`、以及对克隆目录
+> 直接打包都无需任何构建步骤即可工作。`tests/contract/contract.test.ts` 里的
+> 「clean clone → pack」用例是这条的**闸门**：它克隆本仓库（不带 `node_modules`），断言
+> 克隆中**已经**含 `dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`，且
+> `npm pack --ignore-scripts` 的 tarball 里也含这三个文件。防止产物悄悄腐坏的是
+> `prepublishOnly`：发布路径上它先跑 typecheck 与全量测试、再重建两侧产物。
 
 依赖 `@cherrystudio/remote-protocol@0.3.0` 与 `@cherrystudio/remote-transport@0.1.2`
 以**精确版本**固定（无 `^`），并有测试断言锁死——升级时必须重跑
@@ -192,10 +193,22 @@ npm run prepublishOnly # 发布前钩子：build + build:client
 > 都会让协议包在运行时加载 schema 失败。这里精确钉在 `4.3.4`——即 peer 区间下界，
 > 也是协议包的测试基线。
 
+> TypeScript 钉在 `~7.0.2`（只放行补丁位）。**已接受的风险**：`tsdown` 生成
+> `dist/index.d.mts` 走的是 TS 7 的实验性 dts API，该面在 minor 版本间可能变动；
+> 限定为 patch-only 区间意味着 minor 不会在区间内静默改变这个面，升级必须显式改
+> `package.json` 并重跑 `npm run build` + 全量测试。类型面的产物随仓库提交，所以一次
+> 坏升级会立刻在契约套件里现形，而不是等下游消费方撞上。
+
 > 说明：本仓库的 `tests/loopback/fakeCherry.ts` 是**测试内**的自环假对端，不是发布物；
 > 文档与代码注释中出现的 `Task N`、`spec §x`、`controller ruling`、`UltraReview` 等编号，
 > 指向本项目内部的 SDD 过程文档（设计/任务/审查记录），**不随包发布**——它们只是把
-> 「这条规则为什么长这样」的出处留在原处。
+> 「这条规则为什么长这样」的出处留在原处。发布物里 `docs/` 只含
+> [`docs/e2e-checklist.md`](docs/e2e-checklist.md)（`files` 逐项列出，未列 `docs` 目录
+> 本身），而 `docs/superpowers/**` 的内部过程文档被**有意排除**在 tarball 之外。
+
+> `files` 里的 `src` 与 `ui` 是**有意发布**的：宿主侧排查（对照 `dist`/`lib` 的产物行为
+> 读原始实现）与二次开发需要它们；运行时实际解析的是 `exports` 指向的 `dist/*` 与
+> `lib/client.js`，`src` 不参与加载。
 
 发布前请走完 `docs/e2e-checklist.md`：Electron 端的人工批准无法 CI 化，真机流程
 （配对 / 发送 / 交互应答 / 断连恢复 / 多设备并存）必须人工过一遍。

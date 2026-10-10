@@ -16,6 +16,14 @@
 #     （该上限无协商通道，超限会以 close 1011 终止整条会话）。
 #   - dataDir 故意不写：留空时装配层按 $DSH_HOME/cherry-remote 解析，
 #     写死会让所有 profile 共用同一份设备档案。
+#
+# ⚠️ 行的 `id` / `name` 不是自由文本——宿主 `applyEntryPatches` 只追加顶层 insert 行，
+#    再由 `declaredRows` / bundle-in-use 判定「本插件已装配」，两处都要求
+#    `row.id == entry.options.id` **且** `row.name == entry.options.name`；缺 id 或
+#    缺 name 的行会被**静默跳过**（不报错、不装配）。因此：
+#      `id`   = 组合条目 id，必须严格等于 `src/index.ts` 导出的插件 `name`；
+#      `name` = npm 包名（package.json `name`）。
+#    这条不变式由 `tests/contract/contract.test.ts` 断言锁死。
 - insert:
     - id: cherry-remote
       name: 'dsh-cherry-bridge'

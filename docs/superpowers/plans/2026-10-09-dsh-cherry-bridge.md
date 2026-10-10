@@ -91,6 +91,7 @@
 - **类型层后果（必填类型与 v1 缺失键的共存）**：`schemaVersion` 在 `DeviceRecord` 上为**必填**（对外契约），但 v1 档案不含该键——故读取层**不得**直接以 `DeviceRecord` 反序列化磁盘内容，而须先落到**宽松解析类型**（`DeviceRecordOnDisk = Partial<DeviceRecord> & { schemaVersion?: number }`，模块内部类型、不导出），经「判版本 → 迁移 → 校验」后再断言为 `DeviceRecord` 必填类型；即必填类型是**读路径出口**而非入口，两者以宽松中间类型共存，禁止用 `as DeviceRecord` 跳过版本判定
 
 - [ ] **Step 1: 写失败测试**——①upsert/list/remove 往返持久化（0600）；②resolve 三规则（精确/唯一前缀/歧义候选）；③`schemaVersion: 1` 旧档案读入时迁移到当前版本且字段不丢——**v1 fixture 形态定义：v1 = 当前字段集减 `schemaVersion`**（合成旧档 fixture，仅作迁移机制验证样本，不代表真实历史版本）；**补例：`schemaVersion` 缺失 + 字段集残缺（如缺 `port`/`grants`）→ 报错、不迁移**（区别于字段集完整的 v1：`schemaVersion` 缺失只在字段集完整时才等价于 v1，残缺档案须拒绝而非按 v1 迁移）；**读路径顺序固定：先用宽松结构（`schemaVersion?: number`，其余键全部可选）`JSON.parse` 后判版本 → 命中迁移表则迁移 → 迁移完成后再落 `DeviceRecord` 必填类型**（不得让宽松结构逸出读取层）；④当前版本档案读入**免迁移（幂等）**——重复读入不触发迁移、字段与版本号不变；⑤**高版本档案（未知 `schemaVersion`，如 99）→ 拒绝读取并报错**（不降级、不按当前版本解析）；⑥文件损坏 → 空库 + 不抛 + **warn 日志断言（RF4）**
+  > **R3 裁定（RF4 收窄）**：`⑥` 的「文件损坏」按**读/写路径分别裁定**——**读路径**损坏 = 返回空视图 + `warn`（不抛、不冒险解析）；**写路径**损坏 = **quarantine 拒绝并保全 `.corrupt` 文件**（不覆盖、不静默丢弃）。即 RF4 的「降级不崩溃」精神被收窄为「读路径降级、写路径保全」两分，而非全路径统一降级。
 - [ ] **Step 2: 运行确认失败**
 - [ ] **Step 3: 实现**——JSON 文件读写（写后 fsync）；**读路径按 Interfaces 固定顺序实现：宽松解析（`DeviceRecordOnDisk`）→ 判 `schemaVersion` → 迁移 → 校验落 `DeviceRecord` 必填类型**；`schemaVersion` 缺失时**仅当字段集完整**才按 1 处理，字段集残缺即报错；迁移函数表 `{ 1 → 2 }` 起步（**`{1→2}` 仅为机制样本；真实演进自发布后的版本 2 起**，schemaVersion 缺失视为 1）
 - [ ] **Step 4: 运行确认通过**

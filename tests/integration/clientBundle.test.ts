@@ -252,7 +252,7 @@ describe('client bundle (build smoke)', () => {
     // the subpath was silently bundled. Asserting the config is what keeps the
     // artifact assertion above from regressing unnoticed.
     const config = readFileSync(resolve(repoRoot, 'ui', 'vite.config.ts'), 'utf8')
-    expect(config).toContain("external: [/^react")
+    expect(config).toContain("external: [/^react$/, /^react\\//]")
   })
 
   // ---------------------------------------------------------------------------
