@@ -531,7 +531,17 @@ export function buildDiagnostics(
   }
 }
 
-/** The device keys a sanitized report is allowed to carry (contract ③). */
+/**
+ * The device keys a sanitized report is allowed to carry (contract ③).
+ *
+ * `limits` is here because {@link sanitizeDevice} EMITS it. A whitelist that
+ * omits a field the projection produces is a false statement about the
+ * contract: an operator (or a test) reading this list to decide what may appear
+ * in a report would conclude the negotiated caps never reach it, when in fact
+ * they are exactly what an operator needs to judge whether a refusal was the
+ * peer's cap talking. They carry no credential — four numbers, themselves
+ * re-projected field by field in {@link projectLimits}.
+ */
 export const DIAGNOSTICS_DEVICE_KEYS: readonly string[] = [
   'deviceId',
   'displayName',
@@ -540,4 +550,5 @@ export const DIAGNOSTICS_DEVICE_KEYS: readonly string[] = [
   'hosts',
   'port',
   'desktopIdentity',
+  'limits',
 ]

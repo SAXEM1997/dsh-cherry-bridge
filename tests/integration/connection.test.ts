@@ -839,4 +839,87 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(fakeInfo.fake.connectionCount).toBe(1)
     expect(fakeInfo.fake.authenticateCount).toBe(1)
   })
+
+  // -------------------------------------------------------------------------
+  // R3-F2: the structured OFFLINE face for a request in flight at link loss
+  // -------------------------------------------------------------------------
+
+  it('F2-3 a business request in flight when the link drops gets the structured offline face, not a raw disposal message', async () => {
+    const identity = await createDeviceIdentity()
+    // The peer accepts the request but stalls it, so the caller is genuinely
+    // IN FLIGHT when the socket goes away.
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 }, requestDelayMs: 5_000 })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), backoffInitialMs: 60_000 })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+
+    const pending = connection.rpc.request('connection.ping', { nonce: 'in-flight' })
+    // Let the request reach the wire, then drop the link under it.
+    await sleep(100)
+    expect(fakeInfo.fake.dropConnections()).toBe(1)
+
+    const error = await pending.then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
+    expect(error).toBeInstanceOf(Error)
+    const message = (error as Error).message
+    // The §6 face, or the channel-closed mapping that already exists for a dead
+    // link — NOT the internal-sounding disposal text, which names this client's
+    // own object lifetime rather than the state of the DEVICE.
+    expect(message).not.toMatch(/disposed/i)
+    expect(message).toMatch(/channel closed|offline|disconnected/i)
+  }, 15_000)
+
+  // -------------------------------------------------------------------------
+  // R3-F2: close() cancels the CANDIDATE ITERATION
+  // -------------------------------------------------------------------------
+
+  it('F2-5a close() during candidate 1\'s handshake stops the pass: no further candidate is dialed', async () => {
+    const identity = await createDeviceIdentity()
+    // One peer that accepts the socket and STALLS the handshake — the window
+    // close() has to land in.
+    const fakeInfo = await makeFake({ requestDelayMs: 5_000 })
+    // The SAME address listed twice. A record's candidates share one port, so
+    // this is the honest way to observe a second candidate attempt: without the
+    // cancellation guard the loop falls through to candidate 2 and dials the
+    // very same peer again, which the peer counts as a second accepted socket.
+    const record = recordFor(fakeInfo, { hosts: [fakeInfo.host, fakeInfo.host] })
+    const connection = makeConnection({ identity, record })
+
+    const pending = connection.connect()
+    await sleep(80) // inside candidate 1's hello round-trip
+    await connection.close()
+
+    await expect(pending).rejects.toThrow(/closed/)
+    expect(fakeInfo.fake.socketCount).toBe(1)
+    // Any stray dial would land well inside this window: the second dial is
+    // immediate (no backoff) once the first candidate's failure is classified.
+    await sleep(250)
+    expect(fakeInfo.fake.socketCount).toBe(1)
+  }, 15_000)
+
+  it('F2-5b close() during a candidate handshake, then a fresh connect(): the NEW cycle\'s link survives', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    // First cycle: start it and abandon it mid-handshake.
+    const abandoned = connection.connect()
+    await sleep(20)
+    await connection.close()
+    await expect(abandoned).rejects.toThrow(/closed/)
+
+    // Second cycle: the abandoned attempt must not be able to tear this one
+    // down. A stale candidate iteration still dialing post-close would complete
+    // its handshake against the epoch the NEW cycle now owns and, on failure,
+    // route the teardown into the live link.
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    await expect(connection.rpc.request('connection.ping', { nonce: 'alive' })).resolves.toMatchObject({
+      nonce: 'alive',
+    })
+    expect(connection.state).toBe('connected')
+  }, 15_000)
 })

@@ -753,4 +753,42 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     if (!('events' in newest)) throw new Error('expected events')
     expect(newest.nextCursor.seq).toBe('3')
   })
+
+  it('F2-6d a non-string streamEpoch is refused with a warning, never treated as the current epoch', async () => {
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+    const subscriptionId = rig.fake.subscriptions.find((entry) => entry.sessionId === 's1')!.subscriptionId
+
+    consoleWarn.mockClear()
+    // A malformed epoch: the peer DID send the field, so it is making a claim
+    // about which stream this batch belongs to — one this layer cannot check.
+    // The dangerous reading is "not a string, so skip the comparison", which
+    // silently accepts the batch as belonging to the CURRENT stream.
+    rig.fake.pushNotification('agent.events', {
+      subscriptionId,
+      sessionId: 's1',
+      streamEpoch: 42,
+      events: [{ kind: 'execution.updated', seq: '1', payload: { executionId: 'malformed' } }],
+    })
+
+    await waitFor(
+      () => consoleWarn.mock.calls.flat().map(String).some((message) => /stream epoch/i.test(message)),
+      3_000,
+      'the malformed-epoch warning',
+    )
+
+    // Nothing was folded: the batch is dropped, so no event and no cursor move.
+    const read = rig.subs.read('s1')
+    if (!('events' in read)) throw new Error('expected events')
+    expect(read.events).toHaveLength(0)
+    expect(read.nextCursor.seq).toBe('0')
+
+    // A well-formed batch on the SAME subscription still lands, so the guard
+    // refuses the malformed frame rather than the stream.
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'ok' } })
+    await waitFor(() => {
+      const next = rig.subs.read('s1')
+      return 'events' in next && next.events.length === 1
+    }, 3_000, 'the well-formed event')
+  })
 })

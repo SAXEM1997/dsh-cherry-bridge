@@ -191,8 +191,14 @@ export interface CherryHttpDeps {
    * Without eviction, PATCH address maintenance silently keeps dialing the
    * old address, and disable→enable reuses an instance still holding
    * `enabled:false` (whose `connect()` short-circuits to `disabled` forever).
+   *
+   * The return value is AWAITED by its callers when one is given. The assembly's
+   * eviction is asynchronous — it releases the peer subscriptions over the
+   * still-live socket before closing the connection — and a caller that returned
+   * early would let its own follow-up work (DELETE's `store.remove`) land in the
+   * middle of that teardown. `void` is still accepted for a synchronous pool.
    */
-  evict?(deviceId: string): void
+  evict?(deviceId: string): void | Promise<void>
   /**
    * Assembly channel: one device's state changed. Returns an optional
    * DETACHER — `SseHub.dispose` must remove the callback it registered, because
@@ -835,7 +841,7 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
         writeError(res, 400, 'invalid-request', 'device id is not valid URL encoding')
         return
       }
-      if (method === 'DELETE') return deleteDevice(res, route, deviceId)
+      if (method === 'DELETE') return await deleteDevice(res, route, deviceId)
       if (method === 'PATCH') return patchDevice(req, res, route, deviceId)
       writeError(res, 405, 'method-not-allowed', 'DELETE or PATCH only')
       return
@@ -1014,7 +1020,7 @@ function safely<T>(read: () => T | undefined, fallback?: T): T | undefined {
   }
 }
 
-function deleteDevice(res: HttpResponseLike, route: RouteContext, deviceId: string): void {
+async function deleteDevice(res: HttpResponseLike, route: RouteContext, deviceId: string): Promise<void> {
   if (!route.deps.store.list().some((device) => device.deviceId === deviceId)) {
     writeError(res, 404, 'not-found', `no device ${deviceId}`)
     return
@@ -1027,13 +1033,23 @@ function deleteDevice(res: HttpResponseLike, route: RouteContext, deviceId: stri
   // with it the accessToken — is gone while a socket still authenticated with
   // that token is up, which is exactly the leak this teardown exists to prevent.
   //
-  // The record is still present at this moment, which matters: the assembly's
+  // The eviction is AWAITED, which is the second half of that invariant and not
+  // a formality. `evict` claims the device's pool entries synchronously and then
+  // spends real time releasing them: the subscription layer goes first (it
+  // closes the peer subscriptions over the still-live socket, so the desktop
+  // frees their slots instead of reaping them on a timeout), and only then is
+  // the connection closed. Returning early would let `store.remove` land in the
+  // middle of that sequence — the record and its token discarded while the
+  // socket is still up and the peer still holds subscriptions for a device this
+  // harness no longer knows about. `cherry_unpair` awaits for the same reason;
+  // this route is its other caller and must not be the weaker one.
+  //
+  // The record is still present throughout, which matters: the assembly's
   // eviction reads it to dispose the device's subscription layer before closing
-  // the socket (so the peer is released cleanly rather than left to reap).
-  // Failures here are not the browser's problem; the archive edit below is what
-  // the caller asked for, and it still happens.
+  // the socket. Failures here are not the browser's problem; the archive edit
+  // below is what the caller asked for, and it still happens.
   try {
-    route.deps.evict?.(deviceId)
+    await route.deps.evict?.(deviceId)
   } catch (error) {
     console.warn(`[cherry-remote] device ${deviceId} teardown failed before removal`, error)
   }

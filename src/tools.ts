@@ -115,6 +115,28 @@ export interface CherryAmbiguousDevice {
   candidates: string[]
 }
 
+/**
+ * The device archive is unreadable and READ-ONLY, so no device question can be
+ * answered at all.
+ *
+ * Its own verdict rather than `ambiguous-device` with an empty candidate list,
+ * and that is the whole point. Ambiguity is an ANSWER — "pick one of these" —
+ * and with no candidates it tells the caller to disambiguate against a device
+ * set the plugin cannot see, while the real condition (a damaged
+ * `devices.json` that only an operator can repair) never surfaces. Every
+ * device-dependent tool answers this instead, so one branch on the caller's
+ * side covers the whole face.
+ */
+export interface CherryArchiveQuarantined {
+  error: 'archive-quarantined'
+  /** The shared recovery instruction ({@link QUARANTINE_RECOVERY}). */
+  guidance: string
+  /** The archive that cannot be read; still on disk, byte-for-byte. */
+  archive: string
+  /** The best-effort preservation copy, when one was made. */
+  preservedAs?: string
+}
+
 /** Why an aggregate stopped before the peer said it was done. */
 export type CherryTruncationReason =
   /** The caller's `limit` was reached with more items available. */
@@ -192,6 +214,30 @@ export interface CherryReadSnapshot {
   truncationReason?: CherryTruncationReason
 }
 
+/**
+ * The MESSAGE-walk verdict a terminal/timeout/idle aggregate carries.
+ *
+ * These three results ride the SAME `#readTerminalMessages` walk `cherry_read`
+ * does, but unlike `cherry_read` they cannot simply hand back a page: their
+ * `text` is the ANSWER (the run's reply, or the partial content so far), so a
+ * walk that stopped early is a correctness problem rather than a listing
+ * detail. The fields are MESSAGE-scoped (`messagesTruncated`, not `truncated`)
+ * because the result already carries an EVENT cursor under `cursor`, and a
+ * bare `truncated` would read as a verdict on the whole result.
+ *
+ * The flag never changes the STATUS: a truncated terminal aggregate is still
+ * `completed`. Surfacing is the contract — the caller learns that the text may
+ * be partial and where to resume, and decides what to do about it.
+ */
+export interface CherryMessageWalkVerdict {
+  /** Present and true exactly when the message walk stopped before the peer's end. */
+  messagesTruncated?: boolean
+  /** Why it stopped, present exactly when `messagesTruncated` is true. */
+  messagesTruncationReason?: CherryTruncationReason
+  /** The `agent.messages.list` cursor to resume the walk from. */
+  messagesResumeCursor?: string
+}
+
 // ---------------------------------------------------------------------------
 // Interactive-face contracts (Task 9)
 // ---------------------------------------------------------------------------
@@ -209,6 +255,12 @@ export interface CherryReadSnapshot {
  *    what arrived plus the cursor to resume from.
  *  - `idle` — `cherry_wait` on a session with no in-flight execution: the
  *    current snapshot, returned at once (no error, no waiting).
+ *  - `subscription-lost` — the run's event stream went away mid-wait and could
+ *    not be rebuilt. The run's outcome is UNKNOWABLE from here, which is a
+ *    different statement from `timeout` ("nothing settled inside the window")
+ *    and must not borrow its name: a caller that saw `timeout` would re-wait,
+ *    while this one has to fix the subscription (or read the run back by id)
+ *    first.
  *
  * NOTE the deliberate omission: a COMMAND RECEIPT's `interrupted` (the command
  * outcome is undecided) is a DIFFERENT dimension and never appears here.
@@ -221,6 +273,7 @@ export type CherryRunStatus =
   | 'awaiting-interaction'
   | 'timeout'
   | 'idle'
+  | 'subscription-lost'
 
 /** The four terminal execution statuses the waiter predicate covers. */
 const TERMINAL_EXECUTION_STATUSES = ['completed', 'failed', 'cancelled', 'interrupted'] as const
@@ -290,6 +343,20 @@ const MIN_WAIT_TIMEOUT_MS = 1
  * injectable for tests.
  */
 const DEFAULT_WAIT_POLL_MS = 25
+
+/**
+ * What a caller whose wait lost its event stream should do next.
+ *
+ * Reached only when the re-ensure itself could not be completed, so the run's
+ * outcome genuinely cannot be observed from here. The instruction names the two
+ * routes that DO work — the read face does not depend on the subscription, and
+ * a later `cherry_wait` rebuilds one from scratch — because "subscription lost"
+ * without a next step is a dead end for the caller.
+ */
+const SUBSCRIPTION_LOST_GUIDANCE =
+  'the session\'s event subscription was lost mid-wait and could not be re-established; the run\'s ' +
+  'outcome is unknowable from this wait. Read the session with cherry_read (it does not need a ' +
+  'subscription), or call cherry_wait again to rebuild the subscription from a fresh baseline'
 
 /**
  * Externalized part content is read in ≤24 KiB slices and the WHOLE content's
@@ -600,8 +667,11 @@ function defineCherryTool(definition: {
 }
 
 /**
- * The six read tools. Kept as one class (rather than six closures) so the
- * per-session and per-device state Tasks 9/10 add has an obvious home.
+ * The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
+ * family: the six READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9), and
+ * two MANAGEMENT ones (Task 10), plus the registration framework they all
+ * share. Kept as one class (rather than per-face closures) so the per-session
+ * and per-device state the later faces add has an obvious home.
  */
 class CherryToolEngine {
   readonly #deps: CherryToolsDeps
@@ -707,6 +777,29 @@ class CherryToolEngine {
     return { record: resolution, connection }
   }
 
+  /**
+   * The quarantined-archive verdict, or `undefined` for a healthy store.
+   *
+   * Consulted BEFORE any resolution, because a quarantined store's empty view
+   * makes every downstream answer a lie: `resolve` cannot find a device that IS
+   * paired (the archive is unreadable), so it reports ambiguity with no
+   * candidates, and a caller reasonably concludes the device is not paired —
+   * about a store that still holds its access token on disk. The probe is a
+   * cheap readonly field read on the store, and it is deliberately checked on
+   * every device-dependent entry point rather than once at registration: the
+   * archive can go bad while the process is running.
+   */
+  #quarantineVerdict(): CherryArchiveQuarantined | undefined {
+    const info = this.#deps.store.quarantineInfo()
+    if (info === undefined) return undefined
+    return {
+      error: 'archive-quarantined',
+      guidance: QUARANTINE_RECOVERY,
+      archive: info.file,
+      ...(info.corruptPath === undefined ? {} : { preservedAs: info.corruptPath }),
+    }
+  }
+
   /** True when `#resolve` answered with a structured verdict instead of a link. */
   #isVerdict(
     resolved: ResolvedDevice | CherryAmbiguousDevice | CherryDeviceUnavailable,
@@ -734,10 +827,18 @@ class CherryToolEngine {
    * The connection-plus-record pair, or the ambiguous verdict to return
    * verbatim. Lets each tool's body read as `resolved.link ?? resolved.verdict`
    * without repeating the discriminant dance.
+   *
+   * The quarantine check comes FIRST: it is the strongest statement available
+   * (the device set itself is unknowable), and letting resolution run would
+   * replace it with a weaker, wrong one.
    */
   #linkOr(
     device: string,
-  ): { link: ResolvedDevice; verdict?: undefined } | { link?: undefined; verdict: CherryAmbiguousDevice } {
+  ):
+    | { link: ResolvedDevice; verdict?: undefined }
+    | { link?: undefined; verdict: CherryAmbiguousDevice | CherryArchiveQuarantined } {
+    const quarantined = this.#quarantineVerdict()
+    if (quarantined !== undefined) return { verdict: quarantined }
     const resolved = this.#requireConnection(device)
     if ('error' in resolved) return { verdict: resolved }
     return { link: resolved }
@@ -874,6 +975,8 @@ class CherryToolEngine {
       },
       execute: async (args) => {
         const selector = optionalString(args['device'])
+        const quarantined = this.#quarantineVerdict()
+        if (quarantined !== undefined) return quarantined
         if (selector === undefined) {
           return { devices: this.#deps.store.list().map((record) => this.#deviceView(record)) }
         }
@@ -884,8 +987,17 @@ class CherryToolEngine {
     })
   }
 
-  /** The `cherry_devices` selector: candidates beat a throw (ruling ⑤). */
-  #selectRecords(selector: string): DeviceRecord[] | CherryAmbiguousDevice {
+  /**
+   * The `cherry_devices` selector: candidates beat a throw (ruling ⑤), and the
+   * quarantined archive outranks both.
+   *
+   * `cherry_unpair` shares this, so the quarantine check here is what keeps its
+   * `store.remove` from ever being reached on a READ-ONLY archive — the write
+   * would refuse and throw `QuarantinedArchiveError` straight out of the tool.
+   */
+  #selectRecords(selector: string): DeviceRecord[] | CherryAmbiguousDevice | CherryArchiveQuarantined {
+    const quarantined = this.#quarantineVerdict()
+    if (quarantined !== undefined) return quarantined
     const resolution = this.#deps.store.resolve(selector)
     if ('ambiguous' in resolution) {
       return { error: 'ambiguous-device', device: selector, candidates: resolution.ambiguous }
@@ -1732,14 +1844,20 @@ class CherryToolEngine {
 
         if (activeExecutionId === undefined) {
           // The IDLE answer, not a failure and not a wait: nothing is in flight,
-          // so the current snapshot IS the result.
+          // so the current snapshot IS the result. The message walk is bounded
+          // like every other aggregate, so its verdict rides along — an idle
+          // snapshot of a session past the ceiling is a PARTIAL history, and a
+          // caller stacking it against a later read would otherwise see content
+          // vanish with nothing to explain it.
+          const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session)
           return {
             status: 'idle' satisfies CherryRunStatus,
             sessionId,
             session,
             executionId: null,
-            messages: await this.#readTerminalMessages(connection, sessionId, session),
+            messages,
             cursor: this.#cursorOf(subscriptions, sessionId),
+            ...walk,
           }
         }
 
@@ -2192,7 +2310,27 @@ class CherryToolEngine {
         // this — the caches are pure derived state and can always be rebuilt.
         this.#forgetDevice(record.deviceId)
         await this.#deps.evict(record.deviceId)
-        this.#deps.store.remove(record.deviceId)
+        // The remove is GUARDED, not merely ordered. `#selectRecords` already
+        // rejects a quarantined store before a record can be named, so reaching
+        // here in that state would mean the archive went bad between the two
+        // reads — rare, but the window is real and the consequence is a raw
+        // `QuarantinedArchiveError` thrown out of a tool call, which is the one
+        // thing no face of this plugin does. Re-checking turns it into the same
+        // structured verdict, and the eviction above is harmless either way
+        // (the caches describe a pairing this call is abandoning regardless).
+        try {
+          this.#deps.store.remove(record.deviceId)
+        } catch (error) {
+          if (error instanceof QuarantinedArchiveError) {
+            return {
+              error: 'archive-quarantined',
+              guidance: QUARANTINE_RECOVERY,
+              archive: error.file,
+              ...(error.corruptPath === undefined ? {} : { preservedAs: error.corruptPath }),
+            }
+          }
+          throw error
+        }
 
         return {
           device: record.deviceId,
@@ -2488,6 +2626,67 @@ class CherryToolEngine {
   }
 
   /**
+   * The cursor a re-ensure should resume a MID-WAIT session from.
+   *
+   * It CANNOT be {@link #cursorOf} at the moment of recovery: the subscription
+   * is gone by definition, so `read` answers `cursor-out-of-window` and there is
+   * no layer cursor left to ask for. So the cursor is CARRIED — the last one the
+   * layer handed out while the session was still live, captured on every pass of
+   * the wait.
+   *
+   * Carrying it matters because the two recovery modes are NOT equivalent for a
+   * waiter. A cursor lets the peer REPLAY, so the events that arrived while the
+   * stream was down reach the fold as events — which is all `#observedState`
+   * understands. A cursorless ensure lands in checkpoint mode instead, which
+   * rebuilds peer-side STATE and delivers no events at all: the run could settle
+   * and this wait would never see it. The carried cursor keeps the recovery on
+   * the replay path.
+   *
+   * It is only usable while its EPOCH still matches: a re-subscribe creates a
+   * new peer-side stream, and offering a foreign epoch is refused as "epoch
+   * changed". That refusal is not a hazard — the layer answers it by falling
+   * back to a checkpoint, which is the same place the cursorless call would have
+   * landed — so the stale-epoch cursor is passed through rather than guessed
+   * about here.
+   */
+  #resumeCursorOf(carried: AgentCursor | undefined): AgentCursor | undefined {
+    return carried
+  }
+
+  /**
+   * The wait's terminal answer when its event stream could not be rebuilt.
+   *
+   * A RESULT, not a throw: the run is almost certainly fine — it is this
+   * harness's VIEW of it that was lost — and a caller that can read the session
+   * back (`cherry_read` needs no subscription) has everything it needs to
+   * recover. The `guidance` says so in one sentence, because a bare status name
+   * leaves the caller with no next step.
+   *
+   * The execution id is still reported whenever the wait had attached to one,
+   * so a caller can re-wait on it or read it back by id rather than guess.
+   */
+  #subscriptionLostResult(
+    sessionId: string,
+    executionId: string | undefined,
+    commandId: string | undefined,
+    reason: string,
+  ): Record<string, unknown> {
+    console.warn(
+      `[cherry-remote] wait on session ${sessionId} lost its event subscription and could not re-` +
+        `establish it (${reason || 'the session is no longer tracked'}); reporting subscription-lost ` +
+        'rather than inventing a timeout',
+    )
+    return {
+      status: 'subscription-lost' satisfies CherryRunStatus,
+      sessionId,
+      executionId: executionId ?? null,
+      ...(commandId === undefined ? {} : { commandId }),
+      reason: reason === '' ? 'the session is no longer tracked' : reason,
+      guidance: SUBSCRIPTION_LOST_GUIDANCE,
+    }
+  }
+
+  /**
    * The waiter: parks until the session's EXECUTION reaches one of the four
    * terminal states, an unanswered interaction makes the run a SOFT terminal,
    * or the window elapses.
@@ -2538,6 +2737,19 @@ class CherryToolEngine {
     // buffer only appends, so each pass folds just the events that arrived since
     // the previous one instead of rescanning the whole (cumulative) buffer.
     const observation: ObservationCarry = {}
+    // The ONE re-ensure budget (see the recovery block in the loop). A boolean,
+    // not a counter: the point is that a wait cannot convert its whole window
+    // into subscribe round trips.
+    let reEnsureAttempted = false
+    // Why the re-ensure failed, for the structured verdict. Set only on the
+    // path that also sets `reEnsureAttempted`, so it always describes a real
+    // attempt rather than a guessed cause.
+    let reEnsureFailure = ''
+    // The last cursor the subscription LAYER handed out while this session was
+    // still live. Kept so a mid-wait recovery has a replay position to offer
+    // (see `#resumeCursorOf`); it is captured fresh on every pass, so it is the
+    // newest position the wait was actually parked at.
+    let carriedCursor: AgentCursor | undefined
 
     for (;;) {
       // The link is the precondition for EVERYTHING below: a closed connection
@@ -2545,6 +2757,42 @@ class CherryToolEngine {
       // only delay the caller's discovery that the run is unobservable.
       if (connection.state !== 'connected') {
         throw new DeviceUnavailableError(connection.record.deviceId, connection.state)
+      }
+
+      // The session's SUBSCRIPTION is the second precondition, and it can be
+      // lost on a perfectly healthy link. Two ordinary routes do it mid-wait:
+      // the peer pushes `agent.subscriptions.resetRequired` (the layer drops the
+      // session outright), or a 9th subscribe evicts this session under the
+      // local LRU cap. Both leave `read` answering `cursor-out-of-window`, so
+      // every later pass would see an EMPTY buffer, spin its poll interval, and
+      // finally report `timeout` — a wrong verdict for a run that settled long
+      // before, and one the caller cannot distinguish from a genuinely slow run.
+      //
+      // Recovery is one re-ensure from the cursor already held (which the layer
+      // accepts as a replay request, so the peer sends only what arrived since).
+      // It is attempted AT MOST ONCE per wait: a peer that keeps tearing the
+      // subscription down would otherwise turn every poll pass into a subscribe
+      // round trip, and the caller would still never get an answer. Failing that
+      // one attempt ends the wait with a structured verdict rather than burning
+      // the rest of the window on a stream nobody is feeding.
+      if (!subscriptions.activeSessions().includes(sessionId)) {
+        if (reEnsureAttempted) {
+          return this.#subscriptionLostResult(sessionId, latestExecutionId, options.commandId, reEnsureFailure)
+        }
+        reEnsureAttempted = true
+        try {
+          await subscriptions.ensure(sessionId, this.#resumeCursorOf(carriedCursor))
+        } catch (error) {
+          reEnsureFailure = error instanceof Error ? error.message : String(error)
+          return this.#subscriptionLostResult(sessionId, latestExecutionId, options.commandId, reEnsureFailure)
+        }
+        // Another pass is needed before any judgement: the replayed events have
+        // to be folded before the run can be judged. The OBSERVATION CARRY is
+        // deliberately kept rather than rebuilt — it holds this wait's baseline
+        // cut, adopted execution and any terminal already seen, none of which the
+        // lost buffer can invalidate — and the fold is seq-gated, so a replayed
+        // event at the boundary is not folded twice.
+        continue
       }
 
       const observed = this.#observedState(subscriptions, sessionId, {
@@ -2617,6 +2865,10 @@ class CherryToolEngine {
       // no sleep at all — burning the heap rather than the clock. A rejecting
       // wake therefore falls back to a full poll interval before the next pass.
       const cursor = this.#cursorOf(subscriptions, sessionId)
+      // Remember the parked position for the recovery path: by the time the
+      // loss is noticed, this is the only cursor still describing where this
+      // wait had got to.
+      if (cursor !== undefined) carriedCursor = cursor
       const pollMs = Math.min(this.#waitPollMs, Math.max(1, deadline - now))
       // The park is CANCELLED before the next one is made, and also when this
       // pass ends for any other reason. Without the disposer the loop would
@@ -2850,6 +3102,24 @@ class CherryToolEngine {
    * "First" means first in the buffer's own order — the buffer is append-ordered
    * by construction, so this is the earliest post-baseline run, not whichever
    * event happens to be newest.
+   *
+   * ACCEPTED BOUND (adjudicated, no behavior change): both this scan and
+   * {@link CherryToolEngine.#settledStatusOf} read the session buffer, which the
+   * subscription layer TRIMS to its per-session byte budget by dropping the
+   * OLDEST events. Once a run's `execution.updated` has been trimmed away, the
+   * id it named is no longer knowable from here, so a wait that has not yet
+   * attached to that run degrades to what it would have been without adoption at
+   * all: it parks out its window and answers `timeout` (with the partial content
+   * and the resume cursor, per spec §6) rather than `completed`. The bound is
+   * therefore ~2 MiB of buffered events per session — the default budget — and
+   * reaching it takes a run that both emits that much event traffic AND whose
+   * command receipt omitted `executionId`. The degradation is bounded and
+   * recoverable rather than silent: `timeout` is a non-failure answer, and
+   * `cherry_read` rebuilds the full picture without the buffer.
+   *
+   * It is NOT fixed by scanning the peer's journal, because the peer's replay
+   * window is itself bounded and the tool has no cursor to offer it — the same
+   * trim would simply move one layer down, at the cost of an RPC on every pass.
    */
   #adoptExecution(
     subscriptions: SessionSubscriptions,
@@ -2955,7 +3225,7 @@ class CherryToolEngine {
       unknown
     >
     const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
-    const messages = await this.#readTerminalMessages(connection, sessionId, session)
+    const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session)
     // The cache is refreshed from the terminal snapshot so a follow-up send
     // does not have to re-read the session.
     const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
@@ -2969,6 +3239,10 @@ class CherryToolEngine {
       text: aggregateAssistantText(messages, typeof terminalMessageId === 'string' ? terminalMessageId : undefined),
       messages,
       cursor: this.#cursorOf(subscriptions, sessionId),
+      // The walk's own verdict rides beside the EVENT cursor, never replacing
+      // it: a caller resuming the RUN and a caller resuming the HISTORY are
+      // asking two different questions.
+      ...walk,
     }
   }
 
@@ -2992,7 +3266,7 @@ class CherryToolEngine {
       unknown
     >
     const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
-    const messages = await this.#readTerminalMessages(connection, sessionId, session)
+    const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session)
     return {
       status: 'timeout' satisfies CherryRunStatus,
       sessionId,
@@ -3001,6 +3275,10 @@ class CherryToolEngine {
       text: aggregateAssistantText(messages),
       messages,
       cursor: this.#cursorOf(subscriptions, sessionId),
+      // Partial content is the POINT of a timeout answer, so the walk verdict
+      // matters most here: "here is what arrived" must not read as "here is
+      // everything" when the history walk itself ran out at the ceiling.
+      ...walk,
     }
   }
 
@@ -3008,14 +3286,20 @@ class CherryToolEngine {
    * The session's assistant messages, read to completion with `{ref}` parts
    * aggregated through `agent.content.read` — the SAME path `cherry_read` uses
    * (spec §3.6: the terminal aggregate resolves externalized parts too).
+   *
+   * The MESSAGE-walk verdict comes back WITH the messages rather than being
+   * dropped: this walk is bounded by {@link MAX_AGGREGATE_LIMIT} messages, so a
+   * session past that ceiling stops with the peer still holding pages. The three
+   * callers (terminal, timeout, idle) each surface it — a walk never stops early
+   * and reports success.
    */
   async #readTerminalMessages(
     connection: DeviceConnection,
     sessionId: string,
     session: Record<string, unknown>,
-  ): Promise<CherryReadMessage[]> {
+  ): Promise<{ messages: CherryReadMessage[] } & CherryMessageWalkVerdict> {
     const historyRevision = optionalString(session['historyRevision'])
-    if (historyRevision === undefined) return []
+    if (historyRevision === undefined) return { messages: [] }
 
     const page = await this.#aggregate(
       connection,
@@ -3029,7 +3313,7 @@ class CherryToolEngine {
     for (const raw of page.items) {
       messages.push(await this.#projectMessage(connection, sessionId, raw))
     }
-    return messages
+    return { messages, ...messageWalkVerdict(page) }
   }
 
   async #ensureSubscription(deviceId: string, sessionId: string): Promise<void> {
@@ -3119,7 +3403,26 @@ function questionKeysOf(input: unknown): string[] {
   return parsed
 }
 
-/** Extracts the ordered question texts from an interaction input, if any. */
+/**
+ * Extracts the ordered question texts from an interaction input, if any.
+ *
+ * BEST-EFFORT BY DESIGN, and the `{ref}` branch is where that shows. The peer
+ * externalizes an interaction input above 4 KiB into a `{ref}`, and resolving
+ * one needs an `agent.content.read` round trip this pure parse has no way to
+ * make. So a `{ref}` input yields `undefined` and the caller gets an EMPTY
+ * question list.
+ *
+ * What that means for a caller is worth stating plainly: a question card whose
+ * input was externalized is UNANSWERABLE through the tool face today, because
+ * `cherry_respond`'s `response` form is keyed by question TEXT and there is no
+ * text to key by. The card is still visible (`cherry_interactions` reports its
+ * id, kind and summary) and a `decision` card is unaffected — its answer is the
+ * `decision` field, not a per-question map. Resolving `{ref}` inputs through the
+ * SAME externalized-content walk `cherry_read` uses is the deferred fix
+ * (adjudicated: documented best-effort now, `content.read` resolution later),
+ * and it is deferred rather than half-done because an unverified ref must never
+ * be presented as an answer key.
+ */
 function parseQuestionInput(input: unknown): string[] | undefined {
   if (!isRecord(input)) return undefined
   let body: unknown
@@ -3143,6 +3446,25 @@ function parseQuestionInput(input: unknown): string[] | undefined {
 }
 
 /**
+ * The message-walk verdict, projected off an aggregate page.
+ *
+ * Extracted so the three non-`cherry_read` walkers ({@link
+ * CherryToolEngine.#readTerminalMessages}) report truncation in EXACTLY the
+ * shape `cherry_read` already does, from one place: a second, independently
+ * worded projection is how the terminal face and the read face drift apart
+ * again. Absent fields (rather than `false`/`undefined` keys) keep a complete
+ * walk's result shape unchanged for existing callers.
+ */
+function messageWalkVerdict(page: CherryPage<unknown>): CherryMessageWalkVerdict {
+  if (!page.truncated) return {}
+  return {
+    messagesTruncated: true,
+    ...(page.truncationReason === undefined ? {} : { messagesTruncationReason: page.truncationReason }),
+    ...(page.nextCursor === undefined ? {} : { messagesResumeCursor: page.nextCursor }),
+  }
+}
+
+/**
  * The assistant text a terminal aggregate reports: the awaited RUN's assistant
  * message text parts, joined.
  *
@@ -3157,6 +3479,13 @@ function parseQuestionInput(input: unknown): string[] | undefined {
  * execution's terminal named — is the exact cut. When the peer named none, the
  * LAST assistant message is the run's own reply under the protocol's
  * append-per-run ordering, which still beats summing the history.
+ *
+ * THE FALLBACK IS BEST-EFFORT, AND THAT IS WHY THE CALLER FLAGS IT. The
+ * last-in-walk message is only the run's reply when the walk reached the
+ * session's true end. On a session past the aggregate ceiling it is a message
+ * from an EARLIER run, and `terminalMessageId` is present but outside the walk
+ * in the same way — both cases leave the text partial or stale, so neither may
+ * be presented as a complete answer (see {@link CherryMessageWalkVerdict}).
  */
 function aggregateAssistantText(messages: CherryReadMessage[], terminalMessageId?: string): string {
   const scoped =

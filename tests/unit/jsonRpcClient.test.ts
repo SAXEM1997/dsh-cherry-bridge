@@ -501,6 +501,34 @@ describe('JsonRpcClient', () => {
     await expect(client.request('echo.ok', { ok: true })).resolves.toEqual({ ok: true })
   })
 
+  it('⑨b (F2-6b) bounds the LENGTH of the classification fields a hostile peer can log', async () => {
+    const { client, peer } = await openLoopback()
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // Excluding payload fields is not enough when the CLASSIFICATION fields are
+    // themselves peer-supplied and unbounded. A 10k-character method name makes
+    // the frame fail validation, and the drop warning then quotes the method —
+    // so without a bound the peer chooses how many bytes land in the log.
+    const HUGE_METHOD = `m${'x'.repeat(10_000)}`
+    await peer.write({ jsonrpc: '2.0', id: 424242, method: HUGE_METHOD, params: {} })
+
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('dropped invalid JSON-RPC request'))
+    })
+
+    const line = warn.mock.calls.map((call) => call.map(String).join(' ')).join('\n')
+    // The log line stays small — nowhere near the 10k the peer sent.
+    expect(line.length).toBeLessThan(2_000)
+    // The method is still CLASSIFIED (its head is intact, so an operator can
+    // tell what the peer attempted)...
+    expect(line).toContain('mxxxx')
+    // ...and it is explicitly marked as clipped, so a truncated value is never
+    // mistaken for the peer's real method name.
+    expect(line).toContain('…')
+    expect(line).not.toContain(HUGE_METHOD)
+  })
+
   it('⑩ (F4) updateMaxInFlight resizes admissions without touching pending requests', async () => {
     const { client, peer } = await openLoopback({ maxInFlight: 4 })
     const harness = new PeerHarness(peer)

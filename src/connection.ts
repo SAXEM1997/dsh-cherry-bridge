@@ -89,9 +89,16 @@ export class DeviceUnavailableError extends Error {
  * CEILING for the business-request window — not the window itself. The window
  * is owned by the rpc layer and is sized from the peer's hello-reported
  * `inFlightRequests` (spec §3.4「取回报一半」): see
- * {@link businessWindowFor}. 8 is what the client uses either when the peer
- * reports nothing (the fallback limit below) or when half its report exceeds
- * this ceiling.
+ * {@link businessWindowFor}. The ceiling binds only when HALF the peer's report
+ * exceeds it — a peer reporting 64 gets 8, not 32.
+ *
+ * The FALLBACK is a DIFFERENT path and does not land on this number. When the
+ * peer's hello says nothing about `inFlightRequests`, {@link FALLBACK_LIMITS}
+ * supplies 8, and `#handshake` then runs that through the same half-the-report
+ * rule as any other report: `floor(8 / 2)` = 4. So a silent peer gets a
+ * business window of 4 — deliberately the CONSERVATIVE reading, since the whole
+ * point of the halving is to stay inside an allowance the peer never confirmed.
+ * The client is constructed at 8 only for the window before hello answers.
  */
 const BUSINESS_MAX_IN_FLIGHT = 8
 const FALLBACK_LIMITS: EffectiveLimits = {
@@ -632,6 +639,20 @@ export class DeviceConnection {
 
     let lastError: Error = new Error(`device ${this.record.deviceId}: all candidate hosts unreachable`)
     for (const host of this.record.hosts) {
+      // CANCELLATION GATE, at the top of every candidate. `close()` bumps the
+      // epoch and clears `#running`, so either check is enough — both are here
+      // because they answer different halves of the same question ("is this
+      // pass still the live one?") and a future refactor of one must not
+      // silently reopen the hole.
+      //
+      // Without it, a close() landing DURING a candidate's handshake is
+      // classified as a per-host failure (the socket went away — which is true,
+      // and is exactly why the dial loop wants to try the next address) and the
+      // pass keeps dialing the REST of the candidate list, running a full
+      // hello+authenticate against each. Those late attempts are not merely
+      // wasted work: once a new cycle has started, a stale attempt's teardown
+      // path can land on the NEW cycle's link and kill it.
+      if (!this.#running || epoch !== this.#epoch) throw new CancelledError()
       let link: LiveLink
       try {
         link = await this.#dial(host, this.record.port, epoch)
@@ -648,6 +669,12 @@ export class DeviceConnection {
         await this.#handshake(link, epoch)
         return
       } catch (error) {
+        // A close() that landed mid-handshake surfaces here as the failure of
+        // whatever call was in flight (`#teardownLink` rejected it), so the
+        // epoch is re-checked before the error is classified: cancellation is
+        // not this ADDRESS's fault, and falling through would dial the next
+        // candidate for a pass that no longer exists.
+        if (error instanceof CancelledError || !this.#running || epoch !== this.#epoch) throw new CancelledError()
         // The terminal faces end the pass: they describe the PAIRING, not this
         // address, so trying the next candidate would only repeat them.
         if (!isPerHostFailure(error)) throw error
@@ -964,7 +991,14 @@ export class DeviceConnection {
     // keeps the handlers for the next cycle, but nothing is attached any more.
     this.#attachedHandlers.clear()
     if (link !== undefined) {
-      link.client.dispose()
+      // LINK-LOSS disposal, not plain `dispose()`: every request still in flight
+      // on this socket must hear about the DEVICE (the spec §6 `{device, state}`
+      // condition, reached through the channel-closed face the layers above
+      // already classify), not about this client object's own lifetime. The
+      // message is the only difference between the two paths, and it is the
+      // whole difference a caller acts on: "the channel closed" is a statement
+      // about the desktop, "the client was disposed" reads like a plugin bug.
+      link.client.disposeForLinkLoss()
       void link.channel.close().catch(noop)
       try {
         link.ws.close()

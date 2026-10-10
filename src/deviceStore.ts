@@ -282,7 +282,13 @@ function readArchive(file: string): ArchiveFile | undefined {
     text = readFileSync(file, 'utf8')
   } catch (error) {
     if (isNotFound(error)) {
-      console.warn(`device archive ${file} could not be read; starting from an empty archive:`, error)
+      // INFO, not a warning: a missing archive is the NORMAL first-run state
+      // (and also what a deliberate delete looks like). Warning here would put
+      // a line in every operator's log on every fresh install, for a condition
+      // that is not actionable and not a fault — which is precisely how a log
+      // teaches its reader to ignore warnings. The quarantine path below keeps
+      // `warn`, because that one really does need a human.
+      console.info(`device archive ${file} does not exist yet; starting from an empty archive`)
       return undefined
     }
     throw new QuarantinedArchiveError(file, error)
@@ -459,6 +465,41 @@ export class DeviceStore {
 
   constructor(file: string) {
     this.#file = file
+  }
+
+  /**
+   * Whether the archive has been found unreadable and quarantined.
+   *
+   * A READ-ONLY PROBE, and deliberately not a `list()`-shaped one. The whole
+   * problem it solves is that a quarantined store's empty view is
+   * INDISTINGUISHABLE from a genuinely empty one: `list()` returns `[]` either
+   * way, so a caller that only looks at the returned array cannot tell "no
+   * devices are paired" from "the device list is unknowable". Faces that would
+   * otherwise answer with that empty view — every device tool, and the HTTP
+   * reads — ask this instead and report the real condition.
+   *
+   * It consults `#load()` so a store that has never been read still answers
+   * truthfully (reading is what DISCOVERS the corruption), and so a store whose
+   * archive went bad mid-life is reported as it is NOW rather than as it was at
+   * construction. `#load()` cannot throw for this reason: a corrupt archive is
+   * quarantined into the empty view rather than propagated.
+   */
+  get quarantined(): boolean {
+    this.#load()
+    return this.#quarantine !== undefined
+  }
+
+  /**
+   * The quarantine, when there is one: the file, the preservation copy, and the
+   * underlying failure. `undefined` for a healthy store.
+   *
+   * Same read-only contract as {@link quarantined}, for the faces that need to
+   * NAME the two files the operator has to look at rather than only report that
+   * something is wrong.
+   */
+  quarantineInfo(): QuarantinedArchiveError | undefined {
+    this.#load()
+    return this.#quarantine
   }
 
   list(): DeviceRecord[] {

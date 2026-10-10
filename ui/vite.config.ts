@@ -124,7 +124,13 @@ export default defineConfig(({ mode }) => {
         },
     build: isClientBundle
       ? {
-          outDir: resolve(here, '..', 'lib'),
+          // `CHERRY_BUILD_OUT_DIR` redirects the artifact for the freshness
+          // check (`tests/unit/artifactFreshness.test.ts`), which must build the
+          // bundle WITHOUT overwriting the committed `lib/client.js` it is about
+          // to compare against — an in-place rebuild would repair the staleness
+          // and then compare the repaired file with itself. Unset in every
+          // normal build, so the published path is unchanged.
+          outDir: process.env['CHERRY_BUILD_OUT_DIR'] ?? resolve(here, '..', 'lib'),
           emptyOutDir: false,
           // The host loads this file as a classic script through the module
           // loader, so it must be one self-contained CJS chunk (ModuleLoader

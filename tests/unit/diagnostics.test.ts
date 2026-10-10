@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildDiagnostics, digestIdentity, sanitizeDevice } from '../../src/diagnostics.js'
+import { buildDiagnostics, digestIdentity, sanitizeDevice, DIAGNOSTICS_DEVICE_KEYS } from '../../src/diagnostics.js'
 import type { DiagnosticsSources } from '../../src/diagnostics.js'
 import type { DeviceRecord } from '../../src/deviceStore.js'
 
@@ -45,6 +45,27 @@ describe('final review: digestIdentity on an absent identity', () => {
   it('R10c: a device with no pinned identity reports `unknown` through sanitizeDevice', () => {
     const projected = sanitizeDevice(record({ desktopIdentity: '' }), 'offline')
     expect(projected.desktopIdentity).toBe('unknown')
+  })
+})
+
+describe('F2-6c: the device whitelist describes the shape sanitizeDevice really emits', () => {
+  it('lists every key the projection produces, `limits` included, and nothing it does not', () => {
+    const projected = sanitizeDevice(record(), 'connected', {
+      heartbeatMs: 20_000,
+      subscriptions: 8,
+      pageItems: 100,
+      inFlightRequests: 8,
+    })
+
+    // The whitelist is a statement about what MAY appear. A field the projection
+    // emits but the list omits makes the list wrong — and `limits` was exactly
+    // that: the negotiated caps reach every report, but a reader of this list
+    // would conclude they never do.
+    expect([...DIAGNOSTICS_DEVICE_KEYS].sort()).toEqual(Object.keys(projected).sort())
+    expect(DIAGNOSTICS_DEVICE_KEYS).toContain('limits')
+    // And the credential fields are still absent from both.
+    expect(Object.keys(projected)).not.toContain('accessToken')
+    expect(Object.keys(projected)).not.toContain('tokenExpiresAt')
   })
 })
 

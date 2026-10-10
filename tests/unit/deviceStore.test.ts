@@ -33,11 +33,12 @@ const DEVICES_FILENAME = 'devices.json'
 const tempDirs: string[] = []
 
 beforeEach(() => {
-  // The store legitimately warns on every unreadable archive — including the
+  // The store legitimately logs on every unreadable archive — including the
   // first-run ENOENT that most tests trigger just by pointing at a fresh
-  // directory. Silence it globally so the suite output stays pristine; the
-  // tests that ASSERT on the warning re-spy inside themselves.
+  // directory. Silence both channels globally so the suite output stays
+  // pristine; the tests that ASSERT on a log re-spy inside themselves.
   vi.spyOn(console, 'warn').mockImplementation(() => {})
+  vi.spyOn(console, 'info').mockImplementation(() => {})
 })
 
 afterEach(async () => {
@@ -564,6 +565,32 @@ describe('DeviceStore corruption handling', () => {
     expect((await readArchive(file)).devices).toEqual([makeRecord()])
   })
 
+  it('F2-6g first-run ENOENT is INFO-level: a normal path never warns', async () => {
+    // A missing archive is the ordinary state of every fresh install (and of a
+    // deliberate delete). Logging it at `warn` puts a line in every operator's
+    // log for something that needs no action, which is how a log teaches its
+    // reader to ignore warnings altogether.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
+
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    expect(store.list()).toEqual([])
+
+    expect(warn).not.toHaveBeenCalled()
+    expect(info.mock.calls.flat().map(String).join('\n')).toMatch(/does not exist yet|empty archive/i)
+  })
+
+  it('F2-6g a first-run store is still writable after the info line (no quarantine was raised)', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    expect(store.quarantined).toBe(false)
+
+    store.upsert(makeRecord())
+    expect(store.quarantined).toBe(false)
+    expect(store.list()).toEqual([makeRecord()])
+  })
+
   it('returns an empty store, does not throw, and warns when the file is corrupt (⑥ RF4)', async () => {
     const file = await makeStoreFile()
     await writeFile(file, '{ this is not json', 'utf8')
@@ -604,12 +631,13 @@ describe('DeviceStore corruption handling', () => {
     expect(warn).toHaveBeenCalled()
   })
 
-  it('warns but does not throw when the archive disappeared (⑥ RF4)', async () => {
+  it('logs at info level but does not throw when the archive disappeared (⑥ RF4, F2-6g)', async () => {
     const file = await makeStoreFile()
     // Spied BEFORE the first read: the first-run read is exactly the path under
-    // test here, and letting its warning escape would leave stray stderr in the
-    // suite output (the store genuinely warns on every unreadable archive).
+    // test here, and letting its log line escape would leave stray stderr in the
+    // suite output.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {})
     new DeviceStore(file).upsert(makeRecord())
 
     // Simulates the archive being deleted underneath a running plugin.
@@ -618,6 +646,11 @@ describe('DeviceStore corruption handling', () => {
     const store = new DeviceStore(file)
     expect(store.list()).toEqual([])
     expect(store.resolve('dev-alpha')).toEqual({ ambiguous: [] })
-    expect(warn).toHaveBeenCalled()
+    // The degradation is still ANNOUNCED — just at the level it deserves. A
+    // missing archive is not a fault to act on, so warning about it trains the
+    // operator to ignore warnings; saying nothing at all would hide a real
+    // event (the archive vanishing under a running plugin).
+    expect(info).toHaveBeenCalled()
+    expect(warn).not.toHaveBeenCalled()
   })
 })

@@ -881,7 +881,11 @@ describe('④ PATCH address maintenance', () => {
 
   it('evicts the pooled connection on an address change, but not on an unrelated edit', async () => {
     const evicted: string[] = []
-    mount({ evict: (deviceId) => evicted.push(deviceId) })
+    mount({
+      evict: (deviceId) => {
+        evicted.push(deviceId)
+      },
+    })
     store.upsert(record({ hosts: ['10.0.0.1'], port: 1234 }))
 
     // A rename touches no address: the live connection stays as it is.
@@ -1236,6 +1240,32 @@ describe('⑥ lifecycle', () => {
     // At eviction time the record was STILL in the archive: the socket is torn
     // down first, and only then is the record (and its token) discarded.
     expect(observed).toEqual([{ when: 'evict', devices: ['dev-1'] }])
+    expect(store.list()).toHaveLength(0)
+  })
+
+  it('F2-6a DELETE AWAITS an asynchronous eviction before removing the record', async () => {
+    // R5b pins the ORDER of the two steps. This pins the other half of the same
+    // invariant: that the first step has genuinely FINISHED. The assembly's
+    // eviction is asynchronous — it releases the peer subscriptions over the
+    // still-live socket, then closes the connection — so a route that fires it
+    // and moves on leaves `store.remove` landing mid-teardown, with the record
+    // (and its token) gone while the socket is still up.
+    const observed: string[] = []
+    mount({
+      evict: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        observed.push('evict-complete')
+      },
+      detach: () => undefined,
+    })
+    store.upsert(record())
+
+    const { status } = await call('/devices/dev-1', { method: 'DELETE' })
+
+    expect(status).toBe(204)
+    // The eviction had completed BY THE TIME THE RESPONSE WENT OUT, and the
+    // record is gone after it — never the other way round.
+    expect(observed).toEqual(['evict-complete'])
     expect(store.list()).toHaveLength(0)
   })
 

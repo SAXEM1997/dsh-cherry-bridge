@@ -14,6 +14,14 @@ const DEFAULT_TIMEOUT_MS = 30_000
 const CHANNEL_CLOSED_MESSAGE = 'JSON-RPC channel closed'
 /** Bounded number of schema issues quoted in one drop warning. */
 const ISSUE_LIMIT = 3
+/**
+ * Longest peer-supplied identifier (`method` / `id`) quoted in a drop warning.
+ *
+ * A LOG-SIZE bound, not a protocol one: the frame has already failed validation
+ * when this applies, so the peer is either broken or hostile, and the log line
+ * must not grow with whatever it sent.
+ */
+const FRAME_FIELD_LIMIT = 120
 
 export interface JsonRpcClientOptions {
   /** Business requests allowed in flight at once; further calls queue. */
@@ -63,6 +71,15 @@ function encodeFrame(value: unknown): unknown {
  * (a bounded identifier the remote controls, and the only part that routes the
  * report), the request id when the frame carries one, and the schema path that
  * failed. Everything else stays out.
+ *
+ * BOUNDED IN LENGTH TOO, not only in content. `method` and `id` are
+ * peer-supplied strings, and a hostile or merely broken peer can put a
+ * megabyte in either: the frame fails validation, and this function then writes
+ * that megabyte into the operator's log at warn level. Excluding payload fields
+ * is not enough when the CLASSIFICATION fields are themselves unbounded, so
+ * both are truncated with an explicit ellipsis (the marker matters — a silently
+ * clipped value reads as the peer's actual method name, and an operator would
+ * go looking for a tool that never existed).
  */
 function describeFrame(value: unknown): string {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -70,9 +87,20 @@ function describeFrame(value: unknown): string {
   }
   const record = value as Record<string, unknown>
   const parts: string[] = []
-  if (typeof record['method'] === 'string') parts.push(`method="${record['method']}"`)
-  if ('id' in record) parts.push(`id=${JSON.stringify(record['id'])}`)
+  if (typeof record['method'] === 'string') parts.push(`method="${bounded(record['method'])}"`)
+  if ('id' in record) parts.push(`id=${bounded(JSON.stringify(record['id']))}`)
   return parts.length === 0 ? 'frame has no method or id' : parts.join(' ')
+}
+
+/**
+ * A peer-supplied identifier, clipped to {@link FRAME_FIELD_LIMIT} for logging.
+ *
+ * The limit is generous enough to keep every realistic method name and request
+ * id intact — 120 characters is longer than any name the protocol defines — so
+ * the clip only ever fires on a frame that is already malformed or hostile.
+ */
+function bounded(text: string): string {
+  return text.length <= FRAME_FIELD_LIMIT ? text : `${text.slice(0, FRAME_FIELD_LIMIT)}…`
 }
 
 /** The zod issue paths of a failed parse, joined for one bounded log line. */
@@ -229,6 +257,31 @@ export class JsonRpcClient {
     if (this.disposed) return
     this.disposed = true
     this.failAll('JSON-RPC client disposed')
+  }
+
+  /**
+   * Tears the client down because its LINK went away, not because the local
+   * side chose to stop using it.
+   *
+   * The distinction is the whole point of a separate entry point. `dispose()`
+   * describes this object's own lifetime ("this client was disposed"), which is
+   * an internal-sounding statement about the plugin's bookkeeping; a caller
+   * holding an in-flight request needs to hear about the DEVICE — the spec §6
+   * `{device, state}` condition — and this is the message every layer above
+   * already classifies as a dead channel. So the link-loss path fails in flight
+   * with {@link CHANNEL_CLOSED_MESSAGE}, exactly as the read loop's own
+   * channel-death path does, and marks the client `closed` so a request issued
+   * after the loss fails fast with the same face instead of queueing onto a
+   * socket that no longer exists.
+   *
+   * `disposed` is set too — nothing may use this client again — but it is set
+   * AFTER the rejection, so the message a caller sees is the link-loss one.
+   */
+  disposeForLinkLoss(): void {
+    if (this.disposed) return
+    this.closed = true
+    this.failAll(CHANNEL_CLOSED_MESSAGE)
+    this.disposed = true
   }
 
   /**

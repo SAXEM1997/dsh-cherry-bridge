@@ -585,6 +585,8 @@ export class FakeCherry {
   #watermark: number
   #subscriptions = new Map<string, FakeSubscriptionRecord>()
   #subscribeCalls: FakeSubscribeCall[] = []
+  /** When set, every `agent.sessions.subscribe` is refused with this reason. */
+  #refuseSubscriptionsWith: string | undefined
   #checkpointReadCalls: Array<{ subscriptionId: string; checkpointId: string; pageCursor: string | undefined }> = []
   #activateCalls: Array<{ subscriptionId: string; appliedCursor: AgentCursor; ok: boolean }> = []
   #ackCalls: Array<{ subscriptionId: string; cursor: AgentCursor }> = []
@@ -905,6 +907,20 @@ export class FakeCherry {
   }
 
   /**
+   * REPLACES the message fixtures the read face serves.
+   *
+   * For a test that wants one long-history scenario and one short-history
+   * scenario on the SAME running peer: an idle snapshot is otherwise answered
+   * from whatever the fixture declared at construction. The handlers read
+   * through `this.#agent().messages`, so the swap takes effect immediately
+   * (and a later run still APPENDS its terminal message, as the real peer does).
+   */
+  setAgentMessages(messages: FakeMessageRecord[]): void {
+    if (this.#options.agent === undefined) this.#options.agent = {}
+    this.#options.agent.messages = messages
+  }
+
+  /**
    * Moves one session's `historyRevision` (and with it the `idleRevision` its
    * summary reports while the session is idle).
    *
@@ -1055,6 +1071,19 @@ export class FakeCherry {
   }
 
   /**
+   * Refuses EVERY subsequent `agent.sessions.subscribe` with `reason`, or stops
+   * refusing when called with `undefined`.
+   *
+   * Distinct from `subscriptionLimit`, which models a cap the client can see
+   * and work around by evicting: this is a peer that answers RESOURCE_EXHAUSTED
+   * (or anything else) no matter how much room the client makes, so a recovery
+   * path has no route back and its failure face is what gets exercised.
+   */
+  refuseSubscriptions(reason: string | undefined): void {
+    this.#refuseSubscriptionsWith = reason
+  }
+
+  /**
    * REPLAYS one already-emitted event to the live subscriber of `sessionId`,
    * carrying its ORIGINAL (lower) seq — the peer-side fault of a duplicate or
    * out-of-order delivery on an otherwise healthy stream.
@@ -1132,6 +1161,29 @@ export class FakeCherry {
    */
   setRequestDelay(ms: number | undefined): void {
     this.#requestDelayMs = ms
+  }
+
+  /**
+   * Abruptly closes every LIVE socket while leaving the listener up, so the
+   * client observes a mid-run link loss and its own supervisor decides what to
+   * do next (backoff → reconnect). Distinct from {@link stop}, which also takes
+   * the server down and therefore ends the story at "offline".
+   *
+   * `terminate()` rather than a graceful close: a real link loss is a reset, and
+   * a graceful close would let the client finish in-flight reads first — which
+   * is exactly the window these scenarios are about.
+   *
+   * Returns the sockets it dropped, so a test can count a PEER-SIDE dial that
+   * arrived after the drop.
+   */
+  dropConnections(): number {
+    const dropped = this.#live.length
+    for (const { socket, controller } of this.#live) {
+      controller.abort()
+      socket.terminate()
+    }
+    this.#live = []
+    return dropped
   }
 
   async stop(): Promise<void> {
@@ -1447,6 +1499,16 @@ export class FakeCherry {
   #handleAgentSubscribe(params: Record<string, unknown>): Record<string, unknown> {
     const sessionId = params['sessionId'] as string
     const cursor = params['cursor'] as AgentCursor | undefined
+
+    // Injected refusal: the peer answers EVERY subscribe with this reason for
+    // as long as it is set. Models a desktop whose allowance is exhausted for
+    // reasons the client cannot see, so a recovery that re-subscribes has no
+    // route back and must say so rather than retry forever.
+    if (this.#refuseSubscriptionsWith !== undefined) {
+      const reason = this.#refuseSubscriptionsWith
+      this.#subscribeCalls.push({ sessionId, cursor, mode: 'error', reason })
+      throw new FakeRpcError({ reason, message: `Subscribe refused (${reason})` })
+    }
 
     for (const existing of this.#subscriptions.values()) {
       if (existing.sessionId === sessionId && existing.phase !== 'reset') {

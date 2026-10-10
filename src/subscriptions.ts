@@ -794,6 +794,22 @@ export class SessionSubscriptions {
       // expected during eviction races, so this is not a warning.
       return
     }
+    // A MISSING epoch is the peer's older shape and is tolerated (the check
+    // below simply has nothing to compare against). A PRESENT but non-string
+    // epoch is a different thing entirely: it is a value this layer cannot
+    // compare, and letting it through would silently treat the batch as
+    // belonging to the CURRENT stream — which is exactly the assumption the
+    // epoch exists to prevent. The peer is saying "this came from an epoch",
+    // and this layer cannot tell WHICH, so the batch is refused with a warning
+    // rather than folded into a stream it may not belong to.
+    if (streamEpoch !== undefined && typeof streamEpoch !== 'string') {
+      console.warn(
+        `[cherry-remote] ignoring agent.events for session ${sessionId}: stream epoch is ` +
+          `${JSON.stringify(streamEpoch)} (${typeof streamEpoch}), not a string; refusing to treat a ` +
+          'malformed epoch as the current one',
+      )
+      return
+    }
     if (typeof streamEpoch === 'string' && streamEpoch !== state.cursor.streamEpoch) {
       console.warn(
         `[cherry-remote] ignoring agent.events for session ${sessionId}: stream epoch ${streamEpoch} ` +

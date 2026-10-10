@@ -131,7 +131,7 @@ function readArchive(file) {
 		text = readFileSync(file, "utf8");
 	} catch (error) {
 		if (isNotFound(error)) {
-			console.warn(`device archive ${file} could not be read; starting from an empty archive:`, error);
+			console.info(`device archive ${file} does not exist yet; starting from an empty archive`);
 			return;
 		}
 		throw new QuarantinedArchiveError(file, error);
@@ -284,6 +284,39 @@ var DeviceStore = class {
 	constructor(file) {
 		this.#file = file;
 	}
+	/**
+	* Whether the archive has been found unreadable and quarantined.
+	*
+	* A READ-ONLY PROBE, and deliberately not a `list()`-shaped one. The whole
+	* problem it solves is that a quarantined store's empty view is
+	* INDISTINGUISHABLE from a genuinely empty one: `list()` returns `[]` either
+	* way, so a caller that only looks at the returned array cannot tell "no
+	* devices are paired" from "the device list is unknowable". Faces that would
+	* otherwise answer with that empty view — every device tool, and the HTTP
+	* reads — ask this instead and report the real condition.
+	*
+	* It consults `#load()` so a store that has never been read still answers
+	* truthfully (reading is what DISCOVERS the corruption), and so a store whose
+	* archive went bad mid-life is reported as it is NOW rather than as it was at
+	* construction. `#load()` cannot throw for this reason: a corrupt archive is
+	* quarantined into the empty view rather than propagated.
+	*/
+	get quarantined() {
+		this.#load();
+		return this.#quarantine !== void 0;
+	}
+	/**
+	* The quarantine, when there is one: the file, the preservation copy, and the
+	* underlying failure. `undefined` for a healthy store.
+	*
+	* Same read-only contract as {@link quarantined}, for the faces that need to
+	* NAME the two files the operator has to look at rather than only report that
+	* something is wrong.
+	*/
+	quarantineInfo() {
+		this.#load();
+		return this.#quarantine;
+	}
 	list() {
 		return this.#load().map((record) => structuredClone(record));
 	}
@@ -423,6 +456,14 @@ const CHANNEL_CLOSED_MESSAGE = "JSON-RPC channel closed";
 /** Bounded number of schema issues quoted in one drop warning. */
 const ISSUE_LIMIT = 3;
 /**
+* Longest peer-supplied identifier (`method` / `id`) quoted in a drop warning.
+*
+* A LOG-SIZE bound, not a protocol one: the frame has already failed validation
+* when this applies, so the peer is either broken or hostile, and the log line
+* must not grow with whatever it sent.
+*/
+const FRAME_FIELD_LIMIT = 120;
+/**
 * The structured error a peer returns for a request. `code` is the literal
 * 1000 the transport reserves for protocol failures; `data.reason` is the
 * discriminator consumers switch on.
@@ -454,14 +495,33 @@ function encodeFrame(value) {
 * (a bounded identifier the remote controls, and the only part that routes the
 * report), the request id when the frame carries one, and the schema path that
 * failed. Everything else stays out.
+*
+* BOUNDED IN LENGTH TOO, not only in content. `method` and `id` are
+* peer-supplied strings, and a hostile or merely broken peer can put a
+* megabyte in either: the frame fails validation, and this function then writes
+* that megabyte into the operator's log at warn level. Excluding payload fields
+* is not enough when the CLASSIFICATION fields are themselves unbounded, so
+* both are truncated with an explicit ellipsis (the marker matters — a silently
+* clipped value reads as the peer's actual method name, and an operator would
+* go looking for a tool that never existed).
 */
 function describeFrame(value) {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return `frame is ${value === null ? "null" : Array.isArray(value) ? "an array" : typeof value}`;
 	const record = value;
 	const parts = [];
-	if (typeof record["method"] === "string") parts.push(`method="${record["method"]}"`);
-	if ("id" in record) parts.push(`id=${JSON.stringify(record["id"])}`);
+	if (typeof record["method"] === "string") parts.push(`method="${bounded(record["method"])}"`);
+	if ("id" in record) parts.push(`id=${bounded(JSON.stringify(record["id"]))}`);
 	return parts.length === 0 ? "frame has no method or id" : parts.join(" ");
+}
+/**
+* A peer-supplied identifier, clipped to {@link FRAME_FIELD_LIMIT} for logging.
+*
+* The limit is generous enough to keep every realistic method name and request
+* id intact — 120 characters is longer than any name the protocol defines — so
+* the clip only ever fires on a frame that is already malformed or hostile.
+*/
+function bounded(text) {
+	return text.length <= FRAME_FIELD_LIMIT ? text : `${text.slice(0, FRAME_FIELD_LIMIT)}…`;
 }
 /** The zod issue paths of a failed parse, joined for one bounded log line. */
 function describeIssues(error) {
@@ -587,6 +647,30 @@ var JsonRpcClient = class {
 		if (this.disposed) return;
 		this.disposed = true;
 		this.failAll("JSON-RPC client disposed");
+	}
+	/**
+	* Tears the client down because its LINK went away, not because the local
+	* side chose to stop using it.
+	*
+	* The distinction is the whole point of a separate entry point. `dispose()`
+	* describes this object's own lifetime ("this client was disposed"), which is
+	* an internal-sounding statement about the plugin's bookkeeping; a caller
+	* holding an in-flight request needs to hear about the DEVICE — the spec §6
+	* `{device, state}` condition — and this is the message every layer above
+	* already classifies as a dead channel. So the link-loss path fails in flight
+	* with {@link CHANNEL_CLOSED_MESSAGE}, exactly as the read loop's own
+	* channel-death path does, and marks the client `closed` so a request issued
+	* after the loss fails fast with the same face instead of queueing onto a
+	* socket that no longer exists.
+	*
+	* `disposed` is set too — nothing may use this client again — but it is set
+	* AFTER the rejection, so the message a caller sees is the link-loss one.
+	*/
+	disposeForLinkLoss() {
+		if (this.disposed) return;
+		this.closed = true;
+		this.failAll(CHANNEL_CLOSED_MESSAGE);
+		this.disposed = true;
 	}
 	/**
 	* Rejects every request that can no longer be answered — both those in flight
@@ -1099,9 +1183,16 @@ var DeviceUnavailableError = class extends Error {
 * CEILING for the business-request window — not the window itself. The window
 * is owned by the rpc layer and is sized from the peer's hello-reported
 * `inFlightRequests` (spec §3.4「取回报一半」): see
-* {@link businessWindowFor}. 8 is what the client uses either when the peer
-* reports nothing (the fallback limit below) or when half its report exceeds
-* this ceiling.
+* {@link businessWindowFor}. The ceiling binds only when HALF the peer's report
+* exceeds it — a peer reporting 64 gets 8, not 32.
+*
+* The FALLBACK is a DIFFERENT path and does not land on this number. When the
+* peer's hello says nothing about `inFlightRequests`, {@link FALLBACK_LIMITS}
+* supplies 8, and `#handshake` then runs that through the same half-the-report
+* rule as any other report: `floor(8 / 2)` = 4. So a silent peer gets a
+* business window of 4 — deliberately the CONSERVATIVE reading, since the whole
+* point of the halving is to stay inside an allowance the peer never confirmed.
+* The client is constructed at 8 only for the window before hello answers.
 */
 const BUSINESS_MAX_IN_FLIGHT = 8;
 const FALLBACK_LIMITS = {
@@ -1486,6 +1577,7 @@ var DeviceConnection = class {
 		if (this.record.hosts.length === 0) throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, /* @__PURE__ */ new Error("the device record has no candidate hosts"));
 		let lastError = /* @__PURE__ */ new Error(`device ${this.record.deviceId}: all candidate hosts unreachable`);
 		for (const host of this.record.hosts) {
+			if (!this.#running || epoch !== this.#epoch) throw new CancelledError();
 			let link;
 			try {
 				link = await this.#dial(host, this.record.port, epoch);
@@ -1499,6 +1591,7 @@ var DeviceConnection = class {
 				await this.#handshake(link, epoch);
 				return;
 			} catch (error) {
+				if (error instanceof CancelledError || !this.#running || epoch !== this.#epoch) throw new CancelledError();
 				if (!isPerHostFailure(error)) throw error;
 				this.#teardownLink();
 				lastError = error instanceof Error ? error : new Error(String(error));
@@ -1704,7 +1797,7 @@ var DeviceConnection = class {
 		this.#refreshFirstFailureAt = void 0;
 		this.#attachedHandlers.clear();
 		if (link !== void 0) {
-			link.client.dispose();
+			link.client.disposeForLinkLoss();
 			link.channel.close().catch(noop$1);
 			try {
 				link.ws.close();
@@ -2659,6 +2752,10 @@ var SessionSubscriptions = class {
 		}
 		const state = this.#sessions.get(sessionId);
 		if (state === void 0 || state.subscriptionId !== subscriptionId) return;
+		if (streamEpoch !== void 0 && typeof streamEpoch !== "string") {
+			console.warn(`[cherry-remote] ignoring agent.events for session ${sessionId}: stream epoch is ${JSON.stringify(streamEpoch)} (${typeof streamEpoch}), not a string; refusing to treat a malformed epoch as the current one`);
+			return;
+		}
 		if (typeof streamEpoch === "string" && streamEpoch !== state.cursor.streamEpoch) {
 			console.warn(`[cherry-remote] ignoring agent.events for session ${sessionId}: stream epoch ${streamEpoch} does not match ${state.cursor.streamEpoch}`);
 			return;
@@ -2798,6 +2895,16 @@ const MIN_WAIT_TIMEOUT_MS = 1;
 * injectable for tests.
 */
 const DEFAULT_WAIT_POLL_MS = 25;
+/**
+* What a caller whose wait lost its event stream should do next.
+*
+* Reached only when the re-ensure itself could not be completed, so the run's
+* outcome genuinely cannot be observed from here. The instruction names the two
+* routes that DO work — the read face does not depend on the subscription, and
+* a later `cherry_wait` rebuilds one from scratch — because "subscription lost"
+* without a next step is a dead end for the caller.
+*/
+const SUBSCRIPTION_LOST_GUIDANCE = "the session's event subscription was lost mid-wait and could not be re-established; the run's outcome is unknowable from this wait. Read the session with cherry_read (it does not need a subscription), or call cherry_wait again to rebuild the subscription from a fresh baseline";
 function isRecord(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -2921,8 +3028,11 @@ function defineCherryTool(definition) {
 	};
 }
 /**
-* The six read tools. Kept as one class (rather than six closures) so the
-* per-session and per-device state Tasks 9/10 add has an obvious home.
+* The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
+* family: the six READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9), and
+* two MANAGEMENT ones (Task 10), plus the registration framework they all
+* share. Kept as one class (rather than per-face closures) so the per-session
+* and per-device state the later faces add has an obvious home.
 */
 var CherryToolEngine = class {
 	#deps;
@@ -3016,6 +3126,28 @@ var CherryToolEngine = class {
 			connection
 		};
 	}
+	/**
+	* The quarantined-archive verdict, or `undefined` for a healthy store.
+	*
+	* Consulted BEFORE any resolution, because a quarantined store's empty view
+	* makes every downstream answer a lie: `resolve` cannot find a device that IS
+	* paired (the archive is unreadable), so it reports ambiguity with no
+	* candidates, and a caller reasonably concludes the device is not paired —
+	* about a store that still holds its access token on disk. The probe is a
+	* cheap readonly field read on the store, and it is deliberately checked on
+	* every device-dependent entry point rather than once at registration: the
+	* archive can go bad while the process is running.
+	*/
+	#quarantineVerdict() {
+		const info = this.#deps.store.quarantineInfo();
+		if (info === void 0) return void 0;
+		return {
+			error: "archive-quarantined",
+			guidance: QUARANTINE_RECOVERY,
+			archive: info.file,
+			...info.corruptPath === void 0 ? {} : { preservedAs: info.corruptPath }
+		};
+	}
 	/** True when `#resolve` answered with a structured verdict instead of a link. */
 	#isVerdict(resolved) {
 		return "error" in resolved;
@@ -3039,8 +3171,14 @@ var CherryToolEngine = class {
 	* The connection-plus-record pair, or the ambiguous verdict to return
 	* verbatim. Lets each tool's body read as `resolved.link ?? resolved.verdict`
 	* without repeating the discriminant dance.
+	*
+	* The quarantine check comes FIRST: it is the strongest statement available
+	* (the device set itself is unknowable), and letting resolution run would
+	* replace it with a weaker, wrong one.
 	*/
 	#linkOr(device) {
+		const quarantined = this.#quarantineVerdict();
+		if (quarantined !== void 0) return { verdict: quarantined };
 		const resolved = this.#requireConnection(device);
 		if ("error" in resolved) return { verdict: resolved };
 		return { link: resolved };
@@ -3118,6 +3256,8 @@ var CherryToolEngine = class {
 			},
 			execute: async (args) => {
 				const selector = optionalString(args["device"]);
+				const quarantined = this.#quarantineVerdict();
+				if (quarantined !== void 0) return quarantined;
 				if (selector === void 0) return { devices: this.#deps.store.list().map((record) => this.#deviceView(record)) };
 				const selected = this.#selectRecords(selector);
 				if (!Array.isArray(selected)) return selected;
@@ -3125,8 +3265,17 @@ var CherryToolEngine = class {
 			}
 		});
 	}
-	/** The `cherry_devices` selector: candidates beat a throw (ruling ⑤). */
+	/**
+	* The `cherry_devices` selector: candidates beat a throw (ruling ⑤), and the
+	* quarantined archive outranks both.
+	*
+	* `cherry_unpair` shares this, so the quarantine check here is what keeps its
+	* `store.remove` from ever being reached on a READ-ONLY archive — the write
+	* would refuse and throw `QuarantinedArchiveError` straight out of the tool.
+	*/
 	#selectRecords(selector) {
+		const quarantined = this.#quarantineVerdict();
+		if (quarantined !== void 0) return quarantined;
 		const resolution = this.#deps.store.resolve(selector);
 		if ("ambiguous" in resolution) return {
 			error: "ambiguous-device",
@@ -3740,14 +3889,18 @@ var CherryToolEngine = class {
 				const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
 				const activeExecutionId = optionalString(session["activeExecutionId"]);
-				if (activeExecutionId === void 0) return {
-					status: "idle",
-					sessionId,
-					session,
-					executionId: null,
-					messages: await this.#readTerminalMessages(connection, sessionId, session),
-					cursor: this.#cursorOf(subscriptions, sessionId)
-				};
+				if (activeExecutionId === void 0) {
+					const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
+					return {
+						status: "idle",
+						sessionId,
+						session,
+						executionId: null,
+						messages,
+						cursor: this.#cursorOf(subscriptions, sessionId),
+						...walk
+					};
+				}
 				return this.#awaitRun(connection, subscriptions, sessionId, {
 					timeoutMs: waitTimeout(args["timeoutMs"]),
 					startedAt: Date.now(),
@@ -4067,7 +4220,17 @@ var CherryToolEngine = class {
 				const record = selected[0];
 				this.#forgetDevice(record.deviceId);
 				await this.#deps.evict(record.deviceId);
-				this.#deps.store.remove(record.deviceId);
+				try {
+					this.#deps.store.remove(record.deviceId);
+				} catch (error) {
+					if (error instanceof QuarantinedArchiveError) return {
+						error: "archive-quarantined",
+						guidance: QUARANTINE_RECOVERY,
+						archive: error.file,
+						...error.corruptPath === void 0 ? {} : { preservedAs: error.corruptPath }
+					};
+					throw error;
+				}
 				return {
 					device: record.deviceId,
 					displayName: record.displayName,
@@ -4293,6 +4456,56 @@ var CherryToolEngine = class {
 		return "events" in result ? result.nextCursor : void 0;
 	}
 	/**
+	* The cursor a re-ensure should resume a MID-WAIT session from.
+	*
+	* It CANNOT be {@link #cursorOf} at the moment of recovery: the subscription
+	* is gone by definition, so `read` answers `cursor-out-of-window` and there is
+	* no layer cursor left to ask for. So the cursor is CARRIED — the last one the
+	* layer handed out while the session was still live, captured on every pass of
+	* the wait.
+	*
+	* Carrying it matters because the two recovery modes are NOT equivalent for a
+	* waiter. A cursor lets the peer REPLAY, so the events that arrived while the
+	* stream was down reach the fold as events — which is all `#observedState`
+	* understands. A cursorless ensure lands in checkpoint mode instead, which
+	* rebuilds peer-side STATE and delivers no events at all: the run could settle
+	* and this wait would never see it. The carried cursor keeps the recovery on
+	* the replay path.
+	*
+	* It is only usable while its EPOCH still matches: a re-subscribe creates a
+	* new peer-side stream, and offering a foreign epoch is refused as "epoch
+	* changed". That refusal is not a hazard — the layer answers it by falling
+	* back to a checkpoint, which is the same place the cursorless call would have
+	* landed — so the stale-epoch cursor is passed through rather than guessed
+	* about here.
+	*/
+	#resumeCursorOf(carried) {
+		return carried;
+	}
+	/**
+	* The wait's terminal answer when its event stream could not be rebuilt.
+	*
+	* A RESULT, not a throw: the run is almost certainly fine — it is this
+	* harness's VIEW of it that was lost — and a caller that can read the session
+	* back (`cherry_read` needs no subscription) has everything it needs to
+	* recover. The `guidance` says so in one sentence, because a bare status name
+	* leaves the caller with no next step.
+	*
+	* The execution id is still reported whenever the wait had attached to one,
+	* so a caller can re-wait on it or read it back by id rather than guess.
+	*/
+	#subscriptionLostResult(sessionId, executionId, commandId, reason) {
+		console.warn(`[cherry-remote] wait on session ${sessionId} lost its event subscription and could not re-establish it (${reason || "the session is no longer tracked"}); reporting subscription-lost rather than inventing a timeout`);
+		return {
+			status: "subscription-lost",
+			sessionId,
+			executionId: executionId ?? null,
+			...commandId === void 0 ? {} : { commandId },
+			reason: reason === "" ? "the session is no longer tracked" : reason,
+			guidance: SUBSCRIPTION_LOST_GUIDANCE
+		};
+	}
+	/**
 	* The waiter: parks until the session's EXECUTION reaches one of the four
 	* terminal states, an unanswered interaction makes the run a SOFT terminal,
 	* or the window elapses.
@@ -4318,8 +4531,22 @@ var CherryToolEngine = class {
 		let latestExecutionId = options.executionId;
 		const baselineSeq = options.baselineSeq ?? this.#newestSeq(subscriptions, sessionId);
 		const observation = {};
+		let reEnsureAttempted = false;
+		let reEnsureFailure = "";
+		let carriedCursor;
 		for (;;) {
 			if (connection.state !== "connected") throw new DeviceUnavailableError(connection.record.deviceId, connection.state);
+			if (!subscriptions.activeSessions().includes(sessionId)) {
+				if (reEnsureAttempted) return this.#subscriptionLostResult(sessionId, latestExecutionId, options.commandId, reEnsureFailure);
+				reEnsureAttempted = true;
+				try {
+					await subscriptions.ensure(sessionId, this.#resumeCursorOf(carriedCursor));
+				} catch (error) {
+					reEnsureFailure = error instanceof Error ? error.message : String(error);
+					return this.#subscriptionLostResult(sessionId, latestExecutionId, options.commandId, reEnsureFailure);
+				}
+				continue;
+			}
 			const observed = this.#observedState(subscriptions, sessionId, {
 				baselineSeq,
 				carry: observation,
@@ -4351,6 +4578,7 @@ var CherryToolEngine = class {
 				...options.commandId === void 0 ? {} : { commandId: options.commandId }
 			});
 			const cursor = this.#cursorOf(subscriptions, sessionId);
+			if (cursor !== void 0) carriedCursor = cursor;
 			const pollMs = Math.min(this.#waitPollMs, Math.max(1, deadline - now));
 			const park = subscriptions.waitFor(sessionId, cursor);
 			try {
@@ -4479,6 +4707,24 @@ var CherryToolEngine = class {
 	* "First" means first in the buffer's own order — the buffer is append-ordered
 	* by construction, so this is the earliest post-baseline run, not whichever
 	* event happens to be newest.
+	*
+	* ACCEPTED BOUND (adjudicated, no behavior change): both this scan and
+	* {@link CherryToolEngine.#settledStatusOf} read the session buffer, which the
+	* subscription layer TRIMS to its per-session byte budget by dropping the
+	* OLDEST events. Once a run's `execution.updated` has been trimmed away, the
+	* id it named is no longer knowable from here, so a wait that has not yet
+	* attached to that run degrades to what it would have been without adoption at
+	* all: it parks out its window and answers `timeout` (with the partial content
+	* and the resume cursor, per spec §6) rather than `completed`. The bound is
+	* therefore ~2 MiB of buffered events per session — the default budget — and
+	* reaching it takes a run that both emits that much event traffic AND whose
+	* command receipt omitted `executionId`. The degradation is bounded and
+	* recoverable rather than silent: `timeout` is a non-failure answer, and
+	* `cherry_read` rebuilds the full picture without the buffer.
+	*
+	* It is NOT fixed by scanning the peer's journal, because the peer's replay
+	* window is itself bounded and the tool has no cursor to offer it — the same
+	* trim would simply move one layer down, at the cost of an RPC on every pass.
 	*/
 	#adoptExecution(subscriptions, sessionId, baselineSeq) {
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
@@ -4561,7 +4807,7 @@ var CherryToolEngine = class {
 		const { terminalMessageId, ...rest } = extra;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
-		const messages = await this.#readTerminalMessages(connection, sessionId, session);
+		const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle !== void 0) this.#revisionCache.set(this.#cacheKey(connection.record.deviceId, sessionId), idle);
 		return {
@@ -4571,7 +4817,8 @@ var CherryToolEngine = class {
 			session,
 			text: aggregateAssistantText(messages, typeof terminalMessageId === "string" ? terminalMessageId : void 0),
 			messages,
-			cursor: this.#cursorOf(subscriptions, sessionId)
+			cursor: this.#cursorOf(subscriptions, sessionId),
+			...walk
 		};
 	}
 	/**
@@ -4586,7 +4833,7 @@ var CherryToolEngine = class {
 	async #timeoutResult(connection, subscriptions, sessionId, extra) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
-		const messages = await this.#readTerminalMessages(connection, sessionId, session);
+		const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
 		return {
 			status: "timeout",
 			sessionId,
@@ -4594,17 +4841,24 @@ var CherryToolEngine = class {
 			session,
 			text: aggregateAssistantText(messages),
 			messages,
-			cursor: this.#cursorOf(subscriptions, sessionId)
+			cursor: this.#cursorOf(subscriptions, sessionId),
+			...walk
 		};
 	}
 	/**
 	* The session's assistant messages, read to completion with `{ref}` parts
 	* aggregated through `agent.content.read` — the SAME path `cherry_read` uses
 	* (spec §3.6: the terminal aggregate resolves externalized parts too).
+	*
+	* The MESSAGE-walk verdict comes back WITH the messages rather than being
+	* dropped: this walk is bounded by {@link MAX_AGGREGATE_LIMIT} messages, so a
+	* session past that ceiling stops with the peer still holding pages. The three
+	* callers (terminal, timeout, idle) each surface it — a walk never stops early
+	* and reports success.
 	*/
 	async #readTerminalMessages(connection, sessionId, session) {
 		const historyRevision = optionalString(session["historyRevision"]);
-		if (historyRevision === void 0) return [];
+		if (historyRevision === void 0) return { messages: [] };
 		const page = await this.#aggregate(connection, "agent.messages.list", {
 			sessionId,
 			historyRevision
@@ -4614,7 +4868,10 @@ var CherryToolEngine = class {
 		}), MAX_AGGREGATE_LIMIT);
 		const messages = [];
 		for (const raw of page.items) messages.push(await this.#projectMessage(connection, sessionId, raw));
-		return messages;
+		return {
+			messages,
+			...messageWalkVerdict(page)
+		};
 	}
 	async #ensureSubscription(deviceId, sessionId) {
 		const subscriptions = this.#deps.subs(deviceId);
@@ -4695,7 +4952,26 @@ function questionKeysOf(input) {
 	if (parsed === void 0) return [];
 	return parsed;
 }
-/** Extracts the ordered question texts from an interaction input, if any. */
+/**
+* Extracts the ordered question texts from an interaction input, if any.
+*
+* BEST-EFFORT BY DESIGN, and the `{ref}` branch is where that shows. The peer
+* externalizes an interaction input above 4 KiB into a `{ref}`, and resolving
+* one needs an `agent.content.read` round trip this pure parse has no way to
+* make. So a `{ref}` input yields `undefined` and the caller gets an EMPTY
+* question list.
+*
+* What that means for a caller is worth stating plainly: a question card whose
+* input was externalized is UNANSWERABLE through the tool face today, because
+* `cherry_respond`'s `response` form is keyed by question TEXT and there is no
+* text to key by. The card is still visible (`cherry_interactions` reports its
+* id, kind and summary) and a `decision` card is unaffected — its answer is the
+* `decision` field, not a per-question map. Resolving `{ref}` inputs through the
+* SAME externalized-content walk `cherry_read` uses is the deferred fix
+* (adjudicated: documented best-effort now, `content.read` resolution later),
+* and it is deferred rather than half-done because an unverified ref must never
+* be presented as an answer key.
+*/
 function parseQuestionInput(input) {
 	if (!isRecord(input)) return void 0;
 	let body;
@@ -4708,6 +4984,24 @@ function parseQuestionInput(input) {
 	else body = input;
 	if (!isRecord(body) || !Array.isArray(body["questions"])) return void 0;
 	return body["questions"].map((question) => isRecord(question) ? optionalString(question["question"]) : void 0).filter((question) => question !== void 0);
+}
+/**
+* The message-walk verdict, projected off an aggregate page.
+*
+* Extracted so the three non-`cherry_read` walkers ({@link
+* CherryToolEngine.#readTerminalMessages}) report truncation in EXACTLY the
+* shape `cherry_read` already does, from one place: a second, independently
+* worded projection is how the terminal face and the read face drift apart
+* again. Absent fields (rather than `false`/`undefined` keys) keep a complete
+* walk's result shape unchanged for existing callers.
+*/
+function messageWalkVerdict(page) {
+	if (!page.truncated) return {};
+	return {
+		messagesTruncated: true,
+		...page.truncationReason === void 0 ? {} : { messagesTruncationReason: page.truncationReason },
+		...page.nextCursor === void 0 ? {} : { messagesResumeCursor: page.nextCursor }
+	};
 }
 /**
 * The assistant text a terminal aggregate reports: the awaited RUN's assistant
@@ -4724,6 +5018,13 @@ function parseQuestionInput(input) {
 * execution's terminal named — is the exact cut. When the peer named none, the
 * LAST assistant message is the run's own reply under the protocol's
 * append-per-run ordering, which still beats summing the history.
+*
+* THE FALLBACK IS BEST-EFFORT, AND THAT IS WHY THE CALLER FLAGS IT. The
+* last-in-walk message is only the run's reply when the walk reached the
+* session's true end. On a session past the aggregate ceiling it is a message
+* from an EARLIER run, and `terminalMessageId` is present but outside the walk
+* in the same way — both cases leave the text partial or stale, so neither may
+* be presented as a complete answer (see {@link CherryMessageWalkVerdict}).
 */
 function aggregateAssistantText(messages, terminalMessageId) {
 	const scoped = terminalMessageId === void 0 ? lastAssistantMessage(messages) : messages.filter((message) => message.messageId === terminalMessageId);
@@ -5243,7 +5544,7 @@ async function handleRequest(req, res, route) {
 				writeError(res, 400, "invalid-request", "device id is not valid URL encoding");
 				return;
 			}
-			if (method === "DELETE") return deleteDevice(res, route, deviceId);
+			if (method === "DELETE") return await deleteDevice(res, route, deviceId);
 			if (method === "PATCH") return patchDevice(req, res, route, deviceId);
 			writeError(res, 405, "method-not-allowed", "DELETE or PATCH only");
 			return;
@@ -5388,13 +5689,13 @@ function safely(read, fallback) {
 		return fallback;
 	}
 }
-function deleteDevice(res, route, deviceId) {
+async function deleteDevice(res, route, deviceId) {
 	if (!route.deps.store.list().some((device) => device.deviceId === deviceId)) {
 		writeError(res, 404, "not-found", `no device ${deviceId}`);
 		return;
 	}
 	try {
-		route.deps.evict?.(deviceId);
+		await route.deps.evict?.(deviceId);
 	} catch (error) {
 		console.warn(`[cherry-remote] device ${deviceId} teardown failed before removal`, error);
 	}
