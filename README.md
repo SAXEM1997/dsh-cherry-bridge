@@ -77,11 +77,12 @@ profile 手工加行等价于：
 设备选择器（`device` 参数）接受**精确 `deviceId`** 或**唯一的显示名前缀**；前缀命中
 多项时返回结构化歧义错误，不会任选一个。
 
-`cherry_send(wait: true)` / `cherry_wait` 返回的 `status` 有 **7 个取值**：四个协议终态
-（`completed`/`failed`/`cancelled`/`interrupted`）之外，还有三个 waiter 自己的判定——
+`cherry_send(wait: true)` / `cherry_wait` 返回的 `status` 有 **8 个取值**：四个协议终态
+（`completed`/`failed`/`cancelled`/`interrupted`）之外，还有四个 waiter 自己的判定——
 `awaiting-interaction`（软终态：出现待答交互卡，运行仍活着）、`timeout`（窗口用尽，
 **不是失败**，返回已到达的部分内容与续读游标）、`idle`（`cherry_wait` 遇到没有在途执行
-的会话，立即返回当前快照）。
+的会话，立即返回当前快照）、`subscription-lost`（等待途中事件订阅丢失且重建失败，运行
+结局从此处**不可知**：与 `timeout` 不同，随附修复订阅／按 id 回读运行的指引）。
 
 ## 设置页（web client）
 
