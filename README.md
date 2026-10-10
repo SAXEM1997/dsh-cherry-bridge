@@ -111,7 +111,7 @@ profile 手工加行等价于：
 | `PATCH /cherry-remote/api/devices/:id` | 改显示名/启用状态/地址/端口（`hosts` 为**整体替换**）。 |
 | `DELETE /cherry-remote/api/devices/:id` | 移除设备并断开其连接。 |
 | `POST /cherry-remote/api/pair` | 启动一次配对，立即返回 `202 {claimId}`，进度走 SSE。 |
-| `GET /cherry-remote/api/events` | SSE：`device-state` / `pairing-progress`（每帧带产生它的 `claimId`，含心跳）。 |
+| `GET /cherry-remote/api/events` | SSE：`device-state` / `pairing-progress`（`pairing-progress` 每帧带产生它的 `claimId`；心跳为无载荷注释行）。 |
 | `GET /cherry-remote/api/diagnostics` | 运维诊断报告（见下）。 |
 
 > `pairing-progress` 帧的最小形状是 `{stage, detail?}`；本插件在其上**额外**附带可选的

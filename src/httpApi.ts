@@ -1294,10 +1294,14 @@ async function startPairing(req: HttpRequestLike, res: HttpResponseLike, route: 
         } catch (reportError) {
           console.warn('[cherry-remote] reporting the quarantined archive failed', reportError)
         }
+        // The shared instruction VERBATIM, with only the two contextual paths
+        // appended. A hand-written sibling here would be a third independent
+        // wording of "move the file aside", which is exactly the drift the
+        // constant exists to prevent.
         publish(
           'archive-quarantined',
-          `device archive ${error.file} is unreadable; move ${error.corruptPath ?? `${error.file}.corrupt`} ` +
-            'aside (then restart or re-apply the plugin) to resume pairing',
+          `${QUARANTINE_RECOVERY} (archive: ${error.file}; preserved as ` +
+            `${error.corruptPath ?? `${error.file}.corrupt`})`,
         )
         return
       }

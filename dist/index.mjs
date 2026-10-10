@@ -5865,7 +5865,7 @@ async function startPairing(req, res, route) {
 				} catch (reportError) {
 					console.warn("[cherry-remote] reporting the quarantined archive failed", reportError);
 				}
-				publish("archive-quarantined", `device archive ${error.file} is unreadable; move ${error.corruptPath ?? `${error.file}.corrupt`} aside (then restart or re-apply the plugin) to resume pairing`);
+				publish("archive-quarantined", `${QUARANTINE_RECOVERY} (archive: ${error.file}; preserved as ${error.corruptPath ?? `${error.file}.corrupt`})`);
 				return;
 			}
 			const verdict = pairingVerdict(error);
