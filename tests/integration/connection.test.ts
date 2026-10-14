@@ -244,6 +244,72 @@ describe('DeviceConnection over a real loopback channel', () => {
     } satisfies EffectiveLimits)
   })
 
+  it('①c (U1) tolerates a 2.1.5+ hello that advertises capabilities this client does not know', async () => {
+    // The upstream upgrade that added resumable uploads extended the hello
+    // reply: three new support flags and five `agentUpload*` limit entries. The
+    // peer's own support schema is a loose object, so they arrive UNANNOUNCED,
+    // and the failure mode this pins is the silent one: a client that validated
+    // the reply strictly (or read the limits record positionally) would go
+    // offline against a desktop that is merely newer.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: {
+        heartbeatMs: 25_000,
+        capabilities: {
+          agentFailureVersion: 1,
+          agentUploadsVersion: 1,
+          agentUploadChecksum: 'sha256',
+          agentAttachmentSelections: true,
+          connectionEndpointsVersion: 1,
+        },
+        limits: {
+          subscriptions: 5,
+          pageItems: 60,
+          inFlightRequests: 6,
+          // Verbatim from the 2.1.5+ peer (RemoteConnection.ts capability block).
+          agentUploadFileBytes: 33_554_432,
+          agentUploadMessageBytes: 67_108_864,
+          agentUploadFiles: 4,
+          agentUploadChunkBytes: 1_048_576,
+          agentUploadWindow: 2,
+        },
+      },
+    })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    // NON-VACUOUS: the reply really carried the fields the client does not
+    // know — otherwise "the client ignored them" would be proven by nothing.
+    expect(fakeInfo.fake.lastHelloReply).toMatchObject({
+      agentUploadsVersion: 1,
+      agentUploadChecksum: 'sha256',
+      agentAttachmentSelections: true,
+    })
+    expect(Object.keys((fakeInfo.fake.lastHelloReply?.['limits'] ?? {}) as Record<string, number>)).toEqual(
+      expect.arrayContaining([
+        'agentUploadFileBytes',
+        'agentUploadMessageBytes',
+        'agentUploadFiles',
+        'agentUploadChunkBytes',
+        'agentUploadWindow',
+      ]),
+    )
+    // The KNOWN limits are read BY NAME: the unknown entries neither displace
+    // them nor leak into the (closed-shape) effective projection.
+    expect(connection.limits).toEqual({
+      heartbeatMs: 25_000,
+      subscriptions: 5,
+      pageItems: 60,
+      inFlightRequests: 6,
+    } satisfies EffectiveLimits)
+
+    // The link is USABLE, not merely established: an authenticated business
+    // call rides the same handshake that carried the unknown capabilities.
+    await expect(assemblyToolCall(connection, 'agent.sessions.list', { agentId: 'agent-1' })).resolves.toBeDefined()
+    await connection.close()
+  })
+
   it('② refreshes the token automatically before expiresAt', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake({ tokenTtlMs: 1_200 })

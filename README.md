@@ -48,7 +48,7 @@ profile 手工加行等价于：
 | --- | --- | --- | --- |
 | `dataDir` | string | `$DSH_HOME/cherry-remote`（回退 `~/.dsh/cherry-remote`） | 插件数据目录，存放 `identity.key` 与 `devices.json`（均 `0600`）。 |
 | `perSessionCacheBytes` | number | `2097152`（2 MiB） | 每个会话的**本地**订阅事件缓存字节上限。超出时按 LRU 丢弃最旧事件并 `warn` 记录。 |
-| `rateBudgetPerSecond` | number | `32` | 每设备二级平滑请求预算（请求/秒）。桌面端实现的硬上限是 64 req/s 且**无协商通道**，超限会以 close `1011` 终止整条会话；这里取保守值。 |
+| `rateBudgetPerSecond` | number | `32` | 每设备二级平滑请求预算（请求/秒）。桌面端实现的硬上限是 64 req/s 且**无协商通道**（2.1.5 起 `agent.content.read` 另有 512 req/s 的独立窗口），超限会以 close `1011` 终止整条会话；这里取保守值。 |
 
 > ⚠️ `cordis.patch.yml` 的 `config` 是**整体替换**，不与 bundle 默认值合并。装配层
 > （`resolveBridgeConfig`）对缺键回落上述默认值——因此删掉一个键得到的是**插件默认
@@ -63,7 +63,7 @@ profile 手工加行等价于：
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。 |
-| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。 |
+| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后经 `agent.sessions.get` 回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。 |
@@ -182,15 +182,33 @@ npm run prepublishOnly # 发布前闸门：typecheck + test + build + build:clie
 > `npm pack --ignore-scripts` 的 tarball 里也含这三个文件。防止产物悄悄腐坏的是
 > `prepublishOnly`：发布路径上它先跑 typecheck 与全量测试、再重建两侧产物。
 
-依赖 `@cherrystudio/remote-protocol@0.3.0` 与 `@cherrystudio/remote-transport@0.1.2`
+依赖 `@cherrystudio/remote-protocol@0.5.0` 与 `@cherrystudio/remote-transport@0.2.1`
 以**精确版本**固定（无 `^`），并有测试断言锁死——升级时必须重跑
 `tests/contract/contract.test.ts` 以防 schema drift。契约套件同时逐条建模了「本仓库
 自环假对端」与「真实 Cherry Studio」的**六项行为差异**，并逐条对应
 [`docs/e2e-checklist.md`](docs/e2e-checklist.md) 中的人工核验步骤。
 
+### 与 Cherry Studio 版本的对应关系
+
+已验证的桌面端范围是 **2.1.4 → 2.1.6**（含 `main` 上 2.1.6 之后的提交），依据是逐面比对
+上游 `src/main/services/remoteAccess/` 与 `packages/remote-{protocol,transport}` 的差异：
+
+| 上游变化 | 影响 |
+| --- | --- |
+| 2.1.5 起 `connection.hello` 增加 `agentUploadsVersion`/`agentUploadChecksum`/`agentAttachmentSelections` 与 5 个 `agentUpload*` limits | **加法**，无影响：hello 无严格校验，限额按名读取（回归测试：`tests/integration/connection.test.ts` ①c） |
+| 2.1.5 起记录分帧引入二进制 marker（首字节 `1`）承载上传块 | **加法**：JSON 记录双向编码未变，本插件既不发也不收二进制 |
+| 2.1.5 起附件按 `{kind:'file', name, ref}`（顶层 `ref`）投影，字节可经 `agent.content.read` 取 | 只取**元数据**（`name`/`mediaType`/`byteLength`），**绝不取字节**：读路径是文本通道（`tests/integration/toolsRead.test.ts` ④k/④l） |
+| 2.1.5 起 `agent.messages.send` 要求 `text` trim 后非空 | `cherry_send` 对空白正文本地给出 `text-empty`，不上线（`tests/integration/toolsSendGuard.test.ts`） |
+| `agent.content.read` 单独放宽到 512 req/s；其余业务方法仍是 64 req/s | 本插件的 32 req/s 预算不变，仍然安全 |
+| 2.1.5 起 Linux 无钥匙串时以明文 0600 存设备身份；identity **永不重生成** | 升级**不需要重新配对**；无钥匙串的 Linux 桌面从「不可用」变为「可用」 |
+
+配对 payload、mDNS 广告、协议版本（`[1]`）与 Noise profile 在上游本轮更新中**零改动**。
+上游另有 `5db8ab7`（agent runtime 由 DSH 换成 Pi，删除其自带的 `packages/dsh-bridge`）——
+那是**反方向**的桥（Cherry 驱动 DSH），与本插件依赖的 remote-access 面无关。
+
 > `zod` 是**运行时**依赖，不是可删的死依赖：本包的 `dist` 把
 > `@cherrystudio/remote-protocol` 作为 external，而该协议的运行时产物处处 `import
-> zod`（peer `^4.3.4`，其自身 dev pin 为 4.3.4）。把它降级为 devDependency 或移除，
+> zod`（peer `^4.3.4`，协议包自身的 dev pin 已升到 4.4.3，不影响这个区间下界）。把它降级为 devDependency 或移除，
 > 都会让协议包在运行时加载 schema 失败。这里精确钉在 `4.3.4`——即 peer 区间下界，
 > 也是协议包的测试基线。
 

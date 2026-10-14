@@ -275,6 +275,51 @@ describe('JsonRpcClient', () => {
     expect(first).toHaveBeenLastCalledWith('agent.events', { events: [] })
   })
 
+  it('③b (U2) carries the 2.1.5+ `agent.uploads.ack` notification through the same branch', async () => {
+    // The upstream upload feature added a SERVER-INITIATED notification this
+    // client never asks for: it answers a binary upload chunk, and this plugin
+    // sends none. It is asserted here because "a method we do not know" and "a
+    // method that does not exist yet" are different risks: this one is a REAL
+    // frame a newer desktop can put on the wire, and it must reach the consumer
+    // (whose method filter ignores it) rather than being dropped as malformed.
+    const { client, peer } = await openLoopback()
+
+    const handler = vi.fn()
+    client.onNotification(handler)
+
+    await peer.write({
+      jsonrpc: '2.0',
+      method: 'agent.uploads.ack',
+      params: { ok: true, requestId: 'req-1', uploadId: 'up-1', writerEpoch: '1', committedOffset: '1024' },
+    })
+    await vi.waitFor(() => {
+      expect(handler).toHaveBeenCalledTimes(1)
+    })
+    expect(handler).toHaveBeenCalledWith('agent.uploads.ack', {
+      ok: true,
+      requestId: 'req-1',
+      uploadId: 'up-1',
+      writerEpoch: '1',
+      committedOffset: '1024',
+    })
+
+    // The FAILURE face travels the same way (the peer reports a rejected chunk
+    // as a structured protocol failure inside the notification).
+    await peer.write({
+      jsonrpc: '2.0',
+      method: 'agent.uploads.ack',
+      params: { ok: false, requestId: 'req-2', error: { reason: 'RESOURCE_EXHAUSTED', message: 'Upload window exceeded' } },
+    })
+    await vi.waitFor(() => {
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+    expect(handler).toHaveBeenLastCalledWith('agent.uploads.ack', {
+      ok: false,
+      requestId: 'req-2',
+      error: { reason: 'RESOURCE_EXHAUSTED', message: 'Upload window exceeded' },
+    })
+  })
+
   it('④ drops a malformed response that matches no branch (drop + warn)', async () => {
     const { client, peer } = await openLoopback()
 

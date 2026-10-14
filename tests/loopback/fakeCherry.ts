@@ -34,6 +34,17 @@ export interface FakeHelloOptions {
   limits?: Record<string, number>
   /** Omit the limits key entirely to exercise the client's fallback. */
   omitLimits?: boolean
+  /**
+   * Extra protocol-support fields merged into the reply beside `protocolVersion`.
+   *
+   * This is the FORWARD-COMPATIBILITY knob: a 2.1.5+ desktop advertises
+   * `agentUploadsVersion` / `agentUploadChecksum` / `agentAttachmentSelections`
+   * (and adds five `agentUpload*` entries to `limits`) that this client knows
+   * nothing about. The peer's own support schema is a loose object, so those
+   * fields arrive unannounced — the client must take what it knows and ignore
+   * the rest, which is what the regression test pins.
+   */
+  capabilities?: Record<string, unknown>
 }
 
 /**
@@ -407,6 +418,11 @@ export interface FakePartRecord {
   toolName?: string
   toolCallId?: string
   name?: string
+  /**
+   * The media type a `file` part advertises on its ref (default
+   * `application/octet-stream`). Ignored by the other kinds.
+   */
+  mediaType?: string
 }
 
 /** One event appended to a fake journal; `seq`/`streamEpoch` are assigned on append. */
@@ -563,6 +579,7 @@ export class FakeCherry {
   #inFlight = 0
   #maxInFlight = 0
   #lastHelloProtocolVersions: number[] | undefined
+  #lastHelloReply: Record<string, unknown> | undefined
   #helloEchoMatchesOffer = false
   #offeredVersionsAtHello: readonly number[] = []
   #tokenIssues: IssuedToken[] = []
@@ -711,6 +728,17 @@ export class FakeCherry {
 
   get lastHelloProtocolVersions(): readonly number[] | undefined {
     return this.#lastHelloProtocolVersions
+  }
+
+  /**
+   * The hello reply this peer actually put on the wire.
+   *
+   * Recorded so a forward-compatibility assertion can prove the reply CARRIED
+   * the unknown capability fields instead of passing merely because the client
+   * ignores whatever it is given.
+   */
+  get lastHelloReply(): Record<string, unknown> | undefined {
+    return this.#lastHelloReply
   }
 
   /** True iff the last hello echoed the prelude offer element-wise (index-by-index). */
@@ -1367,11 +1395,16 @@ export class FakeCherry {
     }
     live.hello = true
     const hello = this.#options.hello ?? {}
-    return {
+    const reply = {
       protocolVersion: live.channel.protocolVersion,
+      // Unknown-to-the-client support fields ride HERE, where the real peer's
+      // loose object puts them (see `FakeHelloOptions.capabilities`).
+      ...(hello.capabilities ?? {}),
       ...(hello.omitLimits ? {} : { limits: hello.limits ?? {} }),
       ...(hello.omitHeartbeatMs ? {} : { heartbeatMs: hello.heartbeatMs ?? 20_000 }),
     }
+    this.#lastHelloReply = reply
+    return reply
   }
 
   #handleAuthenticate(params: Record<string, unknown>): Record<string, unknown> {
@@ -1924,6 +1957,41 @@ export class FakeCherry {
       this.#contentBytes.set(key, bytes)
       this.#contentDigests.set(key, digest)
     }
+    // Cherry >= 2.1.5 projects an attachment as `{kind: 'file', name, ref}`:
+    // the ref sits at the TOP LEVEL and there is NO `content` key at all
+    // (`partSchema`'s file variant, which is what the `agent.parts.list`
+    // projection in `agentQueries.projectPersistedParts` emits). The bytes stay
+    // pinned and ARE servable through `agent.content.read` — which is exactly
+    // what a text-channel client must not do with them.
+    if (part.kind === 'file') {
+      return {
+        partId,
+        revision,
+        kind: 'file',
+        name: part.name ?? 'file',
+        ref: {
+          contentId: partId,
+          revision,
+          byteLength: String(declaredBytes),
+          mediaType: part.mediaType ?? 'application/octet-stream',
+          sha256: advertised,
+        },
+      }
+    }
+    // The PRE-2.1.5 file projection (Cherry 2.1.4, still inside the verified
+    // range) is a `data` part whose metadata sits INSIDE `content` —
+    // `dataPart(partId, revision, 'file', { mediaType, filename })`, with an
+    // explicit null filename when the peer has none. A fixture that names a
+    // mediaType on a `data` part asks for exactly that shape.
+    if (part.kind === 'data' && part.mediaType !== undefined) {
+      return {
+        partId,
+        revision,
+        kind: 'data',
+        name: 'file',
+        content: { mediaType: part.mediaType, filename: part.name ?? null },
+      }
+    }
     return {
       partId,
       revision,
@@ -1932,7 +2000,7 @@ export class FakeCherry {
       ...(part.kind === 'tool-input' || part.kind === 'tool-output'
         ? { toolName: part.toolName ?? 'tool', ...(part.toolCallId === undefined ? {} : { toolCallId: part.toolCallId }) }
         : {}),
-      ...(part.kind === 'file' || part.kind === 'data' ? { name: part.name ?? 'file' } : {}),
+      ...(part.kind === 'data' ? { name: part.name ?? 'file' } : {}),
       ...(part.kind === 'text' || part.kind === 'reasoning' || part.kind === 'tool-input'
         ? { state: part.state ?? 'completed' }
         : part.kind === 'tool-output'

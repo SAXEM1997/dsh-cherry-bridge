@@ -45,7 +45,7 @@ import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from
  * Every item of the six-entry difference list is asserted here twice over:
  *
  *  - the SCHEMA side says what the published protocol allows (authority: the
- *    pinned `@cherrystudio/remote-protocol@0.3.0` package installed in this
+ *    pinned `@cherrystudio/remote-protocol@0.5.0` package installed in this
  *    repo), and
  *  - the WIRE side says what this fake actually does when driven against a
  *    real Noise-XX loopback connection.
@@ -821,8 +821,8 @@ describe('⑤ the pinned protocol versions', () => {
     const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
       dependencies?: Record<string, string>
     }
-    expect(manifest.dependencies?.['@cherrystudio/remote-protocol']).toBe('0.3.0')
-    expect(manifest.dependencies?.['@cherrystudio/remote-transport']).toBe('0.1.2')
+    expect(manifest.dependencies?.['@cherrystudio/remote-protocol']).toBe('0.5.0')
+    expect(manifest.dependencies?.['@cherrystudio/remote-transport']).toBe('0.2.1')
     for (const name of ['@cherrystudio/remote-protocol', '@cherrystudio/remote-transport']) {
       const declared = manifest.dependencies![name]!
       expect(declared.startsWith('^')).toBe(false)
@@ -863,8 +863,8 @@ describe('⑤ the pinned protocol versions', () => {
 
   it('the INSTALLED packages really are those versions (the pin is not aspirational)', async () => {
     for (const [name, version] of [
-      ['@cherrystudio/remote-protocol', '0.3.0'],
-      ['@cherrystudio/remote-transport', '0.1.2'],
+      ['@cherrystudio/remote-protocol', '0.5.0'],
+      ['@cherrystudio/remote-transport', '0.2.1'],
     ] as const) {
       const manifest = JSON.parse(
         readFileSync(join(repoRoot, 'node_modules', name, 'package.json'), 'utf8'),

@@ -166,6 +166,16 @@ schema 已允许 `interrupted`，所以客户端**必须**处理，但当前服�
 - [ ] 该端点同样受信任 fence 约束：非回环 Host、非同源 Origin、`sec-fetch-site: cross-site`
       一律 403；无 Origin 的非浏览器客户端放行。
 - [ ] 全流程日志不含 token / invitationSecret / accessToken / 消息文本 / part 文本。
+- [ ] **上游版本核验**（桌面端为 2.1.4–2.1.6 或已比对过的更新版本；依据见 README
+      「与 Cherry Studio 版本的对应关系」）：
+      - [ ] 桌面端**升级后无需重新配对**：设备档案直接连上，`desktopIdentity` 未变。
+      - [ ] 桌面端为 2.1.5+ 且会话里有**来自手机上传的附件**时：该 part 为 `kind:"file"`
+            并带 `name`/`mediaType`/`byteLength`，`content` 为空，且**没有**任何
+            `agent.content.read` 调用（一次都不该有——那些字节是文件，不是文本）。
+      - [ ] `cherry_send` 传空白文本（如 `"   "`）→ 本地返回 `text-empty`，对端未收到
+            `agent.messages.send`。
+      - [ ] 桌面端广播了本插件不认识的支持字段时，`cherry_devices` 的 limits 投影仍只有
+            4 个已知键（heartbeatMs/subscriptions/pageItems/inFlightRequests），连接不被拒。
 - [ ] `package.json` 中 `@cherrystudio/remote-protocol`、`@cherrystudio/remote-transport`
       为精确版本（无 `^`）。
 - [ ] `npm test` 全绿（含 `tests/contract/contract.test.ts`）。

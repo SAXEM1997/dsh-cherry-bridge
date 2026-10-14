@@ -3436,7 +3436,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -3547,6 +3547,16 @@ var CherryToolEngine = class {
 		const revision = String(raw["revision"] ?? "");
 		const kind = String(raw["kind"] ?? "");
 		const content = isRecord(raw["content"]) ? raw["content"] : {};
+		if (kind === "file") return {
+			partId,
+			kind,
+			revision,
+			content: "",
+			...this.#attachmentFace(kind, raw, content),
+			...typeof raw["state"] === "string" ? { state: raw["state"] } : {},
+			...typeof raw["toolName"] === "string" ? { toolName: raw["toolName"] } : {},
+			...typeof raw["toolCallId"] === "string" ? { toolCallId: raw["toolCallId"] } : {}
+		};
 		let text;
 		if (typeof content["text"] === "string") text = content["text"];
 		else if (isRecord(content["ref"])) try {
@@ -3570,9 +3580,37 @@ var CherryToolEngine = class {
 			kind,
 			revision,
 			content: text,
+			...this.#attachmentFace(kind, raw, content),
 			...typeof raw["state"] === "string" ? { state: raw["state"] } : {},
 			...typeof raw["toolName"] === "string" ? { toolName: raw["toolName"] } : {},
 			...typeof raw["toolCallId"] === "string" ? { toolCallId: raw["toolCallId"] } : {}
+		};
+	}
+	/**
+	* The descriptive metadata of an attachment part — and deliberately NOT a
+	* way to reach its bytes.
+	*
+	* Two peer generations are covered, because both are inside the verified
+	* range and they disagree about where the metadata lives:
+	*
+	*  - **Cherry ≥ 2.1.5** — `{kind: 'file', name, ref}`, ref at the TOP level.
+	*  - **Cherry 2.1.4** — `{kind: 'data', name, content: {mediaType, filename}}`.
+	*
+	* Only string fields are lifted: a null `filename` (the peer's explicit "no
+	* name") stays absent rather than becoming the string "null". Anything a
+	* caller needs beyond this — the bytes — stays behind `agent.content.read`,
+	* which this plugin does not call for a file part.
+	*/
+	#attachmentFace(kind, raw, content) {
+		if (kind !== "file" && kind !== "data") return {};
+		const ref = isRecord(raw["ref"]) ? raw["ref"] : isRecord(content["ref"]) ? content["ref"] : {};
+		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(content["filename"]);
+		const mediaType = optionalString(ref["mediaType"]) ?? optionalString(content["mediaType"]);
+		const byteLength = optionalString(ref["byteLength"]);
+		return {
+			...name === void 0 ? {} : { name },
+			...mediaType === void 0 ? {} : { mediaType },
+			...byteLength === void 0 ? {} : { byteLength }
 		};
 	}
 	/**
@@ -3797,7 +3835,7 @@ var CherryToolEngine = class {
 					text: {
 						type: "string",
 						maxLength: TEXT_MAX_LENGTH,
-						description: `The message text. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling).`
+						description: `The message text, which must not be blank. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling).`
 					},
 					wait: {
 						type: "boolean",
@@ -3831,6 +3869,10 @@ var CherryToolEngine = class {
 					limit: TEXT_MAX_LENGTH,
 					length: text.length,
 					message: `the message is ${text.length} characters; the protocol caps a single send at ${TEXT_MAX_LENGTH}. Split it into several cherry_send calls.`
+				};
+				if (text.trim().length === 0) return {
+					error: "text-empty",
+					message: "the message text is empty (or whitespace only); the peer requires a non-blank body."
 				};
 				await this.#ensureSubscription(record.deviceId, sessionId);
 				const subscriptions = this.#deps.subs(record.deviceId);

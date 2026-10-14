@@ -778,6 +778,109 @@ describe('read-only cherry tools over a real loopback channel', () => {
     )
   })
 
+  it('④k a `file` part is reported as METADATA and never fetched (the 2.1.5+ attachment projection)', async () => {
+    // Cherry 2.1.5 started projecting an uploaded attachment as
+    // `{kind: 'file', name, ref}` — the ref at the TOP level, no `content` —
+    // and made those bytes servable through `agent.content.read` (the file
+    // module's revision-bound reference). They are FILE bytes: a read here is a
+    // TEXT channel into a model's context, so the part must cost no content
+    // round trip at all, not merely decode badly.
+    const fileBytes = '\u0000\u0001binary-ish payload'
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Attachments',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'text', text: 'look at this' },
+              { kind: 'file', text: fileBytes, name: 'photo.png', mediaType: 'image/png' },
+            ],
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        parts: Array<{ kind: string; content: string; name?: string; mediaType?: string; byteLength?: string }>
+      }>
+    }
+    const parts = result.messages[0]!.parts
+    expect(parts[1]).toMatchObject({
+      kind: 'file',
+      content: '',
+      name: 'photo.png',
+      mediaType: 'image/png',
+      byteLength: String(Buffer.byteLength(fileBytes)),
+    })
+    // No `unavailable`: nothing FAILED here — the bytes were deliberately not
+    // requested, which is a different statement from "the peer would not serve
+    // them", and conflating the two would send a caller hunting a fault.
+    expect(parts[1]).not.toHaveProperty('unavailable')
+    // THE DISCRIMINATOR. The peer really could serve these bytes (same
+    // mechanism as any `{ref}`, verified below), so a regression that resolved
+    // the file ref as text would succeed on the wire and fail only HERE.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+    expect(parts[0]!.content).toBe('look at this')
+  })
+
+  it('④l the pre-2.1.5 `data`-kind file projection reports the same metadata, so an upgrade never anonymizes an attachment', async () => {
+    // Cherry 2.1.4 (inside the verified range) projected the same file as a
+    // `data` part carrying `{mediaType, filename}` INSIDE `content`. The two
+    // generations must reach the caller in the same shape, or a desktop upgrade
+    // would silently turn a named attachment back into an empty part.
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Attachments',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'data', text: '', name: 'report.pdf', mediaType: 'application/pdf' },
+              { kind: 'data', text: '', mediaType: 'image/jpeg' }, // filename: null — the peer's explicit "no name"
+            ],
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ kind: string; content: string; name?: string; mediaType?: string }> }>
+    }
+    const parts = result.messages[0]!.parts
+    expect(parts[0]).toMatchObject({ kind: 'data', content: '', name: 'report.pdf', mediaType: 'application/pdf' })
+    // A null filename stays ABSENT rather than becoming the string "null", and
+    // a media type the peer did not state stays absent too.
+    expect(parts[1]!).toMatchObject({ kind: 'data', content: '', mediaType: 'image/jpeg' })
+    expect(parts[1]!).not.toHaveProperty('name')
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
   it('⑤ cherry_read and cherry_events ensure the session subscription on first use and ack after delivery', async () => {
     const rig = await makeRig({
       agent: {

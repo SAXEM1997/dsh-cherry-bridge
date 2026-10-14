@@ -187,6 +187,14 @@ export interface CherryReadPart {
   state?: string
   toolName?: string
   toolCallId?: string
+  /**
+   * The DESCRIPTIVE face of a binary attachment (`kind: 'file'`): what the file
+   * is, never what it holds. `content` stays empty for such a part by design —
+   * see {@link CherryToolEngine.#attachmentFace}.
+   */
+  name?: string
+  mediaType?: string
+  byteLength?: string
 }
 
 /** One message in a `cherry_read` snapshot. */
@@ -1180,7 +1188,9 @@ class CherryToolEngine {
         'Read a session\'s message history snapshot. Two-level baseline: `agent.sessions.get` ' +
         'supplies the history revision, `agent.messages.list` the messages, and each message\'s ' +
         'own revision the parts. Large part text is externalized by the peer and fetched and ' +
-        'sha256-verified through `agent.content.read`.',
+        'sha256-verified through `agent.content.read`. A binary attachment is reported as ' +
+        '`kind: "file"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes ' +
+        'are deliberately not fetched into a text channel.',
       parameters: {
         type: 'object',
         properties: {
@@ -1336,6 +1346,30 @@ class CherryToolEngine {
     const kind = String(raw['kind'] ?? '')
     const content = isRecord(raw['content']) ? raw['content'] : {}
 
+    // A FILE PART IS NEVER RESOLVED AS TEXT, whatever shape its reference
+    // takes. Cherry ≥ 2.1.5 projects an uploaded attachment as
+    // `{kind: 'file', name, ref}` — a TOP-LEVEL `ref`, no `content` at all —
+    // and `agent.content.read` really will serve those bytes. They are FILE
+    // bytes: this projection hands text to a model, so resolving them would
+    // decode binary as UTF-8 and pull megabytes into the context window. The
+    // honest face is the file's METADATA with an empty body.
+    //
+    // (`{ref}` nested under `content` on a `file` part is not the real peer's
+    // shape, but it is schema-legal — `partSchema`'s file variant is a loose
+    // object — and the same rule is the safe one for it.)
+    if (kind === 'file') {
+      return {
+        partId,
+        kind,
+        revision,
+        content: '',
+        ...this.#attachmentFace(kind, raw, content),
+        ...(typeof raw['state'] === 'string' ? { state: raw['state'] } : {}),
+        ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
+        ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
+      }
+    }
+
     let text: string
     if (typeof content['text'] === 'string') {
       text = content['text']
@@ -1371,9 +1405,51 @@ class CherryToolEngine {
       kind,
       revision,
       content: text,
+      // Pre-2.1.5 peers (2.1.4 is inside the verified range) projected a file
+      // as a `data` part whose metadata sits INSIDE `content`; lifting it here
+      // is what keeps an attachment from degrading into an anonymous empty
+      // part across the peer upgrade.
+      ...this.#attachmentFace(kind, raw, content),
       ...(typeof raw['state'] === 'string' ? { state: raw['state'] } : {}),
       ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
       ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
+    }
+  }
+
+  /**
+   * The descriptive metadata of an attachment part — and deliberately NOT a
+   * way to reach its bytes.
+   *
+   * Two peer generations are covered, because both are inside the verified
+   * range and they disagree about where the metadata lives:
+   *
+   *  - **Cherry ≥ 2.1.5** — `{kind: 'file', name, ref}`, ref at the TOP level.
+   *  - **Cherry 2.1.4** — `{kind: 'data', name, content: {mediaType, filename}}`.
+   *
+   * Only string fields are lifted: a null `filename` (the peer's explicit "no
+   * name") stays absent rather than becoming the string "null". Anything a
+   * caller needs beyond this — the bytes — stays behind `agent.content.read`,
+   * which this plugin does not call for a file part.
+   */
+  #attachmentFace(
+    kind: string,
+    raw: Record<string, unknown>,
+    content: Record<string, unknown>,
+  ): { name?: string; mediaType?: string; byteLength?: string } {
+    if (kind !== 'file' && kind !== 'data') return {}
+    const ref = isRecord(raw['ref']) ? raw['ref'] : isRecord(content['ref']) ? content['ref'] : {}
+    // WHERE the name lives is part of the shape, not a matter of preference: on
+    // a `file` part `name` IS the filename, while a `data` part's `name` is the
+    // data KIND label — the 2.1.4 projection passes the literal `'file'` there —
+    // so the filename can only come from `content.filename`. Reading `name` for
+    // the data kind would report "file" as the attachment's name.
+    const name = kind === 'file' ? optionalString(raw['name']) : optionalString(content['filename'])
+    const mediaType = optionalString(ref['mediaType']) ?? optionalString(content['mediaType'])
+    const byteLength = optionalString(ref['byteLength'])
+    return {
+      ...(name === undefined ? {} : { name }),
+      ...(mediaType === undefined ? {} : { mediaType }),
+      ...(byteLength === undefined ? {} : { byteLength }),
     }
   }
 
@@ -1698,7 +1774,9 @@ class CherryToolEngine {
           text: {
             type: 'string',
             maxLength: TEXT_MAX_LENGTH,
-            description: `The message text. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling).`,
+            description:
+              `The message text, which must not be blank. At most ${TEXT_MAX_LENGTH} characters ` +
+              '(the protocol ceiling).',
           },
           wait: {
             type: 'boolean',
@@ -1737,6 +1815,24 @@ class CherryToolEngine {
             message:
               `the message is ${text.length} characters; the protocol caps a single send at ` +
               `${TEXT_MAX_LENGTH}. Split it into several cherry_send calls.`,
+          } satisfies Record<string, unknown>
+        }
+
+        // A BLANK BODY IS A LOCAL VERDICT, not a peer error. Cherry ≥ 2.1.5
+        // validates `agent.messages.send` with a refine that requires text which
+        // TRIMS to something (attachments are the other legal way to carry a
+        // send, and this client never sends them), so a whitespace-only body is
+        // refused by the peer's schema. Answering here keeps the caller on the
+        // plugin's structured verdicts instead of round-tripping a validation
+        // error from the wire.
+        //
+        // Deliberately NOT mirrored as a JSON-Schema `pattern`: `maxLength` is a
+        // host-side guard against an unbounded input, while blankness is a
+        // semantic rule whose useful answer is this verdict.
+        if (text.trim().length === 0) {
+          return {
+            error: 'text-empty',
+            message: 'the message text is empty (or whitespace only); the peer requires a non-blank body.',
           } satisfies Record<string, unknown>
         }
 
