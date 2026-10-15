@@ -25,7 +25,7 @@
 - **`deny` 的观测源**：**无参全局视图** `ctx.tools.schemas()` ∩ `CHERRY_TOOL_NAMES`；**禁止** `schemas(agent)`（已被 `layers.every(admits)` 过滤，自引用会把已隐藏的工具放回去）。
 - **空集语义**：目标 deny 为空集 ⇒ **只释放、不安装**；观测集合为空（工具尚未注册）⇒ **绝不提交空 `deny`**（会装成 no-op 层，被 guard 误读成"已隐藏"），但既有层的释放照常。
 - **每 agent 任一刻只允许一层**本插件的 restriction；换层一律"**先装新、后释放旧**"（restriction 取交集，叠加不可恢复）。
-- **同步判定**：guard、restriction 安装与 `agent/created` 监听器**只读缓存**，绝不在同步窗口里 `await`；缓存未命中即 fail-closed（不可见）并触发重算。
+- **同步判定**：guard、restriction 安装与 `agent/created` 监听器**只读缓存**，绝不在同步窗口里 `await`；缓存未命中即按 **D7** 处理——**仅 `selected`** fail-closed（不可见）；**`global` 下按唯一定义式 `isVisible(doc, judgement(agent)?.workspaceId)` 仍为可见 ⇒ 目标集合为空集、只释放不装层**，并触发重算。
 - **默认都不给**：文档不存在 ⇒ `mode:'selected'` + 空列表 ⇒ 谁都不给；文档读不出/字段非法 ⇒ 落到严格度序（`selected`+空 > `selected`+非空 > `global`）**更严**的一侧，**绝不**静默变成全局。
 - **稳定错误码**（字符串常量，不得往 `error` 槽位塞对象）：`invalid-scope`(400) / `missing-expected-revision`(400) / `scope-revision-conflict`(409) / `workspace-list-unavailable`(503) / `scope-version-unsupported`(503)。
 - **作用域文档**：`$DSH_HOME/cherry-remote/scope.json`，0600，原子写（`.tmp` + fsync + chmod + rename），`revision` 单调递增；**权威态在内存**，写盘仅作持久化。
@@ -98,7 +98,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 
 - 工作区列表在本模块里只有三态——**未读**（初始态：注入回调尚未到达，从未读过）/ **读成功**（`list()` 返回**非空**列表）/ **读失败**（`list()` 抛错**或返回空数组**）。**`[]`（读成功但空表）等同读失败**（B16）：否则空注册表会被读成"全部 id 已失效"，把用户的勾选**静默修剪光**——这正是 B16 禁止的静默损坏。
 - **`rebuild()`（Task 3）是 `setWorkspaces` 的唯一生产写入者**：读成功 ⇒ 写列表；读失败或返回空数组 ⇒ 写"不可用"；**"未读"是初始态、不由任何代码写入**（判据 = 从未调用过 `setWorkspaces`）。`setWorkspaces` 的入参语义据此固定：**非空数组 = 读成功**、**`undefined` 或空数组 = 读失败**。
-- 对外表现：**未读** ⇒ `workspaces()` 与 `staleWorkspaceIds()` 都是**空数组**、**不**产生 `degraded` 标注（"还没读过"不是"读不出来"）、`PUT` **允许**写入但**不修剪**（`pruned` 为空）；**读成功** ⇒ 正常对账与修剪；**读失败** ⇒ fail-closed + `degraded`（`source:'workspace-list'`）+ `PUT` 被拒绝（503）。
+- 对外表现：**未读** ⇒ `workspaces()` 与 `staleWorkspaceIds()` 都是**空数组**、**不**产生 `degraded` 标注（"还没读过"不是"读不出来"）、`PUT` **允许**写入但**不修剪**（`pruned` 为空）；**读成功** ⇒ 正常对账与修剪；**读失败** ⇒ **仅 `selected`** fail-closed（不可见；**`global` 下判定不受列表影响、仍为可见**）+ `degraded`（`source:'workspace-list'`）+ `PUT` 被拒绝（503）。
 - **`workspace-list` 降级标注只允许一处写入**——本模块里 `setWorkspaces` 写入"不可用"的那一处；HTTP / 宿主 / UI 层**不得**再补一条同源标注（同源去重、异源并存的口径见 `degraded()`）。
 
 - [ ] **Step 1: 写失败测试**——`tests/unit/toolScopeDoc.test.ts`：
@@ -151,7 +151,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
   ⑦ `invalidateDerived()` ⇒ `judgement()` 与 `pathUnmatched()` 清空（teardown 的载体，Task 4 ④ 会用）。
   ⑧ 列表读不到（`list()` 抛错**或返回空数组**）⇒ `listAvailable:false`、degraded 追加 `workspace-list`；判定侧：**有 `cwd` 的 agent 一律 `unresolved`**（列表不可用 / 注册表未就绪都算"本次解析失败"——与 D14 的"有界复检只对 `unresolved` 启动"一致），**无 `cwd` 者仍为 `no-cwd`**；`selected` 下不可见（fail-closed），**`global` 下判定不受列表影响、`visible` 仍为 `true`**（B16：fail-closed 只适用于 `selected`）。
   ⑨ `global` + 无 `cwd` + 列表降级 ⇒ `visible:true`（判据只有 `isVisible`，不看 `cwd`、不看列表）；由此目标 deny 集合为空 ⇒ 宿主侧**不装层**（只释放既有层——本 task 断言 `visible` 一侧，装层动作的断言在 Task 5 ③）。
-  ⑩ **三态与唯一写入者**（与 ⑧ 的"读失败"**分开断言，不得混测**）：**未读**（`rebuild()` 从未跑过）⇒ `workspaces()`/`staleWorkspaceIds()` 都是 `[]`、`degraded()` 不含 `workspace-list`、`save()` 允许且**不修剪**；此时判定整代为**空**（`judgement()` 全 `undefined` ⇒ 同步 fail-closed）——三态里的**"未读"只存在于 effect 挂载前**，**D14 的四值只在 `rebuild()` 跑过之后才存在**，二者不冲突；`rebuild()` 一旦运行，列表要么**读成功**（非空 ⇒ 写列表、正常对账、`staleWorkspaceIds()` 给出注册表外的 id），要么**读失败/返回空** ⇒ 按 ⑧（`rebuild()` 是 `setWorkspaces` 的唯一生产写入者）。
+  ⑩ **三态与唯一写入者**（与 ⑧ 的"读失败"**分开断言，不得混测**）：**未读**（`rebuild()` 从未跑过）⇒ `workspaces()`/`staleWorkspaceIds()` 都是 `[]`、`degraded()` 不含 `workspace-list`、`save()` 允许且**不修剪**；此时判定整代为**空**（`judgement()` 全 `undefined` ⇒ 按 **D7** 处理——**仅 `selected`** 同步 fail-closed（不可见）；**`global` 下按回退式仍为可见（空集、只释放）**）——三态里的**"未读"只存在于 effect 挂载前**，**D14 的四值只在 `rebuild()` 跑过之后才存在**，二者不冲突；`rebuild()` 一旦运行，列表要么**读成功**（非空 ⇒ 写列表、正常对账、`staleWorkspaceIds()` 给出注册表外的 id），要么**读失败/返回空** ⇒ 按 ⑧（`rebuild()` 是 `setWorkspaces` 的唯一生产写入者）。
   ⑪ **一个坏项不连累其它项与全部 agent**：夹具令注册表里某一项的 `path` 触发 `resolveByPath` **reject**（缺失路径）⇒ 该项**不进映射**、`rebuild()` **不抛**、`degraded()` **不新增**任何条目（尤其**不含** `workspace-list`）、经 `log` 桩记**恰好一条**；其余项照常参与判定——把该坏项从夹具里拿掉再跑一次，**全部** agent 的 `judgement()`（`status` / `workspaceId` / `visible`）与本轮逐条相同（一个坏项不影响其它项与全部 agent 的判定）。
 - [ ] **Step 2: 运行确认失败**——`npx vitest run tests/unit/toolScopeJudge.test.ts`，预期 FAIL（导出/方法不存在）。
 - [ ] **Step 3: 实现**——在 `ToolScopeState` 内按"构建新一代（映射 + 判定 + 解析状态 + `pathUnmatched`）→ 一次赋值原子替换"实现；`rebuild()` 是**唯一**允许 async 的地方；`judgement` 只读当代缓存。**构建次序固定**：先 `list()`（拿到结果就交给 `setWorkspaces`——**非空 ⇒ 写列表**；**抛错或返回空数组 ⇒ 写"不可用" + `workspace-list` 标注**）⇒ 再逐项 `resolveByPath(item.path)` 拿**实体路径**作键、实体 `workspaceId` 作值（**该项 reject ⇒ 跳过该项**：不中断本轮构建、经 `log` 记一条、**不计入 `degraded`**）⇒ 再逐 agent 调 `resolveByPath(agent.cwd)` 定四值（有 `cwd` 但列表不可用/注册表未就绪 ⇒ 一律 `unresolved`）。**去尾斜杠 / 统一大小写都不做**（realpath 语义已足够；退化路径保持大小写敏感，见 ③）。`resolveByPath` 的返回值按真实契约消费（**实体或 `undefined`**，路径缺失时它 **reject**），**不得**把它当"返回路径字符串"用。三态口径与 Task 2 一致：**`rebuild()` 是 `setWorkspaces` 的唯一生产写入者**、`workspace-list` 标注只写一处、**`[]` 等同读失败**（B16）。
@@ -279,12 +279,12 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 - [ ] **Step 1: 写失败测试**——追加断言（**编号沿用原序列**：原来的 ①②③（合并 / 置脏补跑、新 agent 首次安装、唯一弃权点）已**整体移入 Task 5 ⑫⑬⑭**——它们与安装/释放判据同轮，故本清单从 ④ 起，不重排编号）：
   ④ **有界复检**：`unresolved` ⇒ 按 `recheckDelaysMs` 各排一次（两个定时器）；两次后仍 `unresolved` ⇒ 不再排（定时器总数 = 2）；`no-cwd` / `no-match` / `resolved` ⇒ **零定时器**（无空转）；夹具断言"复检只对 `unresolved` 启动"（D14）。**复检失败只记录、不抛**：夹具令复检定时器里那次 `rebuild()` **抛错** ⇒ 只记录（`log` 桩，缺省退回 `console.warn` 一条）+ **不抛**、**不产生未捕获拒绝**（D14 明文"失败只记录、不抛"；同步窗口同受此约束，见 ⑥）。
   ⑤ 复检只修正"暂时不可见"：夹具先给缺失的 `sessionIds` 投影、在第一次复检时刻补上 ⇒ 复检后该 agent 装层（B13 的 `sessionIds` 滞后补偿）；`cwd` 缺失的会话**不因复检翻盘**（仍不可见）。
-  ⑥ **同步返回**：夹具令 `rebuild()` 挂起（`resolveByPath` 永不 resolve）⇒ `agent/created` 监听器**立即同步返回**、建会话不失败、当轮按 fail-closed 处理；`rebuild()` 完成后由合并闸的**补跑轮**纠正（不丢收敛）。
+  ⑥ **同步返回**：夹具令 `rebuild()` 挂起（`resolveByPath` 永不 resolve）⇒ `agent/created` 监听器**立即同步返回**、建会话不失败、当轮按 **D7** 处理——**仅 `selected`** 按 fail-closed（不可见）；**`global` 下按回退式仍可见（空集、只释放）**；`rebuild()` 完成后由合并闸的**补跑轮**纠正（不丢收敛）。
   ⑦ teardown 清掉未触发的复检定时器（无泄漏）：`vi.getTimerCount() === 0`。
-  ⑧ **补齐断言（与 Task 5 的合并闸共用同一夹具）**：① 复检触发的重算与 `tools/change` 触发的重算**共用同一个合并闸**——复检窗口内到达的 `tools/change` 只置脏、由补跑轮吸收，不产生并发的第二轮（每 agent 每轮至多重装一次）；② **teardown 是唯一的弃权点**：置位后到达的 `agent/created` / `tools/change` **既不排复检定时器、也不装层**（与 Task 5 ⑭ 是同一判据的两侧）。
+  ⑧ **补齐断言（与 Task 5 的合并闸共用同一夹具；内嵌项用 `(a)(b)` 编号，避免与顶层的 `T6④`–`T6⑨` 混淆）**：(a) 复检触发的重算与 `tools/change` 触发的重算**共用同一个合并闸**——复检窗口内到达的 `tools/change` 只置脏、由补跑轮吸收，不产生并发的第二轮（每 agent 每轮至多重装一次）；(b) **teardown 是唯一的弃权点**：置位后到达的 `agent/created` / `tools/change` **既不排复检定时器、也不装层**（与 Task 5 ⑭ 是同一判据的两侧）。
   ⑨ **B13 的头号正路径（正向组合）**：夹具先让判定缓存**已就绪**（`judgement()` 命中且 `visible:true`——规范化路径命中，不是复检补偿来的），随后触发 `agent/created` ⇒ **当轮**即按该判定落层：目标集合为空集 ⇒ **不装 `deny`**（只释放既有层）、**不排复检定时器**（`resolved` 零定时器，与 ④ 一致）。这就是 spec §7「规则二**当轮装层**」（B13「第一轮就有工具」）的直接承载——与 ⑤ 的"复检补偿投影滞后"是**两条独立路径**，本条的层必须来自**当轮命中**而非后续复检。
 - [ ] **Step 2: 运行确认失败**——`npx vitest run tests/integration/toolScopeHost.test.ts`，预期新增断言 FAIL。
-- [ ] **Step 3: 实现**——`agent/created` 监听器只做**同步判定** + 装层（或 fail-closed），**不在同步窗口里 await**（宿主按 `@mode serial` 派发它，监听器抛错会让建会话失败）；`unresolved` 时才 `setTimeout` 有界复检（间隔取 `recheckDelaysMs`，两次后不再排）；所有定时器登记在 effect 的 disposer 里一并清除，并受 `tornDown` 短路约束（teardown 后不再排新定时器）。重算入口的合并闸已由 Task 5 建立，本 task 只在其上触发复检。
+- [ ] **Step 3: 实现**——`agent/created` 监听器只做**同步判定** + 按方向锚的**唯一定义式**装层或只释放（缓存未命中时**仅 `selected`** fail-closed），**不在同步窗口里 await**（宿主按 `@mode serial` 派发它，监听器抛错会让建会话失败）；`unresolved` 时才 `setTimeout` 有界复检（间隔取 `recheckDelaysMs`，两次后不再排）；所有定时器登记在 effect 的 disposer 里一并清除，并受 `tornDown` 短路约束（teardown 后不再排新定时器）。重算入口的合并闸已由 Task 5 建立，本 task 只在其上触发复检。
   **为什么订阅与合并闸不在本 task**：理由见 Task 5 Step 3 末；本 task 只保留**有界复检 + 同步判定 + 补齐断言**，不重复实现闸。
 - [ ] **Step 4: 运行确认通过**——同命令 PASS。
 - [ ] **Step 5: 门禁**——`npm run typecheck`（`src/toolScopeHost.ts` 与 `tests/integration/toolScopeHost.test.ts` 都在 server 项目的覆盖面上，**无需登记**）。
