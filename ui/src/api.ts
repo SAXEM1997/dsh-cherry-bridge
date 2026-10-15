@@ -9,7 +9,14 @@
  * is the whole point of the wire contract.
  */
 import { API_BASE } from './types'
-import type { DevicePatch, DeviceSummary } from './types'
+import type {
+  DevicePatch,
+  DeviceSummary,
+  ScopeClient,
+  ScopeResponse,
+  ScopeSaveRequest,
+  ScopeSaveResult,
+} from './types'
 
 /** A refused call, carrying the server's structured error verbatim. */
 export class ApiError extends Error {
@@ -86,4 +93,41 @@ export async function patchDevice(deviceId: string, patch: DevicePatch): Promise
 /** `DELETE /devices/:id` — 204, no body. */
 export async function removeDevice(deviceId: string): Promise<void> {
   await request(`${API_BASE}/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' })
+}
+
+/**
+ * `GET /scope` — the whole scope state in ONE body (spec §6.3).
+ *
+ * The page cannot reach the workspace registry itself, so the server projects
+ * the list down (`id`/`title`/`path` only) and answers with the document, the
+ * two diagnostic channels and the host block together.
+ */
+export async function getScope(): Promise<ScopeResponse> {
+  const body = await request(`${API_BASE}/scope`)
+  return body as ScopeResponse
+}
+
+/**
+ * `PUT /scope` — validate and commit the read-modify-write cycle.
+ *
+ * `expectedRevision` travels beside the document (that is what makes the write
+ * conflict-detecting), and a refusal arrives as an {@link ApiError} carrying the
+ * server's stable code VERBATIM: `invalid-scope` / `missing-expected-revision`
+ * (400), `scope-revision-conflict` (409), `workspace-list-unavailable` /
+ * `scope-version-unsupported` (503). The caller branches on that string — never
+ * on the prose — because only the code is stable across versions.
+ */
+export async function putScope(body: ScopeSaveRequest): Promise<ScopeSaveResult> {
+  const result = await request(`${API_BASE}/scope`, { method: 'PUT', body: JSON.stringify(body) })
+  return result as ScopeSaveResult
+}
+
+/**
+ * The production {@link ScopeClient}: the same-origin calls above behind the
+ * seam the panel (and `App`) accept, so tests can inject a stub without
+ * touching production wiring.
+ */
+export const defaultScopeClient: ScopeClient = {
+  get: () => getScope(),
+  put: (body) => putScope(body),
 }

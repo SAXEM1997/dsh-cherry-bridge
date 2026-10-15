@@ -103,6 +103,69 @@
   color: #f85149;
 }
 
+/* --- enablement scope panel ---------------------------------------------- */
+
+/* All three visible as a group, never as one combined verdict: the mode radio
+   pair, the workspace ticks and the save that commits them (§6.4). */
+.cherry-scope-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 8px 0;
+  padding: 6px 10px;
+  border: 1px dashed color-mix(in srgb, currentColor 20%, transparent);
+  border-radius: 8px;
+}
+
+.cherry-scope-modes label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.cherry-scope-degraded,
+.cherry-scope-options,
+.cherry-scope-stale ul,
+.cherry-scope-unmatched ul {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.cherry-scope-degraded li,
+.cherry-scope-options li {
+  margin: 2px 0;
+}
+
+.cherry-scope-options label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.cherry-scope-option-title {
+  font-weight: 600;
+}
+
+/* The two diagnostic boxes are deliberately separate surfaces: a deleted
+   workspace and an unmatched cwd are different answers (§6.1/§6.4). */
+.cherry-scope-stale,
+.cherry-scope-unmatched {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px dashed color-mix(in srgb, currentColor 25%, transparent);
+}
+
+.cherry-scope-save {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
+}
+
 /* --- device cards -------------------------------------------------------- */
 
 .cherry-cards {

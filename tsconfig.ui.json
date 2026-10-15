@@ -1,6 +1,8 @@
 {
-  // The UI project: the settings page (`ui/**`) and the two tests that must run
-  // in a UI environment — `tests/unit/ui.test.ts` (jsdom + testing-library) and
+  // The UI project: the settings page (`ui/**`) and the three tests that must
+  // run in a UI environment — `tests/unit/ui.test.ts` and
+  // `tests/unit/uiScopePanel.test.ts` (both jsdom + testing-library; the second
+  // covers the 「启用范围」 settings section) plus
   // `tests/integration/clientBundle.test.ts` (it loads the built bundle in a
   // browser-shaped VM). Its counterpart is `tsconfig.json`; the split is
   // load-bearing because this project adds the DOM libs and `jsx: react-jsx`,
@@ -31,5 +33,10 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["ui", "tests/unit/ui.test.ts", "tests/integration/clientBundle.test.ts"]
+  "include": [
+    "ui",
+    "tests/unit/ui.test.ts",
+    "tests/unit/uiScopePanel.test.ts",
+    "tests/integration/clientBundle.test.ts"
+  ]
 }

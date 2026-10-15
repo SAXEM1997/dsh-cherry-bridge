@@ -128,6 +128,113 @@ export const STAGE_LABELS: Record<string, string> = {
     '设备档案无法读取（已保留为 .corrupt 副本）。请将该文件移开后重启或重新加载插件，再重试配对',
 }
 
+// ---------------------------------------------------------------------------
+// The scope document face (spec §6.3/§6.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The two enablement modes, verbatim from the server's document.
+ *
+ * `global` means the tools are available in every workspace and the saved
+ * `workspaceIds` do NOT take part in the judgement (B2) — which is why the page
+ * must say so rather than pretending an unticked list means "nothing enabled".
+ */
+export type ScopeMode = 'global' | 'selected'
+
+/** One scope document, exactly as `GET/PUT /cherry-remote/api/scope` carries it. */
+export interface ScopeDoc {
+  mode: ScopeMode
+  workspaceIds: string[]
+  revision: number
+}
+
+/** One registered workspace, projected down to what the page may see. */
+export interface ScopeWorkspace {
+  id: string
+  title: string
+  path: string
+}
+
+/**
+ * The host capability tri-state (B7/D8/D13).
+ *
+ * `capable` is `state === 'ready'` and nothing else; `pending` is "the injected
+ * callbacks have not arrived yet" and must never be rendered as a refusal.
+ */
+export type ScopeHostState = 'pending' | 'unsupported' | 'ready'
+
+/**
+ * The five degradation sources (B12/B16/B17).
+ *
+ * The list is FIXED: a corrupt scope document is carried by the strictness
+ * order (`selected` + an empty list) and the page's own empty-state wording,
+ * NOT by a sixth member here (B9).
+ */
+export type DegradedSource =
+  | 'install'
+  | 'workspace-list'
+  | 'visibility-only'
+  | 'scope-version'
+  | 'path-normalization'
+
+/** One degradation note; the same source never appears twice (latest wins). */
+export interface DegradedNote {
+  source: DegradedSource
+  reason: string
+}
+
+/** The host block beside the document: capability plus its degradation notes. */
+export interface ScopeHost {
+  state: ScopeHostState
+  capable: boolean
+  reason: string
+  degraded: DegradedNote[]
+}
+
+/** One "ticked, but this session's cwd does not match" diagnostic entry. */
+export interface PathUnmatchedEntry {
+  agentId: string
+  cwd: string
+}
+
+/**
+ * The whole `GET /cherry-remote/api/scope` body.
+ *
+ * `staleWorkspaceIds` and `pathUnmatched` are two SEPARATE channels on purpose
+ * (§6.1): "an id the registry no longer has" and "this session's cwd belongs to
+ * no registered workspace" are different answers and neither may be derived
+ * from — or merged with — the other.
+ */
+export interface ScopeResponse {
+  scope: ScopeDoc
+  workspaces: ScopeWorkspace[]
+  staleWorkspaceIds: string[]
+  pathUnmatched: PathUnmatchedEntry[]
+  host: ScopeHost
+}
+
+/** The read-modify-write body `PUT /scope` accepts. */
+export interface ScopeSaveRequest {
+  mode: ScopeMode
+  workspaceIds: string[]
+  expectedRevision: number
+}
+
+/** The `PUT /scope` success body: the committed document plus what it pruned. */
+export interface ScopeSaveResult {
+  scope: ScopeDoc
+  pruned: string[]
+}
+
+/**
+ * The panel's HTTP seam, in the same style as {@link EventSourceFactory}: the
+ * default is the real same-origin `fetch` client, and tests inject a stub.
+ */
+export interface ScopeClient {
+  get(): Promise<ScopeResponse>
+  put(body: ScopeSaveRequest): Promise<ScopeSaveResult>
+}
+
 /** Human labels for the five states, shared by the light and the light's name. */
 export const STATE_LABELS: Record<DeviceState, string> = {
   connected: '已连接',

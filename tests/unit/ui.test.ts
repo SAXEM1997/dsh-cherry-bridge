@@ -117,17 +117,39 @@ interface Harness {
 const jsonResponse = (status: number, body: unknown): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
+/**
+ * The `GET /cherry-remote/api/scope` answer every render path needs.
+ *
+ * `App` mounts the 「启用范围」 panel, which reads on mount — and this mock THROWS
+ * on an unregistered request, so a path with no `/scope` answer rejects the
+ * panel's promise and renders its error line instead (the failure mode is per
+ * render path, not "every case turns red"). Registered LAST inside
+ * `installFetch`, because the lookup is first-match-wins: a case that ever needs
+ * its own `/scope` entry still overrides it. Built fresh per harness on purpose
+ * — a `Response` body can only be read once.
+ */
+function scopeSnapshot(): Response {
+  return jsonResponse(200, {
+    scope: { mode: 'selected', workspaceIds: [], revision: 0 },
+    workspaces: [],
+    staleWorkspaceIds: [],
+    pathUnmatched: [],
+    host: { state: 'ready', capable: true, reason: '宿主能力齐备', degraded: [] },
+  })
+}
+
 function installFetch(responses: Array<[string, string, Response]>): Harness {
   const calls: FetchCall[] = []
   const order: string[] = []
   let counter = 0
+  const table: Array<[string, string, Response]> = [...responses, ['GET', '/cherry-remote/api/scope', scopeSnapshot()]]
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     const method = (init?.method ?? 'GET').toUpperCase()
     const raw = init?.body
     calls.push({ url, method, body: raw === undefined ? undefined : JSON.parse(String(raw)), at: counter++ })
     order.push(`fetch ${method} ${url}`)
-    for (const [responseMethod, responseUrl, response] of responses) {
+    for (const [responseMethod, responseUrl, response] of table) {
       if (responseMethod === method && url.endsWith(responseUrl)) return response
     }
     throw new Error(`unexpected request: ${method} ${url}`)
@@ -158,6 +180,10 @@ type AppProps = ComponentProps<typeof App>
 /**
  * Renders the settings page, pushes the initial `device-state` frame, and waits
  * for the card to appear — the shared opening move of every card test.
+ *
+ * Only `/devices` is registered here: `/scope` (the panel `App` mounts) is
+ * answered by `installFetch` itself, so the four DIRECT render paths below get
+ * it through the same table.
  */
 async function renderWithDevice(
   responses: Array<[string, string, Response]> = [],
@@ -247,18 +273,25 @@ describe('pairing wizard', () => {
   it('subscribes to the SSE stream before POSTing /pair', async () => {
     const { order } = await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-9' })]])
 
+    // `order` records EVERY request, and the scope panel's own `GET /scope` read
+    // is one of them (child effects flush before the app's, so it can even come
+    // first). The claim below is about two events — the stream opening and the
+    // pairing POST — so it is read off a view restricted to those two, derived
+    // at each point of use (the POST has not happened yet at the first one).
+    const pairingOf = (): string[] =>
+      order.filter((entry) => entry === 'sse' || entry.includes('POST /cherry-remote/api/pair'))
     // The stream is already open from the first render.
-    expect(order[0]).toBe('sse')
+    expect(pairingOf()[0]).toBe('sse')
     expect(stream().listeners.get('pairing-progress')?.size ?? 0).toBeGreaterThan(0)
 
     submitPayload()
 
     await screen.findByText('配对进行中')
-    const pairIndex = order.findIndex((entry) => entry.includes('POST /cherry-remote/api/pair'))
+    const pairIndex = pairingOf().findIndex((entry) => entry.includes('POST /cherry-remote/api/pair'))
     expect(pairIndex).toBeGreaterThan(0)
     // Subscribe-before-pair: the code frame is never replayed, so a POST that
     // beat the subscription would lose it forever.
-    expect(order.indexOf('sse')).toBeLessThan(pairIndex)
+    expect(pairingOf().indexOf('sse')).toBeLessThan(pairIndex)
   })
 
   it('keeps the code when the stream was open before the POST', async () => {
@@ -490,6 +523,9 @@ describe('device card status light', () => {
 
       const light = await screen.findByRole('img', { name: label })
       expect(light.getAttribute('data-state')).toBe(state)
+      // Every render path in this file must be answered for the scope panel's
+      // own `/scope` read (one of the four DIRECT paths this line covers).
+      expect(await screen.findByRole('radio', { name: '仅选定工作区' })).toBeTruthy()
     })
   }
 })
@@ -582,6 +618,8 @@ describe('device card actions', () => {
     render(createElement(App, { eventSourceFactory: harnessFactory() }))
     stream().emit({ event: 'device-state', data: { deviceId: DEVICE.deviceId, state: 'disabled' } })
     await screen.findByText(DEVICE.displayName)
+    // Second DIRECT render path: the scope panel's read is answered here too.
+    expect(await screen.findByRole('radio', { name: '仅选定工作区' })).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: '启用' }))
 
@@ -667,6 +705,8 @@ describe('sse driven state', () => {
     render(createElement(App, { eventSourceFactory: harness.eventSourceFactory }))
     await screen.findByText(DEVICE.displayName)
     await screen.findByText('笔记本')
+    // Third DIRECT render path: the scope panel's read is answered here too.
+    expect(await screen.findByRole('radio', { name: '仅选定工作区' })).toBeTruthy()
 
     // Both cards exist but no state has been reported on the stream yet: the
     // FIRST-FRAME contract (one `device-state` per device on connect) is the
@@ -768,7 +808,7 @@ describe('settings page registration', () => {
     expect(document.head.querySelectorAll('[data-cherry-remote-styles]').length).toBe(0)
   })
 
-  it('renders the registered component as the settings page', () => {
+  it('renders the registered component as the settings page', async () => {
     const slots = new FakeSlots()
     installFetch([['GET', '/cherry-remote/api/devices', jsonResponse(200, [])]])
 
@@ -781,6 +821,10 @@ describe('settings page registration', () => {
     // The page the shell would show is this plugin's settings view.
     expect(screen.getByText('Cherry Studio 互联')).toBeTruthy()
     expect(screen.getByLabelText('配对信息')).toBeTruthy()
+    // Fourth DIRECT render path: the scope panel read its `/scope` answer through
+    // the same harness (this is the component the shell renders, so it is the
+    // path an operator actually arrives on).
+    expect(await screen.findByRole('radio', { name: '仅选定工作区' })).toBeTruthy()
   })
 
   it('scopes every stylesheet rule to the plugin root, so no host UI is restyled', () => {

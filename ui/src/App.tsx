@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { DeviceCard } from './DeviceCard'
 import { PairingWizard } from './PairingWizard'
+import { ToolScopePanel } from './ToolScopePanel'
 import { listDevices } from './api'
 import { API_BASE } from './types'
 import type {
@@ -27,6 +28,7 @@ import type {
   DeviceSummary,
   EventSourceFactory,
   PairingProgressEvent,
+  ScopeClient,
 } from './types'
 
 export interface AppProps {
@@ -37,6 +39,12 @@ export interface AppProps {
   eventSourceFactory?: EventSourceFactory
   /** Transient verification-code lifetime, forwarded to the wizard. */
   codeLifetimeMs?: number
+  /**
+   * The scope panel's HTTP seam. Defaults to the real same-origin client;
+   * injected by tests in the same style as `eventSourceFactory`, so no test has
+   * to stand up a fake registry server to render the page.
+   */
+  scopeClient?: ScopeClient
 }
 
 /** The production stream opener; the host page always has `EventSource`. */
@@ -55,7 +63,11 @@ function parseFrame<T>(data: string): T | undefined {
   }
 }
 
-export function App({ eventSourceFactory = defaultEventSourceFactory, codeLifetimeMs }: AppProps): ReturnType<typeof Object> {
+export function App({
+  eventSourceFactory = defaultEventSourceFactory,
+  codeLifetimeMs,
+  scopeClient,
+}: AppProps): ReturnType<typeof Object> {
   const [devices, setDevices] = useState<DeviceSummary[]>([])
   const [states, setStates] = useState<Record<string, DeviceState>>({})
   const [progress, setProgress] = useState<PairingProgressEvent | undefined>(undefined)
@@ -179,6 +191,10 @@ export function App({ eventSourceFactory = defaultEventSourceFactory, codeLifeti
         onRunStart={startRun}
         onSettled={onSettled}
       />
+
+      {/* Above the device list: the scope decides which workspaces the tools
+          appear in, which is the setting an operator comes here to change. */}
+      <ToolScopePanel {...(scopeClient === undefined ? {} : { client: scopeClient })} />
 
       <section className="cherry-panel" aria-labelledby="cherry-devices-title">
         <h3 id="cherry-devices-title">已配对设备</h3>
