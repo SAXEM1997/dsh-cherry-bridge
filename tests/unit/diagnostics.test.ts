@@ -249,6 +249,16 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
   /** Longer than `ERROR_MESSAGE_MAX`: a truncated value would be observable. */
   const LONG_CWD = `/${'deeply/nested/'.repeat(30)}project`
 
+  /**
+   * A `source` OUTSIDE the closed five-value set, beside the reasons it must not
+   * leak. The input is a loose bag (`sanitizeDiagnostics` takes `scope: unknown`
+   * on purpose), so an unknown source is a real arrival — a peer or a plugin
+   * version on the other side of the wire, a hand-assembled report — and
+   * `projectDegraded` drops it rather than narrowing it to a plausible member.
+   */
+  const BOGUS_SOURCE = 'bogus'
+  const BOGUS_REASON = '不在五个已知来源之内'
+
   /** The over-stuffed probe: every credential the brief names, at both levels. */
   function overstuffed(): Record<string, unknown> {
     return {
@@ -262,7 +272,14 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
         state: 'ready',
         capable: true,
         reason: '宿主就绪',
-        degraded: [{ source: 'install', reason: '安装被拒', accessToken: 'scope-leaked' }],
+        degraded: [
+          // A VALID source carrying a smuggled key: the inner projection is what
+          // strips `accessToken`, and this note must survive.
+          { source: 'install', reason: '安装被拒', accessToken: 'scope-leaked' },
+          { source: 'path-normalization', reason: '路径规范化降级' },
+          // …and a source OUTSIDE the closed set, which must not survive at all.
+          { source: BOGUS_SOURCE, reason: BOGUS_REASON, accessToken: 'scope-leaked-3' },
+        ],
         identity: 'host-identity-probe',
       },
       pathUnmatched: [{ agentId: 'agent-1', cwd: LONG_CWD, accessToken: 'scope-leaked-2' }],
@@ -305,9 +322,42 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
         state: 'ready',
         capable: true,
         reason: '宿主就绪',
-        degraded: [{ source: 'install', reason: '安装被拒' }],
+        degraded: [
+          { source: 'install', reason: '安装被拒' },
+          { source: 'path-normalization', reason: '路径规范化降级' },
+        ],
       },
     })
+  })
+
+  it('③ drops a `degraded` note whose `source` is not one of the five known values', () => {
+    // THE BRANCH THIS EXISTS FOR: the `continue` in `projectDegraded` that
+    // discards a foreign source. The probe below carried a VALID source with an
+    // extra key, which exercises the inner `{source, reason}` projection but
+    // never the DROP — so `DegradedSource`'s closure rested on inspection alone.
+    const sanitized = sanitizeDiagnostics({ scope: overstuffed() })
+
+    // DROPPED, and dropped ENTIRELY: the foreign note is gone from the array
+    // while the valid ones survive, in order. Asserting only "no error was
+    // thrown" (or only the absence of one string) would pass over a
+    // re-labelled, truncated or passthrough note just as happily.
+    expect(sanitized.scope.host.degraded.map((note) => note.source)).toEqual(['install', 'path-normalization'])
+    expect(sanitized.scope.host.degraded).toHaveLength(2)
+    // Nothing of it survives anywhere in the body an operator receives — not the
+    // source, not its reason.
+    expect(JSON.stringify(sanitized)).not.toContain(BOGUS_SOURCE)
+    expect(JSON.stringify(sanitized)).not.toContain(BOGUS_REASON)
+
+    // The report an operator actually reads is the same projection, so the drop
+    // holds on that path too.
+    const report = buildDiagnostics(
+      diagnosticsSources({ scope: () => overstuffed() as unknown as DiagnosticsScope }),
+    )
+    expect(report.scope.host.degraded).toEqual([
+      { source: 'install', reason: '安装被拒' },
+      { source: 'path-normalization', reason: '路径规范化降级' },
+    ])
+    expect(JSON.stringify(report.scope)).not.toContain(BOGUS_SOURCE)
   })
 
   it('③ the REPORT itself is a projection: an over-stuffed source cannot smuggle a key in', () => {

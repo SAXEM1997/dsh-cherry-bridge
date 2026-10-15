@@ -13,7 +13,10 @@
  *    wording changed, and `scope-version-unsupported` must never read as "just
  *    re-read and retry" — re-reading cannot change the document's version.
  *  - **A failure never moves the draft.** The local `mode`/`workspaceIds` are
- *    the operator's edit; a refusal leaves them exactly where they were (§6.4).
+ *    the operator's edit; a refusal leaves them exactly where they were (§6.4),
+ *    and it triggers no re-read either — re-seeding overwrites those ticks, so
+ *    the conflict's recovery is an explicit click on the control the conflict
+ *    arm carries (see `reread`).
  *  - **Disabling the save has THREE independent sources** — `unsupported`,
  *    the `scope-version` degradation and the `workspace-list` degradation — and
  *    `pending` is none of them. They may appear side by side and none may be
@@ -79,6 +82,11 @@ const DEGRADED_LABELS: Record<DegradedSource, string> = {
 
 /**
  * The copy for each stable `PUT` refusal code.
+ *
+ * `scope-revision-conflict` is the one refusal whose message instructs a
+ * RE-READ, so it is also the one whose rendering carries the control that
+ * performs it (`reread`); an instruction with no way to follow it is how the
+ * operator ends up re-sending the same stale revision forever.
  *
  * `scope-version-unsupported` gets its own recovery sentence: re-reading cannot
  * change the document's version, so sending the operator round that loop would
@@ -146,16 +154,28 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
   // degradation arriving through the write path: the save stays disabled.
   const [versionBlocked, setVersionBlocked] = useState(false)
 
+  /**
+   * The ONE place a served document becomes the draft.
+   *
+   * Shared by the mount read and the operator-requested re-read so the two
+   * cannot drift: `mode`, the ticked ids and — the reason this is a function at
+   * all — the `revision` the NEXT save bases itself on all come from the
+   * response in one step.
+   */
+  const seedFromDocument = useCallback((response: ScopeResponse): void => {
+    setData(response)
+    setMode(response.scope.mode)
+    setIds([...response.scope.workspaceIds])
+    setRevision(response.scope.revision)
+    setLoadError(undefined)
+  }, [])
+
   useEffect(() => {
     let live = true
     void client.get().then(
       (response) => {
         if (!live) return
-        setData(response)
-        setMode(response.scope.mode)
-        setIds([...response.scope.workspaceIds])
-        setRevision(response.scope.revision)
-        setLoadError(undefined)
+        seedFromDocument(response)
       },
       (cause: unknown) => {
         if (live) setLoadError(describeCause(cause))
@@ -164,7 +184,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
     return () => {
       live = false
     }
-  }, [client])
+  }, [client, seedFromDocument])
 
   const degraded = data?.host.degraded ?? []
   // A plain predicate, not a memo: `degraded` is projected afresh each render,
@@ -241,6 +261,37 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
       },
     )
   }, [client, ids, mode, revision])
+
+  /**
+   * The operator-requested RE-READ: the conflict's own recovery (§6.4).
+   *
+   * A 409 tells the operator to re-read, so the panel must be able to do it —
+   * the mount read is otherwise the page's only `GET`, which leaves every later
+   * save re-sending the same stale `revision` and 409-ing until a full reload.
+   *
+   * Nothing here runs automatically on a refusal: re-seeding REPLACES the draft,
+   * so doing it silently in response to a failed save would discard exactly the
+   * edit that caused the conflict. It runs only from the control below — and
+   * because it re-seeds, it also replaces the `revision` the next `PUT` sends.
+   *
+   * The conflict message is cleared only once the read SUCCEEDS: if the `GET`
+   * itself fails the conflict still stands, the control stays on screen, and
+   * `loadError` says what went wrong.
+   */
+  const reread = useCallback((): void => {
+    setBusy(true)
+    void client.get().then(
+      (response) => {
+        setBusy(false)
+        seedFromDocument(response)
+        setFailure(undefined)
+      },
+      (cause: unknown) => {
+        setBusy(false)
+        setLoadError(describeCause(cause))
+      },
+    )
+  }, [client, seedFromDocument])
 
   return (
     <section className="cherry-panel" aria-labelledby="cherry-scope-title">
@@ -402,6 +453,16 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
             <p className="cherry-error" role="alert">
               {failure.label}
             </p>
+            {/* The conflict arm's OWN recovery. The copy above instructs a
+                re-read, so the control that performs one belongs on this arm —
+                and ONLY on this arm: `scope-version-unsupported` says outright
+                that re-reading cannot change the document, and the remaining
+                three codes are not a stale base that a read would refresh. */}
+            {failure.code === 'scope-revision-conflict' && (
+              <button type="button" onClick={reread} disabled={busy}>
+                重新读取
+              </button>
+            )}
             {failure.detail !== undefined && <p className="cherry-hint cherry-mono">{failure.detail}</p>}
           </div>
         )}

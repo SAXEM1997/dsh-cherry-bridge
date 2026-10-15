@@ -87,21 +87,29 @@ interface ScopeStub {
   puts: ScopeSaveRequest[]
   /** How many `GET`s were issued (a refusal must not silently re-read). */
   gets: number
+  /** What the NEXT `GET` answers — the server moving on while the page sat idle. */
+  serve(next: ScopeResponse): void
 }
 
 function installScope(response: ScopeResponse, outcome?: PutOutcome): ScopeStub {
   const puts: ScopeSaveRequest[] = []
+  // The answer the stub is currently serving. A conflict case re-points it at a
+  // NEWER document, which is what the other tab's save did to the real one.
+  let served = response
   const stub: ScopeStub = {
     puts,
     gets: 0,
+    serve: (next: ScopeResponse): void => {
+      served = next
+    },
     client: {
       get: () => {
         stub.gets += 1
-        return Promise.resolve(response)
+        return Promise.resolve(served)
       },
       put: (body) => {
         puts.push(body)
-        if (outcome === undefined) return Promise.resolve({ scope: response.scope, pruned: [] })
+        if (outcome === undefined) return Promise.resolve({ scope: served.scope, pruned: [] })
         if ('code' in outcome) return Promise.reject(new ApiError(outcome.status, outcome.code, outcome.message))
         return Promise.resolve(outcome)
       },
@@ -116,12 +124,18 @@ function installScope(response: ScopeResponse, outcome?: PutOutcome): ScopeStub 
 
 const SAVE_BUTTON = '保存启用范围'
 const CLEAR_BUTTON = '清除已失效选择'
+/** The conflict's own recovery control; absent whenever there is nothing to re-read. */
+const REREAD_BUTTON = '重新读取'
 
 const pageText = (): string => document.body.textContent ?? ''
 /** The text of one addressed slot; '' when the slot is absent. */
 const slotText = (selector: string): string => document.querySelector(selector)?.textContent ?? ''
 
 const saveButton = (): HTMLButtonElement => screen.getByRole('button', { name: SAVE_BUTTON }) as HTMLButtonElement
+
+/** The re-read control, or `null` when the panel shows no such affordance. */
+const rereadButton = (): HTMLButtonElement | null =>
+  screen.queryByRole('button', { name: REREAD_BUTTON }) as HTMLButtonElement | null
 
 const isChecked = (role: 'radio' | 'checkbox', name: string): boolean =>
   (screen.getByRole(role, { name }) as HTMLInputElement).checked
@@ -419,6 +433,12 @@ describe('启用范围面板 (§6.4)', () => {
       expect(stub.gets).toBe(1)
 
       if (alsoExpected !== undefined) expect(pageText()).toContain(alsoExpected)
+      // The re-read control belongs to the CONFLICT arm alone: a re-read is that
+      // refusal's own recovery, while the version arm says outright that
+      // re-reading cannot change the document, and the other three are not a
+      // stale base at all. It is absent everywhere else rather than offered as a
+      // standing "read again" that would solve nothing.
+      expect(rereadButton() === null, code).toBe(code !== 'scope-revision-conflict')
       if (code === 'scope-version-unsupported') {
         // Re-reading cannot change the document's version, so the panel must not
         // send the operator round that loop — and the save is disabled.
@@ -669,6 +689,63 @@ describe('启用范围面板 (§6.4)', () => {
     await loaded()
 
     expect(slotText('[data-scope-empty]')).toContain('此状态下 cherry_* 工具不会出现在任何会话里')
+  })
+
+  // -------------------------------------------------------------------------
+  // ⑮ The conflict's own recovery: an EXPLICIT re-read that re-seeds the draft
+  // -------------------------------------------------------------------------
+
+  it('⑮ a revision conflict offers a re-read that re-seeds the draft the next save bases itself on', async () => {
+    // The finding this pins: the conflict copy says 「请重新读取后再保存」, but the
+    // panel's only `GET` was the mount read and a refusal deliberately moves
+    // nothing — so without a control here every later save re-sends the SAME
+    // stale `revision` and 409s forever (the recovery being a page reload the
+    // copy never mentions). Multi-tab editing is the trigger, which §6.4
+    // contemplates by name.
+    const stub = installScope(
+      snapshot({ scope: doc({ revision: 3, workspaceIds: ['ws-1'] }) }),
+      { status: 409, code: 'scope-revision-conflict', message: '服务端对 scope-revision-conflict 的说明' },
+    )
+    renderPanel(stub)
+    await loaded()
+
+    // Nothing has failed yet, so there is nothing to re-read: the control is not
+    // a standing offer on a healthy screen.
+    expect(rereadButton()).toBeNull()
+
+    fireEvent.click(saveButton())
+    await waitFor(() => {
+      expect(pageText()).toContain('配置已被他处修改')
+    })
+    // …and the refusal did NOT re-read on its own. Re-seeding throws away the
+    // ticks the operator just made, so it may only ever run when they ask.
+    expect(stub.gets).toBe(1)
+    expect(rereadButton()).toBeTruthy()
+
+    // Meanwhile the other tab committed: this is the document the conflict was
+    // about, and the revision the next successful save must be based on.
+    stub.serve(snapshot({ scope: doc({ revision: 9, workspaceIds: ['ws-2'] }) }))
+    fireEvent.click(rereadButton()!)
+
+    await waitFor(() => {
+      expect(slotText('[data-scope-revision]')).toContain('9')
+    })
+
+    expect(stub.gets).toBe(2)
+    // The re-read REPLACES the draft with what it read — mode and ticks too.
+    expect(isChecked('checkbox', '项目乙 /srv/beta')).toBe(true)
+    expect(isChecked('checkbox', '项目甲 /srv/alpha')).toBe(false)
+    // The conflict is exactly what the re-read resolves, so its message goes.
+    expect(pageText()).not.toContain('配置已被他处修改')
+
+    fireEvent.click(saveButton())
+    await waitFor(() => {
+      expect(stub.puts).toHaveLength(2)
+    })
+    // THE NON-VACUITY EVIDENCE: the second `PUT` carries the revision the
+    // re-read served. Re-seeding only what is DISPLAYED would leave the stale 3
+    // here — the loop this whole case exists to close.
+    expect(stub.puts[1]).toEqual({ mode: 'selected', workspaceIds: ['ws-2'], expectedRevision: 9 })
   })
 
   it('self-review: nothing is claimed before the read lands', async () => {
