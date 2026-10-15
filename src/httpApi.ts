@@ -5,7 +5,7 @@ import type { DeviceStore } from './deviceStore.js'
 import type { DeviceState, EffectiveLimits } from './connection.js'
 import { PairingError } from './pairing.js'
 import type { PairWithPayloadOptions } from './pairing.js'
-import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics.js'
+import { CONTRACT_DIFFERENCES, buildDiagnostics, readScopeSegment } from './diagnostics.js'
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
 import type { ScopeDoc, ToolScopeState } from './toolScope.js'
 import type { RefreshSummary } from './toolScopeHost.js'
@@ -960,6 +960,12 @@ function diagnosticsReport(route: RouteContext): unknown {
       stats: () => safely(() => deps.diagnosticsStats?.(), {}),
       sessions: () => safely(() => deps.diagnosticsSessions?.(), []),
       recentErrors: () => safely(() => deps.diagnosticsErrors?.(), []),
+      // THE SAME READ as `GET /scope` below: one function, one `deps.scope`
+      // object. The report's `scope.host` is therefore not a second copy that a
+      // later `setHost` could leave behind — it is that read (Task 9 ②), and a
+      // read that throws costs its own segment only (`buildDiagnostics` guards
+      // every source, this one included).
+      scope: () => readScopeSegment(deps.scope),
     }),
     // Effective config is appended AFTER the aggregator's own projection: both
     // keys are numbers the plugin already logs, never a credential.
@@ -985,26 +991,24 @@ function diagnosticsReport(route: RouteContext): unknown {
  * neither may be derived from the other. `degraded` is an ARRAY inside `host` —
  * same source deduplicated (latest reason), different sources coexisting — and
  * an empty array is the honest "no degradation".
+ *
+ * `host` and `pathUnmatched` come out of {@link readScopeSegment} — the very
+ * call the diagnostics report reads its `scope` segment through, so the two
+ * faces serve ONE read of ONE scope state and cannot drift apart (Task 9 ②).
  */
 function scopeSnapshot(res: HttpResponseLike, route: RouteContext): void {
   const scope = route.deps.scope
-  const doc = scope.doc()
-  const host = scope.host()
+  const read = readScopeSegment(scope)
   writeJson(res, 200, {
-    scope: scopeProjection(doc),
+    scope: scopeProjection(scope.doc()),
     workspaces: scope.workspaces().map((workspace) => ({
       id: workspace.id,
       title: workspace.title,
       path: workspace.path,
     })),
     staleWorkspaceIds: [...scope.staleWorkspaceIds()],
-    pathUnmatched: scope.pathUnmatched().map((entry) => ({ agentId: entry.agentId, cwd: entry.cwd })),
-    host: {
-      state: host.state,
-      capable: host.capable,
-      reason: host.reason,
-      degraded: scope.degraded().map((note) => ({ source: note.source, reason: note.reason })),
-    },
+    pathUnmatched: read.pathUnmatched,
+    host: read.host,
   })
 }
 

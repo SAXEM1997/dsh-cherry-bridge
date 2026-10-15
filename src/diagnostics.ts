@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import type { DeviceRecord, DeviceStore } from './deviceStore.js'
 import type { DeviceState, EffectiveLimits } from './connection.js'
+import { DEFAULT_SCOPE } from './toolScope.js'
+import type { DegradedNote, DegradedSource, ScopeDoc, ScopeHostState, ScopeMode } from './toolScope.js'
 
 /**
  * M4 operations surface (spec §5 「可观测性与诊断」, §3.7 route prefix).
@@ -218,6 +220,42 @@ export interface DiagnosticsStats {
   subscriptions: number
 }
 
+/**
+ * The host face of the enablement scope, exactly as BOTH faces read it.
+ *
+ * This object is `GET /scope`'s `host`, value for value: the same
+ * {@link readScopeSegment} call feeds that route and the diagnostics report, so
+ * neither can hold a copy that outlives a `setHost` (Task 9 ②).
+ */
+export interface DiagnosticsScopeHost {
+  state: ScopeHostState['state']
+  capable: boolean
+  reason: string
+  degraded: DegradedNote[]
+}
+
+/**
+ * The enablement-scope segment of the report (Task 9 ①, spec §6.1/§9).
+ *
+ * Every member is a READ of the one live `ToolScopeState` — never a snapshot
+ * taken when the assembly was wired — because the whole point of the segment is
+ * to explain a live "ticked but no tools" report: {@link readScopeSegment} is
+ * the single function `GET /scope` and this report both call, so a `setHost`,
+ * a `noteDegraded` or a document write moves the two faces together.
+ */
+export interface DiagnosticsScope {
+  mode: ScopeMode
+  revision: number
+  workspaceIds: string[]
+  host: DiagnosticsScopeHost
+  /**
+   * cwd samples that resolved outside every registered workspace. Passed
+   * through VERBATIM (see {@link projectPathUnmatched}): this is the evidence
+   * that tells "ticked but no tools" apart from a degraded read.
+   */
+  pathUnmatched: Array<{ agentId: string; cwd: string }>
+}
+
 /** The full report served by `GET /diagnostics`. */
 export interface DiagnosticsReport {
   generatedAt: string
@@ -226,6 +264,12 @@ export interface DiagnosticsReport {
   sessions: DiagnosticsSession[]
   stats: DiagnosticsStats
   recentErrors: DiagnosticsError[]
+  /**
+   * The enablement scope (Task 9): the same read `GET /scope` serves, so an
+   * operator diagnosing 「勾了却无工具」 reads the identical host tri-state and
+   * `pathUnmatched` evidence in both places.
+   */
+  scope: DiagnosticsScope
   /** The six contract differences, so an operator sees them in the report too. */
   contractDifferences: Array<{ id: string; title: string }>
 }
@@ -236,6 +280,66 @@ export interface SubscriptionStat {
   sessionId: string
   subscriptions: number
   cursor?: { sessionId: string; streamEpoch: string; seq: string }
+}
+
+/**
+ * The scope-state reads both faces draw from, as `ToolScopeState` serves them.
+ *
+ * Structural rather than a class reference: this module needs to READ a scope
+ * state, and naming only the four reads keeps that honest — nothing here can
+ * write to the document, the degraded set or the host tri-state.
+ */
+export interface ScopeReadSource {
+  doc(): Pick<ScopeDoc, 'mode' | 'revision' | 'workspaceIds'>
+  host(): ScopeHostState
+  degraded(): readonly DegradedNote[]
+  pathUnmatched(): ReadonlyArray<{ agentId: string; cwd: string }>
+}
+
+/**
+ * The host projection, and the ONE place `capable` is decided.
+ *
+ * `capable` is deliberately not carried alongside `state`: the spec defines it
+ * as nothing but the boolean projection of the tri-state (「`capable` 仅是
+ * `state === 'ready'` 的布尔投影」), so it is derived here instead of copied
+ * from a second field that could contradict it. Every state the plugin's own
+ * host layer writes is already consistent, so this is the identity in practice —
+ * and for a hand-stuffed input it is what makes assertion ① hold unconditionally.
+ */
+function projectHostFace(
+  host: { state: ScopeHostState['state']; reason: string },
+  degraded: readonly DegradedNote[],
+): DiagnosticsScopeHost {
+  return {
+    state: host.state,
+    capable: host.state === 'ready',
+    reason: host.reason,
+    degraded: degraded.map((note) => ({ source: note.source, reason: note.reason })),
+  }
+}
+
+/**
+ * THE one read of the scope state (Task 9 ②).
+ *
+ * Two faces call this and only this: `src/httpApi.ts`'s `GET /scope` handler
+ * takes its `host` and `pathUnmatched` out of the returned segment, and the
+ * diagnostics source hands the very same call to {@link buildDiagnostics}.
+ * There is deliberately no second projection anywhere — a copy built while the
+ * assembly is wired would freeze the capability tri-state at whatever it was
+ * during `apply()`, which is exactly the stale second copy assertion ② forbids.
+ *
+ * Read-only in both directions: `workspaceIds`, the degraded notes and the
+ * unmatched-cwd entries are copied out, never aliased to the live state.
+ */
+export function readScopeSegment(scope: ScopeReadSource): DiagnosticsScope {
+  const doc = scope.doc()
+  return {
+    mode: doc.mode,
+    revision: doc.revision,
+    workspaceIds: [...doc.workspaceIds],
+    host: projectHostFace(scope.host(), scope.degraded()),
+    pathUnmatched: scope.pathUnmatched().map((entry) => ({ agentId: entry.agentId, cwd: entry.cwd })),
+  }
 }
 
 /** The pool/dep surfaces the aggregator draws from. Every extra is optional. */
@@ -255,6 +359,14 @@ export interface DiagnosticsSources {
   sessions?(): readonly SubscriptionStat[]
   /** The ring of recent errors the assembly keeps; absent means "none". */
   recentErrors?(): readonly DiagnosticsError[]
+  /**
+   * The enablement-scope segment (Task 9), as {@link readScopeSegment} reads it
+   * from the live scope state. A READ per call, never a snapshot: the capability
+   * tri-state, the degraded notes and the unmatched-cwd samples all change while
+   * the plugin runs. Absent (or throwing) ⇒ the strict `DEFAULT_SCOPE` side with
+   * the capability at the honest unknown, `pending`.
+   */
+  scope?(): DiagnosticsScope
 }
 
 /**
@@ -381,6 +493,110 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+/** The loose-bag view every projection in this module takes of its input. */
+function bag(raw: unknown): Record<string, unknown> {
+  return (raw ?? {}) as Record<string, unknown>
+}
+
+/** The capability tri-state, or the honest unknown (`pending`) for anything else. */
+function hostStateOr(raw: unknown): ScopeHostState['state'] {
+  return raw === 'ready' || raw === 'unsupported' || raw === 'pending' ? raw : 'pending'
+}
+
+/**
+ * The five degradation sources as a VALUE, and the reason the projection can
+ * reject a hand-stuffed one without a second list that could drift: `Record<
+ * DegradedSource, true>` makes TypeScript refuse a missing member when the union
+ * grows, which a plain array literal could not.
+ */
+const DEGRADED_SOURCES: Readonly<Record<DegradedSource, true>> = {
+  install: true,
+  'workspace-list': true,
+  'visibility-only': true,
+  'scope-version': true,
+  'path-normalization': true,
+}
+
+/** Narrows an unknown value to one of the closed five-source set. */
+function isDegradedSource(value: unknown): value is DegradedSource {
+  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(DEGRADED_SOURCES, value)
+}
+
+/** Re-projects the degraded notes onto `{source, reason}`; a foreign source is dropped. */
+function projectDegraded(raw: unknown): DegradedNote[] {
+  if (!Array.isArray(raw)) return []
+  const notes: DegradedNote[] = []
+  for (const entry of raw) {
+    const value = bag(entry)
+    const source = value['source']
+    if (!isDegradedSource(source)) continue
+    notes.push({
+      source,
+      reason: typeof value['reason'] === 'string' ? value['reason'] : '',
+    })
+  }
+  return notes
+}
+
+/**
+ * Re-projects the unmatched-`cwd` evidence onto `{agentId, cwd}`.
+ *
+ * `cwd` passes through VERBATIM: not digested, not summarized, not run through
+ * {@link truncateErrorMessage}. It is a local path, not a credential, and it is
+ * the one fact that explains "ticked but no tools" — bounding it would destroy
+ * exactly what an operator opened this endpoint for. An entry whose fields are
+ * not strings is dropped rather than coerced into a fabricated path.
+ */
+function projectPathUnmatched(raw: unknown): Array<{ agentId: string; cwd: string }> {
+  if (!Array.isArray(raw)) return []
+  const entries: Array<{ agentId: string; cwd: string }> = []
+  for (const entry of raw) {
+    const value = bag(entry)
+    const agentId = value['agentId']
+    const cwd = value['cwd']
+    if (typeof agentId !== 'string' || typeof cwd !== 'string') continue
+    entries.push({ agentId, cwd })
+  }
+  return entries
+}
+
+/**
+ * Projects the scope segment onto its FIELD whitelist (Task 9 ③).
+ *
+ * The whitelist is applied on the way OUT, to whatever the source handed over:
+ * the shape is rebuilt field by field — `mode`, `revision`, `workspaceIds`,
+ * `host{state,capable,reason,degraded}` and `pathUnmatched[{agentId,cwd}]`, and
+ * nothing else — so a probe key (`accessToken`, `desktopIdentity`, `identity`)
+ * cannot ride along into the report even when a caller stuffs it into the input.
+ * Applied on the way IN it would not be a whitelist at all: an unlisted field
+ * would still reach the body.
+ *
+ * A missing segment reads as the strict side (`DEFAULT_SCOPE`, "nobody") with
+ * the capability at `pending` — the same honest unknown a failed device read
+ * reports as `offline`, not a claim that any document was read.
+ */
+function projectScope(raw: unknown): DiagnosticsScope {
+  const value = bag(raw)
+  const host = bag(value['host'])
+  return {
+    // A non-`global` mode falls to the strict side, which is what an unread or
+    // unreadable document means (B9/D3).
+    mode: value['mode'] === 'global' ? 'global' : DEFAULT_SCOPE.mode,
+    revision: numberOr(value['revision'], DEFAULT_SCOPE.revision),
+    workspaceIds: Array.isArray(value['workspaceIds'])
+      ? value['workspaceIds'].map((id) => String(id))
+      : [],
+    host: projectHostFace(
+      {
+        state: hostStateOr(host['state']),
+        reason: typeof host['reason'] === 'string' ? host['reason'] : '',
+      },
+      projectDegraded(host['degraded']),
+    ),
+    pathUnmatched: projectPathUnmatched(value['pathUnmatched']),
+  }
+}
+
 /**
  * The sanitizer, as a pure function over a loose bag.
  *
@@ -394,11 +610,19 @@ export function sanitizeDiagnostics(source: {
   sessions?: readonly unknown[]
   recentErrors?: readonly unknown[]
   stats?: Partial<DiagnosticsStats>
+  /**
+   * The enablement-scope segment (Task 9 ③), taken as a LOOSE bag for the same
+   * reason `devices` is: {@link projectScope} applies the field whitelist here,
+   * on the way out, so whatever a caller hands over is projected rather than
+   * trusted.
+   */
+  scope?: unknown
 }): {
   devices: DiagnosticsDevice[]
   sessions: DiagnosticsSession[]
   recentErrors: DiagnosticsError[]
   stats: DiagnosticsStats
+  scope: DiagnosticsScope
 } {
   return {
     devices: (source.devices ?? []).map(projectDevice),
@@ -440,6 +664,7 @@ export function sanitizeDiagnostics(source: {
       connectionsBuilt: source.stats?.connectionsBuilt ?? 0,
       subscriptions: source.stats?.subscriptions ?? 0,
     },
+    scope: projectScope(source.scope),
   }
 }
 
@@ -519,7 +744,19 @@ export function buildDiagnostics(
     stats = {}
   }
 
-  const projected = sanitizeDiagnostics({ devices, sessions, recentErrors, stats })
+  // The scope segment is guarded like every other source. An unreadable scope
+  // state costs its own segment only: this endpoint is opened exactly when
+  // something is wrong, so it must not be the thing that fails. The source is
+  // still handed to the sanitizer as-is — the whitelist, not this guard, is what
+  // keeps an unexpected field out of the body.
+  let scope: unknown
+  try {
+    scope = sources.scope?.()
+  } catch {
+    scope = undefined
+  }
+
+  const projected = sanitizeDiagnostics({ devices, sessions, recentErrors, stats, scope })
   return {
     generatedAt: new Date().toISOString(),
     plugin: { name: identity.name, prefix: identity.prefix },
@@ -527,6 +764,7 @@ export function buildDiagnostics(
     sessions: projected.sessions,
     stats: projected.stats,
     recentErrors: projected.recentErrors,
+    scope: projected.scope,
     contractDifferences: CONTRACT_DIFFERENCES.map((entry) => ({ id: entry.id, title: entry.title })),
   }
 }

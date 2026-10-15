@@ -183,7 +183,7 @@ describe('F6: the two tsconfig projects partition tests/**/*.test.ts', () => {
     expect(testFiles).toContain('tests/unit/ui.test.ts')
     expect(testFiles).toContain('tests/integration/clientBundle.test.ts')
     expect(testFiles).toContain('tests/contract/contract.test.ts')
-    // The two UI-environment files this split exists for.
+    // The three UI-environment files this split exists for.
     expect(testFiles).toContain('tests/unit/projectCoverage.test.ts')
   })
 
@@ -208,7 +208,7 @@ describe('F6: the two tsconfig projects partition tests/**/*.test.ts', () => {
     expect(uncovered).toEqual([])
   })
 
-  it('routes the two UI-environment tests to the UI project specifically', () => {
+  it('routes the three UI-environment tests to the UI project specifically', () => {
     // The point of the split, stated directly: these two need DOM libs / jsdom
     // and must be the UI project's, not the server's.
     for (const file of ['tests/unit/ui.test.ts', 'tests/integration/clientBundle.test.ts']) {
