@@ -13,7 +13,7 @@
 
 **Tech Stack:** TypeScript (Node ≥22.18)、Cordis 插件（`ctx.inject` / `ctx.effect`）、`@deepseek-ai/dsh-tools` restriction/guard 面（**以结构化类型对接，不新增运行时依赖**——与 `src/tools.ts:69-76` 的既有做法一致）、vitest（jsdom 用于 UI 测试）、tsdown + vite 构建、React。
 
-**Spec:** `docs/superpowers/specs/2026-10-15-cherry-tool-scope-design.md`（实测 **831** 行；状态已与实况对齐——已经过两轮外部审查 + 最终通读 PASS，并在计划阶段按审查结论补了两处澄清：**工作区列表三态**（§6.1，未读 / 读成功 / 读失败）与 **guard 作用域**（§4，只对 `CHERRY_TOOL_NAMES` 生效）。**本计划从 spec 立论，执行者必须同时读 spec**）。**本计划自身的行数不在此写死**：以文末「Self-Review 记录」节的实测值为准。澄清记录：`docs/superpowers/clarifications/cherry-tool-scope.md`。
+**Spec:** `docs/superpowers/specs/2026-10-15-cherry-tool-scope-design.md`（实测 **831** 行；**spec 头部的状态行照录于此，计划侧不另写一套状态叙述**：「已复审（两轮外部审查 + 最终通读 PASS）+ 计划阶段按 Gate 2 结论补三处澄清」——该行由主 Agent 在取得用户确认后同步进 spec；计划阶段落进 spec 的消歧**一律以 spec 正文为准**，其中本计划正文逐条消费的两处是：**工作区列表三态**（§6.1，未读 / 读成功 / 读失败）与 **guard 作用域**（§4，只对 `CHERRY_TOOL_NAMES` 生效）。**本计划从 spec 立论，执行者必须同时读 spec**）。**本计划自身的行数不在此写死**：以文末「Self-Review 记录」节的实测值为准。澄清记录：`docs/superpowers/clarifications/cherry-tool-scope.md`。
 
 ## Global Constraints
 
@@ -102,7 +102,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 
 - [ ] **Step 1: 写失败测试**——`tests/unit/toolScopeDoc.test.ts`：
   ① 文件不存在 ⇒ `doc()` **与 `DEFAULT_SCOPE` 整体相等**（`expect(doc()).toEqual(DEFAULT_SCOPE)`——不是逐字段列出后再比，也正因如此 `DEFAULT_SCOPE` **不含** `updatedAt` 键，D3 默认都不给）；`load()` 不抛。
-  ② `normalizeScope`：合法 JSON ⇒ 无 `problem`；缺字段 / 类型错 / `mode:'nope'` ⇒ `problem:'parse'` 且 `doc` 落到**严格侧**（`selected` + 空列表，B9）；**解析失败 / 字段非法只走既有承载**——既有 `console.warn`（`log?` 注入）+ 严格度序落到更严一侧，**不得**为它新增 `DegradedSource` 成员（该枚举五值固定；`scope-version` 是"文档版本高于本插件支持"专用的那一个，解析失败**没有**专属成员），B9 的"并在设置页提示"由**既有** UI 文案位承载（Task 8 的空态 / 告警行，其断言在 Task 8 落），本 task 只需保证 `problem:'parse'` 在状态层可区分；`{"version":2,...}` ⇒ `problem:'version-unsupported'` 且**不得**被当成"用户空选"（判定口径同严格侧，但 `load()` 必须追加 degraded 标注 `scope-version`，reason 含"文档版本高于本插件支持"）。
+  ② `normalizeScope`：合法 JSON ⇒ 无 `problem`；缺字段 / 类型错 / `mode:'nope'` ⇒ `problem:'parse'` 且 `doc` 落到**严格侧**（`selected` + 空列表，B9）；**解析失败 / 字段非法只走既有承载**——既有 `console.warn`（`log?` 注入）+ 严格度序落到更严一侧，**不得**为它新增 `DegradedSource` 成员（该枚举五值固定；`scope-version` 是"文档版本高于本插件支持"专用的那一个，解析失败**没有**专属成员）；**且"记录 warn"必须有可观测承载**——夹具注入 `log` 桩（`new ToolScopeState({ file, log })`）⇒ 一次解析失败 / 字段非法**恰好调用该桩一次**（未注入 `log` 时退回既有 `console.warn`，同一断言改用 `console.warn` 桩），而合法文档与"文件不存在"⇒ **零次**（这条断言是显式的，不得只写在实现里）；B9 的"并在设置页提示"由**既有** UI 文案位承载（Task 8 ⑫ 的空态 / 告警行，其断言在 Task 8 落），本 task 只需保证 `problem:'parse'` 在状态层可区分；`{"version":2,...}` ⇒ `problem:'version-unsupported'` 且**不得**被当成"用户空选"（判定口径同严格侧，但 `load()` 必须追加 degraded 标注 `scope-version`，reason 含"文档版本高于本插件支持"）。
   ③ `isVisible`：`global` ⇒ 任意 id（含 `undefined`）可见（B2）；`selected` + 非空 ⇒ 命中可见、未命中/`undefined` 不可见（D7/B5）；`selected` + 空 ⇒ 全员不可见（B1）。
   ④ id 归一（§6.1 输入契约）：`normalizeWorkspaceId(123) === '123'`、`normalizeWorkspaceId('  W ') === 'W'`；文档里 `'123'` 与注册表的 `123` **判定为同一工作区**；归一后仍不同 ⇒ 不匹配。
   ⑤ 严格度序方向（B9 判据）：同一组工作区下，可见集合满足 `selected+[]` ⊆ `selected+[W]` ⊆ `global`。
@@ -164,9 +164,9 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 **Files:**
 - Create: `tests/helpers/fakeToolHost.ts`（**复刻 7 条宿主语义的假宿主**，Task 5/6/7 复用；它是**宿主语义**假宿主，**不是**装配夹具——两者别混，见下面的「既有装配夹具的迁移」）
 - Create: `src/toolScopeHost.ts`
-- Modify: `src/index.ts`（`apply()` 里创建 `ToolScopeState` + **实例化并挂载** `createToolScopeHost`，并把它交给 HTTP deps；**移除** `apply()` 里对 `registerCherryTools` 的直接调用，改由本子系统在注入回调内调用）
+- Modify: `src/index.ts`（`apply()` 里创建 `ToolScopeState` + **实例化并挂载** `createToolScopeHost`；**deps 接线也归本 task**：`assemblyDeps()` 增加 `scope` 与 `refreshScope: () => host.refresh()`，随既有的 `registerHttpApi(ctx, deps)` 一起交给传输层（Task 7 只加 `/scope` 路由、只消费这两个字段，不再改本文件）；**移除** `apply()` 里对 `registerCherryTools` 的直接调用，改由本子系统在注入回调内调用）
 - Modify: `src/httpApi.ts`（`CherryHttpDeps` 定义在 `src/httpApi.ts:148`；本 task 必须给它加 `scope` 与 `refreshScope` 两个字段——**即便字段写成可选也仍要改这个文件**，故它必然归本 task：写者顺序固定 **Task 4 → Task 7 → Task 9**）
-- Modify: `tests/integration/toolsManage.test.ts`、`tests/contract/contract.test.ts`、`tests/integration/httpApi.test.ts`（**既有装配夹具的就地迁移**，见下面的专节）
+- Modify: `tests/integration/toolsManage.test.ts`、`tests/contract/contract.test.ts`、`tests/integration/httpApi.test.ts`（**既有装配夹具的就地迁移 + 三处既有 deps 字面量补字段**：`CherryHttpDeps` 的两个新字段由本 task 加，也由本 task 就地补齐全部调用点——见下面的专节）
 - Test: `tests/integration/toolScopeHost.test.ts`（新）
 
 **Interfaces:**
@@ -176,7 +176,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
     - `inject?<T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown`——**返回值忽略**：它是宿主的 fiber 句柄（依赖卸载/重挂即以它为单位），本插件不持有、也不释放它（释放路径只有 `mount()` 返回的 disposer）；既有接缝 `src/httpApi.ts:85` 同样声明为 `unknown`
     - `on?<T>(event: string, cb: (payload: T) => void): () => void`——事件订阅面（宿主先例：`ctx.on('agent/created', ({ agent }) => …)`）
     - `effect?(cb: () => () => void, label?: string): unknown`——label 的**决定只在写这一处**：`'cherry-remote.tool-scope()'`（§6.2 明文）；Step 3 的装配点按这个名字使用，不再重写字符串字面量
-  - `export interface ScopeHostDeps { scope: ToolScopeState; names: readonly string[]; registerTools: () => () => void; recheckDelaysMs?: readonly number[]; log?: (message: string, error?: unknown) => void }`——`registerTools` **保持单一聚合 disposer 形状**（与 `src/tools.ts:645,656` 一致），不得改写成"返回多个 disposer"
+  - `export interface ScopeHostDeps { scope: ToolScopeState; names: readonly string[]; registerTools: () => () => void; recheckDelaysMs?: readonly number[]; log?: (message: string, error?: unknown) => void }`——`registerTools` **保持单一聚合 disposer 形状**（与 `src/tools.ts:655` / `:657` 一致），不得改写成"返回多个 disposer"
   - `export interface ToolScopeHost { mount(ctx: ScopeHostContext): () => void; refresh(): RefreshSummary | undefined; state(): ScopeHostState }`——**释放路径只留一条**：`mount()` 返回的 disposer；**不提供** `dispose()`，装配侧**不得**新增第二个 `ctx.effect`（`tests/integration/httpApi.test.ts:1460/1479` 断言 `effects` 长度为 1）
   - `export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost`
   - `export interface RefreshSummary { agents: number; installed: number; released: number; skipped: number }`
@@ -194,7 +194,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 - `tests/integration/toolsManage.test.ts`（`assemblyCtx`，`:604-647`）：`inject(deps, cb)` 分流——`deps` 含 `webServer`/`webRuntime` ⇒ 既有 web 面响应；含 `agents`/`workspaceRegistry` ⇒ 注入 `{ agents, workspaceRegistry }`，并在**注入回调 ctx** 上补 `effect`（承载本子系统的挂载生命周期）与 `on`（事件订阅）；`ctx.tools` 服务补齐 `restrict`/`guard`/`schemas`（`schemas()` 无参 = 全局视图、带 agent = 已过滤视图），否则能力恒为 `unsupported`、装配级断言恒真而空过。**既有语义保留**：`:1421-1431` 删掉 `ctx.tools` ⇒ `console.warn` 且**不抛**。
 - `tests/integration/httpApi.test.ts`（`assemblyCtx`，`:1403-1432`）：同一分流 + 注入回调 ctx 的 `effect`/`on` 与 `restrict`/`schemas`。这是 **1 个夹具 × 6 个用例**（`:1451` / `:1468` / `:1495` / `:1540` / `:1599` / `:1652`），要逐点核对。**两条既有断言不得变**：`:1460` / `:1479` 的 `ctx.effects` 长度为 **1**（装配只允许一个 `ctx.effect`）；`:1647-1655` headless（`inject` 抛错）⇒ `apply()` **不抛** + warn。
 - `tests/contract/contract.test.ts`（`apply()` 夹具，`:1690-1800` 区间的四处）：同一分流 + 注入回调 ctx 的 `effect`/`on`；`makeRig()`（`:237-301`）**直接**调 `registerCherryTools`、不经 `apply()`，不受影响，契约断言照旧全绿。
-- 这三处的 **deps 字面量**（`tests/contract/contract.test.ts:1120-1135`、`tests/integration/httpApi.test.ts:253-262`、`:1147-1154`）补 `scope`/`refreshScope` 归 **Task 7**，本 task 不动它们。
+- 这三处的 **deps 字面量**（`tests/contract/contract.test.ts:1120-1135`、`tests/integration/httpApi.test.ts:253-262`、`:1147-1154`）**同样归本 task**：`CherryHttpDeps` 新增的 `scope` / `refreshScope` 是**必填**字段（`src/httpApi.ts:148`），三处字面量必须**就地补齐**——`npm run typecheck` 覆盖 `tests/**`，只加接口不补调用点 ⇒ 本 task 的 Step 5 必红。这两个文件本来就是本 task 的 Files（上面的装配夹具迁移也在这两个文件里），故这是**同一次就地改动**，不存在"留到后面的 task 再补"的第二步。
 
 - [ ] **Step 1: 写失败测试**——先写假宿主（Step 3 与它同时落地，测试引用它），再写 `tests/integration/toolScopeHost.test.ts`：
   ① `pending`：**`mount()` 已调用、但注入回调尚未到达**（夹具只登记回调、不调用它）⇒ 一个工具都没注册、`state().state === 'pending'`、`state().capable === false`、`reason` 是**中性等待**措辞（断言**不含**"不支持"/"unsupported"）。
@@ -209,10 +209,10 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
   ⑩ **回调在同一次运行内幂等**：同一 effect 生命周期内重复触发（重复投递 `agent/created`、重复的挂载请求）⇒ **不重复注册**（`register` 调用次数恒 = 14，不随 live agent 数或事件次数增长）、每个 agent 仍只有一层；只有 effect 重跑（重挂）才做全新注册（⑤ 已覆盖"不抛 `already registered`"）。
   ⑪ **既有两例语义 + 两条新行为**（载体是上面三处装配夹具）：① `tests/integration/toolsManage.test.ts:1421-1431` 缺 `ctx.tools` ⇒ `console.warn` 且**不抛**；② `tests/integration/httpApi.test.ts:1647-1655` headless（`inject` 抛错）⇒ `apply()` **不抛** + warn；③ 新行为一：`unsupported` 时**仍** `console.warn`（既有 headless 语义不变）；④ 新行为二：`inject` 抛错 ⇒ `mount()` **不抛**、降级为 `pending` 并 warn（`state().state === 'pending'`、一个工具都不注册）。
 - [ ] **Step 2: 运行确认失败**——`npx vitest run tests/integration/toolScopeHost.test.ts`，预期 FAIL（`src/toolScopeHost.ts` 不存在）。
-- [ ] **Step 3: 实现**——`createToolScopeHost` **不作状态所有**（状态归 `ToolScopeState`）；`mount(ctx)` 内：`ctx.inject(['agents','workspaceRegistry'], (agentCtx) => agentCtx.effect(() => { … }, EFFECT_LABEL))`（`EFFECT_LABEL` = Interfaces 里**唯一一处**钉死的那个 label，此处只引用、**不重写字符串**），effect 内**次序固定**：探能力三态（**静态能力缺失优先 ⇒ `unsupported`**；`pending` = `mount()` 已调用但注入回调尚未到达；`unsupported` 仍经 `log` 发一条 warn）⇒ `ready` 才 `registerTools()` 并把**那个单一的聚合** disposer 收进本 effect ⇒ 对全部 live agent 装 restriction + 在**插件根 ctx** 上装**一层** guard ⇒ 订阅 `agent/created` / `agent/disposed`（**本 task 不订阅 `tools/change`**，理由见下）⇒ **返回合并 disposer**（退订/置 `torn-down` ⇒ 释放注册 ⇒ 释放全部 restriction ⇒ 释放 guard ⇒ `scope.invalidateDerived()`，**一并作废**判定缓存 / 规范化路径映射 / 解析状态 / 已装层记录）。`pending`/`unsupported` 都要把三态写进 `scope.setHost(...)` 且**什么都不注册**；`ctx.inject` 抛错（宿主服务未就绪）⇒ `mount()` **不抛**、降级 `pending` 并 warn。`src/index.ts` 的 `apply()`（既有写法见 `:675` / `:697-698` / `:704-715`）：`const scope = new ToolScopeState({ file: join(dataDir,'scope.json') }); scope.load()`；**实例化并挂载**（生产装配点，不得只声明不挂）`const host = createToolScopeHost({ scope, names: CHERRY_TOOL_NAMES, registerTools: () => registerCherryTools(ctx, deps) })` ⇒ `state.disposers.push(host.mount(ctx))`——`names` 的单一来源是 Task 1 的 `CHERRY_TOOL_NAMES`（B11），`registerTools` 用闭包**延后到注入到达时**才调 `registerCherryTools`，因此**移除** `apply()` 里既有的直接调用；HTTP 注册**照旧无条件**（含 pending/unsupported，D9），`registerHttpApi(ctx, deps)` 的 `deps` 增加 `scope` 与 `refreshScope: () => host.refresh()`（与 Task 7 的消费一致）；**不得新增第二个 `ctx.effect`**——释放路径只有 `mount()` 返回的 disposer 这一条（`tests/integration/httpApi.test.ts:1460/1479` 断言 `effects` 长度为 1；插件根 ctx 上既有的那一个 `ctx.effect(...)` 负责 release 时遍历 `state.disposers`）。
+- [ ] **Step 3: 实现**——`createToolScopeHost` **不作状态所有**（状态归 `ToolScopeState`）；`mount(ctx)` 内：`ctx.inject(['agents','workspaceRegistry'], (agentCtx) => agentCtx.effect(() => { … }, EFFECT_LABEL))`（`EFFECT_LABEL` = Interfaces 里**唯一一处**钉死的那个 label，此处只引用、**不重写字符串**），effect 内**次序固定**：探能力三态（**静态能力缺失优先 ⇒ `unsupported`**；`pending` = `mount()` 已调用但注入回调尚未到达；`unsupported` 仍经 `log` 发一条 warn）⇒ `ready` 才 `registerTools()` 并把**那个单一的聚合** disposer 收进本 effect ⇒ 对全部 live agent 装 restriction + 在**插件根 ctx** 上装**一层** guard ⇒ 订阅 `agent/created` / `agent/disposed`（**本 task 不订阅 `tools/change`**，理由见下）⇒ **返回合并 disposer**（退订/置 `torn-down` ⇒ 释放注册 ⇒ 释放全部 restriction ⇒ 释放 guard ⇒ `scope.invalidateDerived()`，**一并作废**判定缓存 / 规范化路径映射 / 解析状态 / 已装层记录）。`pending`/`unsupported` 都要把三态写进 `scope.setHost(...)` 且**什么都不注册**；`ctx.inject` 抛错（宿主服务未就绪）⇒ `mount()` **不抛**、降级 `pending` 并 warn。`src/index.ts` 的 `apply()`（既有写法见 `:675` / `:697-698` / `:704-715`）：`const scope = new ToolScopeState({ file: join(dataDir,'scope.json') }); scope.load()`；**实例化并挂载**（生产装配点，不得只声明不挂）`const host = createToolScopeHost({ scope, names: CHERRY_TOOL_NAMES, registerTools: () => registerCherryTools(ctx, deps) })` ⇒ `state.disposers.push(host.mount(ctx))`——`names` 的单一来源是 Task 1 的 `CHERRY_TOOL_NAMES`（B11），`registerTools` 用闭包**延后到注入到达时**才调 `registerCherryTools`，因此**移除** `apply()` 里既有的直接调用；HTTP 注册**照旧无条件**（含 pending/unsupported，D9），`assemblyDeps()` 增加 `scope` 与 `refreshScope: () => host.refresh()`，随 `registerHttpApi(ctx, deps)` 一起交给传输层（**接线在本 task**，Task 7 只加 `/scope` 路由、只消费这两个字段）；**不得新增第二个 `ctx.effect`**——释放路径只有 `mount()` 返回的 disposer 这一条（`tests/integration/httpApi.test.ts:1460/1479` 断言 `effects` 长度为 1；插件根 ctx 上既有的那一个 `ctx.effect(...)` 负责 release 时遍历 `state.disposers`）。
   **为什么 `tools/change` 的订阅不在本 task**：假宿主第⑦条规定 `restrict()` 在**安装与释放两侧都发** `tools/change`，订阅一建立就会自我触发；订阅必须与安装/释放判据、合并闸**同轮**落地（Task 5），否则本 task 的"Step 4 全 PASS"不可达。
-- [ ] **Step 4: 运行确认通过 + 装配夹具回归清单**——`npx vitest run tests/integration/toolScopeHost.test.ts tests/integration/toolsRead.test.ts tests/integration/toolsManage.test.ts tests/integration/httpApi.test.ts tests/contract/contract.test.ts`，预期全 PASS（后四个证明既有装配没被改坏）：① `toolsManage.test.ts` 的 `assemblyCtx` 按依赖键分流后既有用例全绿（含 `:1421-1431` 缺 `ctx.tools` ⇒ warn 不抛）；② `httpApi.test.ts` 的 **6 个装配用例**（`:1451` / `:1468` / `:1495` / `:1540` / `:1599` / `:1652`）逐点绿，`:1460` / `:1479` 的 `effects` 长度 = 1 与 `:1647-1655` 的 headless 语义均未变；③ `contract.test.ts` 的 `apply()` 夹具（`:1690-1800`）与 `makeRig()` 驱动的契约用例全绿。
-- [ ] **Step 5: 门禁**——`npm run typecheck`（`tests/helpers/fakeToolHost.ts` 与三处迁移过的装配夹具都落在 `tests` 里、被 server 项目覆盖；`fakeToolHost.ts` 不是 `*.test.ts`，不会被 vitest 收集）。
+- [ ] **Step 4: 运行确认通过 + 装配夹具回归清单**——`npx vitest run tests/integration/toolScopeHost.test.ts tests/integration/toolsRead.test.ts tests/integration/toolsManage.test.ts tests/integration/httpApi.test.ts tests/contract/contract.test.ts`，预期全 PASS（后四个证明既有装配没被改坏）：① `toolsManage.test.ts` 的 `assemblyCtx` 按依赖键分流后既有用例全绿（含 `:1421-1431` 缺 `ctx.tools` ⇒ warn 不抛）；② `httpApi.test.ts` 的 **6 个装配用例**（`:1451` / `:1468` / `:1495` / `:1540` / `:1599` / `:1652`）逐点绿，`:1460` / `:1479` 的 `effects` 长度 = 1 与 `:1647-1655` 的 headless 语义均未变；③ `contract.test.ts` 的 `apply()` 夹具（`:1690-1800`）与 `makeRig()` 驱动的契约用例全绿；④ 三处既有 deps 字面量（`contract.test.ts:1120-1135`、`httpApi.test.ts:253-262` 与 `:1147-1154`）已随本 task 补上必填的 `scope` / `refreshScope`——这是本 task 的验收项之一（不是"迁移装配夹具"的附带结果），漏任何一处都会在 Step 5 的 `npm run typecheck` 上红。
+- [ ] **Step 5: 门禁**——`npm run typecheck`（`tests/helpers/fakeToolHost.ts`、三处迁移过的装配夹具**以及三处补过 `scope` / `refreshScope` 的 deps 字面量**都落在 `tests` 里、被 server 项目覆盖：`CherryHttpDeps` 的两个新字段是必填，任一调用点漏补这里就红；`fakeToolHost.ts` 不是 `*.test.ts`，不会被 vitest 收集）。
 - [ ] **Step 6: 重建产物 + 提交**——`npm run build` ⇒ `git add src/toolScopeHost.ts src/index.ts src/httpApi.ts tests/helpers/fakeToolHost.ts tests/integration/toolScopeHost.test.ts tests/integration/toolsManage.test.ts tests/integration/httpApi.test.ts tests/contract/contract.test.ts dist && git commit -m "feat(scope): one assembly point — registration, restriction and guard co-lifecycle"`。
 
 ---
@@ -224,14 +224,15 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 - Test: `tests/integration/toolScopeHost.test.ts`（同一文件追加 `describe`，串行）
 
 **Interfaces:**
-- Consumes：Task 4 的 `createToolScopeHost` / 假宿主 / `MountedLayer`。
+- Consumes：Task 4 的 `createToolScopeHost` / 假宿主；`MountedLayer`（**已装层记录**的元素类型）是 **Task 2** 在 `src/toolScope.ts` 的产出（Task 2 Interfaces 已列），本 task 只是消费它。
 - **本 task 一并落地**（§4「重入与收敛」的三条硬约束）：订阅 `tools/change`、合并 / 置脏补跑、幂等短路、有界放大——它们与安装/释放判据**同轮**，理由见 Step 3 末。
+- **方向锚（防止把装层判据写反）**：`deny` 目标集合 = 该 agent **要隐藏**的名字——**不可见 ⇒ `CHERRY_TOOL_NAMES` 的 14 个名字全部进 `deny`（装层 ⇒ 工具从该 agent 的工具表消失）**；**可见 ⇒ 空集（只释放、不安装 ⇒ 工具回到工具表）**。`global` 恒属"可见"（B2），故 `global` 下目标恒为空集 ⇒ 只释放。集合由 `judgement.visible` 派生（Task 3），**不是**由 `status === 'resolved'` 派生。
 - 关键不变量（实现时必须成立）：**层在 ⇔ 记录在**——`restrict()` 返回即层已装入，记录写在同一同步块内、**先装层后写记录**；释放侧**同步清除记录、再调用 disposer**；换层时记录在同一同步块内整体替换。
 
 - [ ] **Step 1: 写失败测试**——追加断言：
   ① **`deny` 的入参**：夹具记录每次 `restrict` 入参 ⇒ 每次都是 `{deny:[...]}`，且各项 = `schemas()`（无参全局视图）∩ `CHERRY_TOOL_NAMES`，逐名相等；**从未**出现 `{deny: []}`、从未出现 `allow` 键（B12①/B18③）。
   ② **观测集合为空**：在注册前让无参 `schemas()` 取不到我们的名字 ⇒ 不调用 `restrict`（无 no-op 层）、不抛错；注册完成后由补齐**恰好装一层**完整交集（`restrict` 调用次数 = 1）；若该 agent 已有旧层，该旧层照常释放（"不阻止既有层的维护"）（B18③④）。
-  ③ **目标集合变空**（`global`，或该 agent 判定为不在范围内）⇒ **只释放**旧层、不安装；释放夹具重新计算 agent 视图后 `cherry_*` **回到**该 agent 的工具表，且无层残留（B18①/B2）。
+  ③ **目标集合变空**（`global`，或该 agent 判定为**可见**即**在启用范围内**）⇒ **只释放**旧层、不安装；释放后夹具重新计算 agent 视图 ⇒ `cherry_*` **回到**该 agent 的工具表、且无层残留（B18①/B2）。
   ④ **先装新、后释放旧**：夹具记录同一 agent 上的动作序列，断言 `install(new)` 严格早于 `release(old)`；任一时刻层数 ≤ 1；`release` 后 `layer(agent)` 为 `undefined`（B18②/B10）。
   ⑤ **幂等短路**：目标 deny 与当前层逐名相同 ⇒ `restrict` 不被再次调用（§4 ②）。
   ⑥ **安装失败路径**：夹具令 `restrict` 抛错（含"两个时刻错位 ⇒ 交集仍含未知名而抛错"一例）⇒ 不抛到调用方、不静默 ⇒ `degraded()` 追加 `install`（reason 可读），紧随其后的 `tools/change` / 配置保存**重试并成功**（B12②④）。
@@ -280,16 +281,16 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 ### Task 7: HTTP 面 `GET/PUT /cherry-remote/api/scope`（§6.3 + B4/B14/B16）
 
 **Files:**
-- Modify: `src/httpApi.ts`（在既有的 `handleRequest` 分发表加 `first === 'scope'` 分支；`writeError` 原样复用）、`src/index.ts`（`assemblyDeps()` 暴露 `scope` 与 `refreshScope`）
-- Modify: `tests/contract/contract.test.ts`（`:1120-1135` 的 deps 字面量）、`tests/integration/httpApi.test.ts`（`:253-262` 与 `:1147-1154` 的 deps 字面量）——**三处各补 `scope` 与 `refreshScope`**。`scope` / `refreshScope` **保持必填**：不采纳"字段写成可选 ⇒ 缺省时 `/scope` 路由不挂载"的方案（spec 未授权——§6.3 的五个稳定错误码与 §6.4 的 D9 自救面都假定路由始终存在）
+- Modify: `src/httpApi.ts`（在既有的 `handleRequest` 分发表加 `first === 'scope'` 分支；`writeError` 原样复用。`CherryHttpDeps` 的两个字段 `scope` / `refreshScope` 由 **Task 4** 加好——本 task 只**消费**它们，不改接口形状，也不改 `src/index.ts`）
 - Test: `tests/integration/scopeHttpApi.test.ts`（新；复用 `tests/helpers/fakeToolHost.ts` 与 `httpApi.test.ts` 的 `FakeWebServer` 风格）
+- **本 task 不写**这两个文件：`tests/contract/contract.test.ts` 与 `tests/integration/httpApi.test.ts` 的三处 deps 字面量（`contract.test.ts:1120-1135`、`httpApi.test.ts:253-262` / `:1147-1154`）已由 **Task 4** 就地补齐，`assemblyDeps()` 的接线同样在 Task 4；本 task 只在 Step 4 跑它们做回归。`scope` / `refreshScope` **保持必填**：不采纳"字段写成可选 ⇒ 缺省时 `/scope` 路由不挂载"的方案（spec 未授权——§6.3 的五个稳定错误码与 §6.4 的 D9 自救面都假定路由始终存在）
 
 **Interfaces:**
-- Consumes：`ToolScopeState` 的 `doc()/workspaces()/staleWorkspaceIds()/pathUnmatched()/host()/degraded()/save()`、`ToolScopeHost.refresh()`、既有 `isTrustedWebRequest` 围栏与 `writeError(res, status, error, message?)`。`refresh()` 的返回契约由 Task 6 产出、本 task ③ 消费：触发**一轮**重算并返回**该轮**的 `RefreshSummary`（`skipped` = 幂等短路跳过的 agent 数，合并闸的补跑算**同一轮**、不额外计数）；`pending` / `unsupported` 下无重算可跑 ⇒ 返回 `undefined`。
+- Consumes：`ToolScopeState` 的 `doc()/workspaces()/staleWorkspaceIds()/pathUnmatched()/host()/degraded()/save()`、`ToolScopeHost.refresh()`、既有 `isTrustedWebRequest` 围栏与 `writeError(res, status, error, message?)`，以及 **Task 4 已扩好的 `CherryHttpDeps` 两个必填字段** `scope: ToolScopeState` / `refreshScope(): RefreshSummary | undefined`（接口与 `assemblyDeps()` 接线都归 T4，本 task 只读这两个字段）。`refresh()` 的返回契约由 Task 6 产出、本 task ③ 消费：触发**一轮**重算并返回**该轮**的 `RefreshSummary`（`skipped` = 幂等短路跳过的 agent 数，合并闸的补跑算**同一轮**、不额外计数）；`pending` / `unsupported` 下无重算可跑 ⇒ 返回 `undefined`。
 - Produces（响应形状逐字）：
   - `GET /cherry-remote/api/scope` → `{ scope: {mode, workspaceIds, revision}, workspaces: [{id,title,path}], staleWorkspaceIds: string[], pathUnmatched: [{agentId, cwd}], host: {state, capable, reason, degraded: [{source, reason}]} }`
   - `PUT /cherry-remote/api/scope` → 成功 `{ scope: {…规范化文档}, pruned: string[] }`；失败 `{error, message?}`（`writeError` 形状）
-- `CherryHttpDeps` 增量（**两个字段都必填**）：`scope: ToolScopeState`、`refreshScope(): RefreshSummary | undefined`。
+- **`CherryHttpDeps` 的两个字段不是本 task 的产出**：`scope` / `refreshScope` 由 **Task 4** 在 `src/httpApi.ts:148` 加入并接线（见上面的 Consumes），本 task 只加路由分支与响应组装。
 
 - [ ] **Step 1: 写失败测试**——`tests/integration/scopeHttpApi.test.ts`：
   ① `GET` 形状逐字段断言（含 `degraded` 为**数组**、空数组 = 无降级；`host.capable === (host.state === 'ready')`）。
@@ -306,10 +307,10 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
   ⑫ `405 method-not-allowed`：`POST /cherry-remote/api/scope`（以及其余非 `GET`/`PUT` 方法）⇒ `405`、`error === 'method-not-allowed'`（与既有五条路由同写法：`src/httpApi.ts:834/846/852/860/871`），不读 body、不改动已存状态。
   ⑬ **HTTP 级多源并存**（§7⑤）：同一夹具里同时令 `list()` 抛错（`workspace-list`）、`guard` 缺失（`visibility-only`）并叠加一次安装失败（`install`）⇒ `GET.host.degraded` 是**数组**、三个 source 各自一条**同时可见**（异源不得互相覆盖）；同一 source 再触发一次 ⇒ 仍只**一条**且 reason 为最新（同源去重）。
 - [ ] **Step 2: 运行确认失败**——`npx vitest run tests/integration/scopeHttpApi.test.ts`，预期 FAIL（路由 404）。
-- [ ] **Step 3: 实现**——在 `handleRequest` 里加 `first === 'scope' && match.segments.length === 1` 分支：先判方法——`GET` / `PUT` 之外一律 `writeError(res, 405, 'method-not-allowed', 'GET/PUT only')`（与既有五条路由同写法，`src/httpApi.ts:834/846/852/860/871`）；`GET` ⇒ 组装上面的响应（工作区列表**由插件侧**投影下发）；`PUT` ⇒ 读 JSON body（沿用既有 body 读取方式）⇒ `scope.save(body, body?.expectedRevision)` ⇒ `ok` 时**同步** `deps.refreshScope?.()` 再回 `{scope, pruned}`（只要求这一处无 `await`，**不等**重算收敛），否则 `writeError(res, status, error, message)`。`assemblyDeps()` 增加 `scope` 与 `refreshScope`。
+- [ ] **Step 3: 实现**——在 `handleRequest` 里加 `first === 'scope' && match.segments.length === 1` 分支：先判方法——`GET` / `PUT` 之外一律 `writeError(res, 405, 'method-not-allowed', 'GET/PUT only')`（与既有五条路由同写法，`src/httpApi.ts:834/846/852/860/871`）；`GET` ⇒ 组装上面的响应（工作区列表**由插件侧**投影下发）；`PUT` ⇒ 读 JSON body（沿用既有 body 读取方式）⇒ `scope.save(body, body?.expectedRevision)` ⇒ `ok` 时**同步** `deps.refreshScope?.()` 再回 `{scope, pruned}`（只要求这一处无 `await`，**不等**重算收敛），否则 `writeError(res, status, error, message)`。`scope` 与 `refreshScope` 由 Task 4 的 `assemblyDeps()` 交出——本 task 只消费，不改 `src/index.ts`。
 - [ ] **Step 4: 运行确认通过**——`npx vitest run tests/integration/scopeHttpApi.test.ts tests/integration/httpApi.test.ts`，预期全 PASS（后者证明既有路由未回归）。
-- [ ] **Step 5: 门禁**——`npm run typecheck`（`src/httpApi.ts`、`src/index.ts` 与 `tests/integration/scopeHttpApi.test.ts` 都落在 server 项目：`src` 与 `tests` 已在 `tsconfig.json` 的 `include` 里，**无需登记**，见 Global Constraints 的 tsconfig 规则）。
-- [ ] **Step 6: 重建产物 + 提交**——`npm run build` ⇒ `git add src/httpApi.ts src/index.ts tests/integration/scopeHttpApi.test.ts tests/contract/contract.test.ts tests/integration/httpApi.test.ts dist && git commit -m "feat(scope): GET/PUT /cherry-remote/api/scope with stable error codes"`。
+- [ ] **Step 5: 门禁**——`npm run typecheck`（`src/httpApi.ts` 与 `tests/integration/scopeHttpApi.test.ts` 都落在 server 项目：`src` 与 `tests` 已在 `tsconfig.json` 的 `include` 里，**无需登记**，见 Global Constraints 的 tsconfig 规则）。
+- [ ] **Step 6: 重建产物 + 提交**——`npm run build` ⇒ `git add src/httpApi.ts tests/integration/scopeHttpApi.test.ts dist && git commit -m "feat(scope): GET/PUT /cherry-remote/api/scope with stable error codes"`（三处 deps 字面量与 `src/index.ts` 已在 Task 4 的 commit 里，故不在本行的 `git add` 里）。
 
 ---
 
@@ -338,6 +339,9 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
   ⑨ **保存成功回显新 revision**（§6.4 末句）：夹具令 `PUT` 返回 `{scope:{…, revision: 8}, pruned: []}` ⇒ 面板回显**新 revision**（断言文本含新值，且旧值不再被当作当前 revision）。
   ⑩ **`pending` 与列表降级同屏两条并存**（§6.4）：夹具同时令 `host.state === 'pending'` 且 `host.degraded` 含 `workspace-list` ⇒ **两条**提示同时在文档里（中性等待提示 + "注册表列表当前读不到"），**不得**只渲染一条、**不得**由其一推导其二；断言文本**不含**"宿主不支持"。
   ⑪ **既有 UI 用例不被打烂**（`tests/unit/ui.test.ts` 的就地改动）：登记 `/scope` 响应（或注入 `scopeClient` 桩）后该文件 **24 个既有用例**保持全绿；`order[0] === 'sse'`（`:251`）这类顺序断言只在 **sse/pair 两类事件**的范围内成立。
+  ⑫ **损坏文档 ⇒ 设置页出现告警行（B9 的"并在设置页提示"，承载是既有文案位）**：夹具令作用域文档**损坏**（解析失败 / 字段非法 ⇒ 状态层按严格度序落到 `selected` + 空列表）⇒ 面板在**既有**文案位出现告警行（即 ① 里 `selected` + 未勾的那条空态 / 告警行，**同一处**；**不新增 UI 区域、不新增 `DegradedSource` 成员**，文案含"`cherry_*` 工具不会出现在任何会话里"）；同时断言**不得**静默呈现为 `global` 或"一切正常"（`global` 模式的那句空态文案**不在**文档里）。
+  ⑬ **`scope-version` 的渲染态 ⇒ 显式告警 + 禁用保存**：夹具令 `GET` 的 `host.degraded` 含 `source:'scope-version'`（reason 含"文档版本高于本插件支持"，且**本轮没有任何 `PUT`**）⇒ 面板顶部除逐条渲染（⑤）外，还必须有**显式告警**（文本含"文档版本高于本插件支持"）**并禁用保存**。本条的输入是 `GET`，与 ⑥ 的"`PUT` 失败后按错误码分流"是**两条独立路径**，不得互相推导（⑥ 不得被当作本条的断言，反之亦然）。
+  ⑭ **`scope-version` 不得呈现为"一个都没勾"（必须与"用户空选"可区分）**：同一夹具下，`degraded` 含 `scope-version` 时，① 里 `selected` + 未勾的那条空态文案**不在**文档里（不得让用户以为是自己没勾）；把夹具的 `degraded` 换回**空数组**（`scope` 一位不动）⇒ 该空态行**才**出现——两次渲染的文本必须不同。
 - [ ] **Step 2: 运行确认失败**——`npx vitest run tests/unit/uiScopePanel.test.ts`，预期 FAIL（模块不存在 / 项目未登记 ⇒ 先登记再跑，见 Step 3）。
 - [ ] **Step 3: 实现**——先登记 `tsconfig.ui.json` 的 `include` 与 `tsconfig.json` 的 `exclude`（否则 `projectCoverage` 门禁变红且该文件被 `tsc` 静默跳过），再写面板组件；`App` 增**可选** `scopeClient` 接缝（与 `eventSourceFactory` 同风格）并把面板挂在设备列表上方；同时改 `tests/unit/ui.test.ts` 的既有夹具（登记 `/scope` 响应或注入桩）与顺序断言（限定 sse/pair 两类事件）；`api.ts` 的 `putScope` 必须把非 2xx 的 `{error, message}` 原样抛成 `ApiError`（面板据 `error` 分流）。
 - [ ] **Step 4: 同步 tsconfig 头部注释**——更新 `tsconfig.json` 与 `tsconfig.ui.json` 的头部注释：两处都以"**两个** UI 环境测试"为由写死了理由，本 task 加入第三个（`tests/unit/uiScopePanel.test.ts`）后必须同步；仓库习惯是"注释即理由"，漏改则注释与事实不符。
@@ -379,7 +383,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 | `src/toolScope.ts` | 2 → 3 |
 | `src/toolScopeHost.ts` | 4 → 5 → 6 |
 | `src/httpApi.ts` | 4 → 7 → 9（T4 加 deps 字段、T7 加 `/scope` 路由、T9 接诊断来源） |
-| `src/index.ts` | 4 → 7 → 9（同一顺序，仍严格串行） |
+| `src/index.ts` | 4 → 9（T4 里 `apply()` 装配 + `assemblyDeps()` 交出 `scope` / `refreshScope`；**T7 不改本文件**——它只加路由、只消费那两个字段；T9 接诊断来源。仍严格串行） |
 | `src/diagnostics.ts` | 9 |
 | `dist/**`（重建产物） | **每个改 `src/` 的 task**（1/2/3/4/5/6/7/9）——产物与源码**同一个 commit**；同树不得并发重建（并行会让 `artifactFreshness` 变红） |
 | `lib/client.js`（客户端产物） | 8（客户端半的产物，`tests/integration/clientBundle.test.ts` 校验） |
@@ -391,7 +395,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 | `tests/unit/uiScopePanel.test.ts` | 8（新） |
 | `tests/unit/diagnostics.test.ts` | 9（追加） |
 | 三处既有装配夹具：`tests/integration/toolsManage.test.ts`（`assemblyCtx`）、`tests/integration/httpApi.test.ts`（`assemblyCtx`，1 夹具 × 6 用例）、`tests/contract/contract.test.ts`（`apply()` 夹具） | 4（就地迁移） |
-| 三处既有 deps 字面量：`tests/contract/contract.test.ts:1120-1135`、`tests/integration/httpApi.test.ts:253-262` 与 `:1147-1154` | 7（补 `scope` / `refreshScope`）——因此这两个文件的总顺序是 `contract.test.ts`：4 → 7；`httpApi.test.ts`：4 → 7 |
+| 三处既有 deps 字面量：`tests/contract/contract.test.ts:1120-1135`、`tests/integration/httpApi.test.ts:253-262` 与 `:1147-1154` | **4**（就地补必填的 `scope` / `refreshScope`——与上面三处装配夹具是同一次改动）——这两个文件的总顺序都只到 **4**；Task 7 只加路由、只消费，不再改它们 |
 | `tests/unit/ui.test.ts` | 8（既有夹具就地改动：登记 `/scope` 或注入桩 + 顺序断言限定 sse/pair） |
 | `ui/src/**` | 8 |
 | `tsconfig*.json` | 8（`tsconfig.ui.json` 的 `include` / `tsconfig.json` 的 `exclude` + 两处头部注释同步） |
@@ -411,7 +415,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 - **B6**（guard 是已装层的执行侧镜像；"理由可读"与作用域限定）：T3 的 `reason` 行（**由安装动作写进已装层记录**，guard 只读该记录、不重算）+ T5⑦⑨⑪。
 - **B7**（能力三态 / 真实缺因 / `capable` 投影 / `unsupported` 的升级提示与禁用保存）：T4①②③⑥（含三态优先级）+ T8②。
 - **B8**（设置页与 `/cherry-remote/api` 全域可用、配对自救面照常）：T7⑪ + T8②。
-- **B9**（损坏/非法 ⇒ 严格度序 + 既有 warn，不新增 `degraded` 成员）：T2②⑤；"并在设置页提示"由**既有** UI 文案位承载（T8① 的空态/告警行），不新开承载。
+- **B9**（损坏/非法 ⇒ 严格度序 + 既有 warn，不新增 `degraded` 成员）：T2②⑤（T2② 的**显式**断言：解析失败 / 字段非法 ⇒ 既有 warn 被调用**恰好一次**、合法输入零次）；"并在设置页提示"由**既有** UI 文案位承载（T8⑫ 的告警行 = T8① 的空态/告警位），不新开承载。
 - **B10**（反复 apply / 依赖卸载-重挂不叠加）：T4④⑤ + T5⑩。
 - **B11**（14 名单一常量）：T1①（**替换**合约测试里的第二份名单，不是追加 describe）②③ + T4 Step 3 的装配点传 `names: CHERRY_TOOL_NAMES`。
 - **B12**（只提交交集 / 失败不抛不静默 / 部分注册窗口补齐 / 交集仍抛错走失败路径）：T5①②⑥。
@@ -426,9 +430,9 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 - **§6.1 列表三态与唯一写入者**：T2 的「列表三态与唯一写入者」小节 + T3⑧⑩ + T7⑧⑪。
 - **§6.2 动作条与 teardown 次序**：Global Constraints 的 teardown 条 + T4 Step 3 + T5 Step 3。
 - **§6.3 五个稳定错误码（逐一有主）+ 405 路由约定**：状态层 T2⑦（拒绝优先级）；传输层 `invalid-scope` T7④、`missing-expected-revision` T7⑤、`scope-revision-conflict` T7⑥、`workspace-list-unavailable` T7⑧、`scope-version-unsupported` T7⑨——**五个逐一有主**（上一版这里漏了 T7⑤，只列了 ④⑥⑧⑨）；`405 method-not-allowed` T7⑫（仓库既有路由约定，非 spec §6.3 的错误码清单）。
-- **§6.4 每一条**：空态 T8①、能力三态与升级提示 T8②、已失效一键清除 T8③、列表不可用 T8④、降级逐条（五源）T8⑤、错误码分流 T8⑥、文案边界 T8⑦、`pathUnmatched` T8⑧、保存成功回显新 revision T8⑨、`pending` 与列表降级同屏 T8⑩。
+- **§6.4 每一条**：空态 T8①、能力三态与升级提示 T8②、已失效一键清除 T8③、列表不可用 T8④、降级逐条（五源）T8⑤、错误码分流 T8⑥、文案边界 T8⑦、`pathUnmatched` T8⑧、保存成功回显新 revision T8⑨、`pending` 与列表降级同屏 T8⑩、损坏文档的既有告警位 T8⑫、`scope-version` 渲染态的显式告警与禁用保存 T8⑬、`scope-version` 与"用户空选"可区分 T8⑭。
 - **§7 假宿主七条**：T4 的夹具接口 ①–⑦ 逐条写出（含第⑦条"安装与释放两侧都发 / `guard` 两侧都不发"的差异）；由它支撑的断言：交集不可恢复 T5⑩、绝不提交空 `deny` T5①、"释放动作自身发的 `tools/change` 不把层装回来" T5⑭/T6⑧。
-- **§7 边界⑤⑥（多源并存 / 版本过高）**：T2⑥ + T7⑬ + T8⑤；T2② + T7⑨ + T8⑥。
+- **§7 边界⑤⑥（多源并存 / 版本过高）**：T2⑥ + T7⑬ + T8⑤；T2② + T7⑨ + T8⑥⑬⑭（"版本过高"三侧：服务端拒绝、渲染态告警与禁用保存、与"用户空选"可区分）。
 - **§9 授权边界**：正文只把"模块内私有结构 / 面板控件交互 / 诊断字段措辞"留给执行者；`[250, 2000]` 复检间隔（T6 Interfaces）与 `path-normalization` 文案（T3③）**已在正文钉死**，不再列在"留给执行者"里。
 
 **上一版的结论为什么不成立（硬证据）**：上一版只写一句"无遗漏项"，而合约测试里的**第二份 14 名单**——`tests/contract/contract.test.ts:322-337` 的 `TOOL_NAMES` 字面量（被 `:1668` 的 README 逐名断言与 `:1677` 的 rig 注册名断言消费）——在当时**没有任何归宿**；只要它还在，B11 的"单一常量"就不成立。本轮由 T1① 以"**替换**该字面量为 `CHERRY_TOOL_NAMES`（而不是追加一个 describe）"补上，本节也据此改为逐条映射，不再用结论式措辞。
@@ -439,7 +443,7 @@ spec 未逐条测试、但最可能咬到真实用户的五类输入（每条都
 
 **4. Review Focus**：五条都已在对应 task 落成断言（见该节脚注的 task 编号），无空条目。
 
-**5. 比例**：spec **831** 行（修复时点实测）；本计划自身 **446** 行（本批次收口实测，`wc -l`）。代码块只出现三次（命令、JSON 形状、假宿主七条语义清单），未把实现抄成代码。
+**5. 比例**：spec **831** 行（修复时点实测）；本计划自身 **450** 行（本批次收口实测，`wc -l`——头部不写死行数、只在此处给实测值，故本批次改动后此处同步）。代码块只出现三次（命令、JSON 形状、假宿主七条语义清单），未把实现抄成代码。
 
 **6. 自检修正记录**：Step 扫描发现 Task 1–9 的提交步骤原本漏了"改源码必须重建产物并放进同一个 commit"这条硬门禁（`artifactFreshness` 拿 HEAD 的产物与当前源码的重建结果比对），已逐条补上并写进 Global Constraints；`git add` 行里一处 `2>/dev/null` 的凑合写法也一并去掉了。
 
