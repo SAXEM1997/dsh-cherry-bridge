@@ -4176,13 +4176,13 @@ var CherryToolEngine = class {
 	#pairTool() {
 		return defineCherryTool({
 			name: "cherry_pair",
-			description: "Pair this harness with a Cherry Studio desktop from its pairing payload (the QR content it shows). The 6-digit `verificationCode` the desktop displays is returned so the user can confirm it matches. Every outcome is a RESULT, never an error: `status` is \"approved\" (with the new device id), or the terminal \"rejected\"/\"expired\" verdict, or this plugin's own \"invalid-payload\"/\"unreachable\", or \"archive-quarantined\" when the device archive is unreadable and must be moved aside by hand. Pairing can take up to a minute — it waits for the user to approve on the desktop.",
+			description: "Pair this harness with a Cherry Studio desktop from its pairing information. The desktop shows only a QR CODE: scan it (WeChat, a browser) and paste the pairing information that page displays. The 6-digit `verificationCode` the desktop displays is returned so the user can confirm it matches. Every outcome is a RESULT, never an error: `status` is \"approved\" (with the new device id), or the terminal \"rejected\"/\"expired\" verdict, or this plugin's own \"invalid-payload\"/\"unreachable\", or \"archive-quarantined\" when the device archive is unreadable and must be moved aside by hand. Pairing can take up to a minute — it waits for the user to approve on the desktop.",
 			parameters: {
 				type: "object",
 				properties: {
 					payload: {
 						type: "string",
-						description: "The pairing payload the desktop rendered into its QR code (a JSON string)."
+						description: "The pairing information shown by the page the desktop QR code points at (a JSON string). Scan that code with WeChat or a browser and copy the text from there."
 					},
 					name: {
 						type: "string",

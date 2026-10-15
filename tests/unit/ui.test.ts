@@ -181,7 +181,7 @@ async function renderWithDevice(
 
 /** Fills the payload box and submits the wizard form. */
 function submitPayload(payload = 'cherry-pair-abc'): void {
-  fireEvent.change(screen.getByLabelText('配对 payload'), { target: { value: payload } })
+  fireEvent.change(screen.getByLabelText('配对信息'), { target: { value: payload } })
   fireEvent.click(screen.getByRole('button', { name: '开始配对' }))
 }
 
@@ -190,6 +190,23 @@ function submitPayload(payload = 'cherry-pair-abc'): void {
 // ---------------------------------------------------------------------------
 
 describe('pairing wizard', () => {
+  it('①a tells the user to SCAN the desktop QR code (the desktop never shows the pairing text itself)', async () => {
+    // The desktop's pairing screen renders only a QR code; the pairing
+    // information lives on the page that QR points at. The wizard therefore
+    // cannot say "copy the generated pairing information" — it must route the
+    // user through a scan.
+    await renderWithDevice([])
+
+    // Both the hint and the numbered steps have to route through a scan.
+    expect(screen.getAllByText(/扫码/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/微信/).length).toBeGreaterThan(0)
+    // The input is labelled in the user's terms, and its placeholder says WHERE
+    // the text comes from.
+    expect(screen.getByLabelText('配对信息')).toBeTruthy()
+    expect(screen.getByPlaceholderText('粘贴扫码后页面上显示的配对信息')).toBeTruthy()
+    expect(screen.queryByText(/复制生成的配对信息/)).toBeNull()
+  })
+
   it('returns 202 + claimId immediately and renders the code from the SSE frame', async () => {
     const { calls } = await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-7' })]])
 
@@ -314,7 +331,7 @@ describe('pairing wizard', () => {
       await waitFor(() => {
         expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
       })
-      expect(screen.getByLabelText('配对 payload')).toBeTruthy()
+      expect(screen.getByLabelText('配对信息')).toBeTruthy()
       // No raw stage string leaks into the UI.
       expect(screen.queryByText(stage)).toBeNull()
 
@@ -445,7 +462,7 @@ describe('pairing wizard', () => {
       const alerts = screen.getAllByRole('alert').map((node) => node.textContent ?? '')
       expect(alerts.some((text) => text.includes('invalid-payload'))).toBe(true)
     })
-    expect(screen.getByLabelText('配对 payload')).toBeTruthy()
+    expect(screen.getByLabelText('配对信息')).toBeTruthy()
     expect(screen.queryByText('配对进行中')).toBeNull()
   })
 })
@@ -763,7 +780,7 @@ describe('settings page registration', () => {
 
     // The page the shell would show is this plugin's settings view.
     expect(screen.getByText('Cherry Studio 互联')).toBeTruthy()
-    expect(screen.getByLabelText('配对 payload')).toBeTruthy()
+    expect(screen.getByLabelText('配对信息')).toBeTruthy()
   })
 
   it('scopes every stylesheet rule to the plugin root, so no host UI is restyled', () => {

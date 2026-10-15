@@ -34,11 +34,13 @@ profile 手工加行等价于：
 
 ### 首次配对
 
-1. 在 Cherry Studio 桌面端打开 **remote access**，展示配对二维码（或 payload 文本）。
-2. 在 DSH 里调用 `cherry_pair`（设置页向导亦可），提交该 payload。
-3. **双向核对 6 位验证码**：`cherry_pair` 结果与设置页都会醒目展示该代码，请与桌面端
+1. 在 Cherry Studio 桌面端打开 **remote access → 添加设备**：该界面显示的是**二维码**，
+   配对信息（地址、端口与一次性邀请）要点开扫码后的页面才看得到。
+2. **扫这个二维码**（微信、浏览器等均可），把扫码后页面上显示的配对信息复制下来。
+3. 在 DSH 里调用 `cherry_pair`（设置页向导亦可），粘贴这段配对信息。
+4. **双向核对 6 位验证码**：`cherry_pair` 结果与设置页都会醒目展示该代码，请与桌面端
    显示的数字人工比对一致后再在桌面端批准。
-4. 批准后设备档案写入插件数据目录（`devices.json`，权限 `0600`），其
+5. 批准后设备档案写入插件数据目录（`devices.json`，权限 `0600`），其
    `desktopIdentity` 被 pin 住；此后每次连接都校验 Noise 对端静态公钥与 pin 一致，
    防止二维码被劫持后的中间人替换。
 
@@ -71,7 +73,7 @@ profile 手工加行等价于：
 | `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。 |
 | `cherry_respond` | 应答交互卡：提问必须全量作答，审批走 `decision`。 |
 | `cherry_cancel` | 取消会话在途执行（`expectedExecutionId` 必填）。 |
-| `cherry_pair` | 用配对 payload 建立与桌面端的配对。 |
+| `cherry_pair` | 用「扫码后页面显示的配对信息」建立与桌面端的配对。 |
 | `cherry_unpair` | 解除配对：断开连接并从设备档案删除。 |
 
 设备选择器（`device` 参数）接受**精确 `deviceId`** 或**唯一的显示名前缀**；前缀命中
@@ -91,7 +93,7 @@ profile 手工加行等价于：
 一个 **`cherry-remote`** 命名空间页面，提供：
 
 - 设备卡片列表：显示名、地址、连接状态灯、启用/停用、删除；
-- 配对向导：粘贴 payload → 展示 6 位验证码 → 展示终态；
+- 配对向导：粘贴扫码页显示的配对信息 → 展示 6 位验证码 → 展示终态；
 - 实时状态：设备状态与配对进度经同源 SSE 流（`/cherry-remote/api/events`）推送。
 
 开发时可单独跑 `npm run dev:ui`（`ui/` 下的 Vite 入口）。**前提是同一个 DSH 宿主已在

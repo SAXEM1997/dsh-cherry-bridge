@@ -114,8 +114,9 @@ schema 已允许 `interrupted`，所以客户端**必须**处理，但当前服�
 
 ### A. 配对
 
-- [ ] 桌面端打开 remote access，展示配对二维码/payload。
-- [ ] DSH 侧执行 `cherry_pair`（或设置页向导），提交 payload。
+- [ ] 桌面端打开 remote access →「添加设备」，屏幕上只显示**二维码**（界面本身不显示配对信息）。
+- [ ] 用微信或浏览器**扫码**，确认扫码后的页面里显示配对信息（地址/端口/一次性邀请）。
+- [ ] 把该页面里的配对信息复制到设置页向导（或 `cherry_pair` 的 payload 参数）并提交。
 - [ ] **双向核对 6 位验证码**：`cherry_pair` 结果与设置页均醒目展示该码，人工与桌面端比对一致后再在桌面端批准。
 - [ ] 批准后设备档案落盘：`deviceId` / `desktopIdentity` 为**已批准分支**的值（非 claim 回执值），`grants` 仅 `agent`。
 - [ ] 档案文件权限为 `0600`，`accessToken` 不出现在任何日志或 UI 回显中。

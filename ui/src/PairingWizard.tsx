@@ -113,7 +113,7 @@ export function PairingWizard({
     event.preventDefault()
     const trimmed = payload.trim()
     if (trimmed === '') {
-      setError('请先粘贴配对 payload')
+      setError('请先粘贴扫码页显示的配对信息')
       return
     }
     setBusy(true)
@@ -148,22 +148,23 @@ export function PairingWizard({
     <section className="cherry-panel" aria-labelledby="cherry-pairing-title">
       <h3 id="cherry-pairing-title">配对向导</h3>
       <p className="cherry-hint">
-        在 Cherry Studio 桌面端打开「远程连接 → 添加设备」，复制生成的配对信息，粘贴到下方。
+        在 Cherry Studio 桌面端打开「远程连接 → 添加设备」；该界面显示的是<strong>二维码</strong>。
+        请用微信或浏览器等扫码，把扫码后页面上显示的配对信息复制下来，粘贴到下方。
       </p>
 
       <ol className="cherry-steps">
-        <li>Cherry Studio 中生成配对信息（含地址、端口与一次性邀请）</li>
-        <li>粘贴到下方输入框并开始配对</li>
-        <li>对照 Cherry Studio 窗口上的 6 位验证码，确认后即完成</li>
+        <li>Cherry Studio 中打开「添加设备」，屏幕上显示二维码</li>
+        <li>用微信或浏览器等扫码，复制扫码页显示的配对信息（含地址、端口与一次性邀请）</li>
+        <li>粘贴到下方输入框并开始配对，再对照桌面端窗口上的 6 位验证码确认</li>
       </ol>
 
       <form className="cherry-pair-form" onSubmit={submit}>
-        <label htmlFor="cherry-payload">配对 payload</label>
+        <label htmlFor="cherry-payload">配对信息</label>
         <textarea
           id="cherry-payload"
           value={payload}
           rows={3}
-          placeholder="粘贴 Cherry Studio 生成的配对信息"
+          placeholder="粘贴扫码后页面上显示的配对信息"
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setPayload(event.target.value)}
         />
         <button type="submit" disabled={busy || running || !subscribed}>
