@@ -209,9 +209,15 @@ describe('F6: the two tsconfig projects partition tests/**/*.test.ts', () => {
   })
 
   it('routes the three UI-environment tests to the UI project specifically', () => {
-    // The point of the split, stated directly: these two need DOM libs / jsdom
-    // and must be the UI project's, not the server's.
-    for (const file of ['tests/unit/ui.test.ts', 'tests/integration/clientBundle.test.ts']) {
+    // The point of the split, stated directly: these three need DOM libs / jsdom
+    // and must be the UI project's, not the server's. Named one by one for the
+    // same reason the partition test names what slipped: a title that says three
+    // while the body checks two is the drift this file exists to catch.
+    for (const file of [
+      'tests/unit/ui.test.ts',
+      'tests/unit/uiScopePanel.test.ts',
+      'tests/integration/clientBundle.test.ts',
+    ]) {
       expect(matchesAny(ui.include, file)).toBe(true)
       expect(matchesAny(server.exclude, file)).toBe(true)
     }
