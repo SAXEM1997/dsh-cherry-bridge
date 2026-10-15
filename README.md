@@ -9,6 +9,7 @@ access）。插件在 DSH 侧维护设备连接池与订阅缓存，对外暴露
 - 插件 id：`cherry-remote`（呼应协议发现类型 `remoteDiscoveryType` 的 mDNS 服务标识）
 - 传输：`ws://` + Noise XX（加密由 Noise 记录层提供，不依赖 TLS 终止）
 - 工具面：14 个 `cherry_*` 工具
+- 启用范围：这 14 个工具**按工作区**启用，默认**谁都没有**（见下文「启用范围」）
 - HTTP 面：宿主 Web 服务器上的同源前缀 `/cherry-remote/api`
 
 ## 安装
@@ -94,6 +95,7 @@ profile 手工加行等价于：
 
 - 设备卡片列表：显示名、地址、连接状态灯、启用/停用、删除；
 - 配对向导：粘贴扫码页显示的配对信息 → 展示 6 位验证码 → 展示终态；
+- 启用范围面板：`全局` / `仅选定工作区` 二选一 + 工作区多选（标题 + 路径），见下文「启用范围」；
 - 实时状态：设备状态与配对进度经同源 SSE 流（`/cherry-remote/api/events`）推送。
 
 开发时可单独跑 `npm run dev:ui`（`ui/` 下的 Vite 入口）。**前提是同一个 DSH 宿主已在
@@ -101,6 +103,76 @@ profile 手工加行等价于：
 `/cherry-remote/api` 由 `ui/vite.config.ts` 里的 **dev-only 代理**转发到宿主（SSE 也走
 同一条代理，不被缓冲）。没有宿主时页面能渲染，但设备列表与事件流会报错。宿主在别的
 端口时用 `CHERRY_DEV_HOST=http://127.0.0.1:<port> npm run dev:ui` 覆盖，不必改代码。
+
+## 启用范围
+
+14 个 `cherry_*` 工具**按工作区**决定是否出现，而不是在每个会话里都注册一遍。设置页的
+**「启用范围」**面板（命名空间 `cherry-remote`，导航标签「Cherry Studio 互联」）负责编辑它。
+机制是**隐藏而非拒绝**：不在范围的会话里，这些工具**不进工具表**（省上下文），而不是「看得见、
+调用才报错」。
+
+- **默认谁都没有**：作用域文档不存在时按 `selected` + **空列表**处理——**没有任何工作区**拿到
+  这些工具。这是 fail-closed 的一侧：文档损坏 / 字段非法 / 读不出来同样落到更严的一侧，
+  **不存在**「读不出来就当全局」的退路。
+- **`仅选定工作区`（`selected`）**：只有勾选的工作区里的会话才可能出现这些工具；**没有工作区**
+  的会话（`cwd` 不属于任何已注册工作区）则始终没有（fail-closed）。
+- **`全局`（`global`）**：所有工作区都可见；此时面板上的勾选**不参与判定**（切回 `selected`
+  后才生效）。
+- **保存即时生效，含进行中的会话**：保存成功后对**所有 live agent** 重装 / 释放限制层，
+  **下一轮**即生效——不需要重启 DSH，也不需要新建会话；取消勾选同样在下一轮消失。
+- **范围只管工具**：设置页与 `/cherry-remote/api` **不受**范围影响——被排除的工作区也必须能自救
+  （配对、改范围）。
+- **能力不足时不假装**：`host.state` 为 `pending`（注入回调尚未到达）时面板只给**中性等待**提示，
+  **不**禁用保存；为 `unsupported`（`tools.register` / `tools.restrict` / `tools.schemas` 任一
+  静态能力缺失）时给只读告警、按**真实缺因**说明并**禁用保存**。两种状态下这些工具都**不注册**
+  （fail-closed），绝不退回「全局可见」。
+
+> **文案边界**：面板只声称「**本插件未遮蔽**这些工具」。上游 `allow` 型过滤（例如子代理的
+> `toolFilter`）仍可能让某个会话看不到它们——那是接受的行为，本插件不对上层过滤的结果作保证。
+
+### 作用域文档与端点
+
+作用域文档落在插件数据目录：`<dataDir>/scope.json`（默认 `$DSH_HOME/cherry-remote/scope.json`），
+权限 `0600`、原子写入、`revision` 单调递增；它**不进** profile YAML（避免双真相源）。
+
+`GET /cherry-remote/api/scope` 一次返回整份状态：
+
+```json
+{
+  "scope": { "mode": "selected", "workspaceIds": [], "revision": 0 },
+  "workspaces": [{ "id": "…", "title": "…", "path": "…" }],
+  "staleWorkspaceIds": [],
+  "pathUnmatched": [{ "agentId": "…", "cwd": "…" }],
+  "host": { "state": "ready", "capable": true, "reason": "…", "degraded": [] }
+}
+```
+
+- `scope` —— 文档的三个可写字段（`mode` / `workspaceIds` / `revision`）。
+- `workspaces` —— 注册表里的工作区（只投影 `id`/`title`/`path`；浏览器够不到注册表本身）。
+- `staleWorkspaceIds` —— 文档里勾选、但注册表已不存在的 id：**由 `PUT` 修剪是清除它们的唯一
+  路径**，界面据 `pruned` 回显清除结果，而**不是**报「校验失败」。
+- `pathUnmatched` —— **解析成功但规范化后不属于任何已注册工作区**的会话（`agentId` + `cwd`）。
+  它们按「无工作区」处理（不可见），这条只解释「勾了却无工具」的原因——拼写不同 / 符号链接 /
+  该目录确实未注册，三者在此不可区分；它**不是**降级，也不改动勾选或 `mode`、不触发写入。
+- `host` —— 能力三态（`pending` / `unsupported` / `ready`，`capable === (state === 'ready')`）
+  与 `degraded` 数组（`{source, reason}`；同一来源只留最新一条，不同来源并存：`install` /
+  `workspace-list` / `visibility-only` / `scope-version` / `path-normalization`）。
+
+`PUT /cherry-remote/api/scope` 是读-改-写：body 为 `{mode, workspaceIds, expectedRevision}`，
+`expectedRevision` **必填**，就是上一次读到的 `revision`。成功返回 `200 {scope, pruned}`：
+`scope` 是写入后的规范文档（被修剪的 id 已不在其中），`pruned` 是这次被修剪掉的已失效 id，返回的
+新 `revision` 就是下一次写入的基准。失败返回 `{error, message?}`，`error` 是稳定码：
+
+| HTTP | `error` | 含义 |
+| --- | --- | --- |
+| 400 | `invalid-scope` | 字段非法：`mode` 不是 `global`/`selected`，或 `workspaceIds` 不是字符串数组。 |
+| 400 | `missing-expected-revision` | 请求没带基准 `expectedRevision`。 |
+| 409 | `scope-revision-conflict` | 基准 `revision` 已过期（配置被他处改过）；`message` 内含当前 `revision`。 |
+| 503 | `workspace-list-unavailable` | 工作区注册表读不到：拒绝写入，已存勾选与 `mode` **一位不动**（也不修剪）。 |
+| 503 | `scope-version-unsupported` | 作用域文档的 `version` 高于本插件支持：只读降级；**重读仍是同一份文档**。 |
+
+> 请求体**整个**读不出来（非法 JSON）时仍走本模块既有的 `400 invalid-request`——那不是作用域
+> 字段的裁决，故不在上表内。
 
 ## HTTP 面（同源）
 
@@ -112,6 +184,8 @@ profile 手工加行等价于：
 | `GET /cherry-remote/api/devices` | 设备列表。 |
 | `PATCH /cherry-remote/api/devices/:id` | 改显示名/启用状态/地址/端口（`hosts` 为**整体替换**）。 |
 | `DELETE /cherry-remote/api/devices/:id` | 移除设备并断开其连接。 |
+| `GET /cherry-remote/api/scope` | 启用范围：作用域文档 + 注册表工作区列表 + `host` 诊断（见「启用范围」）。 |
+| `PUT /cherry-remote/api/scope` | 保存启用范围（读-改-写，`expectedRevision` 必填）。 |
 | `POST /cherry-remote/api/pair` | 启动一次配对，立即返回 `202 {claimId}`，进度走 SSE。 |
 | `GET /cherry-remote/api/events` | SSE：`device-state` / `pairing-progress`（`pairing-progress` 每帧带产生它的 `claimId`；心跳为无载荷注释行）。 |
 | `GET /cherry-remote/api/diagnostics` | 运维诊断报告（见下）。 |
