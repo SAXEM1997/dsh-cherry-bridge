@@ -185,7 +185,7 @@ describe('T4 host integration: tri-state, injection gate and co-lifecycle', () =
     expect(host.liveSubscriptions('agent/disposed')).toBe(1)
   })
 
-  it('④ dependency unload releases registration, layers, guard and both subscriptions together', async () => {
+  it('④ dependency unload releases registration, layers, guard and all three subscriptions together', async () => {
     const { host, scope } = rig()
     host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
     // Let the first judgement generation land, so "invalidated by the teardown"
@@ -216,7 +216,15 @@ describe('T4 host integration: tri-state, injection gate and co-lifecycle', () =
     // every unregister precedes every layer release, and the guard goes last
     // (it notifies nobody, so it is the harmless last backstop).
     const phases = teardownPhases(host.ops.slice(opsBefore))
-    expect(phases.filter((op) => op === 'unsubscribe')).toHaveLength(2)
+    expect(phases.filter((op) => op === 'unsubscribe')).toHaveLength(3)
+    // The three are the whole subscription set — agent/created, agent/disposed
+    // and Task 5b's `tools/change`; none of them survives the merged disposer.
+    expect(
+      host.ops
+        .slice(opsBefore)
+        .flatMap((entry) => (entry.op === 'unsubscribe' ? [entry.event] : []))
+        .sort(),
+    ).toEqual(['agent/created', 'agent/disposed', 'tools/change'])
     expect(phases.filter((op) => op === 'unregister')).toHaveLength(14)
     expect(phases.filter((op) => op === 'release-layer')).toHaveLength(1)
     expect(phases.filter((op) => op === 'guard-release')).toHaveLength(1)
@@ -1303,5 +1311,299 @@ describe('T5a install/release criteria: the target set, the empty set and the gu
     expect(scope.layer('agent-a')).toBeUndefined()
     expect(host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
     expect(host.verdict('agent-a', 'cherry_devices')).toBeUndefined()
+  })
+})
+
+/**
+ * Wraps the injected `workspaceRegistry.resolveByPath` so a fixture can see the one
+ * thing a gate-less implementation cannot hide: how many judgement rebuilds are in
+ * flight AT ONCE (each round awaits one resolution per workspace, plus one per
+ * agent with a `cwd`, so a lone round peaks at 1 and an overlapping round at 2).
+ *
+ * The optional hook runs while that call is still in flight — i.e. for the round
+ * that awaited it, INSIDE the asynchronous interval. Injecting an event there is
+ * deterministic, which a microtask race in the test body would not be.
+ */
+function instrumentRegistry(fake: FakeToolHost, onResolve?: () => void): () => number {
+  let active = 0
+  let peak = 0
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      const injected = ctx as {
+        workspaceRegistry?: { list(): unknown; resolveByPath?(path: string): Promise<unknown> }
+      }
+      const registry = injected.workspaceRegistry
+      const realResolve = registry?.resolveByPath
+      if (registry === undefined || realResolve === undefined) return cb(ctx)
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        workspaceRegistry: {
+          ...registry,
+          resolveByPath: async (path: string) => {
+            active += 1
+            if (active > peak) peak = active
+            try {
+              const resolved = await realResolve.call(registry, path)
+              onResolve?.()
+              return resolved
+            } finally {
+              active -= 1
+            }
+          },
+        },
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+  return () => peak
+}
+
+/**
+ * T5b — the `tools/change` subscription and the COALESCING GATE (spec §4's
+ * re-entrancy and convergence rules).
+ *
+ * The fake host emits `tools/change` on BOTH sides of `restrict()` (§7), so the
+ * plugin's own install and release work re-enters its own listener. That is why
+ * the subscription and the gate land together: without the gate the subscription
+ * self-triggers, and the coalescing rule is what makes the resulting rounds
+ * terminate. The assertions below are the ones that separate a gated
+ * implementation from an ungated (or absent) one.
+ */
+describe('T5b the tools/change subscription and the coalescing gate (§4)', () => {
+  it('⑫ a tools/change during a round is COALESCED: one dirty catch-up, never a concurrent round', async () => {
+    const releases: Array<() => void> = []
+    let peak: () => number = () => 0
+    let midRound: (() => void) | undefined
+    const { host, scope, tools } = rig({
+      patchRoot: (fake) => {
+        peak = instrumentRegistry(fake, () => {
+          // One shot: the catch-up round must see a quiet registry, or the fixture
+          // itself would keep the round loop alive.
+          const emit = midRound
+          midRound = undefined
+          emit?.()
+        })
+      },
+      registerTools: (fake) => {
+        releases.push(...registerOn(fake, CHERRY_TOOL_NAMES))
+        return () => {
+          for (const release of releases.splice(0)) release()
+        }
+      },
+    })
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    // The subscription is live, the agent is hidden by exactly ONE layer, and the
+    // plugin's own install already echoed `tools/change` back at it.
+    expect(host.liveSubscriptions('tools/change')).toBe(1)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(host.restrictCalls).toHaveLength(1)
+    expect(peak()).toBe(1)
+
+    const rounds = host.listCalls()
+    const installs = host.restrictCalls.length
+
+    // A REAL source change — one of our names leaves the global view — starts a
+    // round, whose own install/release work then emits two more `tools/change`
+    // from INSIDE that round (the fake host notifies on both sides of restrict)…
+    releases.pop()!()
+    // …and a third arrives in the round's asynchronous interval.
+    midRound = () => host.emitToolsChange()
+    await settle()
+
+    // 合并 / 置脏补跑: round 1 + exactly ONE catch-up for ALL of them (an ungated
+    // handler would run one round per emission).
+    expect(host.listCalls() - rounds).toBe(2)
+    // 不并发: no second round ever overlapped the first.
+    expect(peak()).toBe(1)
+    // 有界放大: the catch-up made no layer-changing call — one reinstall overall.
+    expect(host.restrictCalls.length).toBe(installs + 1)
+    expect(denyOf(host.restrictCalls.at(-1)!)).toHaveLength(13)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(13)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('⑬ an agent created during a round is never dropped: the catch-up round adopts it', async () => {
+    const releases: Array<() => void> = []
+    let peak: () => number = () => 0
+    const { host, scope, tools } = rig({
+      patchRoot: (fake) => {
+        peak = instrumentRegistry(fake)
+      },
+      registerTools: (fake) => {
+        releases.push(...registerOn(fake, CHERRY_TOOL_NAMES))
+        return () => {
+          for (const release of releases.splice(0)) release()
+        }
+      },
+    })
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(peak()).toBe(1)
+
+    const rounds = host.listCalls()
+
+    // Round 1 starts on the config-save path…
+    tools.refresh()
+    // …and an agent is created while it is still in flight. Its FIRST install is
+    // synchronous and fail-closed (D14: the cache is a miss, so it must not wait
+    // for an asynchronous resolution before being hidden).
+    host.addAgent({ id: 'agent-b' })
+    expect(host.layerCount('agent-b')).toBe(1)
+    expect(scope.layer('agent-b')?.reason).toContain('缓存未命中')
+
+    await settle()
+
+    // 不并发: the creation did not open a second concurrent round…
+    expect(peak()).toBe(1)
+    // …it set the dirty flag: round 1 + exactly ONE catch-up.
+    expect(host.listCalls() - rounds).toBe(2)
+    // 首次安装永不弃权: exactly one layer for the new agent, and the CATCH-UP round
+    // is what adopts it — the judgement below is one only that round could have
+    // produced, since round 1's agent snapshot predates the creation (the layer's
+    // reason was still the cache-miss wording until the catch-up re-applied).
+    expect(scope.judgement('agent-b')).toBeDefined()
+    // agent-b was created with NO `cwd` (a minimal, store-less session header), so
+    // the path rule cannot judge it: `no-cwd`, and under `selected` that is not
+    // visible (D7) — a resolved judgement here would be a fact about the fixture,
+    // not about the catch-up round.
+    expect(scope.judgement('agent-b')?.status).toBe('no-cwd')
+    expect(scope.judgement('agent-b')?.workspaceId).toBeUndefined()
+    expect(scope.judgement('agent-b')?.visible).toBe(false)
+    // …and the layer's record was refreshed IN PLACE (the reviewed write: same deny
+    // set, no `restrict()` call, no layer churn).
+    expect(host.restrictCalls.filter((call) => call.agentId === 'agent-b')).toHaveLength(1)
+    expect(scope.layer('agent-b')?.reason).toBe(scope.judgement('agent-b')?.reason)
+    expect(scope.layer('agent-b')?.reason).not.toContain('缓存未命中')
+    expect(scope.layer('agent-b')?.deny).toHaveLength(14)
+    expect(host.layerCount('agent-b')).toBe(1)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('⑭ teardown is the ONLY abstention point: an event already in flight lands on a dead subsystem', async () => {
+    /**
+     * A host that dispatches over a SNAPSHOT of its listeners: the fixture's own
+     * listener (registered first) unloads the fibre from inside the dispatch, and
+     * the already-snapshotted plugin listener still receives the event. That is
+     * exactly the window §4 names as the abstention point — and the plugin's OWN
+     * release work emits `tools/change` in the same window.
+     */
+    function rigTornDownMidDispatch(event: 'tools/change' | 'agent/created') {
+      let armed = false
+      let unload: () => void = () => {}
+      const rigged = rig({
+        patchRoot: (fake) => {
+          fake.root.on?.(event, () => {
+            if (armed) unload()
+          })
+        },
+      })
+      unload = rigged.dispose
+      return {
+        ...rigged,
+        arm: () => {
+          armed = true
+        },
+        /**
+         * The PLUGIN's own live subscriptions, with this fixture's sabotage
+         * listener counted out.
+         *
+         * `liveSubscriptions(event)` alone answers the wrong question: it counts 1
+         * for the fixture's own listener (which outlives the teardown that listener
+         * triggers) and 1 for the plugin's — so "0 after teardown" would be
+         * satisfied by an implementation that never subscribed at all, and "1 while
+         * mounted" would be satisfied by the fixture alone. Both counts below are
+         * the plugin's.
+         */
+        pluginSubscriptions(of?: string): number {
+          return rigged.host.liveSubscriptions(of) - (of === undefined || of === event ? 1 : 0)
+        },
+        /** The observable of "a recompute body was entered": a not-visible agent
+         * makes `targetDeny` read the global view, and abstention means it is never
+         * reached. */
+        countSchemas(): () => number {
+          const real = rigged.host.root.tools!.schemas!
+          let calls = 0
+          rigged.host.root.tools!.schemas = (scope?: unknown) => {
+            calls += 1
+            return real(scope)
+          }
+          return () => calls
+        },
+      }
+    }
+
+    async function hiddenAgent(fixture: ReturnType<typeof rigTornDownMidDispatch>): Promise<void> {
+      const { host, scope } = fixture
+      host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+      host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+      await vi.waitFor(() => {
+        expect(scope.judgement('agent-a')).toBeDefined()
+      })
+      await settle()
+      expect(host.layerCount('agent-a')).toBe(1)
+      // The subscription under test is LIVE, and this count is the PLUGIN's: the
+      // whole set (agent/created + agent/disposed + tools/change) is counted, with
+      // the fixture's own listener subtracted (see `pluginSubscriptions`).
+      expect(fixture.pluginSubscriptions()).toBe(3)
+      expect(fixture.pluginSubscriptions('tools/change')).toBe(1)
+    }
+
+    // ── (a) a `tools/change` delivered after the teardown it was dispatched with ──
+    const first = rigTornDownMidDispatch('tools/change')
+    await hiddenAgent(first)
+    const schemasCalls = first.countSchemas()
+    const rounds = first.host.listCalls()
+    const installs = first.host.restrictCalls.length
+
+    first.arm()
+    first.host.emitToolsChange()
+
+    // The teardown ran (registration, layer and subscriptions all gone)…
+    expect(first.host.registeredNames()).toEqual([])
+    expect(first.host.layerTotal()).toBe(0)
+    expect(first.scope.layer('agent-a')).toBeUndefined()
+    expect(first.pluginSubscriptions()).toBe(0)
+    expect(first.pluginSubscriptions('tools/change')).toBe(0)
+    // …and the event that was still in flight did NOT recompute, install or
+    // resurrect the invalidated generation.
+    expect(schemasCalls()).toBe(0)
+    expect(first.host.listCalls()).toBe(rounds)
+    expect(first.host.restrictCalls.length).toBe(installs)
+    expect(first.scope.judgement('agent-a')).toBeUndefined()
+    expect(first.scope.degraded()).toEqual([])
+    expect(first.host.effectFailures).toEqual([])
+
+    // ── (b) an `agent/created` delivered after the teardown it was dispatched with ──
+    const second = rigTornDownMidDispatch('agent/created')
+    await hiddenAgent(second)
+    const schemasCallsB = second.countSchemas()
+    const roundsB = second.host.listCalls()
+    const installsB = second.host.restrictCalls.length
+
+    second.arm()
+    second.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+
+    expect(second.host.registeredNames()).toEqual([])
+    expect(second.host.layerTotal()).toBe(0)
+    expect(second.host.layerCount('agent-b')).toBe(0)
+    expect(second.scope.layer('agent-b')).toBeUndefined()
+    expect(second.scope.judgement('agent-b')).toBeUndefined()
+    expect(schemasCallsB()).toBe(0)
+    expect(second.host.listCalls()).toBe(roundsB)
+    expect(second.host.restrictCalls.length).toBe(installsB)
+    expect(second.scope.degraded()).toEqual([])
+    expect(second.host.effectFailures).toEqual([])
+    expect(second.pluginSubscriptions()).toBe(0)
   })
 })

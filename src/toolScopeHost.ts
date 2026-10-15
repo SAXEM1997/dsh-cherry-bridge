@@ -34,10 +34,18 @@
  *     `invalidateDerived`), which is what makes `guard`'s "层在 ⇒ 拒绝" mirror
  *     true by construction.
  *
- * Deliberately NOT here (the second half of Task 5, and Task 6): the
- * `tools/change` subscription with its coalescing gate, and the bounded recheck.
- * The install/release criteria themselves ARE here — every "completion" and
- * "retry" they describe is reachable through `refresh()`, the config-save path.
+ *  5. **Every trigger of a recompute round goes through ONE coalescing gate**
+ *     ({@link requestRound}, §4 ①'s 合并 / 置脏后补跑). The host emits
+ *     `tools/change` on BOTH sides of `register`/`restrict`, so this module's own
+ *     install and release work re-enters its own listener; the gate is what makes
+ *     that terminating — an in-flight round is never overlapped, the trigger only
+ *     marks it dirty, and the round runs one catch-up pass before it ends. The
+ *     ONLY abstention point is teardown (§4), which every entry checks.
+ *
+ * Deliberately NOT here (Task 6): the bounded recheck. The install/release
+ * criteria and the three subscriptions ARE here — every "completion" and
+ * "retry" they describe is reachable through `refresh()` (the config-save path)
+ * and through `tools/change`.
  */
 import { isVisible } from './toolScope.js'
 import type { ScopeHostState, ToolScopeState, WorkspaceRegistryLike } from './toolScope.js'
@@ -229,9 +237,16 @@ interface HostAgent {
   restrict?: (filter: { readonly deny: readonly string[] }) => () => void
 }
 
-/** One effect run's state: the four faces it owns, and its own torn-down flag. */
+/** One effect run's state: the four faces it owns, its own torn-down flag, and §4's gate. */
 interface EffectState {
   tornDown: boolean
+  /**
+   * §4 ①'s coalescing gate: a round is in flight. A trigger arriving while this
+   * is set must not start a second one — it sets {@link dirty} instead.
+   */
+  running: boolean
+  /** A trigger arrived inside the current round: one catch-up pass is owed. */
+  dirty: boolean
   layers: Map<string, () => void>
   agents: { list(): unknown } | undefined
   registry: WorkspaceRegistryLike | undefined
@@ -549,6 +564,50 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     }
   }
 
+  /**
+   * §4 ①'s re-entrancy gate — the ONE entry of a recompute round.
+   *
+   * The host emits `tools/change` on BOTH sides of `register`/`restrict`, so the
+   * plugin's own install and release work necessarily re-enters its own listener.
+   * Coalescing is what makes that terminating:
+   *
+   *  - a round already in flight is never overlapped: the trigger only marks the
+   *    round DIRTY, and that round runs one catch-up pass before it ends (§4 ①,
+   *    "置脏后补跑，不丢弃") — an event arriving anywhere inside the round,
+   *    including its asynchronous interval, is therefore never lost;
+   *  - the loop stops at a FIXED POINT: a pass that changes no layer makes no
+   *    host call, so it emits nothing and leaves `dirty` false. §4 ③'s bounded
+   *    amplification (at most one reinstall per agent per round) rides on the
+   *    idempotent short-circuit inside {@link applyForAgent}.
+   *
+   * This is also §4's ONLY abstention point, and the check is deliberately the
+   * same one `refresh` / `onCreated` / `onDisposed` / {@link converge} carry: an
+   * event that was already dispatched when the merged disposer ran must reach a
+   * dead subsystem — never a recompute, never a layer.
+   */
+  function requestRound(state: EffectState): void {
+    if (state.tornDown || mountTornDown || !staticCapable) return
+    if (state.running) {
+      state.dirty = true
+      return
+    }
+    state.running = true
+    void runRounds(state)
+  }
+
+  /** The gate's body: the round itself, then every catch-up it accumulated. */
+  async function runRounds(state: EffectState): Promise<void> {
+    try {
+      do {
+        state.dirty = false
+        await converge(state)
+      } while (state.dirty && !state.tornDown && !mountTornDown)
+    } finally {
+      // Even a round torn down mid-flight must not leave the gate stuck.
+      state.running = false
+    }
+  }
+
   // -------------------------------------------------------------------------
   // The guard: the execution-side MIRROR of the installed-layer records
   // -------------------------------------------------------------------------
@@ -578,7 +637,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     // The synchronous window: install/release decisions read the CACHE only, so
     // `save → refresh` is await-free (the convergence rides behind it).
     const summary = applyAll(state)
-    void converge(state)
+    requestRound(state)
     return summary
   }
 
@@ -649,6 +708,8 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
 
     const state: EffectState = {
       tornDown: false,
+      running: false,
+      dirty: false,
       layers: new Map(),
       agents: agentCtx.agents,
       registry: agentCtx.workspaceRegistry,
@@ -714,8 +775,8 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       )
     }
 
-    // ③ The subscriptions (this half: agent lifecycle only — `tools/change`
-    //    belongs with the second half of Task 5).
+    // ③ The subscriptions — all three ride the ONE contained helper (R16), so a
+    //    host that refuses one `on(…)` cannot take the round down with it.
     const on = agentCtx.on
     if (typeof on === 'function') {
       subscribe<{ agent?: unknown }>(state, on, 'agent/created', (payload) => {
@@ -723,6 +784,13 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       })
       subscribe<{ agent?: unknown }>(state, on, 'agent/disposed', (payload) => {
         onDisposed(state, payload)
+      })
+      // ②'s retry path and §4 ①'s re-entrancy: the host emits this event on BOTH
+      //    sides of `register`/`restrict`, so this listener hears the plugin's own
+      //    install and release work. It goes through the gate — never straight
+      //    into a round — or the subscription would self-trigger.
+      subscribe<unknown>(state, on, 'tools/change', () => {
+        requestRound(state)
       })
     }
 
@@ -774,11 +842,15 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     try {
       // Only the CACHE is read here: awaiting `resolveByPath` would block the
       // session's creation, so a cache miss is the D7 fail-closed side.
+      //
+      // §4: this FIRST install never abstains — it happens here, synchronously,
+      // even when a round is in flight (⑬). Only the convergence below is
+      // coalesced, so the agent is adopted by the catch-up pass.
       applyForAgent(state, agent)
     } catch (error) {
       log(`[cherry-remote] agent ${agent.id} 的首次装配失败（不阻塞建会话）`, error)
     }
-    void converge(state)
+    requestRound(state)
   }
 
   /** `agent/disposed`: releases exactly that agent's layer and its record. */

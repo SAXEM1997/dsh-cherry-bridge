@@ -5812,10 +5812,18 @@ var ToolScopeState = class {
 *     `invalidateDerived`), which is what makes `guard`'s "层在 ⇒ 拒绝" mirror
 *     true by construction.
 *
-* Deliberately NOT here (the second half of Task 5, and Task 6): the
-* `tools/change` subscription with its coalescing gate, and the bounded recheck.
-* The install/release criteria themselves ARE here — every "completion" and
-* "retry" they describe is reachable through `refresh()`, the config-save path.
+*  5. **Every trigger of a recompute round goes through ONE coalescing gate**
+*     ({@link requestRound}, §4 ①'s 合并 / 置脏后补跑). The host emits
+*     `tools/change` on BOTH sides of `register`/`restrict`, so this module's own
+*     install and release work re-enters its own listener; the gate is what makes
+*     that terminating — an in-flight round is never overlapped, the trigger only
+*     marks it dirty, and the round runs one catch-up pass before it ends. The
+*     ONLY abstention point is teardown (§4), which every entry checks.
+*
+* Deliberately NOT here (Task 6): the bounded recheck. The install/release
+* criteria and the three subscriptions ARE here — every "completion" and
+* "retry" they describe is reachable through `refresh()` (the config-save path)
+* and through `tools/change`.
 */
 /**
 * The label of this subsystem's mount lifecycle — §6.2 spells it, and this is
@@ -6104,6 +6112,47 @@ function createToolScopeHost(deps) {
 			log("[cherry-remote] 作用域重算失败（只记录，不抛；判定保持上一代）", error);
 		}
 	}
+	/**
+	* §4 ①'s re-entrancy gate — the ONE entry of a recompute round.
+	*
+	* The host emits `tools/change` on BOTH sides of `register`/`restrict`, so the
+	* plugin's own install and release work necessarily re-enters its own listener.
+	* Coalescing is what makes that terminating:
+	*
+	*  - a round already in flight is never overlapped: the trigger only marks the
+	*    round DIRTY, and that round runs one catch-up pass before it ends (§4 ①,
+	*    "置脏后补跑，不丢弃") — an event arriving anywhere inside the round,
+	*    including its asynchronous interval, is therefore never lost;
+	*  - the loop stops at a FIXED POINT: a pass that changes no layer makes no
+	*    host call, so it emits nothing and leaves `dirty` false. §4 ③'s bounded
+	*    amplification (at most one reinstall per agent per round) rides on the
+	*    idempotent short-circuit inside {@link applyForAgent}.
+	*
+	* This is also §4's ONLY abstention point, and the check is deliberately the
+	* same one `refresh` / `onCreated` / `onDisposed` / {@link converge} carry: an
+	* event that was already dispatched when the merged disposer ran must reach a
+	* dead subsystem — never a recompute, never a layer.
+	*/
+	function requestRound(state) {
+		if (state.tornDown || mountTornDown || !staticCapable) return;
+		if (state.running) {
+			state.dirty = true;
+			return;
+		}
+		state.running = true;
+		runRounds(state);
+	}
+	/** The gate's body: the round itself, then every catch-up it accumulated. */
+	async function runRounds(state) {
+		try {
+			do {
+				state.dirty = false;
+				await converge(state);
+			} while (state.dirty && !state.tornDown && !mountTornDown);
+		} finally {
+			state.running = false;
+		}
+	}
 	function guardVerdict(execution) {
 		if (!names.includes(execution.name)) return void 0;
 		const agentId = execution.agent?.id;
@@ -6115,7 +6164,7 @@ function createToolScopeHost(deps) {
 		const state = current;
 		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return void 0;
 		const summary = applyAll(state);
-		converge(state);
+		requestRound(state);
 		return summary;
 	}
 	function teardownEffect(state) {
@@ -6167,6 +6216,8 @@ function createToolScopeHost(deps) {
 		});
 		const state = {
 			tornDown: false,
+			running: false,
+			dirty: false,
 			layers: /* @__PURE__ */ new Map(),
 			agents: agentCtx.agents,
 			registry: agentCtx.workspaceRegistry,
@@ -6205,6 +6256,9 @@ function createToolScopeHost(deps) {
 			});
 			subscribe(state, on, "agent/disposed", (payload) => {
 				onDisposed(state, payload);
+			});
+			subscribe(state, on, "tools/change", () => {
+				requestRound(state);
 			});
 		}
 		refresh();
@@ -6247,7 +6301,7 @@ function createToolScopeHost(deps) {
 		} catch (error) {
 			log(`[cherry-remote] agent ${agent.id} 的首次装配失败（不阻塞建会话）`, error);
 		}
-		converge(state);
+		requestRound(state);
 	}
 	/** `agent/disposed`: releases exactly that agent's layer and its record. */
 	function onDisposed(state, payload) {
