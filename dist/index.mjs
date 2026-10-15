@@ -6962,6 +6962,12 @@ async function handleRequest(req, res, route) {
 			}
 			return writeJson(res, 200, diagnosticsReport(route));
 		}
+		if (first === "scope" && match.segments.length === 1) {
+			if (method === "GET") return scopeSnapshot(res, route);
+			if (method === "PUT") return await saveScopeDocument(req, res, route);
+			writeError(res, 405, "method-not-allowed", "GET/PUT only");
+			return;
+		}
 		writeError(res, 404, "not-found", "unknown route");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -7015,6 +7021,97 @@ function diagnosticsReport(route) {
 			title: entry.title
 		}))
 	};
+}
+/**
+* `GET /cherry-remote/api/scope`: the whole scope state in ONE body.
+*
+* The workspace list is read from the registry by the PLUGIN and projected DOWN
+* (id/title/path only) because the browser cannot reach the registry at all;
+* `sessionIds` is judgement input, not page state, and stays behind.
+*
+* `staleWorkspaceIds` and `pathUnmatched` are two SEPARATE channels beside
+* `host`, on purpose (§6.1): "an id the registry no longer has" and "this
+* session's cwd belongs to no registered workspace" are different answers, and
+* neither may be derived from the other. `degraded` is an ARRAY inside `host` —
+* same source deduplicated (latest reason), different sources coexisting — and
+* an empty array is the honest "no degradation".
+*/
+function scopeSnapshot(res, route) {
+	const scope = route.deps.scope;
+	const doc = scope.doc();
+	const host = scope.host();
+	writeJson(res, 200, {
+		scope: scopeProjection(doc),
+		workspaces: scope.workspaces().map((workspace) => ({
+			id: workspace.id,
+			title: workspace.title,
+			path: workspace.path
+		})),
+		staleWorkspaceIds: [...scope.staleWorkspaceIds()],
+		pathUnmatched: scope.pathUnmatched().map((entry) => ({
+			agentId: entry.agentId,
+			cwd: entry.cwd
+		})),
+		host: {
+			state: host.state,
+			capable: host.capable,
+			reason: host.reason,
+			degraded: scope.degraded().map((note) => ({
+				source: note.source,
+				reason: note.reason
+			}))
+		}
+	});
+}
+/**
+* The three fields the write side accepts back, as every response carries them.
+*
+* Projected field by field rather than spread: `version`/`updatedAt` are the
+* persistence layer's business, and the settings page's read-modify-write cycle
+* needs exactly the document it can PUT back beside a base `revision`.
+*/
+function scopeProjection(doc) {
+	return {
+		mode: doc.mode,
+		workspaceIds: [...doc.workspaceIds],
+		revision: doc.revision
+	};
+}
+/**
+* `PUT /cherry-remote/api/scope`: validate and commit, then refresh.
+*
+* The shape exists for the ONE await-free critical section at its end. `save()`
+* validates the base revision, prunes, bumps the revision by exactly one, writes
+* the file and swaps the in-memory authority — all synchronously — and
+* `refreshScope()` is called in the very next statement. An `await` anywhere
+* between the two would let two concurrent saves both pass the revision check,
+* after which the later write silently overwrites the earlier one.
+*
+* The refresh is NOT awaited and its summary is NOT published (R24): that
+* summary describes the synchronous pass the call itself ran, while convergence
+* — the recompute round it triggers plus the catch-up pass the coalescing gate
+* owes it — rides behind the response. What the caller gets back is the
+* authoritative new state: the normalized document (with the pruned ids gone)
+* and the new revision its next write must base itself on.
+*/
+async function saveScopeDocument(req, res, route) {
+	let body;
+	try {
+		body = await readJsonBody(req);
+	} catch (error) {
+		writeError(res, 400, "invalid-request", error instanceof Error ? error.message : String(error));
+		return;
+	}
+	const result = route.deps.scope.save(body, body.expectedRevision);
+	if (!result.ok) {
+		writeError(res, result.status, result.error, result.message);
+		return;
+	}
+	route.deps.refreshScope();
+	writeJson(res, 200, {
+		scope: scopeProjection(result.doc),
+		pruned: [...result.pruned]
+	});
 }
 /**
 * One device's diagnostics projection: the live state plus, when a connection

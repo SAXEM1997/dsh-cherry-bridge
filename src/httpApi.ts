@@ -7,7 +7,7 @@ import { PairingError } from './pairing.js'
 import type { PairWithPayloadOptions } from './pairing.js'
 import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics.js'
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
-import type { ToolScopeState } from './toolScope.js'
+import type { ScopeDoc, ToolScopeState } from './toolScope.js'
 import type { RefreshSummary } from './toolScopeHost.js'
 
 /**
@@ -892,6 +892,18 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
       return writeJson(res, 200, diagnosticsReport(route))
     }
 
+    // Task 7 (§6.3): the scope document's read/write face. It rides the SAME
+    // prefix seat as every other route and therefore the SAME fence — there is
+    // no second registration and no second fence site to forget.
+    if (first === 'scope' && match.segments.length === 1) {
+      if (method === 'GET') return scopeSnapshot(res, route)
+      if (method === 'PUT') return await saveScopeDocument(req, res, route)
+      // The method verdict comes FIRST: a refused method neither reads the body
+      // nor touches the stored document.
+      writeError(res, 405, 'method-not-allowed', 'GET/PUT only')
+      return
+    }
+
     writeError(res, 404, 'not-found', 'unknown route')
   } catch (error) {
     // Defense in depth: the routes below handle their own failures, so reaching
@@ -954,6 +966,108 @@ function diagnosticsReport(route: RouteContext): unknown {
     ...(config === undefined ? {} : { config }),
     contractDifferences: CONTRACT_DIFFERENCES.map((entry) => ({ id: entry.id, title: entry.title })),
   }
+}
+
+// ---------------------------------------------------------------------------
+// The scope document face (Task 7 / spec §6.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /cherry-remote/api/scope`: the whole scope state in ONE body.
+ *
+ * The workspace list is read from the registry by the PLUGIN and projected DOWN
+ * (id/title/path only) because the browser cannot reach the registry at all;
+ * `sessionIds` is judgement input, not page state, and stays behind.
+ *
+ * `staleWorkspaceIds` and `pathUnmatched` are two SEPARATE channels beside
+ * `host`, on purpose (§6.1): "an id the registry no longer has" and "this
+ * session's cwd belongs to no registered workspace" are different answers, and
+ * neither may be derived from the other. `degraded` is an ARRAY inside `host` —
+ * same source deduplicated (latest reason), different sources coexisting — and
+ * an empty array is the honest "no degradation".
+ */
+function scopeSnapshot(res: HttpResponseLike, route: RouteContext): void {
+  const scope = route.deps.scope
+  const doc = scope.doc()
+  const host = scope.host()
+  writeJson(res, 200, {
+    scope: scopeProjection(doc),
+    workspaces: scope.workspaces().map((workspace) => ({
+      id: workspace.id,
+      title: workspace.title,
+      path: workspace.path,
+    })),
+    staleWorkspaceIds: [...scope.staleWorkspaceIds()],
+    pathUnmatched: scope.pathUnmatched().map((entry) => ({ agentId: entry.agentId, cwd: entry.cwd })),
+    host: {
+      state: host.state,
+      capable: host.capable,
+      reason: host.reason,
+      degraded: scope.degraded().map((note) => ({ source: note.source, reason: note.reason })),
+    },
+  })
+}
+
+/**
+ * The three fields the write side accepts back, as every response carries them.
+ *
+ * Projected field by field rather than spread: `version`/`updatedAt` are the
+ * persistence layer's business, and the settings page's read-modify-write cycle
+ * needs exactly the document it can PUT back beside a base `revision`.
+ */
+function scopeProjection(
+  doc: Pick<ScopeDoc, 'mode' | 'workspaceIds' | 'revision'>,
+): Pick<ScopeDoc, 'mode' | 'workspaceIds' | 'revision'> {
+  return { mode: doc.mode, workspaceIds: [...doc.workspaceIds], revision: doc.revision }
+}
+
+/**
+ * `PUT /cherry-remote/api/scope`: validate and commit, then refresh.
+ *
+ * The shape exists for the ONE await-free critical section at its end. `save()`
+ * validates the base revision, prunes, bumps the revision by exactly one, writes
+ * the file and swaps the in-memory authority — all synchronously — and
+ * `refreshScope()` is called in the very next statement. An `await` anywhere
+ * between the two would let two concurrent saves both pass the revision check,
+ * after which the later write silently overwrites the earlier one.
+ *
+ * The refresh is NOT awaited and its summary is NOT published (R24): that
+ * summary describes the synchronous pass the call itself ran, while convergence
+ * — the recompute round it triggers plus the catch-up pass the coalescing gate
+ * owes it — rides behind the response. What the caller gets back is the
+ * authoritative new state: the normalized document (with the pruned ids gone)
+ * and the new revision its next write must base itself on.
+ */
+async function saveScopeDocument(
+  req: HttpRequestLike,
+  res: HttpResponseLike,
+  route: RouteContext,
+): Promise<void> {
+  let body: Record<string, unknown>
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    // The module's existing body-level refusal, the same one `POST /pair` uses:
+    // a body that cannot be read at all is not a scope-FIELD verdict, so it must
+    // not be dressed up as `invalid-scope`.
+    writeError(res, 400, 'invalid-request', error instanceof Error ? error.message : String(error))
+    return
+  }
+
+  // `expectedRevision` travels beside the document, exactly as the read-modify-
+  // write cycle carries it back. The refusal STATUS and the stable error code
+  // are the scope state's verdict — this face only transports them verbatim
+  // (400 invalid-scope / missing-expected-revision, 409 scope-revision-conflict,
+  // 503 workspace-list-unavailable / scope-version-unsupported).
+  const result = route.deps.scope.save(body, body.expectedRevision)
+  if (!result.ok) {
+    writeError(res, result.status, result.error, result.message)
+    return
+  }
+
+  // NO `await` between the save above and this call (§6.3's hard constraint).
+  route.deps.refreshScope()
+  writeJson(res, 200, { scope: scopeProjection(result.doc), pruned: [...result.pruned] })
 }
 
 /**
