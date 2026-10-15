@@ -21,8 +21,9 @@ import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
 import type { CherryToolsDeps } from '../../src/tools.js'
 import { ToolScopeState } from '../../src/toolScope.js'
 import { createToolScopeHost, registerAtomically } from '../../src/toolScopeHost.js'
+import type { ScopeHostContext } from '../../src/toolScopeHost.js'
 import { FakeToolHost } from '../helpers/fakeToolHost.js'
-import type { FakeCapability } from '../helpers/fakeToolHost.js'
+import type { FakeCapability, FakeRestrictCall } from '../helpers/fakeToolHost.js'
 
 const dirs: string[] = []
 let warn: ReturnType<typeof vi.fn>
@@ -63,6 +64,12 @@ interface RigOptions {
   without?: readonly FakeCapability[]
   /** Override the aggregate registration entry (⑦). */
   registerTools?: (host: FakeToolHost) => () => void
+  /**
+   * Runs against the fake host BEFORE `mount()` — the only window in which a
+   * Task 5 fixture can add live agents, register extra tools or wrap the root
+   * face / the injection callback (a throwing `guard` or `on`, R16).
+   */
+  patchRoot?: (host: FakeToolHost) => void
 }
 
 /** One host-level rig: a fake host plus a real scope state and a real mount. */
@@ -88,6 +95,7 @@ function rig(options: RigOptions = {}) {
       options.registerTools?.(host) ??
       registerAtomically(host.root, (toolsCtx) => registerCherryTools(toolsCtx, inertToolDeps())),
   })
+  options.patchRoot?.(host)
   const dispose = tools.mount(host.root)
   return { host, scope, tools, dispose }
 }
@@ -549,5 +557,666 @@ describe('T4 ⑧ the assembly point: apply() mounts the host', () => {
     } finally {
       for (const dispose of fixture.effects.splice(0)) dispose()
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 5 (first half) — the install / release CRITERIA: the target set and its
+// empty-set semantics, the install-failure path, the layer-mirroring guard and
+// R16's "no host call escapes the effect body".
+//
+// The `tools/change` subscription and its coalescing gate are deliberately NOT
+// exercised here (that is the second half of Task 5): every "completion" and
+// every "retry" below is driven by the CONFIG-SAVE path the production caller
+// uses after a successful PUT — `refresh()`.
+// ---------------------------------------------------------------------------
+
+/** One raw agent record, as the fake host hands it to `agent/created`. */
+interface RawAgentRecord {
+  id: string
+  session: { header: { cwd?: string } }
+  ctx: {
+    tools: { restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void }
+  }
+}
+
+/** Registers `names` on the host's GLOBAL face; returns their disposers. */
+function registerOn(fake: FakeToolHost, names: readonly string[]): Array<() => void> {
+  return names.map((name) =>
+    fake.root.tools!.register({ name, description: name, execute: async () => undefined }),
+  )
+}
+
+/** Captures the RAW agent records, so a fixture can stack its OWN layers. */
+function captureAgents(host: FakeToolHost): Map<string, RawAgentRecord> {
+  const captured = new Map<string, RawAgentRecord>()
+  host.root.on?.<{ agent?: unknown }>('agent/created', (payload) => {
+    const raw = payload?.agent as RawAgentRecord | undefined
+    if (raw !== undefined && typeof raw.id === 'string') captured.set(raw.id, raw)
+  })
+  return captured
+}
+
+/** Wraps the injection callback so the ctx the plugin receives refuses ONE event. */
+function refuseSubscription(fake: FakeToolHost, refused: string): void {
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      const injected = ctx as {
+        on?: (event: string, handler: (payload: unknown) => void) => () => void
+      }
+      const realOn = injected.on
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        on: (event: string, handler: (payload: unknown) => void) => {
+          if (event === refused) throw new Error(`the host refused the "${event}" subscription`)
+          return realOn!.call(injected, event, handler)
+        },
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+}
+
+/** Lets one round's asynchronous judgement + re-application finish. */
+async function settle(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 20))
+}
+
+/** Writes the document through the PUBLIC save path (the production PUT). */
+function saveScope(
+  scope: ToolScopeState,
+  mode: 'global' | 'selected',
+  workspaceIds: readonly string[],
+): void {
+  const result = scope.save({ mode, workspaceIds }, scope.doc().revision)
+  expect(result.ok, JSON.stringify(result)).toBe(true)
+}
+
+/** The deny names of one recorded `restrict()` call. */
+function denyOf(call: FakeRestrictCall): string[] {
+  return [...(call.filter.deny ?? [])]
+}
+
+/** Every `restrict` / `release-layer` action the host performed for one agent. */
+function layerOps(host: FakeToolHost, agentId: string): Array<{ op: string; denyCount: number }> {
+  const ops: ReadonlyArray<{ op: string; agentId?: string; filter?: { deny?: readonly string[] } }> =
+    host.ops
+  return ops
+    .filter((entry) => entry.agentId === agentId && (entry.op === 'restrict' || entry.op === 'release-layer'))
+    .map((entry) => ({ op: entry.op, denyCount: entry.filter?.deny?.length ?? 0 }))
+}
+
+describe('T5a install/release criteria: the target set, the empty set and the guard', () => {
+  it('① the deny argument is the no-argument global view ∩ our names — never empty, never allow (B12①/B18③)', async () => {
+    // A global view that holds MORE than our family: the intersection (not the
+    // raw schemas() list, and not the static name list either) is what may be
+    // submitted.
+    const releases: Array<() => void> = []
+    const { host, scope, tools } = rig({
+      patchRoot: (fake) => registerOn(fake, ['bash', 'read']),
+      registerTools: (fake) => {
+        releases.push(...registerOn(fake, CHERRY_TOOL_NAMES))
+        return () => {
+          for (const release of releases.splice(0)) release()
+        }
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    /** The shape invariants that must hold for EVERY recorded argument. */
+    const assertCallShape = (): void => {
+      expect(host.restrictCalls.length).toBeGreaterThan(0)
+      for (const call of host.restrictCalls) {
+        expect(call.agentId).toBe('agent-a')
+        // The filter carries `deny` and NOTHING else: a restriction the agent
+        // INHERITS must never be narrowed by an `allow` allow-list (§4/D12).
+        expect(Object.keys(call.filter)).toEqual(['deny'])
+        expect(call.filter.allow).toBeUndefined()
+        // …and it is never the empty set: `{ deny: [] }` installs a no-op layer
+        // this plugin's own guard would misread as "already hidden".
+        expect(denyOf(call).length).toBeGreaterThan(0)
+        expect(denyOf(call)).not.toContain('bash')
+      }
+    }
+    /** The arguments recorded from `from` onward are the CURRENT intersection. */
+    const assertDenyEqualsIntersection = (from: number): void => {
+      const observed = new Set(host.root.tools!.schemas!().map((definition) => definition.name))
+      const intersection = [...CHERRY_TOOL_NAMES].filter((name) => observed.has(name)).sort()
+      const calls = host.restrictCalls.slice(from)
+      expect(calls.length).toBeGreaterThan(0)
+      for (const call of calls) {
+        expect([...denyOf(call)].sort()).toEqual(intersection)
+      }
+    }
+    assertCallShape()
+    assertDenyEqualsIntersection(0)
+    // The visible effect of that one argument: our names are gone from the
+    // agent's table while a foreign name stays.
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+    expect(host.agentView('agent-a')).toContain('bash')
+
+    // One of our names leaves the global view ⇒ the NEXT argument must shrink to
+    // the intersection as well: the static list alone is not a legal deny set.
+    const recorded = host.restrictCalls.length
+    releases.pop()!()
+    expect(host.registeredNames()).toHaveLength(15)
+    tools.refresh()
+    assertCallShape()
+    assertDenyEqualsIntersection(recorded)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(13)
+    expect(host.layerCount('agent-a')).toBe(1)
+  })
+
+  it('② a zero-in-scene global view installs nothing — and never submits an empty deny (B18③)', async () => {
+    // The registration has not happened yet, so the no-argument global view holds
+    // none of our names: the intersection is empty, and an empty deny must NOT be
+    // submitted (it would install a no-op layer the guard reads as "hidden").
+    const staged: { register: () => void } = { register: () => {} }
+    const releases: Array<() => void> = []
+    const { host, scope, tools } = rig({
+      registerTools: (fake) => {
+        staged.register = () => {
+          for (const release of registerOn(fake, CHERRY_TOOL_NAMES)) releases.push(release)
+        }
+        return () => {
+          for (const release of releases.splice(0)) release()
+        }
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    expect(host.registeredNames()).toEqual([])
+    expect(host.restrictCalls).toEqual([])
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.effectFailures).toEqual([])
+    expect(tools.state().state).toBe('ready')
+
+    // The completion rides the config-save path: exactly ONE installation, and it
+    // is the full 14-name intersection.
+    staged.register()
+    expect(host.registeredNames()).toHaveLength(14)
+    tools.refresh()
+    expect(host.restrictCalls).toHaveLength(1)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+
+    // An EXISTING layer is still maintained when the view empties: releasing it is
+    // the "维持既有层" half of B18③, not a second failed installation.
+    for (const release of releases.splice(0)) release()
+    expect(host.registeredNames()).toEqual([])
+    tools.refresh()
+    expect(host.restrictCalls).toHaveLength(1)
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+  })
+
+  it('② a partial registration window installs what is in scene, then completes (B12③/B18④)', async () => {
+    // HMR's mid-flight state: only 7 of the 14 are in the global view.
+    const later: Array<() => void> = []
+    const { host, scope, tools } = rig({
+      registerTools: (fake) => {
+        const first = registerOn(fake, CHERRY_TOOL_NAMES.slice(0, 7))
+        later.push(() => {
+          registerOn(fake, CHERRY_TOOL_NAMES.slice(7))
+        })
+        return () => {
+          for (const release of first.splice(0)) release()
+        }
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await settle()
+
+    // Installed with the 7 names that exist — never with 14, and never refused.
+    expect(host.restrictCalls).toHaveLength(1)
+    expect(denyOf(host.restrictCalls[0]!)).toEqual([...CHERRY_TOOL_NAMES.slice(0, 7)])
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(7)
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+
+    // The rest arrive; the config save completes the layer — still ONE layer.
+    later[0]!()
+    expect(host.registeredNames()).toHaveLength(14)
+    tools.refresh()
+
+    expect(host.restrictCalls).toHaveLength(2)
+    expect([...denyOf(host.restrictCalls[1]!)].sort()).toEqual([...CHERRY_TOOL_NAMES].sort())
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+  })
+
+  it('③ a target that becomes empty releases only — the tools return (B18①/B2)', async () => {
+    const { host, scope, tools } = rig()
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    // `selected` with nobody enabled ⇒ hidden.
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')).toBeDefined()
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+
+    // The operator enables the agent's workspace and the config save runs.
+    const installs = host.restrictCalls.length
+    const releases = host.ops.filter((entry) => entry.op === 'release-layer').length
+    saveScope(scope, 'selected', ['w-oa'])
+    expect(tools.refresh()?.released).toBe(1)
+
+    // RELEASE ONLY: no installation was submitted for a now-visible agent…
+    expect(host.restrictCalls.length).toBe(installs)
+    expect(host.ops.filter((entry) => entry.op === 'release-layer').length).toBe(releases + 1)
+    // …its layer is gone, its record with it, and the family is back in its table.
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+    // No layer ⇒ the execution-side mirror allows (the guard is not a second
+    // criterion: it only mirrors the record).
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeUndefined()
+
+    // Hidden again, then switched to `global`: `global` counts as visible under
+    // the SAME definition (B2) ⇒ release only.
+    saveScope(scope, 'selected', [])
+    tools.refresh()
+    expect(host.layerCount('agent-a')).toBe(1)
+    const installsBeforeGlobal = host.restrictCalls.length
+    saveScope(scope, 'global', [])
+    tools.refresh()
+    expect(host.restrictCalls.length).toBe(installsBeforeGlobal)
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+
+    // …and under `global` a COLD judgement cache is the same empty target (the
+    // pinned fallback: `isVisible(doc, undefined)` is true under `global`), so a
+    // brand-new agent is never installed for and never rejected.
+    const before = host.restrictCalls.length
+    host.addAgent({ id: 'agent-c' })
+    expect(host.layerCount('agent-c')).toBe(0)
+    expect(scope.layer('agent-c')).toBeUndefined()
+    await settle()
+    expect(host.restrictCalls.length).toBe(before)
+    expect(host.layerCount('agent-c')).toBe(0)
+    expect(host.verdict('agent-c', 'cherry_devices')).toBeUndefined()
+  })
+
+  it('④ a swap installs the new layer strictly before releasing the old one (B18②/B10)', async () => {
+    const later: Array<() => void> = []
+    const { host, scope, tools } = rig({
+      registerTools: (fake) => {
+        const first = registerOn(fake, CHERRY_TOOL_NAMES.slice(0, 7))
+        later.push(() => {
+          registerOn(fake, CHERRY_TOOL_NAMES.slice(7))
+        })
+        return () => {
+          for (const release of first.splice(0)) release()
+        }
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await settle()
+    expect(host.layerTotal()).toBe(1)
+
+    later[0]!()
+    tools.refresh()
+
+    // The observable point never shows two layers for one agent…
+    expect(host.layerTotal()).toBe(1)
+    expect(host.layerCount('agent-a')).toBe(1)
+    // …the action order is install(new) THEN release(old) — never the reverse
+    // (a release-first swap opens an unhidden window that is unrecoverable)…
+    const actions = layerOps(host, 'agent-a')
+    const installIndex = actions.findIndex((entry) => entry.op === 'restrict' && entry.denyCount === 14)
+    const releaseIndex = actions.findIndex((entry) => entry.op === 'release-layer')
+    expect(installIndex).toBeGreaterThanOrEqual(0)
+    expect(releaseIndex).toBeGreaterThan(installIndex)
+    // …and the record was replaced WHOLESALE by the new layer (not left undefined,
+    // not left describing the released one).
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+  })
+
+  it('⑤ an unchanged deny set short-circuits: the same layer is never reinstalled (§4②)', async () => {
+    const { host, scope, tools } = rig()
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await settle()
+
+    const installs = host.restrictCalls.length
+    const releases = host.ops.filter((entry) => entry.op === 'release-layer').length
+    expect(installs).toBe(1)
+    expect(host.layerCount('agent-a')).toBe(1)
+
+    for (let round = 0; round < 3; round += 1) tools.refresh()
+    await settle()
+
+    expect(host.restrictCalls.length).toBe(installs)
+    expect(host.ops.filter((entry) => entry.op === 'release-layer').length).toBe(releases)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+  })
+
+  it('⑥ a refused installation is recorded, never thrown, and the next save retries (B12②)', async () => {
+    const { host, scope, tools } = rig()
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    const agents = captureAgents(host)
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await settle()
+    expect(host.layerCount('agent-a')).toBe(1)
+
+    // Visible ⇒ the layer is released (the quiet state a failed install must not
+    // turn into "record present, layer absent").
+    saveScope(scope, 'selected', ['w-oa'])
+    tools.refresh()
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+
+    // The host now REFUSES the installation — the fixture wraps the agent's own
+    // `restrict` face, which is the very function `agents.list()` re-projects.
+    const raw = agents.get('agent-a')!
+    const refusing = raw.ctx.tools.restrict
+    raw.ctx.tools.restrict = () => {
+      throw new Error('the host refused this restriction')
+    }
+
+    saveScope(scope, 'selected', [])
+    // Not thrown at the caller (the PUT path calls `refresh()` synchronously)…
+    expect(() => tools.refresh()).not.toThrow()
+    // …not silent: the degradation is recorded with a readable cause…
+    const note = scope.degraded().find((entry) => entry.source === 'install')
+    expect(note).toBeDefined()
+    expect(note?.reason).toContain('agent-a')
+    expect(note?.reason).toContain('the host refused this restriction')
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain('agent-a')
+    // …and nothing was half-written: no layer, no record — so the guard allows
+    // rather than rejecting a tool that is still visible.
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeUndefined()
+
+    // The NEXT config save retries and succeeds.
+    raw.ctx.tools.restrict = refusing
+    tools.refresh()
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeTypeOf('string')
+  })
+
+  it('⑥ the two-moment skew (the intersection still names an unregistered tool) takes the same path (B12④)', async () => {
+    // One of the 14 never made it into the registry…
+    const { host, scope, tools } = rig({
+      registerTools: (fake) => {
+        const releases = registerOn(fake, CHERRY_TOOL_NAMES.slice(0, 13))
+        return () => {
+          for (const release of releases.splice(0)) release()
+        }
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await settle()
+    expect(host.restrictCalls).toHaveLength(1)
+    expect(denyOf(host.restrictCalls[0]!)).toHaveLength(13)
+
+    // …while the OBSERVATION moment still reports it (D12's "两个时刻" — the view
+    // and `restrict`'s acceptance set are two different observations).
+    const realSchemas = host.root.tools!.schemas!
+    host.root.tools!.schemas = () =>
+      CHERRY_TOOL_NAMES.map((name) => ({ name, description: name }))
+
+    host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    await settle()
+
+    expect(host.effectFailures).toEqual([])
+    const note = scope.degraded().find((entry) => entry.source === 'install')
+    expect(note).toBeDefined()
+    expect(note?.reason).toContain('cherry_unpair')
+    // The agent that was never installed stays un-hidden, with no record…
+    expect(host.layerCount('agent-b')).toBe(0)
+    expect(scope.layer('agent-b')).toBeUndefined()
+    // …and the agent that ALREADY had a layer keeps it: a failed install never
+    // opens an unhidden window (先装新后释放旧).
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(13)
+
+    // Both observations agree again ⇒ both layers complete on the next save.
+    host.root.tools!.schemas = realSchemas
+    registerOn(host, CHERRY_TOOL_NAMES.slice(13))
+    tools.refresh()
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(host.layerCount('agent-b')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+    expect(scope.layer('agent-b')?.deny).toHaveLength(14)
+  })
+
+  it('⑦ the guard is the execution-side mirror of the installed-layer record (B6)', async () => {
+    const { host, scope, tools } = rig()
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    // The layer is in ⇒ the call is rejected, with a reason naming the workspace.
+    expect(scope.layer('agent-a')).toBeDefined()
+    const denial = host.verdict('agent-a', 'cherry_devices')
+    expect(typeof denial).toBe('string')
+    expect(denial).toContain('w-oa')
+
+    // The judgement cache is NOT a third input: cleared…
+    scope.judgement = () => undefined
+    expect(host.verdict('agent-a', 'cherry_devices')).toBe(denial)
+    // …or contradicted, the verdict still follows the LAYER.
+    scope.judgement = () => ({
+      agentId: 'agent-a',
+      status: 'resolved',
+      workspaceId: 'w-oa',
+      visible: true,
+      reason: 'contradictory fixture value',
+    })
+    expect(host.verdict('agent-a', 'cherry_devices')).toBe(denial)
+
+    // The mirror's other side: the workspace is enabled, so the layer is released
+    // and the guard allows — even under a contradictory "invisible" judgement.
+    saveScope(scope, 'selected', ['w-oa'])
+    scope.judgement = () => ({
+      agentId: 'agent-a',
+      status: 'resolved',
+      workspaceId: 'w-oa',
+      visible: false,
+      reason: 'contradictory fixture value',
+    })
+    tools.refresh()
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeUndefined()
+  })
+
+  it('⑧ an upstream allow shadow is not our failure (B15)', async () => {
+    const { host, scope, tools } = rig({
+      patchRoot: (fake) => registerOn(fake, ['bash']),
+    })
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    const agents = captureAgents(host)
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+    saveScope(scope, 'selected', ['w-oa'])
+    tools.refresh()
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.degraded()).toEqual([])
+
+    // An upstream (delegation-chain) `allow` layer hides the whole family from
+    // this agent's table — the shadow B15 declares acceptable.
+    agents.get('agent-a')!.ctx.tools.restrict({ allow: ['bash'] })
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+
+    // It is NOT our failure: no denial, no degradation, no error log, and no
+    // attempt to "fix" somebody else's layer.
+    const installs = host.restrictCalls.length
+    const warnings = warn.mock.calls.length
+    tools.refresh()
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeUndefined()
+    expect(scope.degraded()).toEqual([])
+    expect(warn.mock.calls.length).toBe(warnings)
+    expect(host.restrictCalls.length).toBe(installs)
+  })
+
+  it('⑨ the guard is scoped to our names and tolerates a missing execution.agent (§4)', async () => {
+    const { host, scope } = rig()
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+    expect(scope.layer('agent-a')).toBeDefined()
+
+    // Three SEPARATE arms: the guard runs on every dispatch, so an unscoped one
+    // would reject every tool of a hidden workspace, not just our 14.
+    expect(typeof host.verdict('agent-a', 'cherry_devices')).toBe('string')
+    expect(host.verdict('agent-a', 'bash')).toBeUndefined()
+    expect(host.verdict('agent-a', 'read')).toBeUndefined()
+    expect(host.verdict(undefined, 'cherry_devices')).toBeUndefined()
+  })
+
+  it('⑩ restrictions intersect: one layer per agent is the only recoverable shape (B10/§4)', async () => {
+    const { host, scope, tools } = rig()
+    host.setWorkspaces([
+      { id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a', 'agent-b'] },
+    ])
+    const agents = captureAgents(host)
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(host.layerCount('agent-b')).toBe(1)
+
+    // The fixture stacks its OWN second deny layer on agent-a.
+    agents.get('agent-a')!.ctx.tools.restrict({ deny: ['cherry_devices'] })
+    expect(host.layerCount('agent-a')).toBe(2)
+    expect(host.agentView('agent-a')).toEqual([])
+
+    // Both agents become visible ⇒ the plugin releases ITS layer, and only its.
+    saveScope(scope, 'selected', ['w-oa'])
+    tools.refresh()
+
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    // The stacked layer still denies: releasing one of two intersected layers can
+    // never restore the name — which is why ONE layer per agent is the invariant.
+    expect(host.agentView('agent-a')).not.toContain('cherry_devices')
+    expect(host.agentView('agent-a')).toContain('cherry_read')
+    // The sibling, which only ever carried our layer, is left with none at all.
+    expect(host.layerCount('agent-b')).toBe(0)
+    expect(scope.layer('agent-b')).toBeUndefined()
+    expect(host.agentView('agent-b')).toEqual([...CHERRY_TOOL_NAMES])
+  })
+
+  it('⑪ the guard only ever denies — there is no force-allow arm (§4)', async () => {
+    const { host, scope } = rig()
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    const denial = host.verdict('agent-a', 'cherry_devices')
+    expect(typeof denial).toBe('string')
+    expect(denial).not.toBe('')
+
+    // No call order, and no interleaved allow-verdict probe, can turn the denial
+    // back into an allowance: the verdict domain has no third value.
+    for (let round = 0; round < 3; round += 1) {
+      host.verdict('agent-a', 'bash')
+      host.verdict(undefined, 'cherry_devices')
+      host.verdict('agent-b', 'cherry_devices')
+      expect(host.verdict('agent-a', 'cherry_devices')).toBe(denial)
+    }
+    // "层在 ⇒ 拒绝" is monotone; the mirror's other side (no layer ⇒ allow) is
+    // asserted by ⑦/⑨, not derived from this one.
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeTypeOf('string')
+  })
+
+  it('R16 a throwing tools.guard degrades to visibility-only and the round continues (B17)', async () => {
+    const { host, scope } = rig({
+      patchRoot: (fake) => {
+        fake.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+        fake.root.tools!.guard = () => {
+          throw new Error('the host refused the guard')
+        }
+      },
+    })
+    await settle()
+
+    // Nothing escaped the effect body — the injection callback may arrive
+    // asynchronously, with the caller's `try` long off the stack.
+    expect(host.effectFailures).toEqual([])
+    // The round continued: registration and hiding are untouched (B17's "缺失不拒
+    // 注册"), and the guard really is absent.
+    expect(host.registeredNames()).toHaveLength(14)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(host.guardLive()).toBe(0)
+    // Reported, never silent: through the warn carrier and §6.1's degraded set.
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain('guard')
+    const note = scope.degraded().find((entry) => entry.source === 'visibility-only')
+    expect(note).toBeDefined()
+    expect(note?.reason).toContain('guard')
+
+    // The round stays releasable.
+    host.unloadDependencies()
+    expect(host.registeredNames()).toEqual([])
+    expect(host.layerTotal()).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+  })
+
+  it('R16 a throwing on() is reported and the round continues with what succeeded', async () => {
+    const { host, scope, tools } = rig({
+      patchRoot: (fake) => {
+        fake.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+        refuseSubscription(fake, 'agent/created')
+      },
+    })
+    await settle()
+
+    expect(host.effectFailures).toEqual([])
+    // The refused subscription is reported through the warn carrier — the
+    // degraded enum is a fixed five with no member for it.
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain('agent/created')
+    const degraded = scope.degraded()
+    // The subscription that SUCCEEDED is live; the refused one is not.
+    expect(host.liveSubscriptions('agent/created')).toBe(0)
+    expect(host.liveSubscriptions('agent/disposed')).toBe(1)
+    // The round still ran: the live agent was hidden by the first pass.
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')).toBeDefined()
+
+    // …and the config-save path still converges the agents the missing
+    // subscription would have handled synchronously.
+    host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    expect(host.layerCount('agent-b')).toBe(0)
+    tools.refresh()
+    expect(host.layerCount('agent-b')).toBe(1)
+    expect(scope.layer('agent-b')).toBeDefined()
+    expect(scope.degraded()).toEqual(degraded)
+
+    // The round stays releasable.
+    host.unloadDependencies()
+    expect(host.registeredNames()).toEqual([])
+    expect(host.layerTotal()).toBe(0)
+    expect(host.liveSubscriptions()).toBe(0)
   })
 })

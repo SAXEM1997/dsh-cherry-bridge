@@ -34,9 +34,10 @@
  *     `invalidateDerived`), which is what makes `guard`'s "层在 ⇒ 拒绝" mirror
  *     true by construction.
  *
- * Deliberately NOT here (later tasks in the same file): the empty-deny /
- * install-failure criteria and the `tools/change` subscription with its
- * coalescing gate (Task 5), and the bounded recheck (Task 6).
+ * Deliberately NOT here (the second half of Task 5, and Task 6): the
+ * `tools/change` subscription with its coalescing gate, and the bounded recheck.
+ * The install/release criteria themselves ARE here — every "completion" and
+ * "retry" they describe is reachable through `refresh()`, the config-save path.
  */
 import { isVisible } from './toolScope.js'
 import type { ScopeHostState, ToolScopeState, WorkspaceRegistryLike } from './toolScope.js'
@@ -176,6 +177,15 @@ export function registerAtomically(
   }
 }
 
+/**
+ * The readable cause of a caught throw, for a message or a `degraded` note. A
+ * host that rejects with a plain value is reported verbatim rather than as
+ * `[object Object]`.
+ */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 export interface ScopeHostDeps {
   scope: ToolScopeState
   names: readonly string[]
@@ -230,6 +240,9 @@ interface EffectState {
   offs: Array<() => void>
   teardown: () => void
 }
+
+/** The injected ctx's `on`, as this module consumes it (R16 wraps each call). */
+type OnFace = <T>(event: string, handler: (payload: T) => void) => () => void
 
 export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   const { scope } = deps
@@ -320,15 +333,60 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   // -------------------------------------------------------------------------
 
   /**
-   * The pinned target set: visible under the CURRENT document and judgement ⇒
-   * empty (release only), otherwise the family's names.
+   * The no-argument GLOBAL view of the tool registry — D12/B12①'s only
+   * sanctioned observation source for a deny set.
    *
-   * `judgement()?.workspaceId` folds a cache miss into the same expression: under
-   * `global` `isVisible(doc, undefined)` is true (so a miss releases only), and
-   * under `selected` it is false — the D7 fail-closed side.
+   * `schemas(agent)` is deliberately never used: that view is already filtered by
+   * the agent's own layers, so deriving `deny` from it would re-admit the very
+   * names this plugin hides.
+   *
+   * A `schemas()` that THROWS is not an "empty scene" but it must not become a
+   * guess either: the names could not be observed, and submitting a set built
+   * from the static list is exactly the two-moment hazard D12 names. The round
+   * therefore installs nothing (existing layers are still maintained) and reports
+   * the failure — contained HERE because this runs inside the injected effect
+   * body, which a real host may reach asynchronously (R16).
+   */
+  function observeGlobalNames(): Set<string> | undefined {
+    const tools = root?.tools
+    if (tools === undefined || typeof tools.schemas !== 'function') return undefined
+    try {
+      const view = tools.schemas()
+      return new Set(
+        (Array.isArray(view) ? view : [])
+          .map((definition) => definition?.name)
+          .filter((name): name is string => typeof name === 'string'),
+      )
+    } catch (error) {
+      log(
+        '[cherry-remote] 无参 schemas() 读取失败；本轮按“观测集合为空”处理（绝不提交未观测到的 deny），既有层的维护不受影响',
+        error,
+      )
+      return undefined
+    }
+  }
+
+  /**
+   * The pinned target set — the names this agent must HIDE — with one definition
+   * and no second (B18):
+   *
+   *   visible under the CURRENT document and judgement ⇒ the EMPTY set
+   *   not visible ⇒ CHERRY_TOOL_NAMES ∩ the no-argument `schemas()`
+   *
+   * `judgement()?.workspaceId` folds a CACHE MISS into the same expression: under
+   * `global` `isVisible(doc, undefined)` is true (a miss releases only), while
+   * under `selected` it is false — the D7 fail-closed side. Visibility is derived
+   * from `isVisible`, never from `status === 'resolved'`.
+   *
+   * An EMPTY set means RELEASE ONLY. `{ deny: [] }` is never submitted: the host
+   * accepts it as a no-op layer admitting every name, which this plugin's guard
+   * (layer present ⇒ reject) would misread as "already hidden" — tools visible
+   * but rejected (B18③).
    */
   function targetDeny(agentId: string): readonly string[] {
-    return isVisible(scope.doc(), scope.judgement(agentId)?.workspaceId) ? [] : names
+    if (isVisible(scope.doc(), scope.judgement(agentId)?.workspaceId)) return []
+    const observed = observeGlobalNames()
+    return observed === undefined ? [] : names.filter((name) => observed.has(name))
   }
 
   function reasonFor(agentId: string): string {
@@ -336,6 +394,24 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       scope.judgement(agentId)?.reason ??
       '判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）'
     )
+  }
+
+  /** §4 ②'s 同名短路: two deny sets holding exactly the same names. */
+  function sameDenySet(a: readonly string[], b: readonly string[]): boolean {
+    return a.length === b.length && a.every((name) => b.includes(name))
+  }
+
+  /**
+   * Calls one layer's disposer. A release the host refuses is unrecoverable, but
+   * it must not travel into the caller either (B12②'s "不抛到调用方" is the same
+   * rule on both sides of the pair) — it is reported and the round continues.
+   */
+  function disposeQuietly(agentId: string, dispose: () => void): void {
+    try {
+      dispose()
+    } catch (error) {
+      log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error)
+    }
   }
 
   function applyForAgent(state: EffectState, agent: HostAgent): 'installed' | 'released' | 'skipped' {
@@ -348,8 +424,24 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       // synchronous block the guard must never read a record whose layer is gone.
       scope.clearLayer(agent.id)
       state.layers.delete(agent.id)
-      existing()
+      disposeQuietly(agent.id, existing)
       return 'released'
+    }
+
+    // §4 ②'s idempotent short-circuit: this very deny set is already installed,
+    // so no `restrict()` is submitted — reinstalling it would churn the host for
+    // no visible difference. The RECORD identifies the installed layer; a disposer
+    // without one is not a layer this plugin may claim to have installed.
+    const record = scope.layer(agent.id)
+    if (existing !== undefined && record !== undefined && sameDenySet(record.deny, target)) {
+      // The echoed REASON is not part of the layer, and B6 requires it to name the
+      // workspace: a layer installed on a cache miss (the fail-closed first pass)
+      // must stop reporting "判定缓存未命中" once the judgement has landed. Only the
+      // record's reason is rewritten here — the installed layer, its deny set and
+      // the layer ⇔ record pairing are untouched, and no host call is made.
+      const reason = reasonFor(agent.id)
+      if (record.reason !== reason) scope.setLayer(agent.id, { deny: record.deny, reason })
+      return 'skipped'
     }
 
     if (agent.restrict === undefined) {
@@ -362,15 +454,25 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       // 先装新（返回即表示层已装入）…
       dispose = agent.restrict({ deny: [...target] })
     } catch (error) {
+      // B12②/④: never thrown at the caller, never silent — recorded with the
+      // readable cause, so the NEXT round (the config-save path here, the
+      // `tools/change` subscription in Task 5's second half) retries. The old
+      // layer, if any, stays installed: 先装新后释放旧 means a failed install
+      // never opens an un-hidden window (B18②).
+      scope.noteDegraded({
+        source: 'install',
+        reason: `agent ${agent.id} 的 restriction 安装被宿主拒绝：${describeError(error)}（该 agent 本轮未隐藏；下一次重算 / 配置保存会重试）`,
+      })
       log(`[cherry-remote] agent ${agent.id} 的 restriction 安装被宿主拒绝；本轮跳过该 agent`, error)
       return 'skipped'
     }
     // …and the record is written in the SAME synchronous block, then the old
     // layer is released: no observable point ever shows a record pointing at a
-    // released layer, nor two live layers under one agent.
+    // released layer, nor two live layers under one agent. The replaced record is
+    // NOT cleared here — it already describes the layer just installed.
     state.layers.set(agent.id, dispose)
     scope.setLayer(agent.id, { deny: [...target], reason: reasonFor(agent.id) })
-    existing?.()
+    if (existing !== undefined) disposeQuietly(agent.id, existing)
     return 'installed'
   }
 
@@ -538,7 +640,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
         // B7③: the real cause, never a hardcoded one. `unsupported` (rather than
         // `pending`) because the injection DID arrive — the host refused our
         // registrations, so "waiting" would be the dishonest arm.
-        reason: `cherry_* 工具注册失败：${error instanceof Error ? error.message : String(error)}`,
+        reason: `cherry_* 工具注册失败：${describeError(error)}`,
       })
       log('[cherry-remote] cherry_* 工具注册失败；作用域子系统未启用，未安装任何 restriction', error)
       // The effect's own disposer is returned anyway, so the host can still
@@ -556,37 +658,74 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
 
     // ② Then the guard — ONE layer on the plugin ROOT ctx, or the visibility-only
     //    degradation (never a reason to refuse registration, B17).
+    //
+    //    R16: the installation itself is contained. The real host may deliver the
+    //    injection callback asynchronously, with `mount()`'s `try` long off the
+    //    stack, so a host that REFUSES the guard must degrade HERE — with the
+    //    registrations already made and no disposer ever returned otherwise.
     const rootTools = root?.tools
     if (typeof rootTools?.guard === 'function') {
-      state.releaseGuard = rootTools.guard((execution) => guardVerdict(execution))
+      try {
+        state.releaseGuard = rootTools.guard((execution) => guardVerdict(execution))
+      } catch (error) {
+        degradeToVisibilityOnly(`宿主 tools.guard 安装被拒绝：${describeError(error)}`, error)
+      }
     } else {
-      scope.noteDegraded({
-        source: 'visibility-only',
-        reason:
-          '宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 14 个工具，不是渲染层假过滤）',
-      })
+      degradeToVisibilityOnly(
+        '宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 14 个工具，不是渲染层假过滤）',
+      )
     }
 
-    // ③ The subscriptions (this task: agent lifecycle only — `tools/change`
-    //    belongs with Task 5's install/release criteria).
+    // ③ The subscriptions (this half: agent lifecycle only — `tools/change`
+    //    belongs with the second half of Task 5).
     const on = agentCtx.on
     if (typeof on === 'function') {
-      state.offs.push(
-        on<{ agent?: unknown }>('agent/created', (payload) => {
-          onCreated(state, payload)
-        }),
-      )
-      state.offs.push(
-        on<{ agent?: unknown }>('agent/disposed', (payload) => {
-          onDisposed(state, payload)
-        }),
-      )
+      subscribe<{ agent?: unknown }>(state, on, 'agent/created', (payload) => {
+        onCreated(state, payload)
+      })
+      subscribe<{ agent?: unknown }>(state, on, 'agent/disposed', (payload) => {
+        onDisposed(state, payload)
+      })
     }
 
     // ④ The first round: the synchronous, fail-closed pass now, the judgement
     //    generation right behind it.
     refresh()
     return state.teardown
+  }
+
+  /**
+   * B17's single reporting site: the guard being ABSENT and the host REFUSING it
+   * are the same degradation — "仅可见性". It is reported through the existing
+   * warn carrier and recorded in §6.1's `degraded` set, never silent, and it is
+   * never a reason to refuse registration.
+   */
+  function degradeToVisibilityOnly(reason: string, error?: unknown): void {
+    scope.noteDegraded({ source: 'visibility-only', reason })
+    log(`[cherry-remote] ${reason}`, error)
+  }
+
+  /**
+   * One subscription, contained (R16): a host that refuses `on(…)` must not take
+   * the round down with it — the failure is reported and the round continues with
+   * whatever subscriptions succeeded. `DegradedSource` is a fixed five with no
+   * member for a refused subscription, so the honest carrier is the existing warn
+   * channel — the same way §6.1 handles a parse failure (B9).
+   */
+  function subscribe<T>(
+    state: EffectState,
+    on: OnFace,
+    event: string,
+    handle: (payload: T) => void,
+  ): void {
+    try {
+      state.offs.push(on<T>(event, handle))
+    } catch (error) {
+      log(
+        `[cherry-remote] 订阅 ${event} 失败；该事件的重算触发器缺失，本轮继续（其余订阅与已装层不受影响）`,
+        error,
+      )
+    }
   }
 
   /** `agent/created`: synchronous, cache-only, never throws (host `@mode serial`). */
