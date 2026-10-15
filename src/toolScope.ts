@@ -119,6 +119,62 @@ export interface MountedLayer {
 }
 
 /**
+ * The four resolution states of one session → workspace judgement (§6.1/D14):
+ * a canonical-path hit, a failed resolution (registry not ready, a directory
+ * that is momentarily unreachable, a realpath failure — the ONLY state D14's
+ * bounded recheck starts from), a session header without a `cwd`, and a
+ * resolution that succeeded but belongs to no registered workspace.
+ */
+export type ResolutionStatus = 'resolved' | 'unresolved' | 'no-cwd' | 'no-match'
+
+/**
+ * One agent's judgement, as produced by one generation of `rebuild()`.
+ *
+ * `visible` is NOT derived from `status`: it is `isVisible(doc, workspaceId)`
+ * and nothing else, so under `global` every state is visible (B2) while
+ * `selected` fails closed. `reason` names the workspace (title or id) whenever
+ * there is one — Task 5 copies it into the installed-layer record, and `guard`
+ * echoes it back without recomputing anything (B6).
+ */
+export interface AgentJudgement {
+  agentId: string
+  status: ResolutionStatus
+  workspaceId?: string
+  visible: boolean
+  reason: string
+  cwd?: string
+}
+
+/** The slice of a live agent the judgement needs (`agent.session.header.cwd`). */
+export interface ScopeAgentLike {
+  id: string
+  cwd?: string
+}
+
+/**
+ * The workspace registry as this module consumes it.
+ *
+ * `resolveByPath` follows the REAL contract (§4): it resolves to the registry
+ * ENTITY (an object with `id`/`path`), resolves to `undefined` for a directory
+ * the host does not own, and REJECTS for a path that is missing. It is never a
+ * path-string transformer. An old host has no such method at all — that is the
+ * degradation D14 describes.
+ */
+export interface WorkspaceRegistryLike {
+  list(): unknown
+  resolveByPath?(path: string): Promise<unknown | undefined>
+}
+
+/** What one `rebuild()` produced, for the host layer's logging and diagnostics. */
+export interface RebuildSummary {
+  listAvailable: boolean
+  agents: number
+  resolved: number
+  unresolved: number
+  pathUnmatched: number
+}
+
+/**
  * The result of a write attempt.
  *
  * The failure arm carries the stable error code and the status the HTTP face
@@ -179,6 +235,44 @@ export function isVisible(
 
   const wanted = normalizeWorkspaceId(workspaceId)
   return doc.workspaceIds.some((id) => normalizeWorkspaceId(id) === wanted)
+}
+
+/**
+ * One judgement record.
+ *
+ * `visible` is computed in exactly this one place, from {@link isVisible} alone
+ * — never from `status`, and never from the list's health or the presence of a
+ * `cwd`. The optional fields are OMITTED when absent rather than set to
+ * `undefined`, so `Object.hasOwn` still tells "there is no workspace" from
+ * "there is one".
+ */
+function judged(
+  doc: Pick<ScopeDoc, 'mode' | 'workspaceIds'>,
+  agent: ScopeAgentLike,
+  status: ResolutionStatus,
+  workspaceId: string | undefined,
+  reason: string,
+): AgentJudgement {
+  return {
+    agentId: agent.id,
+    status,
+    ...(workspaceId === undefined ? {} : { workspaceId }),
+    visible: isVisible(doc, workspaceId),
+    reason,
+    ...(agent.cwd === undefined ? {} : { cwd: agent.cwd }),
+  }
+}
+
+/**
+ * A workspace as a `reason` fragment: the title when the registry supplied one,
+ * and always the id. Task 5 writes this reason into the installed-layer record
+ * and `guard` echoes it back, so it has to name a workspace a reader can resolve
+ * — the tuple is what makes that true for a titleless item (B6).
+ */
+function describeWorkspace(workspace: Pick<ScopeWorkspace, 'id' | 'title'>): string {
+  return workspace.title === ''
+    ? `工作区 ${workspace.id}`
+    : `工作区「${workspace.title}」(${workspace.id})`
 }
 
 /**
@@ -316,7 +410,14 @@ function serializeScope(doc: ScopeDoc): string {
  * `[]` counting as read failure is the point of B16: reading an empty registry
  * as "every id is gone" would silently prune the user's whole selection.
  * `setWorkspaces` is the ONLY production writer, and it holds the only write
- * site of the `workspace-list` note in this codebase.
+ * site of the `workspace-list` note in this codebase (added when a read fails,
+ * dropped again when one succeeds — the note is state, not history, R8).
+ *
+ * From Task 3 on this class also owns the judgement: `rebuild()` is the only
+ * asynchronous method here and the only caller of `setWorkspaces`; it builds one
+ * whole generation — the canonical path map, the per-agent judgements and the
+ * `pathUnmatched` diagnostics — and swaps it in at once, while `judgement()` and
+ * `pathUnmatched()` are synchronous reads of that generation.
  */
 export class ToolScopeState {
   readonly #file: string
@@ -341,6 +442,15 @@ export class ToolScopeState {
 
   /** Per-agent installed layers: the execution-side mirror `guard` reads. */
   #layers = new Map<string, MountedLayer>()
+
+  /** The current generation's canonical path map: entity path ⇒ workspaceId. */
+  #pathMap = new Map<string, string>()
+
+  /** The current generation's per-agent judgements. `rebuild()` replaces it whole. */
+  #judgements = new Map<string, AgentJudgement>()
+
+  /** cwd samples that resolved outside the registry: diagnostics, NOT degraded. */
+  #pathUnmatched: Array<{ agentId: string; cwd: string }> = []
 
   constructor(options: { file: string; log?: (message: string, error?: unknown) => void }) {
     this.#file = options.file
@@ -381,10 +491,12 @@ export class ToolScopeState {
   /**
    * The workspace list's single write site.
    *
-   * A non-empty array is an authoritative read (reconcile and prune); `undefined`
-   * or `[]` is a read FAILURE — the list becomes unavailable, the judgement goes
-   * fail-closed for `selected`, the write side is refused (503) and the
-   * `workspace-list` note is recorded right here, once, and nowhere else.
+   * A non-empty array is an authoritative read (reconcile and prune, and the
+   * `workspace-list` note is dropped here because a later read succeeded);
+   * `undefined` or `[]` is a read FAILURE — the list becomes unavailable, the
+   * judgement goes fail-closed for `selected`, the write side is refused (503)
+   * and the `workspace-list` note is recorded right here, once, and nowhere
+   * else.
    */
   setWorkspaces(list: readonly unknown[] | undefined): void {
     if (list === undefined || list.length === 0) {
@@ -400,6 +512,11 @@ export class ToolScopeState {
     }
 
     this.#listState = 'read'
+    // R8: `degraded` is STATE, not history. This branch is the same single write
+    // site as the note above and the only place this source is ever dropped —
+    // a note outliving its read failure would keep Task 8's save button
+    // disabled while `save()` itself would accept the very same PUT.
+    this.#clearDegraded('workspace-list')
     this.#workspaces = list
       .map((raw) => toScopeWorkspace(raw))
       .filter((workspace): workspace is ScopeWorkspace => workspace !== undefined)
@@ -421,6 +538,128 @@ export class ToolScopeState {
     if (this.#listState !== 'read') return []
     const known = this.#knownWorkspaceIds()
     return this.#doc.workspaceIds.filter((id) => !known.has(normalizeWorkspaceId(id)))
+  }
+
+  /**
+   * Recomputes ONE generation — the canonical path map, the per-agent judgement
+   * cache and the `pathUnmatched` diagnostics — and swaps it in with a single
+   * assignment. The only asynchronous method on this class.
+   *
+   * The build order is fixed: the list first (`setWorkspaces` is its only
+   * production writer, `[]` counting as a read failure exactly as `undefined`
+   * does), then the map keyed on each item's ENTITY path, then one judgement per
+   * agent. Everything the readers see is built into locals, so a rebuild still
+   * awaiting `resolveByPath` leaves them on the PREVIOUS generation instead of
+   * exposing a half-built map.
+   */
+  async rebuild(
+    registry: WorkspaceRegistryLike,
+    agents: readonly ScopeAgentLike[],
+  ): Promise<RebuildSummary> {
+    this.#ensureLoaded()
+    // One document and one list per generation: an interleaved save or list
+    // write must not be able to judge two agents of the same round differently.
+    const doc = this.#doc
+
+    let listed: readonly unknown[] | undefined
+    let listAvailable = false
+    try {
+      const raw = registry.list()
+      if (Array.isArray(raw) && raw.length > 0) {
+        listed = raw
+        listAvailable = true
+      }
+    } catch (error) {
+      this.#warn('工作区注册表 list() 抛出，按 B16 视为列表不可用（判定 fail-closed，写侧拒绝）', error)
+    }
+
+    // R9: the items go to `setWorkspaces` AS-IS. A non-empty list whose items
+    // are individually unusable is still an authoritative read — the stricter
+    // alternative would answer 503 and refuse the very save that clears the ids
+    // this plugin itself just reported as stale.
+    this.setWorkspaces(listed)
+    const workspaces = this.#workspaces
+
+    const pathMap = new Map<string, string>()
+    const resolveByPath = registry.resolveByPath
+    if (typeof resolveByPath === 'function') {
+      for (const workspace of workspaces) {
+        let entity: unknown
+        try {
+          // `call(registry, …)` so a class method keeps its `this`.
+          entity = await resolveByPath.call(registry, workspace.path)
+        } catch (error) {
+          // ⑪: one unreadable item is skipped — never a failed read, and never a
+          // `degraded` entry (the five-value enum has no member for it).
+          this.#warn(
+            `工作区注册表项 ${workspace.path} 的路径解析失败（resolveByPath reject）；本轮跳过该项，其余项与全部 agent 的判定不受影响`,
+            error,
+          )
+          continue
+        }
+        // Key = the ENTITY's path (realpath semantics: both sides of a symlink
+        // converge here), value = that entity's workspaceId. `undefined` means
+        // the host owns no such directory, so there is no key to record.
+        const resolved = entity === undefined ? undefined : toScopeWorkspace(entity)
+        if (resolved === undefined) continue
+        pathMap.set(resolved.path, resolved.id)
+      }
+    } else {
+      // D14's honest degradation: no realpath, case-sensitive string equality,
+      // and a note that never claims to be canonical-path equivalence.
+      this.noteDegraded({
+        source: 'path-normalization',
+        reason:
+          '宿主无 resolveByPath，路径匹配退化为大小写敏感字符串等价（不做 realpath）；符号链接或拼写差异下规则二可能不命中，此时只剩 sessionIds 一条路',
+      })
+      for (const workspace of workspaces) pathMap.set(workspace.path, workspace.id)
+    }
+
+    const judgements = new Map<string, AgentJudgement>()
+    const pathUnmatched: Array<{ agentId: string; cwd: string }> = []
+    for (const agent of agents) {
+      const judgement = await this.#judge(doc, workspaces, agent, registry, pathMap, listAvailable)
+      judgements.set(agent.id, judgement)
+      // §6.1: a resolved cwd that belongs to no workspace is DIAGNOSTIC, never a
+      // degradation — and it is one of the two states D14 refuses to recheck.
+      if (judgement.status === 'no-match' && judgement.cwd !== undefined) {
+        pathUnmatched.push({ agentId: judgement.agentId, cwd: judgement.cwd })
+      }
+    }
+
+    // One assignment: the generation switches whole.
+    this.#pathMap = pathMap
+    this.#judgements = judgements
+    this.#pathUnmatched = pathUnmatched
+
+    let resolved = 0
+    let unresolved = 0
+    for (const judgement of judgements.values()) {
+      if (judgement.status === 'resolved') resolved += 1
+      else if (judgement.status === 'unresolved') unresolved += 1
+    }
+
+    return {
+      listAvailable,
+      agents: agents.length,
+      resolved,
+      unresolved,
+      pathUnmatched: pathUnmatched.length,
+    }
+  }
+
+  /** The current generation's judgement for one agent, or a cache miss. */
+  judgement(agentId: string): AgentJudgement | undefined {
+    return this.#judgements.get(agentId)
+  }
+
+  /**
+   * Agents whose `cwd` resolved outside every registered workspace, with the
+   * `cwd` sample (§6.1's 路径不匹配诊断). Diagnostics only — no `degraded` entry
+   * carries this, so "勾了却无工具" can be told apart from a degraded read.
+   */
+  pathUnmatched(): ReadonlyArray<{ agentId: string; cwd: string }> {
+    return this.#pathUnmatched
   }
 
   /**
@@ -529,12 +768,142 @@ export class ToolScopeState {
   }
 
   /**
-   * Drops everything derived from a previous mount. At this task that is the
-   * installed-layer records; the judgement cache, the canonical path map and the
-   * `pathUnmatched` diagnostics join them in Task 3.
+   * Drops everything derived from a previous mount: the installed-layer records
+   * and the whole judgement generation — the canonical path map, the per-agent
+   * judgements and the `pathUnmatched` diagnostics (Task 4's teardown asserts
+   * exactly this).
    */
   invalidateDerived(): void {
     this.#layers.clear()
+    this.#pathMap = new Map()
+    this.#judgements = new Map()
+    this.#pathUnmatched = []
+  }
+
+  /**
+   * One agent's judgement against the generation being built, following §4's
+   * two rules in order: the header-validated `sessionIds` projection wins, and
+   * the canonical path map is the only path comparison there is.
+   *
+   * `doc` and `workspaces` are the snapshots `rebuild()` took for this whole
+   * round, so two agents of one generation can never be judged against two
+   * different documents or lists.
+   */
+  async #judge(
+    doc: ScopeDoc,
+    workspaces: readonly ScopeWorkspace[],
+    agent: ScopeAgentLike,
+    registry: WorkspaceRegistryLike,
+    pathMap: ReadonlyMap<string, string>,
+    listAvailable: boolean,
+  ): Promise<AgentJudgement> {
+    // Rule one.
+    const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
+    if (member !== undefined) {
+      return judged(doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`)
+    }
+
+    // Rule two.
+    if (agent.cwd === undefined) {
+      return judged(
+        doc,
+        agent,
+        'no-cwd',
+        undefined,
+        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）',
+      )
+    }
+
+    if (!listAvailable) {
+      // ⑧/B16: "the list could not be read" is "this resolution failed" — the
+      // state D14's bounded recheck is defined to start from.
+      return judged(
+        doc,
+        agent,
+        'unresolved',
+        undefined,
+        `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（D14 的有界复检只对该状态启动）`,
+      )
+    }
+
+    const resolveByPath = registry.resolveByPath
+    if (typeof resolveByPath !== 'function') {
+      // Old host (D14): case-sensitive string equality against the item paths.
+      const workspaceId = pathMap.get(agent.cwd)
+      return workspaceId === undefined
+        ? judged(
+            doc,
+            agent,
+            'no-match',
+            undefined,
+            `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`,
+          )
+        : judged(doc, agent, 'resolved', workspaceId, `路径字符串等价命中 ${this.#label(workspaces, workspaceId)}`)
+    }
+
+    let entity: unknown
+    try {
+      entity = await resolveByPath.call(registry, agent.cwd)
+    } catch (error) {
+      this.#warn(
+        `cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（D14 的有界复检只对该状态启动）`,
+        error,
+      )
+      return judged(
+        doc,
+        agent,
+        'unresolved',
+        undefined,
+        `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`,
+      )
+    }
+
+    if (entity === undefined) {
+      return judged(
+        doc,
+        agent,
+        'no-match',
+        undefined,
+        `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`,
+      )
+    }
+
+    // A successful resolution is looked up on the canonical map — the one path
+    // comparison in this module. An entity outside it is `no-match`, not a hit
+    // on the entity's own id.
+    const resolved = toScopeWorkspace(entity)
+    const workspaceId = resolved === undefined ? undefined : pathMap.get(resolved.path)
+    if (workspaceId === undefined) {
+      return judged(
+        doc,
+        agent,
+        'no-match',
+        undefined,
+        `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`,
+      )
+    }
+    return judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`)
+  }
+
+  /** The workspace id, plus its title when this generation's list carries one. */
+  #label(workspaces: readonly ScopeWorkspace[], workspaceId: string): string {
+    const workspace = workspaces.find((item) => item.id === workspaceId)
+    return workspace === undefined ? `工作区 ${workspaceId}` : describeWorkspace(workspace)
+  }
+
+  /**
+   * The removal half of the note set. `degraded` is STATE, not history (R8):
+   * the `workspace-list` note must not outlive the read failure that produced
+   * it, or one transient registry failure would keep Task 8's save button
+   * disabled for the rest of the process while `save()` itself accepts the very
+   * same `PUT` (it refuses only while the list is CURRENTLY unavailable).
+   *
+   * Module-private on purpose: the method list is a contract for Tasks 4–9, and
+   * `setWorkspaces` is the only place allowed to add OR drop this source. The
+   * other four sources stay append-only — none of them has a success trigger.
+   */
+  #clearDegraded(source: DegradedSource): void {
+    this.#degraded.delete(source)
   }
 
   #knownWorkspaceIds(): Set<string> {
