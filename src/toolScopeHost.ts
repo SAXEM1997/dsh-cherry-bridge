@@ -110,6 +110,72 @@ export interface ScopeInjectedContext {
   on?<T>(event: string, cb: (payload: T) => void): () => void
 }
 
+/**
+ * The registration face {@link registerAtomically} needs: a structural subset of
+ * {@link ScopeHostContext.tools}, so both the assembly's own ctx and a fixture's
+ * fake host satisfy it without a cast.
+ */
+export interface ScopeRegistrationContext {
+  tools?: {
+    register(definition: {
+      readonly name: string
+      readonly description: string
+      readonly parameters?: unknown
+    }): () => void
+  }
+}
+
+/**
+ * Runs ONE aggregate registration entry — `register(ledgerCtx)` — and guarantees
+ * that a FAILED registration leaves nothing behind.
+ *
+ * The aggregate contract is `() => () => void`: the disposer is only ever handed
+ * back on SUCCESS. A factory that registers three tools and then throws (a host
+ * that refuses the fourth registration, or a name a previous assembly leaked)
+ * therefore leaves those three with NO handle at all — its own local disposers
+ * array never escapes, and no layer above it can release them. That is a leak
+ * the caller cannot clean up, so it is closed here, at the single entry point
+ * both the assembly and the fixtures go through: every `register()` disposer is
+ * ledgered, and a throw releases the partial set before it travels on.
+ *
+ * On success the ledger stays out of the way: the returned aggregate disposer
+ * owns every registration.
+ */
+export function registerAtomically(
+  ctx: ScopeRegistrationContext,
+  register: (ctx: ScopeRegistrationContext) => () => void,
+): () => void {
+  const releases: Array<() => void> = []
+  const tools = ctx.tools
+  const ledger: ScopeRegistrationContext =
+    tools === undefined
+      ? ctx
+      : {
+          tools: {
+            register: (definition) => {
+              // `tools.register(…)` keeps its receiver, so a host method that
+              // relies on `this` behaves exactly as it does without the ledger.
+              const release = tools.register(definition)
+              releases.push(release)
+              return release
+            },
+          },
+        }
+
+  try {
+    return register(ledger)
+  } catch (error) {
+    for (const release of releases.splice(0)) {
+      try {
+        release()
+      } catch {
+        // A partial release must never mask the registration failure itself.
+      }
+    }
+    throw error
+  }
+}
+
 export interface ScopeHostDeps {
   scope: ToolScopeState
   names: readonly string[]
@@ -117,6 +183,10 @@ export interface ScopeHostDeps {
    * The aggregate registration entry: ONE call registers the family and ONE
    * disposer releases it (the `registerCherryTools` shape). A "returns many
    * disposers" variant is deliberately not supported.
+   *
+   * PRODUCER CONTRACT: the entry must be atomic — a throw must not leave
+   * registrations behind. `registerAtomically` is the one implementation of
+   * that, and the assembly wires it.
    */
   registerTools: () => () => void
   /** Consumed by Task 6's bounded recheck; declared here as part of the contract. */
@@ -448,10 +518,41 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       teardown: () => {},
     }
     state.teardown = () => teardownEffect(state)
-    current = state
 
     // ① Register first (B18③: registration precedes the first installation).
-    state.releaseRegistrations = deps.registerTools()
+    //
+    // The failure is contained HERE, never left to `mount()`'s `inject` try: the
+    // real host may deliver the injection callback asynchronously, once the
+    // services arrive, with `mount()` long off the stack. `registerAtomically`
+    // guarantees the entry itself is atomic (no partial registration survives);
+    // what is left for this layer is to make sure that a state which never
+    // became `ready` is never LIVE either — see the invariant below.
+    let releaseRegistrations: (() => void) | undefined
+    try {
+      releaseRegistrations = deps.registerTools()
+    } catch (error) {
+      state.tornDown = true
+      scope.setHost({
+        state: 'unsupported',
+        capable: false,
+        // B7③: the real cause, never a hardcoded one. `unsupported` (rather than
+        // `pending`) because the injection DID arrive — the host refused our
+        // registrations, so "waiting" would be the dishonest arm.
+        reason: `cherry_* 工具注册失败：${error instanceof Error ? error.message : String(error)}`,
+      })
+      log('[cherry-remote] cherry_* 工具注册失败；作用域子系统未启用，未安装任何 restriction', error)
+      // The effect's own disposer is returned anyway, so the host can still
+      // dispose the effect; it is a no-op because nothing was installed.
+      return state.teardown
+    }
+    state.releaseRegistrations = releaseRegistrations
+
+    // INVARIANT (no half-built generation is ever observable): `current` becomes
+    // the live generation only HERE, once registration has SUCCEEDED. A failed
+    // setup leaves `current` untouched, so `refresh()` (wired to the `/scope`
+    // route by Task 7) is structurally inert — it cannot install a restriction
+    // layer for a state that never became ready, and it cannot report a round.
+    current = state
 
     // ② Then the guard — ONE layer on the plugin ROOT ctx, or the visibility-only
     //    degradation (never a reason to refuse registration, B17).

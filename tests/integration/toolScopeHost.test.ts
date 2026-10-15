@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
 import type { CherryToolsDeps } from '../../src/tools.js'
 import { ToolScopeState } from '../../src/toolScope.js'
-import { createToolScopeHost } from '../../src/toolScopeHost.js'
+import { createToolScopeHost, registerAtomically } from '../../src/toolScopeHost.js'
 import { FakeToolHost } from '../helpers/fakeToolHost.js'
 import type { FakeCapability } from '../helpers/fakeToolHost.js'
 
@@ -81,10 +81,12 @@ function rig(options: RigOptions = {}) {
     scope,
     names: CHERRY_TOOL_NAMES,
     // The production shape: ONE aggregate disposer, registering through the
-    // plugin root ctx (the same call the assembly makes). The factory runs when
-    // the effect actually registers, never at rig-construction time.
+    // plugin root ctx (the same call the assembly makes), through the same
+    // atomic entry `apply()` uses. The factory runs when the effect actually
+    // registers, never at rig-construction time.
     registerTools: () =>
-      options.registerTools?.(host) ?? registerCherryTools(host.root, inertToolDeps()),
+      options.registerTools?.(host) ??
+      registerAtomically(host.root, (toolsCtx) => registerCherryTools(toolsCtx, inertToolDeps())),
   })
   const dispose = tools.mount(host.root)
   return { host, scope, tools, dispose }
@@ -334,6 +336,85 @@ describe('T4 host integration: tri-state, injection gate and co-lifecycle', () =
     expect(host.liveEffects()).toBe(0)
     expect(warn).toHaveBeenCalled()
     expect(String(warn.mock.calls[0]?.[0])).toMatch(/agents|workspaceRegistry/)
+  })
+
+  it('⑫ a throwing registerTools leaves no half-built generation behind', () => {
+    const { host, tools } = rig({
+      registerTools: (fake) =>
+        registerAtomically(fake.root, (toolsCtx) => {
+          // The partial-registration case is REAL: two tools land in the host
+          // registry before the third call is refused. (The ledger's face is the
+          // minimal registration shape, so a definition carries no `execute`.)
+          toolsCtx.tools!.register({ name: 'cherry_devices', description: 'devices' })
+          toolsCtx.tools!.register({ name: 'cherry_read', description: 'read' })
+          throw new Error('the host refused the third registration')
+        }),
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+
+    // The effect body CONTAINED the failure: nothing escaped into the delivery
+    // site (a real host may deliver the injection callback asynchronously, once
+    // `mount()`'s `try` is long off the stack).
+    expect(host.effectFailures).toEqual([])
+    // The factory really did register two tools before throwing…
+    expect(host.registerCalls).toEqual(['cherry_devices', 'cherry_read'])
+    // …and not one of them survived: the atomic entry point released the partial
+    // set, so the host registry is left exactly as it was.
+    expect(host.registeredNames()).toEqual([])
+    // Nothing was installed, and the tri-state says so — never `ready`.
+    expect(host.layerTotal()).toBe(0)
+    expect(host.guardLive()).toBe(0)
+    expect(host.liveSubscriptions()).toBe(0)
+    expect(tools.state().state).not.toBe('ready')
+    expect(tools.state().capable).toBe(tools.state().state === 'ready')
+    // Reported, never silent (B7③: the real cause is named).
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain('cherry_*')
+    expect(tools.state().reason).toContain('cherry_*')
+
+    // THE HARM CHAIN: a later `refresh()` — wired to the `/scope` route by Task 7
+    // — must be INERT. With a live half-built generation it would install a
+    // restriction layer for `agent-a` while the tri-state claims that nothing is
+    // registered, and would report a successful round.
+    const listCallsBefore = host.listCalls()
+    expect(tools.refresh()).toBeUndefined()
+    expect(host.layerTotal()).toBe(0)
+    expect(host.guardLive()).toBe(0)
+    expect(host.registeredNames()).toEqual([])
+    expect(host.listCalls()).toBe(listCallsBefore)
+
+    // The assembly's release path stays safe to drive.
+    expect(() => host.unloadDependencies()).not.toThrow()
+    expect(host.layerTotal()).toBe(0)
+  })
+
+  it('⑬ a failed setup keeps refresh() inert even when the host still knows the names', () => {
+    // The worst case a NON-atomic producer can leave behind: the host registry
+    // still knows all 14 names, so an installation would SUCCEED if this layer
+    // ever acted on the failed setup. `current` must therefore never become live
+    // for a generation that did not finish — that is this layer's own guarantee,
+    // independent of the producer-side atomicity ⑫ pins.
+    const { host, tools } = rig({
+      registerTools: (fake) => {
+        for (const name of CHERRY_TOOL_NAMES) {
+          fake.root.tools!.register({ name, description: name, execute: async () => undefined })
+        }
+        throw new Error('the host refused the last registration')
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+
+    expect(host.effectFailures).toEqual([])
+    expect(host.registeredNames()).toHaveLength(14)
+    expect(host.layerTotal()).toBe(0)
+    expect(host.guardLive()).toBe(0)
+    expect(tools.state().state).not.toBe('ready')
+
+    // The harm: a live half-built generation would install a deny layer here
+    // (`selected` + an empty judgement cache is the fail-closed side) and report
+    // a successful round while the tri-state says nothing is registered.
+    expect(tools.refresh()).toBeUndefined()
+    expect(host.layerTotal()).toBe(0)
+    expect(host.guardLive()).toBe(0)
   })
 })
 

@@ -5828,6 +5828,39 @@ const PENDING_REASON = "等待宿主注入 agents / workspaceRegistry";
 const READY_REASON = "宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达";
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS = ["agents", "workspaceRegistry"];
+/**
+* Runs ONE aggregate registration entry — `register(ledgerCtx)` — and guarantees
+* that a FAILED registration leaves nothing behind.
+*
+* The aggregate contract is `() => () => void`: the disposer is only ever handed
+* back on SUCCESS. A factory that registers three tools and then throws (a host
+* that refuses the fourth registration, or a name a previous assembly leaked)
+* therefore leaves those three with NO handle at all — its own local disposers
+* array never escapes, and no layer above it can release them. That is a leak
+* the caller cannot clean up, so it is closed here, at the single entry point
+* both the assembly and the fixtures go through: every `register()` disposer is
+* ledgered, and a throw releases the partial set before it travels on.
+*
+* On success the ledger stays out of the way: the returned aggregate disposer
+* owns every registration.
+*/
+function registerAtomically(ctx, register) {
+	const releases = [];
+	const tools = ctx.tools;
+	const ledger = tools === void 0 ? ctx : { tools: { register: (definition) => {
+		const release = tools.register(definition);
+		releases.push(release);
+		return release;
+	} } };
+	try {
+		return register(ledger);
+	} catch (error) {
+		for (const release of releases.splice(0)) try {
+			release();
+		} catch {}
+		throw error;
+	}
+}
 function createToolScopeHost(deps) {
 	const { scope } = deps;
 	const names = deps.names;
@@ -6036,8 +6069,21 @@ function createToolScopeHost(deps) {
 			teardown: () => {}
 		};
 		state.teardown = () => teardownEffect(state);
+		let releaseRegistrations;
+		try {
+			releaseRegistrations = deps.registerTools();
+		} catch (error) {
+			state.tornDown = true;
+			scope.setHost({
+				state: "unsupported",
+				capable: false,
+				reason: `cherry_* 工具注册失败：${error instanceof Error ? error.message : String(error)}`
+			});
+			log("[cherry-remote] cherry_* 工具注册失败；作用域子系统未启用，未安装任何 restriction", error);
+			return state.teardown;
+		}
+		state.releaseRegistrations = releaseRegistrations;
 		current = state;
-		state.releaseRegistrations = deps.registerTools();
 		const rootTools = root?.tools;
 		if (typeof rootTools?.guard === "function") state.releaseGuard = rootTools.guard((execution) => guardVerdict(execution));
 		else scope.noteDegraded({
@@ -7343,7 +7389,7 @@ function apply(ctx, config = {}) {
 	const host = createToolScopeHost({
 		scope,
 		names: CHERRY_TOOL_NAMES,
-		registerTools: () => registerCherryTools(ctx, deps)
+		registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryTools(toolsCtx, deps))
 	});
 	state.disposers.push(host.mount(ctx));
 	loadOrCreateIdentity(dataDir).then((identity) => {

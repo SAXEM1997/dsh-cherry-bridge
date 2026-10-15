@@ -10,7 +10,7 @@ import { SessionSubscriptions } from './subscriptions.js'
 import { CHERRY_TOOL_NAMES, registerCherryTools } from './tools.js'
 import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
 import { ToolScopeState } from './toolScope.js'
-import { createToolScopeHost } from './toolScopeHost.js'
+import { createToolScopeHost, registerAtomically } from './toolScopeHost.js'
 import type { RefreshSummary } from './toolScopeHost.js'
 import { registerHttpApi } from './httpApi.js'
 import type {
@@ -755,11 +755,14 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // a declared-but-unmounted host registers nothing while every host-level test
   // still passes, which is the silent failure this ordering exists to prevent.
   // `registerTools` is a closure, so `registerCherryTools` only runs when the
-  // injection arrives and the capability tri-state is `ready`.
+  // injection arrives and the capability tri-state is `ready`. It goes through
+  // `registerAtomically` because the aggregate contract only hands its disposer
+  // back on SUCCESS: without the ledger, a registration that throws half-way
+  // would leave the definitions it already registered with no owner at all.
   const host = createToolScopeHost({
     scope,
     names: CHERRY_TOOL_NAMES,
-    registerTools: () => registerCherryTools(ctx, deps),
+    registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryTools(toolsCtx, deps)),
   })
   // Mounted AFTER the root effect above and released ONLY through this disposer
   // (the root effect drains `state.disposers`): there is deliberately no second

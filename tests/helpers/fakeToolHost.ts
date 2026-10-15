@@ -138,6 +138,13 @@ export class FakeToolHost {
   guardInstalls = 0
   guardReleases = 0
   injectedEffectRuns = 0
+  /**
+   * Anything that ESCAPED an injected `effect` body. A real host may deliver the
+   * injection callback when the services arrive — asynchronously, with the
+   * caller's `try` long off the stack — so the body must contain its own
+   * failures; an escaped one lands here instead of propagating.
+   */
+  readonly effectFailures: unknown[] = []
   /** When true, `resolveByPath` rejects (D14's "not ready / realpath failed"). */
   resolveByPathThrows = false
 
@@ -310,7 +317,16 @@ export class FakeToolHost {
       effect: (cb: () => () => void) => {
         this.injectedEffectRuns += 1
         this.ops.push({ op: 'effect-run' })
-        const dispose = cb()
+        let dispose: () => void
+        try {
+          dispose = cb()
+        } catch (error) {
+          // The host records the escape; it never lets a plugin's effect body
+          // take down the delivery site (which, in production, is the fibre that
+          // just brought the services up).
+          this.effectFailures.push(error)
+          dispose = () => {}
+        }
         this.#effectDisposers.push(dispose)
         return { dispose }
       },
