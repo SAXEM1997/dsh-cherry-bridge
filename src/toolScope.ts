@@ -186,13 +186,18 @@ export function isVisible(
  * go through it, so the document shape exists in exactly one place.
  *
  * `input` is either the text read from disk or an already-parsed value.
- *  - unparsable text or an invalid field ⇒ `problem: 'parse'` and the STRICT
+ *  - unparsable text, a type-invalid `version` (missing / non-numeric / a
+ *    string), or any other invalid field ⇒ `problem: 'parse'` and the STRICT
  *    side (`selected` + empty): the caller warns through the existing carrier
  *    and the document stays writable (B9);
  *  - a type-legal `version` other than {@link SCOPE_DOC_VERSION} ⇒
  *    `problem: 'version-unsupported'`, the same strict side, and a read-only
  *    degradation the caller records (never a silent "the user selected
- *    nothing");
+ *    nothing"). That branch is decided by `version` ALONE, before the remaining
+ *    field checks: a newer format plausibly carries fields this build cannot
+ *    parse, and letting that combination read as a parse failure would hand a
+ *    newer document back as WRITABLE — the exact opposite of the latch's
+ *    purpose;
  *  - otherwise the normalized document, with `workspaceIds` de-duplicated and
  *    stably sorted ascending by string comparison. The stored literals are
  *    never rewritten — comparison normalization is `isVisible`'s job.
@@ -212,6 +217,12 @@ export function normalizeScope(input: unknown): {
 
   const { version, revision } = value
   if (!isFiniteNumber(version)) return { doc: strictScope(), problem: 'parse' }
+
+  // Before every other field check: a type-legal version that is not ours is the
+  // READ-ONLY side, and the rest of such a document may be an evolved shape this
+  // build cannot parse — which must not make it writable.
+  if (version !== SCOPE_DOC_VERSION) return { doc: strictScope(), problem: 'version-unsupported' }
+
   if (!isFiniteNumber(revision)) return { doc: strictScope(), problem: 'parse' }
 
   const fields = readScopeFields(value)
@@ -221,10 +232,6 @@ export function normalizeScope(input: unknown): {
   if (updatedAt !== undefined && typeof updatedAt !== 'string') {
     return { doc: strictScope(), problem: 'parse' }
   }
-
-  // A type-legal version that is not ours is the READ-ONLY side: the caller must
-  // not overwrite the document, so this is not merged into the parse branch.
-  if (version !== SCOPE_DOC_VERSION) return { doc: strictScope(), problem: 'version-unsupported' }
 
   return {
     doc:

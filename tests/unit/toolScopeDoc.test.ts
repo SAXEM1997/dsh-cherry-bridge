@@ -276,6 +276,41 @@ describe('the version branch has two sides, asserted apart (②, ⑦)', () => {
     expect(state.doc().workspaceIds).toEqual([])
   })
 
+  it('decides the version branch by version alone, before any other field check', () => {
+    // A newer format plausibly carries fields this build cannot parse. The
+    // read-only latch exists for exactly that document: deciding the branch
+    // after the field checks would classify it as a parse failure, hand it back
+    // as writable, and let the next PUT destroy the newer document.
+    const evolved = { version: 2, workspaceIds: 'evolved-shape' }
+
+    expect(normalizeScope(JSON.stringify(evolved)).problem).toBe('version-unsupported')
+
+    const file = makeScopeFile()
+    const original = writeScopeFixture(file, evolved)
+    const state = new ToolScopeState({ file })
+
+    state.load()
+
+    expect(state.doc()).toEqual(DEFAULT_SCOPE)
+    expect(state.degraded()).toEqual([
+      { source: 'scope-version', reason: expect.stringContaining('文档版本高于本插件支持') },
+    ])
+    expect(state.save({ mode: 'global', workspaceIds: [] }, 0)).toEqual({
+      ok: false,
+      status: 503,
+      error: 'scope-version-unsupported',
+      message: expect.any(String),
+    })
+    // 不可覆写 is the property under test, not the error code alone.
+    expect(readText(file)).toBe(original)
+
+    // The other side stays separate: with the SAME otherwise-invalid field, a
+    // type-invalid version is still the parse path (and therefore writable).
+    const mistyped = normalizeScope({ version: '2', workspaceIds: 'evolved-shape' })
+    expect(mistyped.problem).toBe('parse')
+    expect(mistyped.doc).toEqual(DEFAULT_SCOPE)
+  })
+
   it('treats a type-invalid version as the parse path, which stays writable (B9)', () => {
     const file = makeScopeFile()
     // `version: '1'` is a type error, NOT "a version above this plugin": the
