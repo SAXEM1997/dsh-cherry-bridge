@@ -632,7 +632,39 @@ export interface CherryToolEngineOptions {
 }
 
 /**
- * Registers the whole `cherry_*` family on `ctx.tools`.
+ * The 14 `cherry_*` tool names, in the family's documented order.
+ *
+ * THE one list: tool visibility (`deny` sets), the dispatch guard's scope, the
+ * diagnostics face and the contract suite all read this constant instead of
+ * keeping a copy of their own.
+ *
+ * {@link CherryToolEngine.definitions()} still spells each name inside its own
+ * declaration — that literal is what the host registry receives — so the two
+ * CAN drift. The contract suite's bidirectional-difference assertion is the
+ * interceptor: a tool added, renamed or dropped on either side turns red
+ * instead of leaving the published list silently wrong.
+ */
+export const CHERRY_TOOL_NAMES: readonly string[] = [
+  'cherry_devices',
+  'cherry_agents',
+  'cherry_workspaces',
+  'cherry_sessions',
+  'cherry_read',
+  'cherry_events',
+  'cherry_create',
+  'cherry_send',
+  'cherry_wait',
+  'cherry_interactions',
+  'cherry_respond',
+  'cherry_cancel',
+  'cherry_pair',
+  'cherry_unpair',
+] as const
+
+/**
+ * Registers the whole `cherry_*` family on `ctx.tools` — exactly the names in
+ * {@link CHERRY_TOOL_NAMES}, which the contract suite asserts against this
+ * function's own registrations.
  *
  * The registration framework is deliberately thin because Tasks 9/10 extend it:
  * {@link defineCherryTool} is the ONE place a tool declaration is assembled, so

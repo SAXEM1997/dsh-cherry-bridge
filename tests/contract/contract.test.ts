@@ -11,7 +11,7 @@ import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { registerCherryTools } from '../../src/tools.js'
+import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { pairWithPayload } from '../../src/pairing.js'
 import {
@@ -315,26 +315,14 @@ const SESSION = {
 const AGENT = { agentId: 'agent-1', name: 'Agent One' }
 
 /**
- * The 14 tools the plugin registers (spec §9). Declared here as the README's
- * and the rig's shared expectation: a tool added or renamed without the docs
- * following fails the release-config assertion.
+ * The 14 tools the plugin registers (spec §9), taken from the plugin itself
+ * rather than copied here: the README's per-name assertion, the rig's
+ * registration assertion and the drift assertion in `③ release configuration`
+ * all read this ONE constant. With no second copy to compare against, a
+ * "the two lists agree" assertion has nothing left to check — a name added,
+ * renamed or dropped is caught by the assertions themselves.
  */
-const TOOL_NAMES = [
-  'cherry_devices',
-  'cherry_agents',
-  'cherry_workspaces',
-  'cherry_sessions',
-  'cherry_read',
-  'cherry_events',
-  'cherry_create',
-  'cherry_send',
-  'cherry_wait',
-  'cherry_interactions',
-  'cherry_respond',
-  'cherry_cancel',
-  'cherry_pair',
-  'cherry_unpair',
-] as const
+const TOOL_NAMES = CHERRY_TOOL_NAMES
 
 function decisionInteraction(overrides: Partial<FakeInteractionRecord> = {}): FakeInteractionRecord {
   return {
@@ -1659,6 +1647,49 @@ describe('③ release configuration', () => {
     } finally {
       warn.mockRestore()
     }
+  })
+
+  it('declares the 14 cherry_* tool names once, as CHERRY_TOOL_NAMES', () => {
+    // ② The exported list is well-formed: 14 names, none repeated, all in the
+    // family. Tasks 5/6/7 intersect and guard against this list, so a
+    // duplicated or foreign name has to fail HERE rather than skew a later
+    // `deny` set or a guard's scope.
+    expect(CHERRY_TOOL_NAMES).toHaveLength(14)
+    expect(new Set(CHERRY_TOOL_NAMES).size).toBe(14)
+    expect(CHERRY_TOOL_NAMES.every((name) => name.startsWith('cherry_'))).toBe(true)
+  })
+
+  it('registers exactly the names in CHERRY_TOOL_NAMES, in both directions', () => {
+    // ③ The constant is a SINGLE source of truth only while the plugin's own
+    // registration agrees with it. The two differences are asserted
+    // separately: a name missing from the engine and a name only the constant
+    // knows are each an explicit failure, never a one-sided subset check that
+    // the other direction can slip through.
+    //
+    // Registration only assembles and hands over the declarations, so the deps
+    // are deliberately inert: any access during registration is itself a bug,
+    // and it throws here rather than quietly exercising the pool.
+    const deps: CherryToolsDeps = {
+      store: null as unknown as DeviceStore,
+      connect: () => {
+        throw new Error('registration must not resolve a connection')
+      },
+      subs: () => {
+        throw new Error('registration must not read subscriptions')
+      },
+      pair: async () => {
+        throw new Error('registration must not pair')
+      },
+      evict: () => {
+        throw new Error('registration must not evict')
+      },
+    }
+    const ctx = makeToolCtx()
+    registerCherryTools(ctx, deps)
+    const registered = new Set(ctx.definitions.map((definition) => definition.name))
+    const declared = new Set<string>(CHERRY_TOOL_NAMES)
+    expect([...declared].filter((name) => !registered.has(name))).toEqual([])
+    expect([...registered].filter((name) => !declared.has(name))).toEqual([])
   })
 
   it('ships a README documenting install, config, tools and the settings page', () => {

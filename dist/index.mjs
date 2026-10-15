@@ -2997,7 +2997,9 @@ function jsonRender(_args, value) {
 	return textBlock(JSON.stringify(value, null, 2));
 }
 /**
-* Registers the whole `cherry_*` family on `ctx.tools`.
+* Registers the whole `cherry_*` family on `ctx.tools` — exactly the names in
+* {@link CHERRY_TOOL_NAMES}, which the contract suite asserts against this
+* function's own registrations.
 *
 * The registration framework is deliberately thin because Tasks 9/10 extend it:
 * {@link defineCherryTool} is the ONE place a tool declaration is assembled, so
