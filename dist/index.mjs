@@ -2244,12 +2244,12 @@ function eventBytes(event) {
 		return 64;
 	}
 }
-function isRecord$1(value) {
+function isRecord$2(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 /** Validates the three cursor fields the protocol declares (all strings). */
 function readCursor$1(value) {
-	if (!isRecord$1(value)) return void 0;
+	if (!isRecord$2(value)) return void 0;
 	const { sessionId, streamEpoch, seq } = value;
 	if (typeof sessionId !== "string" || typeof streamEpoch !== "string" || typeof seq !== "string") return void 0;
 	return {
@@ -2532,8 +2532,8 @@ var SessionSubscriptions = class {
 		if (typeof subscriptionId !== "string") throw new Error(`agent.sessions.subscribe returned no subscriptionId for ${sessionId}`);
 		if (result["mode"] === "checkpoint") {
 			const checkpoint = result["checkpoint"];
-			const cursor = isRecord$1(checkpoint) ? readCursor$1(checkpoint["cursor"]) : void 0;
-			if (!isRecord$1(checkpoint) || typeof checkpoint["checkpointId"] !== "string" || cursor === void 0) throw new Error(`agent.sessions.subscribe returned a malformed checkpoint descriptor for ${sessionId}`);
+			const cursor = isRecord$2(checkpoint) ? readCursor$1(checkpoint["cursor"]) : void 0;
+			if (!isRecord$2(checkpoint) || typeof checkpoint["checkpointId"] !== "string" || cursor === void 0) throw new Error(`agent.sessions.subscribe returned a malformed checkpoint descriptor for ${sessionId}`);
 			return {
 				mode: "checkpoint",
 				subscriptionId,
@@ -2631,7 +2631,7 @@ var SessionSubscriptions = class {
 			const result = await this.#rpc.request("agent.checkpoints.read", params);
 			const pageItems = result["items"];
 			if (Array.isArray(pageItems)) {
-				for (const item of pageItems) if (isRecord$1(item) && typeof item["kind"] === "string") items.push({
+				for (const item of pageItems) if (isRecord$2(item) && typeof item["kind"] === "string") items.push({
 					kind: item["kind"],
 					value: item["value"]
 				});
@@ -2738,7 +2738,7 @@ var SessionSubscriptions = class {
 	* touched either: the position an event occupied is not being un-retained.
 	*/
 	#onEvents(params) {
-		if (!isRecord$1(params)) {
+		if (!isRecord$2(params)) {
 			console.warn("[cherry-remote] ignoring malformed agent.events notification");
 			return;
 		}
@@ -2762,7 +2762,7 @@ var SessionSubscriptions = class {
 		}
 		let appended = 0;
 		for (const raw of events) {
-			if (!isRecord$1(raw)) continue;
+			if (!isRecord$2(raw)) continue;
 			const seq = String(raw["seq"] ?? "");
 			if (seq === "") continue;
 			const arrived = Number(seq);
@@ -2798,7 +2798,7 @@ var SessionSubscriptions = class {
 	* mode). ⑤ pins this behaviour as intended.
 	*/
 	#onResetRequired(params) {
-		if (!isRecord$1(params)) {
+		if (!isRecord$2(params)) {
 			console.warn("[cherry-remote] ignoring malformed agent.subscriptions.resetRequired notification");
 			return;
 		}
@@ -2905,14 +2905,14 @@ const DEFAULT_WAIT_POLL_MS = 25;
 * without a next step is a dead end for the caller.
 */
 const SUBSCRIPTION_LOST_GUIDANCE = "the session's event subscription was lost mid-wait and could not be re-established; the run's outcome is unknowable from this wait. Read the session with cherry_read (it does not need a subscription), or call cherry_wait again to rebuild the subscription from a fresh baseline";
-function isRecord(value) {
+function isRecord$1(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 /** The peer's failure discriminator, or undefined for a non-protocol error. */
 function failureReason(error) {
 	if (!(error instanceof JsonRpcRequestError)) return void 0;
 	const data = error.data;
-	if (isRecord(data) && typeof data["reason"] === "string") return data["reason"];
+	if (isRecord$1(data) && typeof data["reason"] === "string") return data["reason"];
 }
 /**
 * One `{ref}`'s content could not be TRUSTED: the bytes served do not match the
@@ -2996,6 +2996,35 @@ const FREE_OUTPUT_SCHEMA = {
 function jsonRender(_args, value) {
 	return textBlock(JSON.stringify(value, null, 2));
 }
+/**
+* The 14 `cherry_*` tool names, in the family's documented order.
+*
+* THE one list: tool visibility (`deny` sets), the dispatch guard's scope, the
+* diagnostics face and the contract suite all read this constant instead of
+* keeping a copy of their own.
+*
+* {@link CherryToolEngine.definitions()} still spells each name inside its own
+* declaration — that literal is what the host registry receives — so the two
+* CAN drift. The contract suite's bidirectional-difference assertion is the
+* interceptor: a tool added, renamed or dropped on either side turns red
+* instead of leaving the published list silently wrong.
+*/
+const CHERRY_TOOL_NAMES = [
+	"cherry_devices",
+	"cherry_agents",
+	"cherry_workspaces",
+	"cherry_sessions",
+	"cherry_read",
+	"cherry_events",
+	"cherry_create",
+	"cherry_send",
+	"cherry_wait",
+	"cherry_interactions",
+	"cherry_respond",
+	"cherry_cancel",
+	"cherry_pair",
+	"cherry_unpair"
+];
 /**
 * Registers the whole `cherry_*` family on `ctx.tools` — exactly the names in
 * {@link CHERRY_TOOL_NAMES}, which the contract suite asserts against this
@@ -3492,7 +3521,7 @@ var CherryToolEngine = class {
 	}
 	async #readOnce(connection, sessionId, limit) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const historyRevision = session["historyRevision"];
 		if (typeof historyRevision !== "string") throw new Error(`agent.sessions.get returned no historyRevision for session ${sessionId}`);
 		const page = await this.#aggregate(connection, "agent.messages.list", {
@@ -3548,7 +3577,7 @@ var CherryToolEngine = class {
 		const partId = String(raw["partId"] ?? "");
 		const revision = String(raw["revision"] ?? "");
 		const kind = String(raw["kind"] ?? "");
-		const content = isRecord(raw["content"]) ? raw["content"] : {};
+		const content = isRecord$1(raw["content"]) ? raw["content"] : {};
 		if (kind === "file") return {
 			partId,
 			kind,
@@ -3561,7 +3590,7 @@ var CherryToolEngine = class {
 		};
 		let text;
 		if (typeof content["text"] === "string") text = content["text"];
-		else if (isRecord(content["ref"])) try {
+		else if (isRecord$1(content["ref"])) try {
 			text = await this.#readExternalized(connection, sessionId, content["ref"]);
 		} catch (error) {
 			if (!this.#degradableReadFailure(error)) throw error;
@@ -3605,7 +3634,7 @@ var CherryToolEngine = class {
 	*/
 	#attachmentFace(kind, raw, content) {
 		if (kind !== "file" && kind !== "data") return {};
-		const ref = isRecord(raw["ref"]) ? raw["ref"] : isRecord(content["ref"]) ? content["ref"] : {};
+		const ref = isRecord$1(raw["ref"]) ? raw["ref"] : isRecord$1(content["ref"]) ? content["ref"] : {};
 		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(content["filename"]);
 		const mediaType = optionalString(ref["mediaType"]) ?? optionalString(content["mediaType"]);
 		const byteLength = optionalString(ref["byteLength"]);
@@ -3804,7 +3833,7 @@ var CherryToolEngine = class {
 				const sessionId = typeof receipt["sessionId"] === "string" ? receipt["sessionId"] : void 0;
 				if (sessionId === void 0) return receipt;
 				const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+				const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 				const created = {
 					sessionId,
 					device: record.deviceId,
@@ -3931,7 +3960,7 @@ var CherryToolEngine = class {
 				await this.#ensureSubscription(record.deviceId, sessionId);
 				const subscriptions = this.#deps.subs(record.deviceId);
 				const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+				const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 				const activeExecutionId = optionalString(session["activeExecutionId"]);
 				if (activeExecutionId === void 0) {
 					const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
@@ -4078,7 +4107,7 @@ var CherryToolEngine = class {
 				const sessionId = requiredString(args, "sessionId");
 				const interactionId = requiredString(args, "interactionId");
 				const decision = optionalString(args["decision"]);
-				const response = isRecord(args["response"]) ? args["response"] : void 0;
+				const response = isRecord$1(args["response"]) ? args["response"] : void 0;
 				if (decision === void 0 && response === void 0) return {
 					error: "response-required",
 					message: "provide either `decision` (approve|deny) or `response` ({kind:\"answer\", answers})"
@@ -4093,7 +4122,7 @@ var CherryToolEngine = class {
 				};
 				if (response !== void 0) {
 					const answers = response["answers"];
-					if (response["kind"] !== "answer" || !isRecord(answers)) return {
+					if (response["kind"] !== "answer" || !isRecord$1(answers)) return {
 						error: "invalid-response",
 						message: "`response` must be {kind:\"answer\", answers:{<question text>: <answer>}}"
 					};
@@ -4370,7 +4399,7 @@ var CherryToolEngine = class {
 		const cached = this.#revisionCache.get(this.#cacheKey(deviceId, sessionId));
 		if (cached !== void 0) return cached;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle === void 0) throw new Error(`agent.sessions.get returned no idle revision for session ${sessionId}`);
 		this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle);
@@ -4381,7 +4410,7 @@ var CherryToolEngine = class {
 		let revision;
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			if (String(entry["kind"] ?? "") !== "session.updated") continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			revision = optionalString(payload["idleRevision"]) ?? optionalString(payload["historyRevision"]) ?? revision;
 		}
 		return revision;
@@ -4411,7 +4440,7 @@ var CherryToolEngine = class {
 			return streamed;
 		}
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const active = optionalString((isRecord(sessionResult["session"]) ? sessionResult["session"] : {})["activeExecutionId"]);
+		const active = optionalString((isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {})["activeExecutionId"]);
 		if (active !== void 0) {
 			this.#executionCache.set(this.#cacheKey(deviceId, sessionId), active);
 			return active;
@@ -4427,7 +4456,7 @@ var CherryToolEngine = class {
 		let active;
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			if (String(entry["kind"] ?? "") !== "execution.updated") continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			const executionId = optionalString(payload["executionId"]);
 			const status = optionalString(payload["status"]);
 			if (executionId === void 0 || status === void 0) continue;
@@ -4452,7 +4481,7 @@ var CherryToolEngine = class {
 	async #interactionSnapshot(connection, subscriptions, deviceId, sessionId, interactionId) {
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			if (String(entry["kind"] ?? "") !== "interaction.updated") continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			if (optionalString(payload["interactionId"]) !== interactionId) continue;
 			this.#rememberInteraction(deviceId, sessionId, payload);
 		}
@@ -4688,7 +4717,7 @@ var CherryToolEngine = class {
 			if (Number.isFinite(seq) && seq > scannedSeqNext) scannedSeqNext = seq;
 			const beforeBaseline = !Number.isFinite(seq) || seq <= options.baselineSeq;
 			const kind = String(entry["kind"] ?? "");
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			if (kind === "interaction.updated") {
 				const interactionId = optionalString(payload["interactionId"]);
 				const status = optionalString(payload["status"]);
@@ -4775,7 +4804,7 @@ var CherryToolEngine = class {
 			if (String(entry["kind"] ?? "") !== "execution.updated") continue;
 			const seq = Number(entry["seq"]);
 			if (Number.isFinite(seq) && seq <= baselineSeq) continue;
-			const executionId = optionalString((isRecord(entry["payload"]) ? entry["payload"] : {})["executionId"]);
+			const executionId = optionalString((isRecord$1(entry["payload"]) ? entry["payload"] : {})["executionId"]);
 			if (executionId !== void 0) return executionId;
 		}
 	}
@@ -4791,7 +4820,7 @@ var CherryToolEngine = class {
 			if (String(entry["kind"] ?? "") !== "execution.updated") continue;
 			const seq = Number(entry["seq"]);
 			if (Number.isFinite(seq) && seq > baselineSeq) continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			if (optionalString(payload["executionId"]) !== executionId) continue;
 			const status = optionalString(payload["status"]);
 			if (status !== void 0 && TERMINAL_EXECUTION_STATUSES.includes(status)) settled = {
@@ -4850,7 +4879,7 @@ var CherryToolEngine = class {
 	async #terminalResult(connection, subscriptions, sessionId, status, extra) {
 		const { terminalMessageId, ...rest } = extra;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle !== void 0) this.#revisionCache.set(this.#cacheKey(connection.record.deviceId, sessionId), idle);
@@ -4876,7 +4905,7 @@ var CherryToolEngine = class {
 	*/
 	async #timeoutResult(connection, subscriptions, sessionId, extra) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
 		return {
 			status: "timeout",
@@ -4950,7 +4979,7 @@ var CherryToolEngine = class {
 /** The array at `value`, or an empty array when the peer sent something else. */
 function arrayOf(value) {
 	if (!Array.isArray(value)) return [];
-	return value.filter(isRecord);
+	return value.filter(isRecord$1);
 }
 /** The caller's aggregate limit, defaulting to one page and capped at the max. */
 function aggregateLimit(value) {
@@ -4959,7 +4988,7 @@ function aggregateLimit(value) {
 }
 /** Parses the tool-facing cursor argument into the protocol's cursor shape. */
 function readCursor(value) {
-	if (!isRecord(value)) return void 0;
+	if (!isRecord$1(value)) return void 0;
 	const { sessionId, streamEpoch, seq } = value;
 	if (typeof sessionId !== "string" || typeof streamEpoch !== "string" || typeof seq !== "string") return void 0;
 	return {
@@ -5017,17 +5046,17 @@ function questionKeysOf(input) {
 * be presented as an answer key.
 */
 function parseQuestionInput(input) {
-	if (!isRecord(input)) return void 0;
+	if (!isRecord$1(input)) return void 0;
 	let body;
 	if (typeof input["text"] === "string") try {
 		body = JSON.parse(input["text"]);
 	} catch {
 		return;
 	}
-	else if (isRecord(input["ref"])) return;
+	else if (isRecord$1(input["ref"])) return;
 	else body = input;
-	if (!isRecord(body) || !Array.isArray(body["questions"])) return void 0;
-	return body["questions"].map((question) => isRecord(question) ? optionalString(question["question"]) : void 0).filter((question) => question !== void 0);
+	if (!isRecord$1(body) || !Array.isArray(body["questions"])) return void 0;
+	return body["questions"].map((question) => isRecord$1(question) ? optionalString(question["question"]) : void 0).filter((question) => question !== void 0);
 }
 /**
 * The message-walk verdict, projected off an aggregate page.
@@ -5090,6 +5119,1010 @@ function lastAssistantMessage(messages) {
 		if (message !== void 0 && message.role === "assistant") return [message];
 	}
 	return [];
+}
+//#endregion
+//#region src/atomicFile.ts
+/**
+* Crash-durable atomic replacement of one small UTF-8 file.
+*
+* This is a deliberate REPLICA of `deviceStore.ts`'s `persistArchive` sequence
+* (`.tmp` + fsync + chmod 0600 + rename), not a shared helper extracted from it:
+* the device archive is an existing subsystem the scope work must not touch
+* (spec §3's 永不 non-goal), so the two writers stay independent even though the
+* sequence is the same. A future fix to one must be applied to the other.
+*
+* Why each step is here, in order:
+*
+*  - `mkdirSync(dirname(file))` — the file's directory is the plugin's own data
+*    directory and may not exist on first run; the sequence must not fail there.
+*  - `openSync(temp, 'w', mode)` + `writeSync` + `fsyncSync` — the bytes reach
+*    the disk before the name switches, so a crash cannot leave a rename that
+*    points at unwritten data.
+*  - `closeSync` in `finally` — the descriptor is released even if the write or
+*    the fsync throws.
+*  - `chmodSync(temp, mode)` — `mode` on `open` only applies when the file is
+*    CREATED and is masked by the process umask, while `rename` carries the temp
+*    file's mode onto the target: chmod'ing the temp explicitly makes both
+*    halves of the swap exactly `mode` and re-tightens a pre-existing looser
+*    file instead of leaving it as it was.
+*  - `renameSync(temp, file)` — the switch itself: a reader sees either the
+*    complete old file or the complete new one, never a truncated one. On
+*    failure the temp file is dropped (best effort) so a half-written file is
+*    not left for the next reader to trip over, and the original error is what
+*    propagates — the target was never touched.
+*
+* Synchronous by design: the scope document's write path must complete inside
+* one uninterruptible critical section (no `await` between validating the
+* expected revision and committing the write, spec §6.3).
+*/
+function writeFileAtomicSync(file, text, mode = 384) {
+	mkdirSync(dirname(file), { recursive: true });
+	const temp = `${file}.tmp`;
+	const fd = openSync(temp, "w", mode);
+	try {
+		writeSync(fd, text, void 0, "utf8");
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
+	chmodSync(temp, mode);
+	try {
+		renameSync(temp, file);
+	} catch (error) {
+		try {
+			unlinkSync(temp);
+		} catch {}
+		throw error;
+	}
+}
+/** The id comparison contract: `String(value).trim()`, on both sides. */
+function normalizeWorkspaceId(value) {
+	return String(value).trim();
+}
+/**
+* Boundary normalization of one registry item.
+*
+* The registry's return type is not ours to assume (its ids are not guaranteed
+* to be strings), so every text field goes through `String(...)`: an item with
+* no usable id or path is `undefined` and is dropped by the caller, while
+* `sessionIds` that is not an array degrades to `[]` rather than throwing.
+*/
+function toScopeWorkspace(raw) {
+	if (!isRecord(raw)) return void 0;
+	const id = usableText(raw.id);
+	if (id === void 0) return void 0;
+	const path = usableText(raw.path);
+	if (path === void 0) return void 0;
+	return {
+		id,
+		title: raw.title === void 0 || raw.title === null ? "" : String(raw.title),
+		path,
+		sessionIds: Array.isArray(raw.sessionIds) ? raw.sessionIds.map((value) => String(value)) : []
+	};
+}
+/**
+* The visibility strictness order (B9), and the single implementation of it that
+* the visibility layer, diagnostics, the settings page and the tests share.
+*
+* `global` is visible for any id — including `undefined`, which is why a
+* `global` document never installs a deny layer even when no judgement exists.
+* `selected` is fail-closed: a hit is visible, and a miss, `undefined`, or an
+* empty list is not. Both sides of the comparison are normalized through
+* {@link normalizeWorkspaceId} first; normalizing still unequal means "not a
+* match" — no case folding and no path-level guessing.
+*/
+function isVisible(doc, workspaceId) {
+	if (doc.mode === "global") return true;
+	if (workspaceId === void 0) return false;
+	const wanted = normalizeWorkspaceId(workspaceId);
+	return doc.workspaceIds.some((id) => normalizeWorkspaceId(id) === wanted);
+}
+/**
+* One judgement record.
+*
+* `visible` is computed in exactly this one place, from {@link isVisible} alone
+* — never from `status`, and never from the list's health or the presence of a
+* `cwd`. The optional fields are OMITTED when absent rather than set to
+* `undefined`, so `Object.hasOwn` still tells "there is no workspace" from
+* "there is one".
+*/
+function judged(doc, agent, status, workspaceId, reason) {
+	return {
+		agentId: agent.id,
+		status,
+		...workspaceId === void 0 ? {} : { workspaceId },
+		visible: isVisible(doc, workspaceId),
+		reason,
+		...agent.cwd === void 0 ? {} : { cwd: agent.cwd }
+	};
+}
+/**
+* A workspace as a `reason` fragment: the title when the registry supplied one,
+* and always the id. Task 5 writes this reason into the installed-layer record
+* and `guard` echoes it back, so it has to name a workspace a reader can resolve
+* — the tuple is what makes that true for a titleless item (B6).
+*/
+function describeWorkspace(workspace) {
+	return workspace.title === "" ? `工作区 ${workspace.id}` : `工作区「${workspace.title}」(${workspace.id})`;
+}
+/**
+* The one "input → normalized document" entry point; both `load()` and `save()`
+* go through it, so the document shape exists in exactly one place.
+*
+* `input` is either the text read from disk or an already-parsed value.
+*  - unparsable text, a type-invalid `version` (missing / non-numeric / a
+*    string), or any other invalid field ⇒ `problem: 'parse'` and the STRICT
+*    side (`selected` + empty): the caller warns through the existing carrier
+*    and the document stays writable (B9);
+*  - a type-legal `version` other than {@link SCOPE_DOC_VERSION} ⇒
+*    `problem: 'version-unsupported'`, the same strict side, and a read-only
+*    degradation the caller records (never a silent "the user selected
+*    nothing"). That branch is decided by `version` ALONE, before the remaining
+*    field checks: a newer format plausibly carries fields this build cannot
+*    parse, and letting that combination read as a parse failure would hand a
+*    newer document back as WRITABLE — the exact opposite of the latch's
+*    purpose;
+*  - otherwise the normalized document, with `workspaceIds` de-duplicated and
+*    stably sorted ascending by string comparison. The stored literals are
+*    never rewritten — comparison normalization is `isVisible`'s job.
+*
+* `parseScopeDoc` deliberately does not exist as a separate export: this is the
+* only entry, module-internal helpers included.
+*/
+function normalizeScope(input) {
+	const parsed = parseScopeInput(input);
+	if (!parsed.ok) return {
+		doc: strictScope(),
+		problem: "parse"
+	};
+	const value = parsed.value;
+	if (!isRecord(value)) return {
+		doc: strictScope(),
+		problem: "parse"
+	};
+	const { version, revision } = value;
+	if (!isFiniteNumber(version)) return {
+		doc: strictScope(),
+		problem: "parse"
+	};
+	if (version !== 1) return {
+		doc: strictScope(),
+		problem: "version-unsupported"
+	};
+	if (!isFiniteNumber(revision)) return {
+		doc: strictScope(),
+		problem: "parse"
+	};
+	const fields = readScopeFields(value);
+	if (fields === void 0) return {
+		doc: strictScope(),
+		problem: "parse"
+	};
+	const updatedAt = value.updatedAt;
+	if (updatedAt !== void 0 && typeof updatedAt !== "string") return {
+		doc: strictScope(),
+		problem: "parse"
+	};
+	return { doc: updatedAt === void 0 ? {
+		version,
+		revision,
+		mode: fields.mode,
+		workspaceIds: fields.workspaceIds
+	} : {
+		version,
+		revision,
+		updatedAt,
+		mode: fields.mode,
+		workspaceIds: fields.workspaceIds
+	} };
+}
+/** A fresh strict-side document (never the shared `DEFAULT_SCOPE` object). */
+function strictScope() {
+	return {
+		version: 1,
+		revision: 0,
+		mode: "selected",
+		workspaceIds: []
+	};
+}
+/** `JSON.parse` for text input; any other value is taken as already parsed. */
+function parseScopeInput(input) {
+	if (typeof input !== "string") return {
+		ok: true,
+		value: input
+	};
+	try {
+		return {
+			ok: true,
+			value: JSON.parse(input)
+		};
+	} catch {
+		return { ok: false };
+	}
+}
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isFiniteNumber(value) {
+	return typeof value === "number" && Number.isFinite(value);
+}
+/** `String(value).trim()`, or `undefined` when there is nothing usable. */
+function usableText(value) {
+	if (value === void 0 || value === null) return void 0;
+	const text = String(value).trim();
+	return text === "" ? void 0 : text;
+}
+/**
+* The field-and-type validation shared by the PUT body and the document: `mode`
+* must be one of the two modes and `workspaceIds` must be an array of strings.
+* Registry-outside ids are NOT a validation failure — pruning is their ruling
+* (B14). The returned ids are de-duplicated and sorted.
+*/
+function readScopeFields(value) {
+	if (!isRecord(value)) return void 0;
+	const mode = value.mode;
+	if (mode !== "global" && mode !== "selected") return void 0;
+	const raw = value.workspaceIds;
+	if (!Array.isArray(raw)) return void 0;
+	const ids = [];
+	for (const id of raw) {
+		if (typeof id !== "string") return void 0;
+		ids.push(id);
+	}
+	return {
+		mode,
+		workspaceIds: [...new Set(ids)].sort()
+	};
+}
+/** The on-disk form, matching the shape the rest of the repo writes. */
+function serializeScope(doc) {
+	return `${JSON.stringify(doc, null, 2)}\n`;
+}
+/**
+* In-memory authority over the scope document.
+*
+* A missing file is the default scope (D3) and is SILENT — no warn, no note.
+* Anything else unreadable lands on the strict side with one warn. The document
+* is read at most once per state (`load()` is idempotent), and every read
+* accessor loads lazily, so a caller cannot observe a half-initialized state.
+*
+* The workspace list has exactly three states, fixed by the shape of
+* `setWorkspaces`' argument: 未读 (never called — the initial state, written by
+* nobody), 读成功 (a non-empty array), 读失败 (`undefined` OR an empty array).
+* `[]` counting as read failure is the point of B16: reading an empty registry
+* as "every id is gone" would silently prune the user's whole selection.
+* `setWorkspaces` is the ONLY production writer, and it holds the only write
+* site of the `workspace-list` note in this codebase (added when a read fails,
+* dropped again when one succeeds — the note is state, not history, R8).
+*
+* From Task 3 on this class also owns the judgement: `rebuild()` is the only
+* asynchronous method here and the only caller of `setWorkspaces`; it builds one
+* whole generation — the canonical path map, the per-agent judgements and the
+* `pathUnmatched` diagnostics — and swaps it in at once, while `judgement()` and
+* `pathUnmatched()` are synchronous reads of that generation.
+*/
+var ToolScopeState = class {
+	#file;
+	#log;
+	#loaded = false;
+	#doc = strictScope();
+	/** Set when the on-disk document declared a version this build cannot use. */
+	#versionUnsupported = false;
+	/** Same source ⇒ one entry, latest reason; different sources coexist. */
+	#degraded = /* @__PURE__ */ new Map();
+	#host = {
+		state: "pending",
+		capable: false,
+		reason: "等待宿主注入 agents / workspaceRegistry"
+	};
+	#listState = "unread";
+	#workspaces = [];
+	/** Per-agent installed layers: the execution-side mirror `guard` reads. */
+	#layers = /* @__PURE__ */ new Map();
+	/** The current generation's canonical path map: entity path ⇒ workspaceId. */
+	#pathMap = /* @__PURE__ */ new Map();
+	/** The current generation's per-agent judgements. `rebuild()` replaces it whole. */
+	#judgements = /* @__PURE__ */ new Map();
+	/** cwd samples that resolved outside the registry: diagnostics, NOT degraded. */
+	#pathUnmatched = [];
+	constructor(options) {
+		this.#file = options.file;
+		this.#log = options.log;
+	}
+	/** Reads the document once. Idempotent, and never throws (B9). */
+	load() {
+		this.#ensureLoaded();
+	}
+	/** The current document. The returned object IS the authoritative one. */
+	doc() {
+		this.#ensureLoaded();
+		return this.#doc;
+	}
+	/** The degradation notes, one per source; `[]` means no degradation. */
+	degraded() {
+		this.#ensureLoaded();
+		return [...this.#degraded.values()];
+	}
+	/** Records a note: same source replaces the reason, other sources survive. */
+	noteDegraded(note) {
+		this.#degraded.set(note.source, {
+			source: note.source,
+			reason: note.reason
+		});
+	}
+	/** The host capability tri-state, as written by the host integration layer. */
+	host() {
+		return this.#host;
+	}
+	setHost(next) {
+		this.#host = next;
+	}
+	/**
+	* The workspace list's single write site.
+	*
+	* A non-empty array is an authoritative read (reconcile and prune, and the
+	* `workspace-list` note is dropped here because a later read succeeded);
+	* `undefined` or `[]` is a read FAILURE — the list becomes unavailable, the
+	* judgement goes fail-closed for `selected`, the write side is refused (503)
+	* and the `workspace-list` note is recorded right here, once, and nowhere
+	* else.
+	*/
+	setWorkspaces(list) {
+		if (list === void 0 || list.length === 0) {
+			this.#listState = "unavailable";
+			this.#workspaces = [];
+			this.noteDegraded({
+				source: "workspace-list",
+				reason: "工作区列表不可用（注册表读取失败或返回空表）；判定 fail-closed，写侧拒绝"
+			});
+			return;
+		}
+		this.#listState = "read";
+		this.#clearDegraded("workspace-list");
+		this.#workspaces = list.map((raw) => toScopeWorkspace(raw)).filter((workspace) => workspace !== void 0);
+	}
+	/** The normalized registry list; `[]` for both 未读 and 读失败. */
+	workspaces() {
+		return this.#workspaces;
+	}
+	/**
+	* Document ids the registry no longer has (B14), for the settings page.
+	*
+	* `[]` for 未读 and for 读失败 as well as for a clean document: "cannot read
+	* the list" must never be presented as "every id is stale".
+	*/
+	staleWorkspaceIds() {
+		this.#ensureLoaded();
+		if (this.#listState !== "read") return [];
+		const known = this.#knownWorkspaceIds();
+		return this.#doc.workspaceIds.filter((id) => !known.has(normalizeWorkspaceId(id)));
+	}
+	/**
+	* Recomputes ONE generation — the canonical path map, the per-agent judgement
+	* cache and the `pathUnmatched` diagnostics — and swaps it in with a single
+	* assignment. The only asynchronous method on this class.
+	*
+	* The build order is fixed: the list first (`setWorkspaces` is its only
+	* production writer, `[]` counting as a read failure exactly as `undefined`
+	* does), then the map keyed on each item's ENTITY path, then one judgement per
+	* agent. Everything the readers see is built into locals, so a rebuild still
+	* awaiting `resolveByPath` leaves them on the PREVIOUS generation instead of
+	* exposing a half-built map.
+	*/
+	async rebuild(registry, agents) {
+		this.#ensureLoaded();
+		const doc = this.#doc;
+		let listed;
+		let listAvailable = false;
+		try {
+			const raw = registry.list();
+			if (Array.isArray(raw) && raw.length > 0) {
+				listed = raw;
+				listAvailable = true;
+			}
+		} catch (error) {
+			this.#warn("工作区注册表 list() 抛出，按 B16 视为列表不可用（判定 fail-closed，写侧拒绝）", error);
+		}
+		this.setWorkspaces(listed);
+		const workspaces = this.#workspaces;
+		const pathMap = /* @__PURE__ */ new Map();
+		const resolveByPath = registry.resolveByPath;
+		if (typeof resolveByPath === "function") for (const workspace of workspaces) {
+			let entity;
+			try {
+				entity = await resolveByPath.call(registry, workspace.path);
+			} catch (error) {
+				this.#warn(`工作区注册表项 ${workspace.path} 的路径解析失败（resolveByPath reject）；本轮跳过该项，其余项与全部 agent 的判定不受影响`, error);
+				continue;
+			}
+			const resolved = entity === void 0 ? void 0 : toScopeWorkspace(entity);
+			if (resolved === void 0) continue;
+			pathMap.set(resolved.path, resolved.id);
+		}
+		else {
+			this.noteDegraded({
+				source: "path-normalization",
+				reason: "宿主无 resolveByPath，路径匹配退化为大小写敏感字符串等价（不做 realpath）；符号链接或拼写差异下规则二可能不命中，此时只剩 sessionIds 一条路"
+			});
+			for (const workspace of workspaces) pathMap.set(workspace.path, workspace.id);
+		}
+		const judgements = /* @__PURE__ */ new Map();
+		const pathUnmatched = [];
+		for (const agent of agents) {
+			const judgement = await this.#judge(doc, workspaces, agent, registry, pathMap, listAvailable);
+			judgements.set(agent.id, judgement);
+			if (judgement.status === "no-match" && judgement.cwd !== void 0) pathUnmatched.push({
+				agentId: judgement.agentId,
+				cwd: judgement.cwd
+			});
+		}
+		this.#pathMap = pathMap;
+		this.#judgements = judgements;
+		this.#pathUnmatched = pathUnmatched;
+		let resolved = 0;
+		let unresolved = 0;
+		for (const judgement of judgements.values()) if (judgement.status === "resolved") resolved += 1;
+		else if (judgement.status === "unresolved") unresolved += 1;
+		return {
+			listAvailable,
+			agents: agents.length,
+			resolved,
+			unresolved,
+			pathUnmatched: pathUnmatched.length
+		};
+	}
+	/** The current generation's judgement for one agent, or a cache miss. */
+	judgement(agentId) {
+		return this.#judgements.get(agentId);
+	}
+	/**
+	* Agents whose `cwd` resolved outside every registered workspace, with the
+	* `cwd` sample (§6.1's 路径不匹配诊断). Diagnostics only — no `degraded` entry
+	* carries this, so "勾了却无工具" can be told apart from a degraded read.
+	*/
+	pathUnmatched() {
+		return this.#pathUnmatched;
+	}
+	/**
+	* Validates and commits one write, synchronously (no `await` anywhere in the
+	* critical section, §6.3).
+	*
+	* The refusal priority is FIXED: an unsupported document version (503) > an
+	* unavailable workspace list (503) > invalid request fields (400) > a missing
+	* base revision (400) > a revision conflict (409). Pre-existing state
+	* outranks request-body validation — a newer document plus a malformed body
+	* must report the newer document, never `invalid-scope`.
+	*
+	* On success the pruned ids are dropped (only under an authoritative list —
+	* never while 未读 or 读失败), the revision is bumped by exactly one, the
+	* normalized document is written atomically as 0600, and the in-memory
+	* authority holds THAT document: the returned `doc` is the same object
+	* `doc()` serves.
+	*/
+	save(body, expectedRevision) {
+		this.#ensureLoaded();
+		if (this.#versionUnsupported) return {
+			ok: false,
+			status: 503,
+			error: "scope-version-unsupported",
+			message: "作用域文档版本高于本插件支持（本插件支持 version 1），不能覆写该文档；已存内容一位不动"
+		};
+		if (this.#listState === "unavailable") return {
+			ok: false,
+			status: 503,
+			error: "workspace-list-unavailable",
+			message: "工作区列表不可用，无法替用户做写决策；已存内容一位不动"
+		};
+		const fields = readScopeFields(body);
+		if (fields === void 0) return {
+			ok: false,
+			status: 400,
+			error: "invalid-scope",
+			message: "mode 必须是 global 或 selected，workspaceIds 必须是字符串数组"
+		};
+		if (!isFiniteNumber(expectedRevision)) return {
+			ok: false,
+			status: 400,
+			error: "missing-expected-revision",
+			message: "请求必须携带基准 expectedRevision（读-改-写）"
+		};
+		const current = this.#doc.revision;
+		if (expectedRevision !== current) return {
+			ok: false,
+			status: 409,
+			error: "scope-revision-conflict",
+			message: `配置已被他处修改（当前 revision=${current}），请重新读取后再保存`
+		};
+		const known = this.#listState === "read" ? this.#knownWorkspaceIds() : void 0;
+		const pruned = [];
+		const kept = [];
+		for (const id of fields.workspaceIds) if (known !== void 0 && !known.has(normalizeWorkspaceId(id))) pruned.push(id);
+		else kept.push(id);
+		const { doc } = normalizeScope({
+			version: 1,
+			revision: current + 1,
+			updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+			mode: fields.mode,
+			workspaceIds: kept
+		});
+		writeFileAtomicSync(this.#file, serializeScope(doc));
+		this.#doc = doc;
+		return {
+			ok: true,
+			doc,
+			pruned
+		};
+	}
+	/** The installed layer for one agent, or `undefined` when none is mounted. */
+	layer(agentId) {
+		return this.#layers.get(agentId);
+	}
+	/** Records the layer installed for one agent (the record IS the mirror). */
+	setLayer(agentId, layer) {
+		this.#layers.set(agentId, layer);
+	}
+	/** Forgets one agent's layer, in the same turn its restriction is released. */
+	clearLayer(agentId) {
+		this.#layers.delete(agentId);
+	}
+	/**
+	* Drops everything derived from a previous mount: the installed-layer records
+	* and the whole judgement generation — the canonical path map, the per-agent
+	* judgements and the `pathUnmatched` diagnostics (Task 4's teardown asserts
+	* exactly this).
+	*/
+	invalidateDerived() {
+		this.#layers.clear();
+		this.#pathMap = /* @__PURE__ */ new Map();
+		this.#judgements = /* @__PURE__ */ new Map();
+		this.#pathUnmatched = [];
+	}
+	/**
+	* One agent's judgement against the generation being built, following §4's
+	* two rules in order: the header-validated `sessionIds` projection wins, and
+	* the canonical path map is the only path comparison there is.
+	*
+	* `doc` and `workspaces` are the snapshots `rebuild()` took for this whole
+	* round, so two agents of one generation can never be judged against two
+	* different documents or lists.
+	*/
+	async #judge(doc, workspaces, agent, registry, pathMap, listAvailable) {
+		const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
+		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
+		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）");
+		if (!listAvailable) return judged(doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（D14 的有界复检只对该状态启动）`);
+		const resolveByPath = registry.resolveByPath;
+		if (typeof resolveByPath !== "function") {
+			const workspaceId = pathMap.get(agent.cwd);
+			return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`) : judged(doc, agent, "resolved", workspaceId, `路径字符串等价命中 ${this.#label(workspaces, workspaceId)}`);
+		}
+		let entity;
+		try {
+			entity = await resolveByPath.call(registry, agent.cwd);
+		} catch (error) {
+			this.#warn(`cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（D14 的有界复检只对该状态启动）`, error);
+			return judged(doc, agent, "unresolved", void 0, `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
+		}
+		if (entity === void 0) return judged(doc, agent, "no-match", void 0, `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
+		const resolved = toScopeWorkspace(entity);
+		const workspaceId = resolved === void 0 ? void 0 : pathMap.get(resolved.path);
+		if (workspaceId === void 0) return judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`);
+		return judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`);
+	}
+	/** The workspace id, plus its title when this generation's list carries one. */
+	#label(workspaces, workspaceId) {
+		const workspace = workspaces.find((item) => item.id === workspaceId);
+		return workspace === void 0 ? `工作区 ${workspaceId}` : describeWorkspace(workspace);
+	}
+	/**
+	* The removal half of the note set. `degraded` is STATE, not history (R8):
+	* the `workspace-list` note must not outlive the read failure that produced
+	* it, or one transient registry failure would keep Task 8's save button
+	* disabled for the rest of the process while `save()` itself accepts the very
+	* same `PUT` (it refuses only while the list is CURRENTLY unavailable).
+	*
+	* Module-private on purpose: the method list is a contract for Tasks 4–9, and
+	* `setWorkspaces` is the only place allowed to add OR drop this source. The
+	* other four sources stay append-only — none of them has a success trigger.
+	*/
+	#clearDegraded(source) {
+		this.#degraded.delete(source);
+	}
+	#knownWorkspaceIds() {
+		return new Set(this.#workspaces.map((workspace) => normalizeWorkspaceId(workspace.id)));
+	}
+	/**
+	* The one read of the file, and the one place the strictness order is applied
+	* to disk content:
+	*  - ENOENT ⇒ the default scope, silently (first run, D3);
+	*  - another read error ⇒ the strict side + one warn;
+	*  - an unsupported version ⇒ the strict side + the `scope-version` note and a
+	*    latch that refuses every write;
+	*  - a parse failure / invalid field ⇒ the strict side + one warn, writable.
+	*/
+	#ensureLoaded() {
+		if (this.#loaded) return;
+		this.#loaded = true;
+		let text;
+		try {
+			text = readFileSync(this.#file, "utf8");
+		} catch (error) {
+			if (error.code === "ENOENT") return;
+			this.#warn(`作用域文档 ${this.#file} 读取失败；按 B9 落到更严一侧（selected + 空列表），写入仍可覆盖`, error);
+			return;
+		}
+		const { doc, problem } = normalizeScope(text);
+		this.#doc = doc;
+		if (problem === "parse") {
+			this.#warn(`作用域文档 ${this.#file} 解析失败或字段非法；按 B9 落到更严一侧（selected + 空列表），写入仍可覆盖`);
+			return;
+		}
+		if (problem === "version-unsupported") {
+			this.#versionUnsupported = true;
+			this.noteDegraded({
+				source: "scope-version",
+				reason: "作用域文档版本高于本插件支持（本插件支持 version 1）；已只读降级并拒绝写入，避免覆写更新格式的文档"
+			});
+		}
+	}
+	/** The existing warn channel: the injected `log`, else `console.warn`. */
+	#warn(message, error) {
+		if (this.#log !== void 0) {
+			this.#log(message, error);
+			return;
+		}
+		console.warn(message, error);
+	}
+};
+//#endregion
+//#region src/toolScopeHost.ts
+/**
+* The host integration layer: capability tri-state, the injection gate, and the
+* ONE assembly point where registration, hiding and the dispatch guard are born
+* and die together (spec §6.2 + B7/B10/B17).
+*
+* Four decisions carry this file:
+*
+*  1. **The host is mounted, not merely constructed.** {@link ToolScopeHost.mount}
+*     is the only entry point that installs anything, and it returns the only
+*     release path. `apply()` calls it AFTER the assembly's root `ctx.effect`
+*     and pushes the returned disposer into `state.disposers`, so the plugin's
+*     existing teardown drains it — there is deliberately no second root effect.
+*
+*  2. **The capability probe runs at `mount()` time, off the plugin ROOT ctx's
+*     `tools` face** — never inside the injected effect. `register`, `restrict`
+*     and `schemas` are hard gates (missing any one ⇒ `unsupported`); `guard` is
+*     NOT a gate (missing ⇒ the `visibility-only` degradation). Because the probe
+*     does not depend on the injection arrival, "static capability missing" and
+*     "injection not yet arrived" can hold at once — and the static failure wins.
+*
+*  3. **The injected effect owns the lifecycle of all four faces**: the tool
+*     registrations, every agent's restriction layer, the single global guard,
+*     and the two subscriptions. Its merged disposer unsubscribes FIRST (the
+*     release side of `register`/`restrict` also emits `tools/change`, and a
+*     recompute running in that window would re-install a layer whose disposer
+*     the map no longer holds — an ownerless layer, unrecoverable under
+*     intersection semantics), then releases registrations, then restrictions,
+*     and finally the guard (which notifies nobody).
+*
+*  4. **State ownership stays with {@link ToolScopeState}.** This module keeps
+*     no copy of the document, the degradation set, the judgement generation or
+*     the installed-layer records; it reads and writes them through the scope
+*     state's own surface (`judgement` / `layer` / `setLayer` / `clearLayer` /
+*     `invalidateDerived`), which is what makes `guard`'s "层在 ⇒ 拒绝" mirror
+*     true by construction.
+*
+* Deliberately NOT here (later tasks in the same file): the empty-deny /
+* install-failure criteria and the `tools/change` subscription with its
+* coalescing gate (Task 5), and the bounded recheck (Task 6).
+*/
+/**
+* The label of this subsystem's mount lifecycle — §6.2 spells it, and this is
+* the ONLY place the string is written. The assembly point references the
+* constant through `mount()`; no caller re-spells it.
+*/
+const EFFECT_LABEL = "cherry-remote.tool-scope()";
+/** The neutral waiting wording: `pending` must never read as "the host refuses". */
+const PENDING_REASON = "等待宿主注入 agents / workspaceRegistry";
+/** `ready` means: the three static capabilities AND both injected services. */
+const READY_REASON = "宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达";
+/** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
+const INJECT_KEYS = ["agents", "workspaceRegistry"];
+function createToolScopeHost(deps) {
+	const { scope } = deps;
+	const names = deps.names;
+	const log = deps.log ?? ((message, error) => console.warn(message, error));
+	let root;
+	let staticCapable = false;
+	let mountTornDown = false;
+	/** The effect run currently holding the four faces, if any. */
+	let current;
+	function probe(tools) {
+		const missing = [];
+		if (tools === void 0) missing.push("tools");
+		else {
+			if (typeof tools.register !== "function") missing.push("tools.register");
+			if (typeof tools.restrict !== "function") missing.push("tools.restrict");
+			if (typeof tools.schemas !== "function") missing.push("tools.schemas");
+		}
+		if (missing.length === 0) return {
+			capable: true,
+			reason: READY_REASON
+		};
+		return {
+			capable: false,
+			reason: `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ 这 ${names.length} 个工具一个都不注册（fail-closed）`
+		};
+	}
+	function projectAgent(raw) {
+		if (typeof raw !== "object" || raw === null) return void 0;
+		const value = raw;
+		const id = value.id;
+		if (typeof id !== "string" || id === "") return void 0;
+		const cwdValue = value.session?.header?.cwd;
+		const cwd = typeof cwdValue === "string" && cwdValue !== "" ? cwdValue : void 0;
+		const scopedTools = value.ctx?.tools;
+		const restrict = scopedTools?.restrict;
+		return {
+			id,
+			...cwd === void 0 ? {} : { cwd },
+			...typeof restrict !== "function" ? {} : { restrict: (filter) => restrict.call(scopedTools, filter) }
+		};
+	}
+	function liveAgents(state) {
+		const service = state.agents;
+		const list = service?.list;
+		if (typeof list !== "function") return [];
+		let raw;
+		try {
+			raw = list.call(service);
+		} catch (error) {
+			log("[cherry-remote] agents.list() 抛出；本轮按“没有 live agent”处理", error);
+			return [];
+		}
+		if (!Array.isArray(raw)) return [];
+		return raw.map((entry) => projectAgent(entry)).filter((agent) => agent !== void 0);
+	}
+	/**
+	* The pinned target set: visible under the CURRENT document and judgement ⇒
+	* empty (release only), otherwise the family's names.
+	*
+	* `judgement()?.workspaceId` folds a cache miss into the same expression: under
+	* `global` `isVisible(doc, undefined)` is true (so a miss releases only), and
+	* under `selected` it is false — the D7 fail-closed side.
+	*/
+	function targetDeny(agentId) {
+		return isVisible(scope.doc(), scope.judgement(agentId)?.workspaceId) ? [] : names;
+	}
+	function reasonFor(agentId) {
+		return scope.judgement(agentId)?.reason ?? "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
+	}
+	function applyForAgent(state, agent) {
+		const target = targetDeny(agent.id);
+		const existing = state.layers.get(agent.id);
+		if (target.length === 0) {
+			if (existing === void 0) return "skipped";
+			scope.clearLayer(agent.id);
+			state.layers.delete(agent.id);
+			existing();
+			return "released";
+		}
+		if (agent.restrict === void 0) {
+			log(`[cherry-remote] agent ${agent.id} 没有 agent.ctx.tools.restrict，无法安装 restriction；跳过该 agent`);
+			return "skipped";
+		}
+		let dispose;
+		try {
+			dispose = agent.restrict({ deny: [...target] });
+		} catch (error) {
+			log(`[cherry-remote] agent ${agent.id} 的 restriction 安装被宿主拒绝；本轮跳过该 agent`, error);
+			return "skipped";
+		}
+		state.layers.set(agent.id, dispose);
+		scope.setLayer(agent.id, {
+			deny: [...target],
+			reason: reasonFor(agent.id)
+		});
+		existing?.();
+		return "installed";
+	}
+	function applyAll(state) {
+		const summary = {
+			agents: 0,
+			installed: 0,
+			released: 0,
+			skipped: 0
+		};
+		const agents = liveAgents(state);
+		summary.agents = agents.length;
+		for (const agent of agents) {
+			const outcome = applyForAgent(state, agent);
+			if (outcome === "installed") summary.installed += 1;
+			else if (outcome === "released") summary.released += 1;
+			else summary.skipped += 1;
+		}
+		return summary;
+	}
+	/**
+	* The asynchronous half of one round: one judgement generation, then the same
+	* (synchronous) install/release pass on top of it. Never rejects — a failed
+	* round is recorded, never thrown into a `@mode serial` event dispatch.
+	*/
+	async function converge(state) {
+		try {
+			if (state.tornDown || mountTornDown) return;
+			const registry = state.registry;
+			if (registry === void 0) return;
+			const agents = liveAgents(state).map((agent) => ({
+				id: agent.id,
+				...agent.cwd === void 0 ? {} : { cwd: agent.cwd }
+			}));
+			await scope.rebuild(registry, agents);
+			if (state.tornDown || mountTornDown) return;
+			applyAll(state);
+		} catch (error) {
+			log("[cherry-remote] 作用域重算失败（只记录，不抛；判定保持上一代）", error);
+		}
+	}
+	function guardVerdict(execution) {
+		if (!names.includes(execution.name)) return void 0;
+		const agentId = execution.agent?.id;
+		if (agentId === void 0) return void 0;
+		const layer = scope.layer(agentId);
+		return layer === void 0 ? void 0 : `cherry-remote 作用域限制：${layer.reason}`;
+	}
+	function refresh() {
+		const state = current;
+		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return void 0;
+		const summary = applyAll(state);
+		converge(state);
+		return summary;
+	}
+	function teardownEffect(state) {
+		if (state.tornDown) return;
+		state.tornDown = true;
+		for (const off of state.offs.splice(0)) try {
+			off();
+		} catch (error) {
+			log("[cherry-remote] 作用域子系统退订失败", error);
+		}
+		const releaseRegistrations = state.releaseRegistrations;
+		state.releaseRegistrations = void 0;
+		try {
+			releaseRegistrations?.();
+		} catch (error) {
+			log("[cherry-remote] 释放 cherry_* 工具注册失败", error);
+		}
+		for (const [agentId, dispose] of [...state.layers]) {
+			scope.clearLayer(agentId);
+			try {
+				dispose();
+			} catch (error) {
+				log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error);
+			}
+		}
+		state.layers.clear();
+		const releaseGuard = state.releaseGuard;
+		state.releaseGuard = void 0;
+		try {
+			releaseGuard?.();
+		} catch (error) {
+			log("[cherry-remote] 释放 tools.guard 失败", error);
+		}
+		scope.invalidateDerived();
+		if (current === state) current = void 0;
+		if (scope.host().state === "ready") scope.setHost({
+			state: "pending",
+			capable: false,
+			reason: `${PENDING_REASON}（注入回调已卸载）`
+		});
+	}
+	function setup(agentCtx) {
+		if (mountTornDown) return () => {};
+		if (!staticCapable) return () => {};
+		scope.setHost({
+			state: "ready",
+			capable: true,
+			reason: READY_REASON
+		});
+		const state = {
+			tornDown: false,
+			layers: /* @__PURE__ */ new Map(),
+			agents: agentCtx.agents,
+			registry: agentCtx.workspaceRegistry,
+			releaseRegistrations: void 0,
+			releaseGuard: void 0,
+			offs: [],
+			teardown: () => {}
+		};
+		state.teardown = () => teardownEffect(state);
+		current = state;
+		state.releaseRegistrations = deps.registerTools();
+		const rootTools = root?.tools;
+		if (typeof rootTools?.guard === "function") state.releaseGuard = rootTools.guard((execution) => guardVerdict(execution));
+		else scope.noteDegraded({
+			source: "visibility-only",
+			reason: "宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 14 个工具，不是渲染层假过滤）"
+		});
+		const on = agentCtx.on;
+		if (typeof on === "function") {
+			state.offs.push(on("agent/created", (payload) => {
+				onCreated(state, payload);
+			}));
+			state.offs.push(on("agent/disposed", (payload) => {
+				onDisposed(state, payload);
+			}));
+		}
+		refresh();
+		return state.teardown;
+	}
+	/** `agent/created`: synchronous, cache-only, never throws (host `@mode serial`). */
+	function onCreated(state, payload) {
+		if (state.tornDown || mountTornDown) return;
+		const agent = projectAgent(payload?.agent);
+		if (agent === void 0) return;
+		try {
+			applyForAgent(state, agent);
+		} catch (error) {
+			log(`[cherry-remote] agent ${agent.id} 的首次装配失败（不阻塞建会话）`, error);
+		}
+		converge(state);
+	}
+	/** `agent/disposed`: releases exactly that agent's layer and its record. */
+	function onDisposed(state, payload) {
+		if (state.tornDown || mountTornDown) return;
+		const agent = projectAgent(payload?.agent);
+		if (agent === void 0) return;
+		try {
+			const dispose = state.layers.get(agent.id);
+			scope.clearLayer(agent.id);
+			state.layers.delete(agent.id);
+			dispose?.();
+		} catch (error) {
+			log(`[cherry-remote] 释放 agent ${agent.id} 的 restriction 失败（不阻塞处置）`, error);
+		}
+	}
+	return {
+		mount(ctx) {
+			root = ctx;
+			mountTornDown = false;
+			const probed = probe(ctx.tools);
+			staticCapable = probed.capable;
+			if (!staticCapable) {
+				scope.setHost({
+					state: "unsupported",
+					capable: false,
+					reason: probed.reason
+				});
+				log(`[cherry-remote] 作用域子系统未启用：${probed.reason}`);
+			} else scope.setHost({
+				state: "pending",
+				capable: false,
+				reason: PENDING_REASON
+			});
+			try {
+				ctx.inject?.(INJECT_KEYS, (agentCtx) => {
+					agentCtx.effect?.(() => setup(agentCtx), EFFECT_LABEL);
+				});
+			} catch (error) {
+				log("[cherry-remote] agents / workspaceRegistry 注入不可用；作用域子系统保持 pending", error);
+				scope.setHost({
+					state: "pending",
+					capable: false,
+					reason: PENDING_REASON
+				});
+			}
+			return () => {
+				mountTornDown = true;
+				const teardown = current?.teardown;
+				teardown?.();
+			};
+		},
+		refresh,
+		state() {
+			return scope.host();
+		}
+	};
 }
 //#endregion
 //#region src/httpApi.ts
@@ -5994,6 +7027,8 @@ function noteError(entry) {
 }
 const state = {
 	store: new DeviceStore(join(tmpdirFallback(), "devices.json")),
+	scope: new ToolScopeState({ file: join(tmpdirFallback(), "scope.json") }),
+	refreshScope: () => void 0,
 	identity: void 0,
 	identityError: void 0,
 	rateBudgetPerSecond: 32,
@@ -6202,6 +7237,8 @@ async function recoverSubscriptions(deviceId) {
 function assemblyDeps() {
 	return {
 		store: state.store,
+		scope: state.scope,
+		refreshScope: () => state.refreshScope(),
 		/**
 		* The pairing seam, shared by `cherry_pair` and `POST /pair`.
 		*
@@ -6287,9 +7324,12 @@ function apply(ctx, config = {}) {
 		console.warn("[cherry-remote] releasing the previous assembly failed", error);
 	}
 	evictAllConnections();
+	const scope = new ToolScopeState({ file: join(dataDir, "scope.json") });
+	scope.load();
+	state.scope = scope;
+	state.refreshScope = () => host.refresh();
 	const deps = assemblyDeps();
 	state.disposers.push(registerHttpApi(ctx, deps));
-	state.disposers.push(registerCherryTools(ctx, deps));
 	ctx.effect?.(() => () => {
 		for (const dispose of state.disposers.splice(0)) try {
 			dispose();
@@ -6300,6 +7340,12 @@ function apply(ctx, config = {}) {
 		state.pairingProgressListeners.clear();
 		return evictAllConnections();
 	});
+	const host = createToolScopeHost({
+		scope,
+		names: CHERRY_TOOL_NAMES,
+		registerTools: () => registerCherryTools(ctx, deps)
+	});
+	state.disposers.push(host.mount(ctx));
 	loadOrCreateIdentity(dataDir).then((identity) => {
 		state.identity = identity.key;
 		state.identityError = void 0;

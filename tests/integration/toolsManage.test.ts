@@ -589,11 +589,26 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       dispatch(req: FakeRequest, res: FakeResponse): Promise<boolean>
     }
     effects: Array<() => void>
-    /** The host's tool registry SERVICE, exactly as `ctx.tools` arrives. */
+    /**
+     * The subsystem's mount lifecycle, in its OWN bucket. `effects` holds the
+     * ROOT ctx's effects only: the teardown test below takes `effects[0]` BY
+     * POSITION as the plugin root effect, so an effect registered on the
+     * injection callback's ctx must never enter this array.
+     */
+    injectedEffects: Array<() => void>
+    /**
+     * The host's tool registry SERVICE, exactly as `ctx.tools` arrives: the
+     * three hard-gate methods are present, so the scope subsystem's capability
+     * tri-state can actually reach `ready` (otherwise every assembly-level
+     * registration assertion would pass vacuously).
+     */
     tools: {
       definitions: CherryToolDefinition[]
       registerCalls: number
       register(definition: CherryToolDefinition): () => void
+      restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void
+      guard(guard: (execution: { name: string; agent?: { id: string } }) => string | undefined): () => void
+      schemas(scope?: unknown): ReadonlyArray<{ name: string; description: string; parameters?: unknown }>
     }
     /** webServer present (browser deploy) unless `headless`. */
     headless: boolean
@@ -603,6 +618,17 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 
   function assemblyCtx(headless = false): AssemblyCtx {
     const routes = new Map<string, (req: never, res: never) => unknown>()
+    /** The ctx the scope subsystem's injection callback receives. */
+    const injected = {
+      agents: { list: () => [] },
+      workspaceRegistry: { list: () => [], resolveByPath: async () => undefined },
+      effect(cb: () => () => void) {
+        ctx.injectedEffects.push(cb())
+      },
+      on() {
+        return () => {}
+      },
+    }
     const ctx: AssemblyCtx = {
       server: {
         routes,
@@ -625,6 +651,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         },
       },
       effects: [],
+      injectedEffects: [],
       tools: {
         definitions: [],
         registerCalls: 0,
@@ -636,10 +663,32 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
             if (index >= 0) this.definitions.splice(index, 1)
           }
         },
+        // Not a scoped agent ctx: the real host throws here, and the subsystem
+        // must never call it on this face.
+        restrict() {
+          throw new Error('tools.restrict() requires a scoped context (agent.ctx)')
+        },
+        guard() {
+          return () => {}
+        },
+        // The no-argument global view (D12's observation source).
+        schemas() {
+          return this.definitions.map((definition) => ({
+            name: definition.name,
+            description: definition.description,
+            ...(definition.parameters === undefined ? {} : { parameters: definition.parameters }),
+          }))
+        },
       },
       headless,
-      inject(_deps, cb) {
+      inject(deps, cb) {
         if (headless) throw new Error('service "webServer" is not available')
+        // Split BY DEPENDENCY KEY: the scope subsystem's two keys answer with
+        // the services plus the injected ctx's own effect/on.
+        if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+          cb(injected)
+          return
+        }
         cb({ webServer: ctx.server, webRuntime: { trustedHosts: [] } })
       },
       effect(cb) {

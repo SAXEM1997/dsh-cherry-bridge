@@ -13,6 +13,7 @@ import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
+import { ToolScopeState } from '../../src/toolScope.js'
 import { pairWithPayload } from '../../src/pairing.js'
 import {
   DEFAULT_PER_SESSION_CACHE_BYTES,
@@ -1097,7 +1098,8 @@ function mountHttpApi(overrides: Partial<CherryHttpDeps> = {}): {
 } {
   const server = makeServer()
   const seats: string[] = []
-  const store = new DeviceStore(join(tempDir('cherry-diag-http-'), 'devices.json'))
+  const dir = tempDir('cherry-diag-http-')
+  const store = new DeviceStore(join(dir, 'devices.json'))
   const ctx = {
     webServer: server,
     webRuntime: { trustedHosts: ['harness.internal:23023'] },
@@ -1107,6 +1109,11 @@ function mountHttpApi(overrides: Partial<CherryHttpDeps> = {}): {
   }
   const dispose = registerHttpApi(ctx as unknown as Parameters<typeof registerHttpApi>[0], {
     store,
+    // A REAL scope state (never a placeholder): the diagnostics report
+    // dereferences this object field by field, so an `as never` here would turn
+    // the `/diagnostics` contract cases into 500s.
+    scope: new ToolScopeState({ file: join(dir, 'scope.json') }),
+    refreshScope: () => undefined,
     pair: async () => {
       throw new Error('diagnostics does not pair')
     },
@@ -1714,17 +1721,46 @@ describe('③ release configuration', () => {
 // ③ the REAL assembly serves the diagnostics report from the live pool
 // ---------------------------------------------------------------------------
 
+/**
+ * The minimal assembly ctx the real `apply()` is driven with.
+ *
+ * `inject` splits BY DEPENDENCY KEY: the web keys answer with the fake web
+ * server (unchanged), and the scope subsystem's two keys answer with the
+ * services plus the injected ctx's own `effect`/`on`. These cases assert the
+ * DIAGNOSTICS report rather than tool registration, so the injected effect only
+ * has to exist — but it must exist, or the subsystem's callback would starve and
+ * the assembly path under test would no longer be the production one.
+ */
+function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unknown> {
+  const injectedEffects: Array<() => void> = []
+  return {
+    inject(deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
+      if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+        cb({
+          agents: { list: () => [] },
+          workspaceRegistry: { list: () => [], resolveByPath: async () => undefined },
+          effect(cb: () => () => void) {
+            injectedEffects.push(cb())
+          },
+          on() {
+            return () => {}
+          },
+        })
+        return
+      }
+      cb({ webServer: server, webRuntime: { trustedHosts: [] } })
+    },
+    effect(): void {},
+    injectedEffects,
+  }
+}
+
 describe('③ the real plugin assembly serves /diagnostics', () => {
   it('projects the pooled devices and effective config with no credential in the body', async () => {
     const index = await import('../../src/index.js')
     const server = makeServer()
     const dir = tempDir('cherry-assembly-')
-    const ctx = {
-      inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
-        cb({ webServer: server, webRuntime: { trustedHosts: [] } })
-      },
-      effect(): void {},
-    }
+    const ctx = assemblyCtx(server)
     index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir })
 
     try {
@@ -1771,12 +1807,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
   it('resets the error ring and the build counter on re-apply (minor 8)', async () => {
     const index = await import('../../src/index.js')
     const server = makeServer()
-    const ctx = {
-      inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
-        cb({ webServer: server, webRuntime: { trustedHosts: [] } })
-      },
-      effect(): void {},
-    }
+    const ctx = assemblyCtx(server)
     const first = tempDir('cherry-reapply-1-')
     index.apply(ctx as unknown as CherryHttpContext, { dataDir: first })
 
@@ -1817,12 +1848,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     const { SessionSubscriptions } = await import('../../src/subscriptions.js')
     const index = await import('../../src/index.js')
     const server = makeServer()
-    const ctx = {
-      inject(_deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
-        cb({ webServer: server, webRuntime: { trustedHosts: [] } })
-      },
-      effect(): void {},
-    }
+    const ctx = assemblyCtx(server)
     index.apply(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-cursor-') })
 
     try {

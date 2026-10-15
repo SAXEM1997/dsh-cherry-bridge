@@ -10,6 +10,7 @@ import type { PairWithPayloadOptions } from '../../src/pairing.js'
 import type { DeviceState } from '../../src/connection.js'
 import { isTrustedWebRequest, registerHttpApi } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
+import { ToolScopeState } from '../../src/toolScope.js'
 
 /**
  * Task 11 integration suite: the same-origin HTTP face + SSE stream, driven
@@ -252,6 +253,11 @@ function mount(overrides: Partial<CherryHttpDeps> = {}): FakeCtx {
 
   dispose = registerHttpApi(ctx as unknown as CherryHttpContext, {
     store,
+    // A REAL scope state (never a placeholder): Task 9's `diagnosticsReport`
+    // dereferences this object field by field, so an `as never` here would turn
+    // the existing `/diagnostics` cases into 500s.
+    scope: new ToolScopeState({ file: join(dataDir, 'scope.json') }),
+    refreshScope: () => undefined,
     pair: (opts) => pairImpl(opts),
     identity: () => new Uint8Array([1, 2, 3]),
     connect: () => fakeConnection() as never,
@@ -1146,6 +1152,8 @@ describe('⑥ lifecycle', () => {
 
     const result = registerHttpApi(headless as unknown as CherryHttpContext, {
       store: new DeviceStore(join(dataDir, 'devices.json')),
+      scope: new ToolScopeState({ file: join(dataDir, 'scope.json') }),
+      refreshScope: () => undefined,
       pair: (opts) => pairImpl(opts),
       identity: () => new Uint8Array([1]),
       connect: () => fakeConnection() as never,
@@ -1404,6 +1412,25 @@ describe('plugin assembly (index.ts apply)', () => {
     /** The same FakeWebServer the unit-level tests drive, so `call` works. */
     server: FakeWebServer
     effects: Array<() => void>
+    /**
+     * The scope subsystem's mount lifecycle, in its OWN bucket. `effects` holds
+     * the ROOT ctx's effects only — the cases below assert its length is exactly
+     * 1, and the assembly must not add a second root `ctx.effect`.
+     */
+    injectedEffects: Array<() => void>
+    /**
+     * The host's tool registry face, complete enough for the capability
+     * tri-state to reach `ready` (register + restrict + schemas) — without it
+     * the assembly's registration gate would be unsupported and every
+     * registration assertion would pass vacuously.
+     */
+    tools: {
+      definitions: Array<{ name: string; description: string }>
+      register(definition: { name: string; description: string }): () => void
+      restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void
+      guard(guard: (execution: { name: string; agent?: { id: string } }) => string | undefined): () => void
+      schemas(scope?: unknown): ReadonlyArray<{ name: string; description: string; parameters?: unknown }>
+    }
     dataDir: string
     injectable: boolean
     inject(deps: string[], cb: (wctx: unknown) => unknown): void
@@ -1416,13 +1443,52 @@ describe('plugin assembly (index.ts apply)', () => {
     // otherwise the assembly path would only be reachable by bypassing it.
     const server = new FakeWebServer()
     const effects: Array<() => void> = []
+    const injectedEffects: Array<() => void> = []
+    const definitions: Array<{ name: string; description: string }> = []
+    const injected = {
+      agents: { list: () => [] },
+      workspaceRegistry: { list: () => [], resolveByPath: async () => undefined },
+      effect(cb: () => () => void) {
+        injectedEffects.push(cb())
+      },
+      on() {
+        return () => {}
+      },
+    }
     return {
       server,
       effects,
+      injectedEffects,
+      tools: {
+        definitions,
+        register(definition) {
+          definitions.push(definition)
+          return () => {
+            const index = definitions.indexOf(definition)
+            if (index >= 0) definitions.splice(index, 1)
+          }
+        },
+        restrict() {
+          throw new Error('tools.restrict() requires a scoped context (agent.ctx)')
+        },
+        guard() {
+          return () => {}
+        },
+        schemas() {
+          return definitions.map((definition) => ({ ...definition }))
+        },
+      },
       dataDir,
       injectable,
-      inject(_deps, cb) {
+      inject(deps, cb) {
         if (!injectable) throw new Error('service "webServer" is not available')
+        // Split BY DEPENDENCY KEY: the scope subsystem's two keys get the
+        // services plus the injected ctx's own effect/on; the web keys keep the
+        // pre-existing response.
+        if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+          cb(injected)
+          return
+        }
         cb({ webServer: server, webRuntime: { trustedHosts: [] } })
       },
       effect(cb) {

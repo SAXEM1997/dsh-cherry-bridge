@@ -7,8 +7,11 @@ import type { DeviceState } from './connection.js'
 import { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
-import { registerCherryTools } from './tools.js'
+import { CHERRY_TOOL_NAMES, registerCherryTools } from './tools.js'
 import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
+import { ToolScopeState } from './toolScope.js'
+import { createToolScopeHost } from './toolScopeHost.js'
+import type { RefreshSummary } from './toolScopeHost.js'
 import { registerHttpApi } from './httpApi.js'
 import type {
   CherryHttpContext,
@@ -161,6 +164,20 @@ export function resolveDataDir(config: CherryBridgeConfig = {}, env = process.en
 
 interface AssemblyState {
   store: DeviceStore
+  /**
+   * The scope document's in-memory authority — the ONE owner of the document,
+   * the degradation set, the judgement generation and the installed-layer
+   * records (spec §6.1). `apply` replaces this placeholder with the instance
+   * bound to the current data directory BEFORE any face can read it.
+   */
+  scope: ToolScopeState
+  /**
+   * The scope subsystem's recompute entry, wired by `apply` from the host it
+   * just mounted. Read through the state (like `store`/`identity`) rather than
+   * captured by `assemblyDeps()`, so a re-apply moves the HTTP face onto the
+   * NEW host's entry point instead of the previous one's.
+   */
+  refreshScope: () => RefreshSummary | undefined
   /** Resolved once the identity load settles; pairing reads it lazily. */
   identity: Uint8Array | undefined
   /**
@@ -231,6 +248,10 @@ export function noteError(entry: DiagnosticsError): void {
 
 const state: AssemblyState = {
   store: new DeviceStore(join(tmpdirFallback(), 'devices.json')),
+  // Placeholders, exactly like `store`: `apply` replaces both before any face
+  // can read them, and `refreshScope` has no round to run until it does.
+  scope: new ToolScopeState({ file: join(tmpdirFallback(), 'scope.json') }),
+  refreshScope: () => undefined,
   identity: undefined,
   identityError: undefined,
   rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
@@ -539,6 +560,11 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
 function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
   return {
     store: state.store,
+    // The scope document's authority and the recompute entry, read through the
+    // assembly state exactly like `store`/`identity`: a re-apply rebinds both on
+    // the state, and this one dep object follows it without a second writer.
+    scope: state.scope,
+    refreshScope: () => state.refreshScope(),
     /**
      * The pairing seam, shared by `cherry_pair` and `POST /pair`.
      *
@@ -691,11 +717,22 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // `clear()` used to race it and leave parked `cherry_wait` waiters hanging.
   void evictAllConnections()
 
+  // The scope document's authority for THIS apply, plus the recompute entry the
+  // HTTP face will call. Both are written onto the state BEFORE `assemblyDeps()`
+  // reads them: `refreshScope` is a lazy closure, so it only has to exist by the
+  // time a request arrives (the host is created further down).
+  const scope = new ToolScopeState({ file: join(dataDir, 'scope.json') })
+  scope.load()
+  state.scope = scope
+  state.refreshScope = () => host.refresh()
+
   const deps = assemblyDeps()
   // `registerHttpApi` owns the headless degradation (warn + skip) and the route
-  // disposer; `registerCherryTools` owns the same for the tool registry.
+  // disposer. The TOOL registrations deliberately have no seat here: they are
+  // gated on the scope subsystem's capability tri-state and belong to the host
+  // mounted below, which registers them inside its injection callback and
+  // releases them with the same disposer that releases the restrictions.
   state.disposers.push(registerHttpApi(ctx, deps))
-  state.disposers.push(registerCherryTools(ctx, deps))
 
   // `ctx.effect` ties the teardown to plugin disable/unload. The disposer
   // RETURNS the teardown promise: a host that awaits it (or a test) can order
@@ -713,6 +750,21 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
     state.pairingProgressListeners.clear()
     return evictAllConnections()
   })
+
+  // THE assembly point (spec §6.2). The host must be instantiated AND mounted:
+  // a declared-but-unmounted host registers nothing while every host-level test
+  // still passes, which is the silent failure this ordering exists to prevent.
+  // `registerTools` is a closure, so `registerCherryTools` only runs when the
+  // injection arrives and the capability tri-state is `ready`.
+  const host = createToolScopeHost({
+    scope,
+    names: CHERRY_TOOL_NAMES,
+    registerTools: () => registerCherryTools(ctx, deps),
+  })
+  // Mounted AFTER the root effect above and released ONLY through this disposer
+  // (the root effect drains `state.disposers`): there is deliberately no second
+  // root `ctx.effect`, and `mount()`'s disposer is the subsystem's only path out.
+  state.disposers.push(host.mount(ctx))
 
   void loadOrCreateIdentity(dataDir).then(
     (identity) => {

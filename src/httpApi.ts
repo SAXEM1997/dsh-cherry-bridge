@@ -7,6 +7,8 @@ import { PairingError } from './pairing.js'
 import type { PairWithPayloadOptions } from './pairing.js'
 import { CONTRACT_DIFFERENCES, buildDiagnostics } from './diagnostics.js'
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
+import type { ToolScopeState } from './toolScope.js'
+import type { RefreshSummary } from './toolScopeHost.js'
 
 /**
  * The plugin's same-origin HTTP face (spec §3.7): device management REST plus
@@ -147,6 +149,22 @@ export interface ConnectionLike {
 /** Everything the HTTP face needs from the assembly. */
 export interface CherryHttpDeps {
   store: DeviceStore
+  /**
+   * The scope document's in-memory authority — the ONE owner of the document,
+   * the `degraded` set, the judgement generation and the installed-layer
+   * records (spec §6.1). REQUIRED, not optional: the `/scope` routes and the
+   * diagnostics report dereference it field by field, so a deployment that
+   * forgot to wire it must fail at the type level rather than answer 500 at
+   * request time.
+   */
+  scope: ToolScopeState
+  /**
+   * The scope subsystem's recompute entry (spec §6.2): "save ⇒ immediate
+   * effect" is an await-free `save → refreshScope()` call, and the returned
+   * summary is the round's own echo. Absent capability (pending/unsupported) or
+   * a torn-down mount has no round to run and answers `undefined`.
+   */
+  refreshScope: () => RefreshSummary | undefined
   /**
    * `pairWithPayload`, as the assembly exposes it. The HTTP face calls it for
    * `POST /pair`; the `cherry_pair` TOOL reaches the same implementation
