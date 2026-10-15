@@ -67,6 +67,16 @@ const READY_REASON = '宿主能力齐备（tools.register / tools.restrict / too
 const INJECT_KEYS: readonly string[] = ['agents', 'workspaceRegistry']
 
 /**
+ * D14's bounded recheck schedule: two attempts, then the state is left as it is.
+ *
+ * A `cwd` whose resolution did not CONCLUDE may well resolve a moment later —
+ * the registry was not ready, the directory was momentarily unreachable, or the
+ * `sessionIds` projection had not caught up. Anything past two attempts is an
+ * idle spin, which D14 forbids outright.
+ */
+const DEFAULT_RECHECK_DELAYS_MS: readonly number[] = [250, 2000]
+
+/**
  * The plugin root ctx, as this subsystem consumes it.
  *
  * Every member is optional — INCLUDING `tools` as a whole and each of its four
@@ -207,7 +217,7 @@ export interface ScopeHostDeps {
    * that, and the assembly wires it.
    */
   registerTools: () => () => void
-  /** Consumed by Task 6's bounded recheck; declared here as part of the contract. */
+  /** Consumed by the bounded recheck: one timer per entry, per `unresolved` agent. */
   recheckDelaysMs?: readonly number[]
   /** The existing warn carrier; absent ⇒ `console.warn`. */
   log?: (message: string, error?: unknown) => void
@@ -248,6 +258,14 @@ interface EffectState {
   /** A trigger arrived inside the current round: one catch-up pass is owed. */
   dirty: boolean
   layers: Map<string, () => void>
+  /**
+   * D14's bounded recheck, per agent: the next {@link recheckDelaysMs} index owed
+   * to that agent, and its pending timer. At most ONE timer is live per agent and
+   * at most one entry of the schedule is consumed per firing — the pairing is
+   * what makes "exactly two timers, then silence" true rather than hoped for.
+   */
+  recheckSteps: Map<string, number>
+  recheckTimers: Map<string, ReturnType<typeof setTimeout>>
   agents: { list(): unknown } | undefined
   registry: WorkspaceRegistryLike | undefined
   releaseRegistrations: (() => void) | undefined
@@ -263,6 +281,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   const { scope } = deps
   const names: readonly string[] = deps.names
   const log = deps.log ?? ((message: string, error?: unknown) => console.warn(message, error))
+  const recheckDelaysMs: readonly number[] = deps.recheckDelaysMs ?? DEFAULT_RECHECK_DELAYS_MS
 
   let root: ScopeHostContext | undefined
   let staticCapable = false
@@ -561,6 +580,12 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       applyAll(state)
     } catch (error) {
       log('[cherry-remote] 作用域重算失败（只记录，不抛；判定保持上一代）', error)
+    } finally {
+      // D14's bounded recheck is armed only AFTER the generation is in place. A
+      // FAILED round arms it too: "the resolution could not conclude" is exactly
+      // the state a later attempt may find resolved, and the schedule is finite,
+      // so that is a retry rather than an idle spin.
+      scheduleRechecks(state)
     }
   }
 
@@ -605,6 +630,65 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     } finally {
       // Even a round torn down mid-flight must not leave the gate stuck.
       state.running = false
+    }
+  }
+
+  /**
+   * D14's BOUNDED recheck — the other half of the synchronous judgement, and the
+   * only trigger of a round that is not an event.
+   *
+   * The synchronous window ({@link onCreated}, a config save) reads the CACHE and
+   * nothing else, so a judgement that is merely LATE — the registry was not
+   * ready, a `realpath` call failed, `sessionIds` had not caught up — leaves the
+   * agent fail-closed with no way to notice on its own. Every settled round
+   * therefore arms at most ONE timer per agent whose judgement is `unresolved`,
+   * at `recheckDelaysMs[attempt]`:
+   *
+   *  - `no-cwd` and `no-match` are terminally invisible (D14): the `cwd` is
+   *    detached, deep-frozen creation metadata and a conclusive "no workspace"
+   *    cannot become a hit by waiting, so arming a timer for either is exactly
+   *    the idle spin this rule exists to forbid;
+   *  - the schedule is FINITE — `recheckDelaysMs.length` attempts per agent, and
+   *    an attempt is spent by its FIRING — so an unresolvable state costs a
+   *    bounded number of rounds and then goes quiet;
+   *  - the timer is only a TRIGGER: it calls {@link requestRound} like every
+   *    other one, so a recheck landing inside an in-flight round is coalesced
+   *    into that round's catch-up pass instead of overlapping it. A direct
+   *    `applyAll` here would bypass the gate and could interleave with a round
+   *    already in flight.
+   *
+   * `tornDown` short-circuits the arming AND the firing, so no timer can outlive
+   * the generation that armed it (teardown clears the pending ones as well).
+   */
+  function scheduleRechecks(state: EffectState): void {
+    if (state.tornDown || mountTornDown || !staticCapable) return
+    const agents = liveAgents(state)
+    const live = new Set(agents.map((agent) => agent.id))
+    // A disposed agent owes nothing: drop its pending timer and its attempt count
+    // rather than let them fire against a generation that no longer lists it.
+    for (const [agentId, timer] of [...state.recheckTimers]) {
+      if (live.has(agentId)) continue
+      clearTimeout(timer)
+      state.recheckTimers.delete(agentId)
+    }
+    for (const agentId of [...state.recheckSteps.keys()]) {
+      if (!live.has(agentId)) state.recheckSteps.delete(agentId)
+    }
+
+    for (const agent of agents) {
+      // The ONE state a recheck starts from (D14's 解析状态判据).
+      if (scope.judgement(agent.id)?.status !== 'unresolved') continue
+      // One timer at a time per agent: a pass that re-runs while it is pending
+      // (a `tools/change` catch-up, say) must not arm a second one.
+      if (state.recheckTimers.has(agent.id)) continue
+      const attempt = state.recheckSteps.get(agent.id) ?? 0
+      if (attempt >= recheckDelaysMs.length) continue
+      const timer = setTimeout(() => {
+        state.recheckTimers.delete(agent.id)
+        state.recheckSteps.set(agent.id, attempt + 1)
+        requestRound(state)
+      }, recheckDelaysMs[attempt] ?? 0)
+      state.recheckTimers.set(agent.id, timer)
     }
   }
 
@@ -655,7 +739,14 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
         log('[cherry-remote] 作用域子系统退订失败', error)
       }
     }
-    // ② Then the registrations.
+    // ② Then the pending recheck timers. They are the last thing outside a
+    //    dispatch that could still reach into this generation, so they go before
+    //    anything is released: `tornDown` is already set, so no round can arm a
+    //    new one, and no timer may fire into a half-released state.
+    for (const timer of state.recheckTimers.values()) clearTimeout(timer)
+    state.recheckTimers.clear()
+    state.recheckSteps.clear()
+    // ③ Then the registrations.
     const releaseRegistrations = state.releaseRegistrations
     state.releaseRegistrations = undefined
     try {
@@ -663,7 +754,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     } catch (error) {
       log('[cherry-remote] 释放 cherry_* 工具注册失败', error)
     }
-    // ③ Then every restriction (record cleared before its layer's disposer).
+    // ④ Then every restriction (record cleared before its layer's disposer).
     for (const [agentId, dispose] of [...state.layers]) {
       scope.clearLayer(agentId)
       try {
@@ -673,7 +764,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       }
     }
     state.layers.clear()
-    // ④ The guard LAST: it notifies nobody, so it triggers no recompute, and it
+    // ⑤ The guard LAST: it notifies nobody, so it triggers no recompute, and it
     //    is the last execution-side backstop while the release is in flight.
     const releaseGuard = state.releaseGuard
     state.releaseGuard = undefined
@@ -711,6 +802,8 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       running: false,
       dirty: false,
       layers: new Map(),
+      recheckSteps: new Map(),
+      recheckTimers: new Map(),
       agents: agentCtx.agents,
       registry: agentCtx.workspaceRegistry,
       releaseRegistrations: undefined,
@@ -853,12 +946,25 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     requestRound(state)
   }
 
-  /** `agent/disposed`: releases exactly that agent's layer and its record. */
+  /**
+   * `agent/disposed`: releases exactly that agent's layer and its record.
+   *
+   * The agent's pending recheck goes with it: a session that no longer exists
+   * owes no later round, so an armed timer here would be one wasted recompute at
+   * best — the smaller version of the leak teardown closes for the whole
+   * generation.
+   */
   function onDisposed(state: EffectState, payload: { agent?: unknown } | undefined): void {
     if (state.tornDown || mountTornDown) return
     const agent = projectAgent(payload?.agent)
     if (agent === undefined) return
     try {
+      const timer = state.recheckTimers.get(agent.id)
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        state.recheckTimers.delete(agent.id)
+      }
+      state.recheckSteps.delete(agent.id)
       const dispose = state.layers.get(agent.id)
       scope.clearLayer(agent.id)
       state.layers.delete(agent.id)

@@ -65,6 +65,12 @@ interface RigOptions {
   /** Override the aggregate registration entry (⑦). */
   registerTools?: (host: FakeToolHost) => () => void
   /**
+   * D14's bounded recheck schedule (Task 6's `ScopeHostDeps.recheckDelaysMs`).
+   * Small values, so a fixture can drive the chain under `vi.useFakeTimers()`;
+   * omitted ⇒ the production default `[250, 2000]`.
+   */
+  recheckDelaysMs?: readonly number[]
+  /**
    * Runs against the fake host BEFORE `mount()` — the only window in which a
    * Task 5 fixture can add live agents, register extra tools or wrap the root
    * face / the injection callback (a throwing `guard` or `on`, R16).
@@ -87,6 +93,9 @@ function rig(options: RigOptions = {}) {
   const tools = createToolScopeHost({
     scope,
     names: CHERRY_TOOL_NAMES,
+    // Task 6's bounded recheck: injected as a SCHEDULE, never as a count — the
+    // default is the production `[250, 2000]`.
+    ...(options.recheckDelaysMs === undefined ? {} : { recheckDelaysMs: options.recheckDelaysMs }),
     // The production shape: ONE aggregate disposer, registering through the
     // plugin root ctx (the same call the assembly makes), through the same
     // atomic entry `apply()` uses. The factory runs when the effect actually
@@ -1605,5 +1614,718 @@ describe('T5b the tools/change subscription and the coalescing gate (§4)', () =
     expect(second.scope.degraded()).toEqual([])
     expect(second.host.effectFailures).toEqual([])
     expect(second.pluginSubscriptions()).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 6 — the BOUNDED RECHECK, the SYNCHRONOUS judgement and the remaining
+// assertions (④–⑨).
+//
+// D14's recheck exists for exactly ONE state: `unresolved` (a session whose
+// `cwd` resolution could not CONCLUDE — the registry was not ready, or the
+// resolution call failed). It is bounded (`recheckDelaysMs`, `[250, 2000]` by
+// default), it never runs inside the synchronous window (`agent/created` must
+// return before the host awaits it — `@mode serial` — and a throw there fails
+// session creation), and its recompute goes through the SAME coalescing gate as
+// every other trigger: never `applyAll` directly, so it can never overlap a
+// round that is already in flight.
+// ---------------------------------------------------------------------------
+
+/** One workspace entity, in the shape the registry hands back. */
+function entity(id: string, path: string, sessionIds: readonly string[] = []) {
+  return { id, title: id.toUpperCase(), path, sessionIds: [...sessionIds] }
+}
+
+/**
+ * The registry shape `rebuild()` consumes, for a fixture that warms the
+ * judgement cache ITSELF — the generation a completed round produces. ⑨ needs
+ * exactly that: its layer decision must come from a same-round hit, never from a
+ * recheck's later compensation.
+ */
+function entityRegistry(workspaces: ReadonlyArray<ReturnType<typeof entity>>) {
+  return {
+    list: () => workspaces,
+    resolveByPath: async (path: string) => workspaces.find((workspace) => workspace.path === path),
+  }
+}
+
+/**
+ * Lets a round's asynchronous judgement + re-application finish.
+ *
+ * `setImmediate` is deliberately NOT faked by the tests below (only `setTimeout`
+ * is), so this is a REAL macrotask — and therefore runs after every pending
+ * microtask, which is all a round is made of.
+ */
+async function drain(): Promise<void> {
+  for (let i = 0; i < 25; i += 1) await Promise.resolve()
+  await new Promise<void>((resolve) => {
+    setImmediate(() => resolve())
+  })
+}
+
+/**
+ * Wraps the injected ctx's `on` so a fixture can observe the two things the fake
+ * host itself does not expose:
+ *
+ *  - the RETURN VALUE of the plugin's own listener — ⑥/⑨'s "`agent/created`
+ *    returns synchronously" (a listener that returned a promise would be an
+ *    `await` in the host's `@mode serial` dispatch);
+ *  - the listener itself, deliverable after the host has unsubscribed it —
+ *    ⑧(b)'s "an event already in flight lands on a dead subsystem".
+ */
+function observeListeners(fake: FakeToolHost, events: readonly string[]) {
+  const returns = new Map<string, unknown>()
+  const handlers = new Map<string, Array<(payload: unknown) => unknown>>()
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      const injected = ctx as {
+        on?: (event: string, handler: (payload: unknown) => unknown) => () => void
+      }
+      const realOn = injected.on
+      if (realOn === undefined) return cb(ctx)
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        on: (event: string, handler: (payload: unknown) => unknown) => {
+          const wrapped = (payload: unknown): unknown => {
+            const outcome = handler(payload)
+            if (events.includes(event)) returns.set(event, outcome)
+            return outcome
+          }
+          const list = handlers.get(event) ?? []
+          list.push(wrapped)
+          handlers.set(event, list)
+          return realOn.call(injected, event, wrapped)
+        },
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+
+  return {
+    /** The last value the plugin's listener RETURNED for one event. */
+    lastReturn: (event: string): unknown => returns.get(event),
+    /** Delivers straight to the captured listener, unsubscribe or not. */
+    deliver: (event: string, payload: unknown): void => {
+      for (const handler of handlers.get(event) ?? []) handler(payload)
+    },
+  }
+}
+
+/**
+ * Suspends `resolveByPath` behind a gate the fixture opens when it chooses, so a
+ * round can be held INSIDE its asynchronous interval (⑥). `peak` is the
+ * concurrency observable §4's "不并发" is stated in: a lone round peaks at 1, an
+ * overlapping second round at 2.
+ */
+function holdResolveByPath(fake: FakeToolHost) {
+  let holding = false
+  let gate: Promise<void> = Promise.resolve()
+  let open: () => void = () => {}
+  let active = 0
+  let peak = 0
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      const injected = ctx as {
+        workspaceRegistry?: { list(): unknown; resolveByPath?(path: string): Promise<unknown> }
+      }
+      const registry = injected.workspaceRegistry
+      const realResolve = registry?.resolveByPath
+      if (registry === undefined || realResolve === undefined) return cb(ctx)
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        workspaceRegistry: {
+          ...registry,
+          resolveByPath: async (path: string) => {
+            active += 1
+            if (active > peak) peak = active
+            try {
+              if (holding) await gate
+              return await realResolve.call(registry, path)
+            } finally {
+              active -= 1
+            }
+          },
+        },
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+
+  return {
+    peak: () => peak,
+    /** Every later resolution waits — the round is now suspended. */
+    hold(): void {
+      holding = true
+      gate = new Promise<void>((resolve) => {
+        open = resolve
+      })
+    },
+    release(): void {
+      holding = false
+      open()
+    },
+  }
+}
+
+/**
+ * Rejects `resolveByPath` for exactly ONE path — the fake host's own
+ * `resolveByPathThrows` flag is all-or-nothing, and ④(b) needs the one agent
+ * whose resolution FAILS next to the three states that must never be rechecked.
+ */
+function refusePath(fake: FakeToolHost, refused: string): void {
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      const injected = ctx as {
+        workspaceRegistry?: { list(): unknown; resolveByPath?(path: string): Promise<unknown> }
+      }
+      const registry = injected.workspaceRegistry
+      const realResolve = registry?.resolveByPath
+      if (registry === undefined || realResolve === undefined) return cb(ctx)
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        workspaceRegistry: {
+          ...registry,
+          resolveByPath: async (path: string) => {
+            if (path === refused) throw new Error(`resolveByPath failed for ${path}`)
+            return await realResolve.call(registry, path)
+          },
+        },
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+}
+
+describe('T6 the bounded recheck, the synchronous judgement and the remaining assertions (D14/B13)', () => {
+  // The recheck is a TIMER; every test here drives it on the fake clock. Only
+  // `setTimeout`/`clearTimeout` are faked, so `drain()`'s `setImmediate` and the
+  // promise machinery stay real.
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('④(a) `unresolved` arms exactly the two bounded rechecks, then stops (no idle spin)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { host, scope } = rig({ recheckDelaysMs: [30, 60] })
+    // An agent WITH a `cwd` whose resolution cannot conclude: the registry list
+    // is unreadable (B16) ⇒ the ONE state D14 starts a recheck from.
+    host.setWorkspaces([])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+
+    // The fail-closed first install is already in place, synchronously (D7) …
+    expect(host.layerCount('agent-a')).toBe(1)
+    await drain()
+    expect(scope.judgement('agent-a')?.status).toBe('unresolved')
+    const rounds = host.listCalls()
+
+    // …and the FIRST bounded recheck is armed: one timer per `recheckDelaysMs`
+    // entry, never a repeating interval.
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(30)
+    expect(scope.judgement('agent-a')?.status).toBe('unresolved')
+    // The second (and LAST) entry is now the pending one: 2 timers in total.
+    expect(vi.getTimerCount()).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(60)
+    // Both rechecks ran; the state is STILL unresolved and the bound is reached,
+    // so nothing more is scheduled — an idle spin would keep arming timers.
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls()).toBe(rounds + 2)
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls()).toBe(rounds + 2)
+    // The recheck only re-judges: the fail-closed layer is untouched throughout.
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('④(b) `no-cwd` / `no-match` / `resolved` arm NO timer — `unresolved` alone does (D14: no idle spin)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { host, scope, tools } = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => refusePath(fake, '/w/unready'),
+    })
+    host.setWorkspaces([entity('w-oa', '/w/oa', ['agent-member'])])
+    tools.refresh()
+    await drain()
+    saveScope(scope, 'selected', ['w-oa'])
+
+    // The four resolution states, ALL in one generation. `agent-member`'s `cwd`
+    // is in no workspace: rule ONE (the `sessionIds` projection) is what resolves
+    // it — the same judge, under the other rule.
+    host.addAgent({ id: 'agent-member', cwd: '/w/unrelated' })
+    host.addAgent({ id: 'agent-nomatch', cwd: '/w/nowhere' })
+    host.addAgent({ id: 'agent-nocwd' })
+    // The POSITIVE control: exactly one of the four may arm a recheck, or the
+    // "zero timers" assertions below would hold for an implementation that never
+    // schedules anything at all.
+    host.addAgent({ id: 'agent-unresolved', cwd: '/w/unready' })
+    await drain()
+
+    expect(scope.judgement('agent-member')?.status).toBe('resolved')
+    expect(scope.judgement('agent-nomatch')?.status).toBe('no-match')
+    expect(scope.judgement('agent-nocwd')?.status).toBe('no-cwd')
+    expect(scope.judgement('agent-unresolved')?.status).toBe('unresolved')
+    // Only `unresolved` is recheckable: `no-cwd` (the `cwd` is deep-frozen
+    // creation metadata — missing is missing forever) and `no-match` (resolved
+    // and conclusively outside every workspace) cannot be reversed by waiting.
+    expect(vi.getTimerCount()).toBe(1)
+
+    const rounds = host.listCalls()
+    await vi.advanceTimersByTimeAsync(30)
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(60)
+    // The one unresolved agent's chain is bounded and now exhausted: exactly two
+    // recheck rounds, and the other three contributed no round at all.
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls() - rounds).toBe(2)
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls() - rounds).toBe(2)
+    // The fail-closed side stands where D7 puts it: the member's workspace is
+    // enabled so the family returns; the other three stay hidden.
+    expect(host.layerCount('agent-member')).toBe(0)
+    expect(host.agentView('agent-member')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(host.layerCount('agent-nomatch')).toBe(1)
+    expect(host.layerCount('agent-nocwd')).toBe(1)
+    expect(host.layerCount('agent-unresolved')).toBe(1)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('④(c) a THROWING recheck recompute is logged, never thrown, and leaks no rejection', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { host, scope } = rig({ recheckDelaysMs: [30, 60] })
+    host.setWorkspaces([])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await drain()
+    expect(vi.getTimerCount()).toBe(1)
+
+    // R11: Task 3 deliberately made `rebuild()` non-throwing for REGISTRY faults
+    // (a throwing `list()` becomes `listAvailable:false`, a rejected per-item
+    // resolution is skipped), so a faulting registry can no longer produce the
+    // rejection this arm is about. The failure is therefore forced on the HOST's
+    // call path — and the assertion below is non-vacuous only because the spy and
+    // the log carrier both PROVE that rejection was observed.
+    const injected = new Error('复检重算失败（夹具注入）')
+    const rebuild = vi.spyOn(scope, 'rebuild').mockRejectedValueOnce(injected)
+    const rejections: unknown[] = []
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason)
+    }
+    process.on('unhandledRejection', onRejection)
+    try {
+      await vi.advanceTimersByTimeAsync(30)
+      // A real macrotask: Node settles "was this rejection handled" before it.
+      await drain()
+    } finally {
+      process.off('unhandledRejection', onRejection)
+    }
+
+    // The recheck really did run the recompute and really did reject…
+    expect(rebuild).toHaveBeenCalledTimes(1)
+    // …and D14's "失败只记录、不抛" is what happened: the default carrier is one
+    // `console.warn`, with the readable cause.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('作用域重算失败'), injected)
+    expect(rejections).toEqual([])
+    expect(host.effectFailures).toEqual([])
+    // The gate is not left stuck either: the bounded chain continues (the failed
+    // attempt consumed one step, not the whole schedule) and still ends.
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(60)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.layerCount('agent-a')).toBe(1)
+  })
+
+  it('⑤ the recheck compensates a lagging `sessionIds` projection — and never flips a `no-cwd` session', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { host, scope, tools } = rig({ recheckDelaysMs: [30, 60] })
+    host.setWorkspaces([entity('w-oa', '/w/oa')])
+    tools.refresh()
+    await drain()
+    saveScope(scope, 'selected', ['w-oa'])
+
+    // The registry goes unready again BEFORE the session arrives, so the session
+    // is judged `unresolved` — "temporarily invisible", the only thing a recheck
+    // is allowed to correct.
+    host.setWorkspaces([])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    // …and a session with NO `cwd` is D7's permanent invisibility: the recheck
+    // must never be armed for it.
+    host.addAgent({ id: 'agent-b' })
+    await drain()
+
+    expect(scope.judgement('agent-a')?.status).toBe('unresolved')
+    expect(scope.judgement('agent-b')?.status).toBe('no-cwd')
+    // Fail-closed in the first round for BOTH (selected + no workspace)…
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(host.layerCount('agent-b')).toBe(1)
+    // …and exactly ONE recheck is armed: the `no-cwd` session starts none.
+    expect(vi.getTimerCount()).toBe(1)
+
+    const installs = host.restrictCalls.length
+    // The lagging projection lands while the first recheck is still pending —
+    // nothing else triggers a round (the registry has no membership events).
+    host.setWorkspaces([entity('w-oa', '/w/oa', ['agent-a'])])
+
+    await vi.advanceTimersByTimeAsync(30)
+
+    // The recheck's round settles the layer for the temporarily invisible agent,
+    // on the strength of the projection that has now caught up …
+    const judgement = scope.judgement('agent-a')
+    expect(judgement?.status).toBe('resolved')
+    expect(judgement?.workspaceId).toBe('w-oa')
+    expect(judgement?.visible).toBe(true)
+    // …by RELEASING the fail-closed layer: an empty target never submits a deny
+    // (B18①/③), so the family is back in that agent's view.
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(host.restrictCalls.length).toBe(installs)
+    // A `resolved` generation owes no further recheck at all.
+    expect(vi.getTimerCount()).toBe(0)
+
+    // The `cwd`-less session is NOT flipped by any recheck: advancing every
+    // remaining timer leaves it hidden, re-judged exactly as it was.
+    const rounds = host.listCalls()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls()).toBe(rounds)
+    expect(scope.judgement('agent-b')?.status).toBe('no-cwd')
+    expect(scope.judgement('agent-b')?.visible).toBe(false)
+    expect(host.layerCount('agent-b')).toBe(1)
+    expect(host.agentView('agent-b').filter((name) => name.startsWith('cherry_'))).toEqual([])
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('⑥ a SUSPENDED recompute never blocks session creation: D7 in the same round, corrected by the catch-up', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    // ── (a) `selected`: the fail-closed side of D7 ────────────────────────────
+    let observed: ReturnType<typeof observeListeners> | undefined
+    let held: ReturnType<typeof holdResolveByPath> | undefined
+    const selected = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        observed = observeListeners(fake, ['agent/created'])
+        held = holdResolveByPath(fake)
+      },
+    })
+    selected.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    selected.tools.refresh()
+    await drain()
+    saveScope(selected.scope, 'selected', ['w-oa'])
+
+    const beforeCreation = selected.host.listCalls()
+    held!.hold()
+    // The judgement cache is EMPTY and the recompute that would fill it never
+    // settles: the listener must still return, synchronously, and install the
+    // fail-closed layer in the SAME round.
+    selected.host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    expect(selected.host.layerCount('agent-a')).toBe(1)
+    expect(selected.scope.layer('agent-a')?.reason).toContain('缓存未命中')
+    expect(selected.scope.judgement('agent-a')).toBeUndefined()
+    // The listener's own return value: `undefined`, not a promise (the host
+    // awaits it under `@mode serial`). The round behind it has already read the
+    // registry — synchronously, inside `addAgent` — and is parked on the held
+    // `resolveByPath`, so that read is the only one so far.
+    expect(observed!.lastReturn('agent/created')).toBeUndefined()
+    expect(selected.host.listCalls()).toBe(beforeCreation + 1)
+
+    await drain()
+    // Still suspended — and the synchronous window did NOT wait for it.
+    expect(selected.scope.judgement('agent-a')).toBeUndefined()
+    expect(selected.host.layerCount('agent-a')).toBe(1)
+    expect(selected.host.listCalls()).toBe(beforeCreation + 1)
+
+    // A `tools/change` arriving inside that window only sets the dirty flag: it
+    // must not open a second round (the gate is held).
+    selected.host.emitToolsChange()
+    expect(selected.host.listCalls()).toBe(beforeCreation + 1)
+    expect(held!.peak()).toBe(1)
+
+    held!.release()
+    await drain()
+
+    // Convergence is NOT lost: the caught-up projection judges the agent visible
+    // and the layer is released — by the round + exactly ONE catch-up pass (the
+    // `tools/change` above was absorbed, not dropped and not duplicated).
+    const judgement = selected.scope.judgement('agent-a')
+    expect(judgement?.status).toBe('resolved')
+    expect(judgement?.visible).toBe(true)
+    expect(selected.host.layerCount('agent-a')).toBe(0)
+    expect(selected.scope.layer('agent-a')).toBeUndefined()
+    expect(selected.host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(selected.host.restrictCalls.filter((call) => call.agentId === 'agent-a')).toHaveLength(1)
+    expect(selected.host.listCalls() - beforeCreation).toBe(2)
+    expect(held!.peak()).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(selected.host.effectFailures).toEqual([])
+
+    // ── (b) `global`: the same suspension, but the fallback is VISIBLE ───────
+    let observedGlobal: ReturnType<typeof observeListeners> | undefined
+    let heldGlobal: ReturnType<typeof holdResolveByPath> | undefined
+    const global = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        observedGlobal = observeListeners(fake, ['agent/created'])
+        heldGlobal = holdResolveByPath(fake)
+      },
+    })
+    global.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    global.tools.refresh()
+    await drain()
+    saveScope(global.scope, 'global', [])
+
+    heldGlobal!.hold()
+    // A cache miss under `global` is the EMPTY target (B2: `global` is visible
+    // for any id, `undefined` included) ⇒ release-only, i.e. install nothing.
+    global.host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    expect(observedGlobal!.lastReturn('agent/created')).toBeUndefined()
+    expect(global.host.layerCount('agent-a')).toBe(0)
+    expect(global.host.restrictCalls.filter((call) => call.agentId === 'agent-a')).toEqual([])
+    expect(global.scope.judgement('agent-a')).toBeUndefined()
+
+    heldGlobal!.release()
+    await drain()
+    expect(global.scope.judgement('agent-a')?.visible).toBe(true)
+    // Not one `deny` was ever submitted — not even an empty one (B18③).
+    expect(global.host.restrictCalls.filter((call) => call.agentId === 'agent-a')).toEqual([])
+    expect(global.host.layerCount('agent-a')).toBe(0)
+    expect(global.scope.layer('agent-a')).toBeUndefined()
+    expect(global.host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(global.host.verdict('agent-a', CHERRY_TOOL_NAMES[0]!)).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(global.host.effectFailures).toEqual([])
+  })
+
+  it('⑦ teardown clears the pending recheck timers (no timer outlives its generation)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    const { host, scope, dispose } = rig({ recheckDelaysMs: [30, 60] })
+    host.setWorkspaces([])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await drain()
+
+    expect(scope.judgement('agent-a')?.status).toBe('unresolved')
+    expect(vi.getTimerCount()).toBe(1)
+
+    // The smaller version of the same leak: the AGENT goes away (not the whole
+    // generation). A session that no longer exists owes no later round, so its
+    // pending recheck goes with it rather than fire one wasted recompute.
+    host.addAgent({ id: 'agent-zombie', cwd: '/w/oa' })
+    await drain()
+    expect(scope.judgement('agent-zombie')?.status).toBe('unresolved')
+    expect(vi.getTimerCount()).toBe(2)
+    host.disposeAgent('agent-zombie')
+    await drain()
+    expect(vi.getTimerCount()).toBe(1)
+    const settled = host.listCalls()
+
+    dispose()
+
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(10_000)
+    // Nothing fires, nothing recomputes and nothing installs against the dead
+    // generation (the whole derived state was invalidated with it).
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls()).toBe(settled)
+    expect(host.layerTotal()).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(scope.judgement('agent-a')).toBeUndefined()
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('⑧(a) a recheck round and a `tools/change` round share ONE coalescing gate', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    let peak: () => number = () => 0
+    let midRound: (() => void) | undefined
+    const { host, scope } = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        peak = instrumentRegistry(fake, () => {
+          // One shot: the catch-up pass must see a quiet registry, or the fixture
+          // itself would keep the round loop alive.
+          const emit = midRound
+          midRound = undefined
+          emit?.()
+        })
+      },
+    })
+    host.setWorkspaces([])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await drain()
+    expect(scope.judgement('agent-a')?.status).toBe('unresolved')
+    expect(vi.getTimerCount()).toBe(1)
+
+    const installs = host.restrictCalls.length
+    const rounds = host.listCalls()
+
+    // The registry becomes readable, and a REAL source change arrives from INSIDE
+    // the recheck round's asynchronous interval — i.e. while the gate is held.
+    host.setWorkspaces([entity('w-oa', '/w/oa')])
+    midRound = () => host.emitToolsChange()
+    await vi.advanceTimersByTimeAsync(30)
+
+    // 不并发: the `tools/change` never opened a second round…
+    expect(peak()).toBe(1)
+    // …it only set the dirty flag: the recheck round + exactly ONE catch-up pass.
+    expect(host.listCalls() - rounds).toBe(2)
+    // 每 agent 每轮至多重装一次: the agent stays hidden (`selected`, nobody
+    // enabled) and the catch-up pass short-circuits on the same deny set — one
+    // install overall, one layer, no churn.
+    expect(host.restrictCalls.length).toBe(installs)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.judgement('agent-a')?.status).toBe('resolved')
+    // The recheck chain ended with the `unresolved` state that started it.
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('⑧(b) teardown is the only abstention point: a late event arms no timer and installs nothing', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    let created: ReturnType<typeof captureAgents> | undefined
+    let observed: ReturnType<typeof observeListeners> | undefined
+    const { host, scope, dispose } = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        created = captureAgents(fake)
+        observed = observeListeners(fake, ['agent/created', 'tools/change'])
+      },
+    })
+    host.setWorkspaces([])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await drain()
+    expect(scope.judgement('agent-a')?.status).toBe('unresolved')
+    // The unresolved agent owes a bounded recheck, and it is PENDING.
+    expect(vi.getTimerCount()).toBe(1)
+
+    // A second agent's raw payload is kept, so the fixture can deliver its
+    // `agent/created` to the plugin's listener AFTER the teardown.
+    host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    await drain()
+    const payload = created!.get('agent-b')!
+    const installs = host.restrictCalls.length
+    const rounds = host.listCalls()
+
+    dispose()
+
+    // (i) the pending recheck died with the generation it belonged to …
+    expect(vi.getTimerCount()).toBe(0)
+    // (ii) …and an event ALREADY dispatched (the host dispatches over a listener
+    //      snapshot) lands on a dead subsystem: no recompute, no layer, and no
+    //      NEW timer armed against the dead generation.
+    observed!.deliver('tools/change', undefined)
+    observed!.deliver('agent/created', { agent: payload })
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls()).toBe(rounds)
+    expect(host.restrictCalls.length).toBe(installs)
+    expect(host.layerTotal()).toBe(0)
+    expect(scope.layer('agent-b')).toBeUndefined()
+    expect(host.registeredNames()).toEqual([])
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(host.listCalls()).toBe(rounds)
+    expect(host.layerTotal()).toBe(0)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('⑨ B13’s headline path: a same-round canonical hit installs nothing and arms no recheck', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    // ── (a) the judgement is warm BEFORE the session exists ──────────────────
+    let observed: ReturnType<typeof observeListeners> | undefined
+    const fresh = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        observed = observeListeners(fake, ['agent/created'])
+      },
+    })
+    fresh.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    fresh.tools.refresh()
+    await drain()
+    saveScope(fresh.scope, 'selected', ['w-oa'])
+
+    // The canonical-path HIT is already in the cache — a generation of its own
+    // (`rebuild`, exactly what a completed round produces), never a recheck's
+    // late compensation.
+    await fresh.scope.rebuild(entityRegistry([entity('w-oa', '/w/oa')]), [
+      { id: 'agent-b', cwd: '/w/oa' },
+    ])
+    expect(fresh.host.liveAgentIds()).toEqual([])
+    expect(fresh.scope.judgement('agent-b')?.status).toBe('resolved')
+    expect(fresh.scope.judgement('agent-b')?.workspaceId).toBe('w-oa')
+    expect(fresh.scope.judgement('agent-b')?.visible).toBe(true)
+    expect(vi.getTimerCount()).toBe(0)
+
+    fresh.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+
+    // SAME ROUND: the empty target submits NO deny at all — the family is visible
+    // from the first round, which is B13's "第一轮就有工具"…
+    expect(fresh.host.restrictCalls.filter((call) => call.agentId === 'agent-b')).toEqual([])
+    expect(fresh.host.layerCount('agent-b')).toBe(0)
+    expect(fresh.scope.layer('agent-b')).toBeUndefined()
+    expect(fresh.host.agentView('agent-b')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(fresh.host.verdict('agent-b', CHERRY_TOOL_NAMES[0]!)).toBeUndefined()
+    // …the listener returned synchronously, and a `resolved` generation arms NO
+    // recheck timer (④'s zero-timer arm, from the other side).
+    expect(observed!.lastReturn('agent/created')).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+
+    await drain()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(fresh.host.restrictCalls.filter((call) => call.agentId === 'agent-b')).toEqual([])
+    expect(fresh.host.layerCount('agent-b')).toBe(0)
+
+    // ── (b) …and the same hit RELEASES an already installed layer ─────────────
+    // Identical fixture, one step further: the agent was hidden first (its
+    // workspace was not enabled — the ordinary fail-closed state), then the
+    // operator enables it and a completed generation judges the canonical path a
+    // HIT. The next `agent/created` for that agent (a re-announce — the listener
+    // is per-event, not per-identity) must then release ONLY.
+    let observedSecond: ReturnType<typeof observeListeners> | undefined
+    const second = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        observedSecond = observeListeners(fake, ['agent/created'])
+      },
+    })
+    second.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    second.tools.refresh()
+    await drain()
+    second.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    await drain()
+    expect(second.scope.judgement('agent-b')?.status).toBe('resolved')
+    expect(second.scope.judgement('agent-b')?.visible).toBe(false)
+    expect(second.host.layerCount('agent-b')).toBe(1)
+    expect(second.scope.layer('agent-b')?.deny).toHaveLength(14)
+    // A `resolved` generation armed no recheck here either.
+    expect(vi.getTimerCount()).toBe(0)
+
+    saveScope(second.scope, 'selected', ['w-oa'])
+    await second.scope.rebuild(entityRegistry([entity('w-oa', '/w/oa')]), [
+      { id: 'agent-b', cwd: '/w/oa' },
+    ])
+    expect(second.scope.judgement('agent-b')?.visible).toBe(true)
+
+    const installs = second.host.restrictCalls.length
+    const releases = second.host.ops.filter((entry) => entry.op === 'release-layer').length
+    second.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+
+    // SAME ROUND, synchronously: release only — not a single deny submitted…
+    expect(observedSecond!.lastReturn('agent/created')).toBeUndefined()
+    expect(second.host.restrictCalls.length).toBe(installs)
+    expect(second.host.ops.filter((entry) => entry.op === 'release-layer').length).toBe(releases + 1)
+    expect(second.host.layerCount('agent-b')).toBe(0)
+    expect(second.scope.layer('agent-b')).toBeUndefined()
+    expect(second.host.agentView('agent-b')).toEqual([...CHERRY_TOOL_NAMES])
+    // …and no recheck timer.
+    expect(vi.getTimerCount()).toBe(0)
+
+    await drain()
+    expect(vi.getTimerCount()).toBe(0)
+    expect(second.host.restrictCalls.length).toBe(installs)
+    expect(second.host.layerCount('agent-b')).toBe(0)
+    expect(second.host.effectFailures).toEqual([])
   })
 })
