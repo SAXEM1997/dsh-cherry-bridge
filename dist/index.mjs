@@ -5926,6 +5926,21 @@ function createToolScopeHost(deps) {
 		return raw.map((entry) => projectAgent(entry)).filter((agent) => agent !== void 0);
 	}
 	/**
+	* The ONE reporting site of an unreadable global view.
+	*
+	* The carrier is §6.1's EXISTING `install` source — an installation that could
+	* not be completed is exactly that degradation, and the five-value enum has no
+	* member for "unreadable view" (no sixth is added) — together with the warn
+	* channel. Reported, never silent.
+	*/
+	function noteUnobserved(cause, error) {
+		scope.noteDegraded({
+			source: "install",
+			reason: `无参 schemas() 不可读：${cause}（本轮既不安装也不释放任何层——既有层保持不动，绝不因为读不到就放开隐藏；下一次重算 / 配置保存会重试）`
+		});
+		log("[cherry-remote] 无参 schemas() 不可读；本轮不做任何装层 / 释放动作（fail-closed）", error);
+	}
+	/**
 	* The no-argument GLOBAL view of the tool registry — D12/B12①'s only
 	* sanctioned observation source for a deny set.
 	*
@@ -5933,21 +5948,32 @@ function createToolScopeHost(deps) {
 	* the agent's own layers, so deriving `deny` from it would re-admit the very
 	* names this plugin hides.
 	*
-	* A `schemas()` that THROWS is not an "empty scene" but it must not become a
-	* guess either: the names could not be observed, and submitting a set built
-	* from the static list is exactly the two-moment hazard D12 names. The round
-	* therefore installs nothing (existing layers are still maintained) and reports
-	* the failure — contained HERE because this runs inside the injected effect
-	* body, which a real host may reach asynchronously (R16).
+	* `undefined` means the view could NOT be read, and it is deliberately NOT the
+	* same value as an empty `Set`:
+	*
+	*  - **observed empty** is B18③'s 观测集合为空 — nothing may be installed, while
+	*    an existing layer is still maintained by the ordinary rules;
+	*  - **failed to observe** must make NO layer-changing host call at all (see
+	*    {@link targetDeny}): routing it through the empty-target branch would
+	*    RELEASE the hiding layers of not-visible agents, i.e. fail open on an
+	*    unreadable input — the opposite of the module's own `agents.list()`
+	*    failure, which leaves layers installed (B7 calls "已注册未隐藏" the worst
+	*    state; B9/B16 resolve unreadable inputs to the stricter side).
+	*
+	* Contained HERE because this runs inside the injected effect body, which a real
+	* host may reach asynchronously (R16).
 	*/
 	function observeGlobalNames() {
 		const tools = root?.tools;
-		if (tools === void 0 || typeof tools.schemas !== "function") return void 0;
+		if (tools === void 0 || typeof tools.schemas !== "function") {
+			noteUnobserved("宿主 tools.schemas 不可用");
+			return;
+		}
 		try {
 			const view = tools.schemas();
 			return new Set((Array.isArray(view) ? view : []).map((definition) => definition?.name).filter((name) => typeof name === "string"));
 		} catch (error) {
-			log("[cherry-remote] 无参 schemas() 读取失败；本轮按“观测集合为空”处理（绝不提交未观测到的 deny），既有层的维护不受影响", error);
+			noteUnobserved(describeError(error), error);
 			return;
 		}
 	}
@@ -5957,21 +5983,26 @@ function createToolScopeHost(deps) {
 	*
 	*   visible under the CURRENT document and judgement ⇒ the EMPTY set
 	*   not visible ⇒ CHERRY_TOOL_NAMES ∩ the no-argument `schemas()`
+	*   not visible, view unreadable ⇒ `undefined` (no target could be computed)
 	*
 	* `judgement()?.workspaceId` folds a CACHE MISS into the same expression: under
 	* `global` `isVisible(doc, undefined)` is true (a miss releases only), while
 	* under `selected` it is false — the D7 fail-closed side. Visibility is derived
-	* from `isVisible`, never from `status === 'resolved'`.
+	* from `isVisible`, never from `status === 'resolved'`, and the `visible` arm
+	* needs no observation at all.
 	*
 	* An EMPTY set means RELEASE ONLY. `{ deny: [] }` is never submitted: the host
 	* accepts it as a no-op layer admitting every name, which this plugin's guard
 	* (layer present ⇒ reject) would misread as "already hidden" — tools visible
 	* but rejected (B18③).
+	*
+	* `undefined` is NOT the empty set: the observation failed, so no target exists
+	* and the caller must leave every installed layer exactly where it is.
 	*/
 	function targetDeny(agentId) {
 		if (isVisible(scope.doc(), scope.judgement(agentId)?.workspaceId)) return [];
 		const observed = observeGlobalNames();
-		return observed === void 0 ? [] : names.filter((name) => observed.has(name));
+		return observed === void 0 ? void 0 : names.filter((name) => observed.has(name));
 	}
 	function reasonFor(agentId) {
 		return scope.judgement(agentId)?.reason ?? "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
@@ -5995,6 +6026,7 @@ function createToolScopeHost(deps) {
 	function applyForAgent(state, agent) {
 		const target = targetDeny(agent.id);
 		const existing = state.layers.get(agent.id);
+		if (target === void 0) return "skipped";
 		if (target.length === 0) {
 			if (existing === void 0) return "skipped";
 			scope.clearLayer(agent.id);

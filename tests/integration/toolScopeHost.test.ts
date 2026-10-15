@@ -1219,4 +1219,89 @@ describe('T5a install/release criteria: the target set, the empty set and the gu
     expect(host.layerTotal()).toBe(0)
     expect(host.liveSubscriptions()).toBe(0)
   })
+
+  it('⑥ an UNREADABLE global view never releases a hiding layer (fail-closed, B9/B16/B18③)', async () => {
+    const { host, scope, tools } = rig()
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+
+    // The not-visible agent is hidden and the mirror rejects.
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')).toBeDefined()
+    const denial = host.verdict('agent-a', 'cherry_devices')
+    expect(typeof denial).toBe('string')
+
+    // The host can no longer read its own global view: "failed to observe" is NOT
+    // "observed empty". An unreadable input must never RELEASE a hiding layer —
+    // that would be the fail-open direction (registered, visible, guard allows),
+    // which B7 calls the worst state.
+    const realSchemas = host.root.tools!.schemas!
+    host.root.tools!.schemas = () => {
+      throw new Error('the registry view is unreadable')
+    }
+    const installs = host.restrictCalls.length
+    const releases = host.ops.filter((entry) => entry.op === 'release-layer').length
+    const warnings = warn.mock.calls.length
+
+    expect(() => tools.refresh()).not.toThrow()
+    await settle()
+
+    // (a) NO layer-changing host call at all: the installed layer survives, the
+    //     agent stays hidden and the guard still rejects it.
+    expect(host.restrictCalls.length).toBe(installs)
+    expect(host.ops.filter((entry) => entry.op === 'release-layer').length).toBe(releases)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')).toBeDefined()
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+    expect(host.verdict('agent-a', 'cherry_devices')).toBe(denial)
+    // (b) …and never a no-op layer either.
+    expect(host.restrictCalls.filter((call) => denyOf(call).length === 0)).toEqual([])
+    // (c) reported through the warn carrier…
+    expect(warn.mock.calls.length).toBeGreaterThan(warnings)
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain('schemas')
+    // (d) …and recorded with §6.1's EXISTING `install` source.
+    const note = scope.degraded().find((entry) => entry.source === 'install')
+    expect(note).toBeDefined()
+    expect(note?.reason).toContain('schemas')
+
+    // The view comes back: the layer was never touched, so the same deny set is
+    // still in place and nothing is reinstalled.
+    host.root.tools!.schemas = realSchemas
+    tools.refresh()
+    expect(host.restrictCalls.length).toBe(installs)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')).toBeDefined()
+    expect(host.verdict('agent-a', 'cherry_devices')).toBe(denial)
+  })
+
+  it('③ a VISIBLE agent never consults the global view at all', async () => {
+    const { host, scope, tools } = rig()
+    host.setWorkspaces([{ id: 'w-oa', title: 'OA', path: '/w/oa', sessionIds: ['agent-a'] }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+    saveScope(scope, 'selected', ['w-oa'])
+    tools.refresh()
+    expect(host.layerCount('agent-a')).toBe(0)
+
+    // `visible ⇒ the empty set` needs no observation: an unreadable view must not
+    // even be consulted, so it is neither reported nor degraded.
+    host.root.tools!.schemas = () => {
+      throw new Error('the registry view is unreadable')
+    }
+    const warnings = warn.mock.calls.length
+    expect(() => tools.refresh()).not.toThrow()
+    expect(warn.mock.calls.length).toBe(warnings)
+    expect(scope.degraded().some((entry) => entry.source === 'install')).toBe(false)
+    expect(host.layerCount('agent-a')).toBe(0)
+    expect(scope.layer('agent-a')).toBeUndefined()
+    expect(host.agentView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(host.verdict('agent-a', 'cherry_devices')).toBeUndefined()
+  })
 })
