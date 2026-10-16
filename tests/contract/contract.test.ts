@@ -36,6 +36,7 @@ import type {
 } from '../../src/httpApi.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry.js'
+import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 /**
  * Task 13 — the CONTRACT suite.
@@ -1735,7 +1736,9 @@ function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unkn
   const injectedEffects: Array<() => void> = []
   return {
     inject(deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
-      if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+      // The scope keys match as an EXACT set (B6): a misspelled key in the
+      // plugin's INJECT_KEYS throws here rather than still delivering this ctx.
+      if (asksForScopeKeys(deps)) {
         cb({
           agents: { list: () => [] },
           workspaceRegistry: { list: () => [], resolveByPath: async () => undefined },

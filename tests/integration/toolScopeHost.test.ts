@@ -24,6 +24,7 @@ import { createToolScopeHost, registerAtomically } from '../../src/toolScopeHost
 import type { ScopeHostContext } from '../../src/toolScopeHost.js'
 import { FakeToolHost } from '../helpers/fakeToolHost.js'
 import type { FakeCapability, FakeRestrictCall } from '../helpers/fakeToolHost.js'
+import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 const dirs: string[] = []
 let warn: ReturnType<typeof vi.fn>
@@ -139,6 +140,28 @@ describe('T4 host integration: tri-state, injection gate and co-lifecycle', () =
     expect(tools.state().capable).toBe(true)
     expect(host.registeredNames()).toHaveLength(14)
     expect(host.layerCount('agent-a')).toBe(1)
+  })
+
+  it('①b asks the host for EXACTLY the two scope keys — one typo starves the fibre (B6)', () => {
+    // The guard over the RUNTIME list, not the plugin's static `export const
+    // inject`: `injectKeys()` records the keys the plugin actually handed to
+    // `ctx.inject`, so a misspelling in `INJECT_KEYS` fails HERE even though the
+    // static declaration is unchanged. The two names are a hard-coded LITERAL on
+    // purpose — re-importing the plugin's own constant would only assert that it
+    // equals itself.
+    const { host } = rig()
+
+    expect(host.injectKeys()).toEqual(['agents', 'workspaceRegistry'])
+    // Exactly one request, so the recorded set cannot be someone else's call.
+    expect(host.injectKeyCalls).toHaveLength(1)
+
+    // And the fixtures' exact-set gate itself discriminates: a partial set (one
+    // key misspelled) throws instead of classifying as either ctx. Pinned HERE
+    // because the plugin's own `mount()` catches a throwing `inject` by design
+    // (the tri-state goes `pending` and the HTTP/diagnostics faces keep serving),
+    // so in the two fixtures whose suites only assert those faces a typo would
+    // otherwise be swallowed — the recorded key set above is the loud half.
+    expect(() => asksForScopeKeys(['agents', 'workspaceRegistr'])).toThrow(/PARTIAL match/)
   })
 
   it('② unsupported: register / restrict / schemas are each a hard gate (static failure wins)', () => {
@@ -511,7 +534,9 @@ function assemblyCtx(options: { deferAgents?: boolean } = {}): AssemblyFixture {
       },
     },
     inject(deps: readonly string[], cb: (ctx: unknown) => unknown) {
-      if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+      // EXACT set, not `||`: a misspelled key in INJECT_KEYS must fail loudly
+      // here instead of silently still delivering the scope-capable ctx (B6).
+      if (asksForScopeKeys(deps)) {
         if (options.deferAgents !== true) cb(inside)
         return
       }

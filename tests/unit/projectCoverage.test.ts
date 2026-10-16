@@ -183,7 +183,9 @@ describe('F6: the two tsconfig projects partition tests/**/*.test.ts', () => {
     expect(testFiles).toContain('tests/unit/ui.test.ts')
     expect(testFiles).toContain('tests/integration/clientBundle.test.ts')
     expect(testFiles).toContain('tests/contract/contract.test.ts')
-    // The three UI-environment files this split exists for.
+    // The gate is discovered by its own discovery: `testFiles` is the list the
+    // partition test runs over, so this file must appear in it — a list that
+    // omitted the file checking the list would still look complete.
     expect(testFiles).toContain('tests/unit/projectCoverage.test.ts')
   })
 

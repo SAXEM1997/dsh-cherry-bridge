@@ -371,7 +371,13 @@ describe('启用范围面板 (§6.4)', () => {
 
   it('⑤ renders EVERY degradation note at once, not just the last one', async () => {
     const notes: DegradedNote[] = [
-      { source: 'install', reason: '工具注册失败：宿主拒绝 register（原因甲）' },
+      {
+        source: 'install',
+        // Verbatim from the host's missing-`restrict` writer (src/toolScopeHost.ts):
+        // the install note has no "registration failed" writer at all.
+        reason:
+          'agent agent-1 缺少 agent.ctx.tools.restrict，无法安装 restriction：目标工具保持可见且 guard 放行（无 scoped ctx 的 agent；配置保存 / 下一次重算会重试）',
+      },
       { source: 'workspace-list', reason: '注册表列表读取失败（原因乙）' },
       { source: 'visibility-only', reason: 'tools.guard 缺失，仅可见性降级（原因丙）' },
       { source: 'scope-version', reason: '作用域文档版本高于本插件支持（原因丁）' },
@@ -384,10 +390,10 @@ describe('启用范围面板 (§6.4)', () => {
       expect(slotText(`[data-degraded-source="${note.source}"]`)).toContain(note.reason)
     }
     // Different sources coexist: all five reasons are in the document together.
-    for (const reason of ['原因甲', '原因乙', '原因丙', '原因丁', '原因戊']) {
+    for (const reason of ['缺少 agent.ctx.tools.restrict', '原因乙', '原因丙', '原因丁', '原因戊']) {
       expect(pageText()).toContain(reason)
     }
-    expect(slotText('[data-degraded-source="install"]')).toContain('工具注册失败（install）')
+    expect(slotText('[data-degraded-source="install"]')).toContain('隐藏层应用曾失败（install）')
     expect(slotText('[data-degraded-source="visibility-only"]')).toContain('仅可见性降级')
     expect(slotText('[data-degraded-source="path-normalization"]')).toContain('路径规范化降级')
   })
@@ -433,10 +439,11 @@ describe('启用范围面板 (§6.4)', () => {
       expect(stub.gets).toBe(1)
 
       if (alsoExpected !== undefined) expect(pageText()).toContain(alsoExpected)
-      // The re-read control belongs to the CONFLICT arm alone: a re-read is that
-      // refusal's own recovery, while the version arm says outright that
-      // re-reading cannot change the document, and the other three are not a
-      // stale base at all. It is absent everywhere else rather than offered as a
+      // The re-read control belongs to the CONFLICT arm alone. Two codes' copy
+      // instructs a re-read — this one and `missing-expected-revision` — but only
+      // the conflict is reachable from this panel, whose save always sends a base
+      // (`expectedRevision: revision`), so the missing-base arm would only ever
+      // offer a control no click can reach. Absent there rather than offered as a
       // standing "read again" that would solve nothing.
       expect(rereadButton() === null, code).toBe(code !== 'scope-revision-conflict')
       if (code === 'scope-version-unsupported') {
@@ -572,20 +579,20 @@ describe('启用范围面板 (§6.4)', () => {
 
   it('⑪ answers GET /scope on every App render path the existing suite uses', async () => {
     // The four DIRECT render paths in tests/unit/ui.test.ts — the status-light
-    // matrix loop (:488), the single-card PATCH case (:582), the two-card
-    // first-frames case (:667) and the `Section` registered through `slots`
-    // (:779) — plus `renderWithDevice`'s shape. Each runs against a harness that
+    // matrix loop (:521), the single-card PATCH case (:618), the two-card
+    // first-frames case (:705) and the `Section` registered through `slots`
+    // (:819) — plus `renderWithDevice`'s shape (:188). Each runs against a harness that
     // THROWS on an unregistered request, so a missing `/scope` answer shows up
     // here as the panel's load-error line instead of passing silently.
     const paths: Array<{ name: string; devices: unknown[]; section?: boolean }> = [
-      { name: 'status-light matrix (:488)', devices: [{ ...DEVICE_FIXTURE, state: 'offline' }] },
-      { name: 'single card + PATCH (:582)', devices: [{ ...DEVICE_FIXTURE, enabled: false, state: 'disabled' }] },
+      { name: 'status-light matrix (:521)', devices: [{ ...DEVICE_FIXTURE, state: 'offline' }] },
+      { name: 'single card + PATCH (:618)', devices: [{ ...DEVICE_FIXTURE, enabled: false, state: 'disabled' }] },
       {
-        name: 'two cards, first frames (:667)',
+        name: 'two cards, first frames (:705)',
         devices: [DEVICE_FIXTURE, { ...DEVICE_FIXTURE, deviceId: 'dev-2', displayName: '笔记本' }],
       },
-      { name: 'renderWithDevice (:162)', devices: [DEVICE_FIXTURE] },
-      { name: 'registered settings Section (:779)', devices: [], section: true },
+      { name: 'renderWithDevice (:188)', devices: [DEVICE_FIXTURE] },
+      { name: 'registered settings Section (:819)', devices: [], section: true },
     ]
 
     for (const path of paths) {

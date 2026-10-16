@@ -11,6 +11,7 @@ import type { DeviceState } from '../../src/connection.js'
 import { isTrustedWebRequest, registerHttpApi } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
 import { ToolScopeState } from '../../src/toolScope.js'
+import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 /**
  * Task 11 integration suite: the same-origin HTTP face + SSE stream, driven
@@ -1484,8 +1485,9 @@ describe('plugin assembly (index.ts apply)', () => {
         if (!injectable) throw new Error('service "webServer" is not available')
         // Split BY DEPENDENCY KEY: the scope subsystem's two keys get the
         // services plus the injected ctx's own effect/on; the web keys keep the
-        // pre-existing response.
-        if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+        // pre-existing response. The scope match is an EXACT set, so a
+        // misspelled key throws here instead of still matching (B6).
+        if (asksForScopeKeys(deps)) {
           cb(injected)
           return
         }

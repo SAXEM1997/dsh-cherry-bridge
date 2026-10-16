@@ -12,6 +12,7 @@ import { registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
+import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 /**
  * Task 10 integration suite: the MANAGEMENT `cherry_*` tools (`cherry_pair` /
@@ -684,8 +685,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       inject(deps, cb) {
         if (headless) throw new Error('service "webServer" is not available')
         // Split BY DEPENDENCY KEY: the scope subsystem's two keys answer with
-        // the services plus the injected ctx's own effect/on.
-        if (deps.includes('agents') || deps.includes('workspaceRegistry')) {
+        // the services plus the injected ctx's own effect/on — as an EXACT set,
+        // so a misspelled key throws here instead of still matching (B6).
+        if (asksForScopeKeys(deps)) {
           cb(injected)
           return
         }

@@ -119,6 +119,16 @@ export class FakeToolHost {
   readonly registerCalls: string[] = []
   /** Every `restrict()` ARGUMENT ever passed (including ones that threw). */
   readonly restrictCalls: FakeRestrictCall[] = []
+  /**
+   * Every `inject` key set the plugin has handed to `#inject`, in call order.
+   *
+   * Recorded because the fake itself never INSPECTS the keys: a typo in the
+   * plugin's own `INJECT_KEYS` would otherwise be invisible to every suite that
+   * uses this host. The owning suite asserts the recorded set against the two
+   * key names as a literal (B6), so the plugin's runtime list — not its static
+   * `export const inject` — is what is pinned.
+   */
+  readonly injectKeyCalls: Array<readonly string[]> = []
 
   /** The plugin root ctx, handed to `mount()`. */
   readonly root: ScopeHostContext
@@ -194,6 +204,11 @@ export class FakeToolHost {
   /** Guards currently installed. */
   guardLive(): number {
     return this.guardInstalls - this.guardReleases
+  }
+
+  /** The key set the LAST `inject` asked for — the plugin's own runtime list. */
+  injectKeys(): readonly string[] {
+    return this.injectKeyCalls[this.injectKeyCalls.length - 1] ?? []
   }
 
   /** Live subscriptions, for one event or for all of them. */
@@ -292,6 +307,7 @@ export class FakeToolHost {
   // -------------------------------------------------------------------------
 
   #inject(keys: readonly string[], cb: (ctx: never) => unknown): unknown {
+    this.injectKeyCalls.push([...keys])
     if (this.#options.injectThrows === true) {
       throw new Error(`service "${keys[0] ?? 'agents'}" is not available`)
     }

@@ -54,9 +54,9 @@ export interface ToolScopePanelProps {
  * all (B2). One sentence for both would state the opposite of the truth in one
  * of the two modes.
  */
-export const SELECTED_EMPTY_HINT =
+const SELECTED_EMPTY_HINT =
   '尚未启用任何工作区——此状态下 cherry_* 工具不会出现在任何会话里；勾选后对应工作区的会话（含进行中的）即可使用。'
-export const GLOBAL_EMPTY_HINT =
+const GLOBAL_EMPTY_HINT =
   '当前为全局模式：这些工具在所有工作区都可用；下面的勾选仅在切到「仅选定工作区」后才生效。'
 
 /**
@@ -68,12 +68,22 @@ export const GLOBAL_EMPTY_HINT =
  * "the model can see / call them" phrasing would promise something this plugin
  * cannot keep.
  */
-export const EFFECT_NOTE =
+const EFFECT_NOTE =
   '生效范围内本插件未遮蔽这些 cherry_* 工具；上游的 allow 型过滤（例如子代理的 toolFilter）仍可能让某个会话看不到它们——本页只说明本插件未遮蔽，不对上层过滤的结果作保证。'
 
-/** One line per degradation source; the server's own reason is shown beside it. */
+/**
+ * One line per degradation source; the server's own reason is shown beside it.
+ *
+ * `install` is the general one — its four writers cover a `schemas()` read that
+ * could not compute a target, a layer whose release threw, an agent with no
+ * `agent.ctx.tools.restrict`, and a `restrict()` the host refused (the `reason`
+ * says which) — so the line states the CONSEQUENCE common to all four rather
+ * than any one cause. It says 曾 on purpose: the note is append-only (cleared
+ * only by a successful workspace-list read), so after a recovered round the
+ * surviving claim is that one application failed earlier in this session.
+ */
 const DEGRADED_LABELS: Record<DegradedSource, string> = {
-  install: '工具注册失败（install）：启用范围未生效',
+  install: '隐藏层应用曾失败（install）：相关 agent 的隐藏层未生效或无法确认，启用范围对它可能不适用',
   'workspace-list': '注册表列表当前读不到',
   'visibility-only': '仅可见性降级（缺 tools.guard）：部分会话可能仍看得到这些工具',
   'scope-version': '作用域文档版本高于本插件支持',
@@ -83,10 +93,16 @@ const DEGRADED_LABELS: Record<DegradedSource, string> = {
 /**
  * The copy for each stable `PUT` refusal code.
  *
- * `scope-revision-conflict` is the one refusal whose message instructs a
- * RE-READ, so it is also the one whose rendering carries the control that
- * performs it (`reread`); an instruction with no way to follow it is how the
- * operator ends up re-sending the same stale revision forever.
+ * `scope-revision-conflict` is the ONE refusal whose copy and whose control
+ * agree: its message instructs a RE-READ, and its rendering carries the control
+ * that performs it (`reread`) — an instruction with no way to follow it is how
+ * the operator ends up re-sending the same stale revision forever. Two codes
+ * instruct a re-read in their wording (this one and `missing-expected-revision`,
+ * below), but only this one is REACHABLE from this panel: `save` always sends a
+ * base (`expectedRevision: revision`), so the missing-base refusal exists for a
+ * direct API caller and can never fire here. Reachability — not any claim about
+ * which codes a stale read would refresh — is why the control belongs to this
+ * arm, and to this arm only.
  *
  * `scope-version-unsupported` gets its own recovery sentence: re-reading cannot
  * change the document's version, so sending the operator round that loop would
@@ -453,11 +469,13 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
             <p className="cherry-error" role="alert">
               {failure.label}
             </p>
-            {/* The conflict arm's OWN recovery. The copy above instructs a
-                re-read, so the control that performs one belongs on this arm —
-                and ONLY on this arm: `scope-version-unsupported` says outright
-                that re-reading cannot change the document, and the remaining
-                three codes are not a stale base that a read would refresh. */}
+            {/* The conflict arm's OWN recovery: its copy instructs a re-read, so
+                the control that performs one belongs here. Two codes' copy
+                instructs a re-read — this one and `missing-expected-revision` —
+                but only this code is reachable from this panel, whose `save`
+                always sends `expectedRevision: revision`; the missing-base
+                refusal exists for a direct API caller, so offering the control
+                there would be a button this page can never make useful. */}
             {failure.code === 'scope-revision-conflict' && (
               <button type="button" onClick={reread} disabled={busy}>
                 重新读取
