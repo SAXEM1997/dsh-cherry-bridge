@@ -214,10 +214,14 @@ describe('resolveLocaleFromNavigator', () => {
     expect(resolveLocaleFromNavigator('')).toBe('zh')
   })
 
-  it('does not read navigator itself — the caller owns the single guarded read', () => {
-    // Pure function over its argument: passing an explicit language never
-    // consults the ambient one, which is what makes the guard in `apply()`
-    // (Task 2) the ONE place navigator is touched.
+  it('answers from the argument ALONE, even for the exact languages the host machine runs', () => {
+    // A boundary case, not a purity proof: a REGION-qualified tag (the real
+    // `navigator.language` shape) still resolves by prefix and never by the
+    // ambient value. Purity itself — that `resolveLocaleFromNavigator` does not
+    // read `navigator` — is NOT provable from here, because any value this
+    // environment could inject agrees with the arguments below. It is pinned
+    // structurally instead: by the `typeof navigator === 'undefined'` guard
+    // being the single read, which Task 2's `apply()` owns.
     expect(resolveLocaleFromNavigator('en-GB')).toBe('en')
     expect(resolveLocaleFromNavigator('zh-TW')).toBe('zh')
   })
@@ -249,6 +253,7 @@ describe('localeStore', () => {
 
   it('notifies exactly once on a real change, and the snapshot follows', () => {
     let calls = 0
+    const preChange = localeStore.getSnapshot()
     const seen: LocaleId[] = []
     const unsubscribe = localeStore.subscribe(() => {
       calls += 1
@@ -259,8 +264,10 @@ describe('localeStore', () => {
     // Read INSIDE the listener: the store must already publish the new value.
     expect(seen).toEqual(['en'])
     expect(localeStore.getSnapshot().locale).toBe('en')
-    // ...and a new reference, so subscribers diffing by identity see the change.
-    expect(localeStore.getSnapshot()).not.toBe(undefined)
+    // ...and a DIFFERENT reference from the pre-change snapshot, so subscribers
+    // diffing by identity see the change; `useSyncExternalStore` re-renders on
+    // exactly this distinction.
+    expect(localeStore.getSnapshot()).not.toBe(preChange)
     unsubscribe()
   })
 

@@ -97,14 +97,18 @@ const zh: Dict = {
 
   // -- pairing wizard -------------------------------------------------------
   'wizard.heading': '配对向导',
-  // Split around the <strong> in the hint on purpose: the emphasized words are
-  // the instruction, and `dangerouslySetInnerHTML` is not an option. Both
-  // values sit flush against the `<strong>` (no edge whitespace of their own),
-  // so the rendered sentence reads exactly as it does today in Chinese; the
-  // English halves are written to read correctly the same way.
+  // Split around the `<strong>` in the hint on purpose: the emphasized words are
+  // the instruction, and `dangerouslySetInnerHTML` is not an option. The render
+  // is `{t('wizard.hint.before')} <strong>{t('wizard.hint.qrCode')}</strong>
+  // {t('wizard.hint.after')}` — ONE literal JSX space before `<strong>`, and
+  // nothing but the values themselves after `</strong>`. So `before` ends bare
+  // (the JSX space supplies the gap) while `after` opens flush with its own
+  // punctuation: `。` in Chinese, `.` in English, each followed by one space.
+  // That is why the whitespace rule must not be read as "no internal space" —
+  // no value here carries LEADING or TRAILING whitespace.
   'wizard.hint.before': '在 Cherry Studio 桌面端打开「远程连接 → 添加设备」；该界面显示的是',
   'wizard.hint.qrCode': '二维码',
-  'wizard.hint.after': '。请用微信或浏览器等扫码，把扫码后页面上显示的配对信息复制下来，粘贴到下方。',
+  'wizard.hint.after': '。 请用微信或浏览器等扫码，把扫码后页面上显示的配对信息复制下来，粘贴到下方。',
   'wizard.step.open': 'Cherry Studio 中打开「添加设备」，屏幕上显示二维码',
   'wizard.step.scan': '用微信或浏览器等扫码，复制扫码页显示的配对信息（含地址、端口与一次性邀请）',
   'wizard.step.paste': '粘贴到下方输入框并开始配对，再对照桌面端窗口上的 6 位验证码确认',
@@ -243,12 +247,13 @@ const en: Dict = {
 
   // -- pairing wizard -------------------------------------------------------
   'wizard.heading': 'Pairing wizard',
-  // Rendered flush against the `<strong>`; each half opens with the space it
-  // needs after the emphasized word instead of carrying trailing whitespace.
+  // Rendered as `…shows a <strong>QR code</strong>. Scan it with…`: the JSX
+  // space before `<strong>` separates `before` from the emphasized words, and
+  // `after` starts with the sentence's own `. ` flush against `</strong>`.
   'wizard.hint.before': 'In the Cherry Studio desktop, open “Remote connection → Add device”; that screen shows a',
   'wizard.hint.qrCode': 'QR code',
   'wizard.hint.after':
-    'Scan it with WeChat or a browser, then copy the pairing payload that page displays and paste it below.',
+    '. Scan it with WeChat or a browser, then copy the pairing payload that page displays and paste it below.',
   'wizard.step.open': 'Open “Add device” in Cherry Studio; a QR code appears on screen',
   'wizard.step.scan': 'Scan it with WeChat or a browser and copy the pairing payload (address, port and one-time invite)',
   'wizard.step.paste': 'Paste it below and start pairing, then compare the 6-digit verification code shown in the desktop window',
