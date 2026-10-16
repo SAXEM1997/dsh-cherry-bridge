@@ -434,11 +434,18 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
    *   not visible ⇒ CHERRY_TOOL_NAMES ∩ the no-argument `schemas()`
    *   not visible, view unreadable ⇒ `undefined` (no target could be computed)
    *
-   * `judgement()?.workspaceId` folds a CACHE MISS into the same expression: under
-   * `global` `isVisible(doc, undefined)` is true (a miss releases only), while
-   * under `selected` it is false — the D7 fail-closed side. Visibility is derived
-   * from `isVisible`, never from `status === 'resolved'`, and the `visible` arm
-   * needs no observation at all.
+   * `judgement()` is the per-agent cache; a MISS falls back to
+   * `scope.resolveNow(agent)` — the same §4 rules answered from the CURRENT
+   * generation WITHOUT awaiting anything. `rebuild()` is fed by the currently
+   * live agents alone, so a brand-new agent id can never be pre-judged; without
+   * that fallback the first install would deny all 14 names and the tools would
+   * appear only once the asynchronous round converged — B13's 「第一轮就有工具」
+   * is exactly the other direction. Only when there is NO usable generation
+   * either (a read never taken, failed, or empty) does the expression collapse
+   * to `isVisible(doc, undefined)`: under `global` that is true (a miss releases
+   * only), while under `selected` it is false — the D7 fail-closed side.
+   * Visibility is derived from `isVisible`, never from `status === 'resolved'`,
+   * and the `visible` arm needs no observation at all.
    *
    * An EMPTY set means RELEASE ONLY. `{ deny: [] }` is never submitted: the host
    * accepts it as a no-op layer admitting every name, which this plugin's guard
@@ -448,17 +455,25 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
    * `undefined` is NOT the empty set: the observation failed, so no target exists
    * and the caller must leave every installed layer exactly where it is.
    */
-  function targetDeny(agentId: string): readonly string[] | undefined {
-    if (isVisible(scope.doc(), scope.judgement(agentId)?.workspaceId)) return []
+  function targetDeny(agent: HostAgent): readonly string[] | undefined {
+    const resolved = scope.judgement(agent.id) ?? scope.resolveNow(agent)
+    if (isVisible(scope.doc(), resolved?.workspaceId)) return []
     const observed = observeGlobalNames()
     return observed === undefined ? undefined : names.filter((name) => observed.has(name))
   }
 
-  function reasonFor(agentId: string): string {
-    return (
-      scope.judgement(agentId)?.reason ??
-      '判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）'
-    )
+  function reasonFor(agent: HostAgent): string {
+    const cached = scope.judgement(agent.id)
+    if (cached !== undefined) return cached.reason
+    // The same synchronous fallback, for the arm that matters: a layer installed
+    // on a cache miss while the CURRENT generation already NAMES the agent's
+    // workspace must stop reporting a miss. A resolution that names NO workspace
+    // (`no-cwd` / `no-match`) keeps the miss wording: that text describes the
+    // cache rather than the conclusion, and the round that lands the judgement
+    // rewrites this record in place (T5b ⑬ pins both halves of that).
+    const sync = scope.resolveNow(agent)
+    if (sync?.workspaceId !== undefined) return sync.reason
+    return '判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）'
   }
 
   /** §4 ②'s 同名短路: two deny sets holding exactly the same names. */
@@ -480,7 +495,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   }
 
   function applyForAgent(state: EffectState, agent: HostAgent): 'installed' | 'released' | 'skipped' {
-    const target = targetDeny(agent.id)
+    const target = targetDeny(agent)
     const existing = state.layers.get(agent.id)
 
     // The observation FAILED (only reachable for a not-visible agent): there is no
@@ -511,7 +526,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       // must stop reporting "判定缓存未命中" once the judgement has landed. Only the
       // record's reason is rewritten here — the installed layer, its deny set and
       // the layer ⇔ record pairing are untouched, and no host call is made.
-      const reason = reasonFor(agent.id)
+      const reason = reasonFor(agent)
       if (record.reason !== reason) scope.setLayer(agent.id, { deny: record.deny, reason })
       return 'skipped'
     }
@@ -543,7 +558,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     // released layer, nor two live layers under one agent. The replaced record is
     // NOT cleared here — it already describes the layer just installed.
     state.layers.set(agent.id, dispose)
-    scope.setLayer(agent.id, { deny: [...target], reason: reasonFor(agent.id) })
+    scope.setLayer(agent.id, { deny: [...target], reason: reasonFor(agent) })
     if (existing !== undefined) disposeQuietly(agent.id, existing)
     return 'installed'
   }

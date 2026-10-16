@@ -2246,18 +2246,19 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
     await drain()
     saveScope(fresh.scope, 'selected', ['w-oa'])
 
-    // The canonical-path HIT is already in the cache — a generation of its own
-    // (`rebuild`, exactly what a completed round produces), never a recheck's
-    // late compensation.
-    await fresh.scope.rebuild(entityRegistry([entity('w-oa', '/w/oa')]), [
-      { id: 'agent-b', cwd: '/w/oa' },
-    ])
-    expect(fresh.host.liveAgentIds()).toEqual([])
+    // The canonical-path HIT is already in the cache — a generation a COMPLETED
+    // ROUND produced, with the agent the host really knows: the warm-up is the
+    // ordinary `agent/created` + round, never a hand-called `rebuild` holding an
+    // agent id the host has never seen (a state production cannot produce).
+    fresh.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    await drain()
     expect(fresh.scope.judgement('agent-b')?.status).toBe('resolved')
     expect(fresh.scope.judgement('agent-b')?.workspaceId).toBe('w-oa')
     expect(fresh.scope.judgement('agent-b')?.visible).toBe(true)
     expect(vi.getTimerCount()).toBe(0)
 
+    // The event under test is the RE-ANNOUNCE (the listener is per-event, not
+    // per-identity): same agent, same canonical hit, SAME ROUND.
     fresh.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
 
     // SAME ROUND: the empty target submits NO deny at all — the family is visible
@@ -2327,5 +2328,101 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
     expect(second.host.restrictCalls.length).toBe(installs)
     expect(second.host.layerCount('agent-b')).toBe(0)
     expect(second.host.effectFailures).toEqual([])
+  })
+
+  it('⑩ a brand-new agent resolves in the SAME round from the current generation (B13, no pre-warm)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    let observed: ReturnType<typeof observeListeners> | undefined
+    const fresh = rig({
+      recheckDelaysMs: [30, 60],
+      patchRoot: (fake) => {
+        observed = observeListeners(fake, ['agent/created'])
+      },
+    })
+    fresh.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    fresh.tools.refresh()
+    await drain()
+    saveScope(fresh.scope, 'selected', ['w-oa'])
+
+    // The generation in place is the one an ORDINARY round produced for the live
+    // agents it had — which is none. Nothing pre-judged `agent-b`, and nothing
+    // can: `rebuild()` is fed by the live agents alone, so a brand-new agent id
+    // is never in the per-agent cache when the first install runs.
+    expect(fresh.host.liveAgentIds()).toEqual([])
+    expect(fresh.scope.judgement('agent-b')).toBeUndefined()
+    expect(vi.getTimerCount()).toBe(0)
+
+    fresh.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+
+    // SAME ROUND, synchronously: the EMPTY target submits no deny at all — the
+    // family is visible from the FIRST round, B13's 「第一轮就有工具」.
+    expect(fresh.host.restrictCalls.filter((call) => call.agentId === 'agent-b')).toEqual([])
+    expect(fresh.host.layerCount('agent-b')).toBe(0)
+    expect(fresh.scope.layer('agent-b')).toBeUndefined()
+    expect(fresh.host.agentView('agent-b')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(fresh.host.verdict('agent-b', CHERRY_TOOL_NAMES[0]!)).toBeUndefined()
+    expect(observed!.lastReturn('agent/created')).toBeUndefined()
+    // …and no recheck timer: a resolved, visible agent is not an `unresolved` one.
+    expect(vi.getTimerCount()).toBe(0)
+    // THE PROOF that the synchronous accessor answered: the per-agent cache is
+    // STILL cold at the instant the layer decision was made. A warm cache cannot
+    // exist here — the round has not run yet, and the fixture never warmed one.
+    expect(fresh.scope.judgement('agent-b')).toBeUndefined()
+
+    // The round that follows lands the same conclusion in the cache; the layer
+    // state it finds is already correct, so it submits no deny and arms no timer.
+    await drain()
+    expect(fresh.scope.judgement('agent-b')?.status).toBe('resolved')
+    expect(fresh.scope.judgement('agent-b')?.workspaceId).toBe('w-oa')
+    expect(fresh.scope.judgement('agent-b')?.visible).toBe(true)
+    expect(fresh.host.restrictCalls.filter((call) => call.agentId === 'agent-b')).toEqual([])
+    expect(fresh.host.layerCount('agent-b')).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+    expect(fresh.host.effectFailures).toEqual([])
+  })
+
+  it('⑪ the fail-closed twin: a non-enabled cwd, a missing cwd and NO generation still deny in the SAME round', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+
+    const fresh = rig({ recheckDelaysMs: [30, 60] })
+    fresh.host.setWorkspaces([entity('w-oa', '/w/oa'), entity('w-other', '/w/other')])
+    fresh.tools.refresh()
+    await drain()
+    saveScope(fresh.scope, 'selected', ['w-oa'])
+
+    // ── (a) the cwd RESOLVES — into a workspace this document does not enable ──
+    fresh.host.addAgent({ id: 'agent-other', cwd: '/w/other' })
+    expect(fresh.scope.judgement('agent-other')).toBeUndefined()
+    expect(fresh.host.restrictCalls.filter((call) => call.agentId === 'agent-other')).toHaveLength(1)
+    expect(denyOf(fresh.host.restrictCalls.find((call) => call.agentId === 'agent-other')!)).toEqual([
+      ...CHERRY_TOOL_NAMES,
+    ])
+    expect(fresh.host.layerCount('agent-other')).toBe(1)
+    expect(fresh.scope.layer('agent-other')?.deny).toHaveLength(14)
+    expect(fresh.host.agentView('agent-other')).toEqual([])
+    expect(fresh.host.verdict('agent-other', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+
+    // ── (b) no cwd at all: `no-cwd` is invisible under `selected`, same round ──
+    fresh.host.addAgent({ id: 'agent-nocwd' })
+    expect(fresh.scope.judgement('agent-nocwd')).toBeUndefined()
+    expect(fresh.host.layerCount('agent-nocwd')).toBe(1)
+    expect(fresh.scope.layer('agent-nocwd')?.deny).toHaveLength(14)
+    expect(fresh.host.verdict('agent-nocwd', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+
+    // ── (c) NO usable generation: the registry read FAILED (`unavailable`, never
+    // `read`), so the synchronous accessor must abstain — and the `agent/created`
+    // install stays unconditionally fail-closed. ──
+    const blind = rig({ recheckDelaysMs: [30, 60] })
+    blind.host.setWorkspaces([])
+    blind.tools.refresh()
+    await drain()
+    expect(blind.scope.degraded().map((note) => note.source)).toContain('workspace-list')
+    blind.host.addAgent({ id: 'agent-blind', cwd: '/w/oa' })
+    expect(blind.host.restrictCalls.filter((call) => call.agentId === 'agent-blind')).toHaveLength(1)
+    expect(blind.host.layerCount('agent-blind')).toBe(1)
+    expect(blind.scope.layer('agent-blind')?.deny).toHaveLength(14)
+    expect(blind.host.agentView('agent-blind')).toEqual([])
+    expect(blind.host.verdict('agent-blind', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
   })
 })

@@ -1322,6 +1322,32 @@ var ToolScopeState = class {
 		return this.#judgements.get(agentId);
 	}
 	/**
+	* The same two §4 rules as `#judge`, answered from the CURRENT generation
+	* without awaiting anything — the synchronous window's fallback when
+	* `judgement()` misses.
+	*
+	* `undefined` means "there is no usable generation": the caller keeps today's
+	* fail-closed behaviour. That is NOT the same as a resolution that concluded
+	* "no workspace belongs to this agent".
+	*
+	* PURE READ (D14): no `#ensureLoaded()`, no write to `#judgements`, no await
+	* and no host call — the synchronous window reads the cache and never blocks.
+	* A read that was never taken, or that failed / returned an empty table, has
+	* no generation to read: `'unread'` and `'unavailable'` both mean exactly that.
+	* One consequence: this window cannot await a `resolveByPath` realpath, so a
+	* `cwd` that would only match after one concludes `no-match` here and is
+	* corrected by the asynchronous round.
+	*/
+	resolveNow(agent) {
+		if (this.#listState !== "read") return void 0;
+		const doc = this.#doc;
+		const member = this.#workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
+		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
+		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）");
+		const workspaceId = this.#pathMap.get(agent.cwd);
+		return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 与当前一代的规范路径表不匹配（本窗口无法 await resolveByPath 的 realpath；异步轮次会纠正）`) : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`);
+	}
+	/**
 	* Agents whose `cwd` resolved outside every registered workspace, with the
 	* `cwd` sample (§6.1's 路径不匹配诊断). Diagnostics only — no `degraded` entry
 	* carries this, so "勾了却无工具" can be told apart from a degraded read.
@@ -6166,11 +6192,18 @@ function createToolScopeHost(deps) {
 	*   not visible ⇒ CHERRY_TOOL_NAMES ∩ the no-argument `schemas()`
 	*   not visible, view unreadable ⇒ `undefined` (no target could be computed)
 	*
-	* `judgement()?.workspaceId` folds a CACHE MISS into the same expression: under
-	* `global` `isVisible(doc, undefined)` is true (a miss releases only), while
-	* under `selected` it is false — the D7 fail-closed side. Visibility is derived
-	* from `isVisible`, never from `status === 'resolved'`, and the `visible` arm
-	* needs no observation at all.
+	* `judgement()` is the per-agent cache; a MISS falls back to
+	* `scope.resolveNow(agent)` — the same §4 rules answered from the CURRENT
+	* generation WITHOUT awaiting anything. `rebuild()` is fed by the currently
+	* live agents alone, so a brand-new agent id can never be pre-judged; without
+	* that fallback the first install would deny all 14 names and the tools would
+	* appear only once the asynchronous round converged — B13's 「第一轮就有工具」
+	* is exactly the other direction. Only when there is NO usable generation
+	* either (a read never taken, failed, or empty) does the expression collapse
+	* to `isVisible(doc, undefined)`: under `global` that is true (a miss releases
+	* only), while under `selected` it is false — the D7 fail-closed side.
+	* Visibility is derived from `isVisible`, never from `status === 'resolved'`,
+	* and the `visible` arm needs no observation at all.
 	*
 	* An EMPTY set means RELEASE ONLY. `{ deny: [] }` is never submitted: the host
 	* accepts it as a no-op layer admitting every name, which this plugin's guard
@@ -6180,13 +6213,18 @@ function createToolScopeHost(deps) {
 	* `undefined` is NOT the empty set: the observation failed, so no target exists
 	* and the caller must leave every installed layer exactly where it is.
 	*/
-	function targetDeny(agentId) {
-		if (isVisible(scope.doc(), scope.judgement(agentId)?.workspaceId)) return [];
+	function targetDeny(agent) {
+		const resolved = scope.judgement(agent.id) ?? scope.resolveNow(agent);
+		if (isVisible(scope.doc(), resolved?.workspaceId)) return [];
 		const observed = observeGlobalNames();
 		return observed === void 0 ? void 0 : names.filter((name) => observed.has(name));
 	}
-	function reasonFor(agentId) {
-		return scope.judgement(agentId)?.reason ?? "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
+	function reasonFor(agent) {
+		const cached = scope.judgement(agent.id);
+		if (cached !== void 0) return cached.reason;
+		const sync = scope.resolveNow(agent);
+		if (sync?.workspaceId !== void 0) return sync.reason;
+		return "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
 	}
 	/** §4 ②'s 同名短路: two deny sets holding exactly the same names. */
 	function sameDenySet(a, b) {
@@ -6205,7 +6243,7 @@ function createToolScopeHost(deps) {
 		}
 	}
 	function applyForAgent(state, agent) {
-		const target = targetDeny(agent.id);
+		const target = targetDeny(agent);
 		const existing = state.layers.get(agent.id);
 		if (target === void 0) return "skipped";
 		if (target.length === 0) {
@@ -6217,7 +6255,7 @@ function createToolScopeHost(deps) {
 		}
 		const record = scope.layer(agent.id);
 		if (existing !== void 0 && record !== void 0 && sameDenySet(record.deny, target)) {
-			const reason = reasonFor(agent.id);
+			const reason = reasonFor(agent);
 			if (record.reason !== reason) scope.setLayer(agent.id, {
 				deny: record.deny,
 				reason
@@ -6242,7 +6280,7 @@ function createToolScopeHost(deps) {
 		state.layers.set(agent.id, dispose);
 		scope.setLayer(agent.id, {
 			deny: [...target],
-			reason: reasonFor(agent.id)
+			reason: reasonFor(agent)
 		});
 		if (existing !== void 0) disposeQuietly(agent.id, existing);
 		return "installed";

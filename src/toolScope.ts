@@ -654,6 +654,56 @@ export class ToolScopeState {
   }
 
   /**
+   * The same two §4 rules as `#judge`, answered from the CURRENT generation
+   * without awaiting anything — the synchronous window's fallback when
+   * `judgement()` misses.
+   *
+   * `undefined` means "there is no usable generation": the caller keeps today's
+   * fail-closed behaviour. That is NOT the same as a resolution that concluded
+   * "no workspace belongs to this agent".
+   *
+   * PURE READ (D14): no `#ensureLoaded()`, no write to `#judgements`, no await
+   * and no host call — the synchronous window reads the cache and never blocks.
+   * A read that was never taken, or that failed / returned an empty table, has
+   * no generation to read: `'unread'` and `'unavailable'` both mean exactly that.
+   * One consequence: this window cannot await a `resolveByPath` realpath, so a
+   * `cwd` that would only match after one concludes `no-match` here and is
+   * corrected by the asynchronous round.
+   */
+  resolveNow(agent: ScopeAgentLike): AgentJudgement | undefined {
+    if (this.#listState !== 'read') return undefined
+    const doc = this.#doc
+
+    // Rule one.
+    const member = this.#workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
+    if (member !== undefined) {
+      return judged(doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`)
+    }
+
+    // Rule two.
+    if (agent.cwd === undefined) {
+      return judged(
+        doc,
+        agent,
+        'no-cwd',
+        undefined,
+        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）',
+      )
+    }
+
+    const workspaceId = this.#pathMap.get(agent.cwd)
+    return workspaceId === undefined
+      ? judged(
+          doc,
+          agent,
+          'no-match',
+          undefined,
+          `cwd ${agent.cwd} 与当前一代的规范路径表不匹配（本窗口无法 await resolveByPath 的 realpath；异步轮次会纠正）`,
+        )
+      : judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`)
+  }
+
+  /**
    * Agents whose `cwd` resolved outside every registered workspace, with the
    * `cwd` sample (§6.1's 路径不匹配诊断). Diagnostics only — no `degraded` entry
    * carries this, so "勾了却无工具" can be told apart from a degraded read.
