@@ -33,7 +33,7 @@
  * gap loud and visible in the UI instead of catastrophic — and the host's
  * dictionary does exactly the same, so a key that works here works there.
  */
-import { useSyncExternalStore } from 'react'
+import { useMemo, useSyncExternalStore } from 'react'
 
 /** The two languages this page ships. */
 export type LocaleId = 'zh' | 'en'
@@ -430,8 +430,14 @@ export const localeStore = {
 
 /**
  * The translator for the CURRENT language, re-rendering the caller on a switch.
+ *
+ * The translator is MEMOIZED on the locale, so its identity is stable across
+ * renders that do not change the language: a consumer may put `t` in a
+ * dependency array (or a `useMemo`/`useCallback` list) without re-running on
+ * every render. `localeStore.getSnapshot()` already returns a stable frozen
+ * object per locale, so `current.locale` is the right memo key.
  */
 export function useT(): T {
   const current = useSyncExternalStore(localeStore.subscribe, localeStore.getSnapshot)
-  return createTranslator(current.locale)
+  return useMemo(() => createTranslator(current.locale), [current.locale])
 }

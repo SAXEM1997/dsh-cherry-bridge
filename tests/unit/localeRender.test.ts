@@ -373,6 +373,32 @@ describe('PairingWizard renders its own copy in English', () => {
     expect(hint?.textContent).not.toContain(`  ${tr('wizard.hint.qrCode')}`)
   })
 
+  it('renders the ruled zh hint seam with the adjudicated inter-word space', () => {
+    // The zh half of the same seam. It is the branch's ONLY Chinese DOM delta,
+    // which is precisely why it can rot invisibly: the ~140 zh assertions in
+    // `ui.test.ts` predate the split, and the English cases above cannot see a
+    // dropped space in the Chinese sentence. Pinned literally — not through a
+    // dictionary lookup — because the SHAPE is what was adjudicated: exactly one
+    // space before `二维码` (the inter-word space the ruling kept) and the
+    // JSX-collapsed space after `。` coming from `hint.after`'s own leading
+    // space. Asserting via `zh[...]` would re-derive the string and let a
+    // changed dictionary pass.
+    localeStore.setLocale('zh')
+    const { container } = render(createElement(PairingWizard, { subscribed: true, progress: undefined }))
+
+    const hint = container.querySelector('p.cherry-hint')
+    expect(hint).not.toBeNull()
+    expect(hint?.textContent).toContain('显示的是 二维码。 请用微信')
+    // The emphasis is the `<strong>` element's own text, and the seam around it
+    // is exactly one space on each side of the ruled pair.
+    expect(hint?.querySelector('strong')?.textContent).toBe('二维码')
+    expect(hint?.textContent).toBe(
+      `${zh['wizard.hint.before']} ${zh['wizard.hint.qrCode']}${zh['wizard.hint.after']}`,
+    )
+    expect(hint?.textContent).not.toContain('二维码  ')
+    expect(hint?.textContent).not.toContain('  二维码')
+  })
+
   it('translates the heading, the three steps, the form and the pending notice', () => {
     localeStore.setLocale('en')
     render(createElement(PairingWizard, { subscribed: false, progress: undefined }))

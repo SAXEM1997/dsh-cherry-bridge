@@ -207,6 +207,10 @@ function quietConsole(): { warn: ReturnType<typeof vi.fn> } {
 afterEach(() => {
   cleanup()
   vi.restoreAllMocks()
+  // `vi.restoreAllMocks()` does NOT undo `vi.stubGlobal`, so the navigator stubs
+  // below are released explicitly — otherwise a `zh-CN` stub would leak into the
+  // next file's cases (the fallback is read from the process-global navigator).
+  vi.unstubAllGlobals()
   // The store is a module-level singleton: every case starts from the page's
   // historical default so no test inherits another's language.
   localeStore.setLocale('zh')
@@ -346,6 +350,23 @@ describe('a host without a usable locale service', () => {
       Object.defineProperty(globalThis, 'navigator', { value: original, configurable: true })
     }
   })
+
+  it('resolves a zh-CN navigator to Chinese when no locale service is present', () => {
+    // The REGION-TAGGED Chinese tag, which is the shape a real zh user's browser
+    // sends (`zh-CN`, not bare `zh`). The wiring layer must route it through
+    // `resolveLocaleFromNavigator`'s prefix match and reach the Chinese
+    // dictionary: an absent host means the page renders Chinese, with no throw.
+    // jsdom's own navigator is `en-US`, so without the stub this case would be
+    // indistinguishable from the English fallback.
+    vi.stubGlobal('navigator', { language: 'zh-CN' })
+
+    const { slots } = applyWith({})
+    expect(() => slots.openSlot()).not.toThrow()
+
+    expect(localeStore.getSnapshot().locale).toBe('zh')
+    expect(slots.registration?.options.label()).toBe(ZH_TITLE)
+    expect(render(createElement(LocaleMarker)).container.textContent).toBe(ZH_TITLE)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -367,6 +388,79 @@ describe('a host locale service that misbehaves', () => {
     // reads it, rather than the label throwing on every nav render.
     expect(localeStore.getSnapshot().locale).toBe('en')
     expect(slots.registration?.options.label()).toBe(EN_TITLE)
+  })
+
+  it('does not leak or double the host subscription when getLocale always throws', () => {
+    // THE REGRESSION: `adopt()`'s catch used to clear `host` WITHOUT releasing
+    // the subscription. A host that still announces then re-enters `probe()`
+    // with `host === undefined`, reads the host again and SUBSCRIBES AGAIN —
+    // overwriting the `unsubscribe` variable, so the earlier disposer became
+    // unreachable and every announcement added another live listener. Teardown
+    // released only the last one. This fixture is exactly the shape that
+    // triggers it: `getLocale()` always throws, while `subscribe()` works and
+    // keeps delivering announcements.
+    const { warn } = quietConsole()
+
+    // The live-listener bookkeeping a real service owns: `subscribes` counts the
+    // listeners handed out, `unsubscribes` the disposers actually invoked, so
+    // `subscribes - unsubscribes` is the LIVE count.
+    let subscribes = 0
+    let unsubscribes = 0
+    const listeners = new Set<() => void>()
+    const service = {
+      getLocale: (): { active: string } => {
+        throw new Error('host getLocale always explodes')
+      },
+      subscribe: (listener: () => void): (() => void) => {
+        subscribes += 1
+        listeners.add(listener)
+        return () => {
+          unsubscribes += 1
+          listeners.delete(listener)
+        }
+      },
+    }
+
+    const { slots, teardown } = applyWith({ hasGet: true, localeService: service })
+    expect(() => slots.openSlot()).not.toThrow()
+
+    // The failed adopt already released the subscription: nothing is live once
+    // the probes have finished, so an announcement has nothing of ours to call.
+    // (Pre-fix, this was already 0 here — the leak is what the announcements
+    // below expose.)
+    expect(listeners.size).toBe(0)
+    expect(subscribes - unsubscribes).toBe(0)
+
+    // The host announces three times. Each announcement re-enters `probe()`
+    // through any listener still held; with the leak, each round subscribed
+    // again and the live count grew. With the fix it never exceeds ONE live
+    // listener at any instant — the invariant, not an exact count, because
+    // whether a round re-subscribes depends on whether a listener survived.
+    let peakLive = 0
+    for (let round = 0; round < 3; round += 1) {
+      expect(() => announce({ listeners })).not.toThrow()
+      const live = subscribes - unsubscribes
+      peakLive = Math.max(peakLive, live)
+      expect(listeners.size, `live listeners after announcement ${round + 1}`).toBe(live)
+      expect(live, `live count after announcement ${round + 1}`).toBeLessThanOrEqual(1)
+      // Every listener handed out is accounted for by a disposer: the leak's
+      // signature is `subscribes` climbing while `unsubscribes` lags.
+      expect(live).toBeGreaterThanOrEqual(0)
+    }
+    // The whole point: three announcements never produced a second concurrent
+    // listener. (Pre-fix this peak reached 3, since no disposer ever ran.)
+    expect(peakLive).toBeLessThanOrEqual(1)
+
+    // Nothing escaped: the degraded path warned and the store holds the fallback
+    // (jsdom's `en-US` navigator), not an unrelated language.
+    expect(warn).toHaveBeenCalled()
+    expect(localeStore.getSnapshot().locale).toBe('en')
+
+    // Teardown releases the ONE listener that is still live.
+    expect(teardown).toBeTypeOf('function')
+    teardown?.()
+    expect(listeners.size).toBe(0)
+    expect(subscribes - unsubscribes).toBe(0)
   })
 
   it('warns, does not throw, and keeps the page usable when subscribe throws', () => {

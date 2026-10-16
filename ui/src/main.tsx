@@ -181,9 +181,12 @@ function resolveActiveLocale(active: unknown, fallback: LocaleId): LocaleId {
  *  - **the registration carries no `locale` field**, and `inject` stays
  *    `['slots']`: declaring `locale` would make a host without the provider
  *    fail the entire Web GUI boot, for a feature that is optional by design.
- *  - **nothing here may throw.** Every host interaction is guarded and degrades
- *    to "no localization" (a warning plus the fallback language); a misbehaving
- *    host costs the page its English, never its registration.
+ *  - **nothing in the LOCALE path may throw.** Every interaction with the host's
+ *    `locale` service is guarded and degrades to "no localization" (a warning
+ *    plus the fallback language); a misbehaving host costs the page its English,
+ *    never its registration. (The `ctx.slots.inject`/`register` calls below are
+ *    NOT wrapped — they are the pre-existing registration path, where a `slots`
+ *    failure was never survivable.)
  */
 function apply(ctx: ClientContext): void {
   // The ONE navigator read in the plugin (Global Constraint: 单点守卫).
@@ -213,8 +216,18 @@ function apply(ctx: ClientContext): void {
       active = service.getLocale().active
     } catch (cause) {
       // The host is not trustworthy right now, so it is NOT adopted: the label
-      // then reads the store rather than throwing on every nav render.
-      if (host === service) host = undefined
+      // then reads the store rather than throwing on every nav render. The
+      // subscription is released BEFORE the cached reference is dropped: this
+      // host keeps announcing, and a listener left live would re-enter `probe()`,
+      // find `host === undefined`, read the host again and subscribe a SECOND
+      // time — overwriting `unsubscribe` and orphaning the previous disposer, so
+      // the listener count would double on every announcement. (The wrapper
+      // below is self-clearing, so calling it here is safe and a no-op once
+      // released.)
+      if (host === service) {
+        host = undefined
+        unsubscribe?.()
+      }
       localeStore.setLocale(fallback)
       console.warn(`[${SETTINGS_NAMESPACE}] host locale unavailable; falling back to ${fallback}`, cause)
       return

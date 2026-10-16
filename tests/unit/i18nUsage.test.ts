@@ -11,6 +11,25 @@
  *    still gets translated, reviewed and shipped — and the next person edits a
  *    sentence that no longer appears anywhere.
  *
+ * ## Two blind spots of a TEXTUAL reference scan (read before trusting a green)
+ *
+ * The scan is textual on purpose (see below), and that buys two failure modes
+ * this file cannot see. Both were measured on this tree, not hypothesised:
+ *
+ *  1. **A `t('…')` spelling inside a COMMENT counts as a reference.** The
+ *     scanner reads text, so deleting a call while leaving its comment — the
+ *     ordinary shape of "inline the literal, keep the note" — leaves the key
+ *     looking alive and the reverse direction GREEN. A dead key can therefore
+ *     be masked by a comment, and the fix is to delete the comment with the
+ *     call, not to trust the guard.
+ *  2. **Calls that do not go through a bare `t(` are INVISIBLE.** `main.tsx`'s
+ *     nav label reads `translate('app.title')` (its own local helper, so the
+ *     host is never handed a raw key), which the scanner does not match.
+ *     `app.title` stays alive only because `App.tsx` also spells
+ *     `t('app.title')` — delete THAT one call and the key is reported dead
+ *     although the label still uses it. Any second, differently-named
+ *     translation entry point has the same effect.
+ *
  * ## The usage universe (deliberately wider than "the `t(` call sites")
  *
  * Three sources count as a reference, and all three are needed:

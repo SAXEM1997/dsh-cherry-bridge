@@ -44,7 +44,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { dictionaries } from '../../ui/src/i18n.js'
+import { dictionaries } from '../../ui/src/i18n'
 
 const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const localeDir = join(repoRoot, 'locale')
