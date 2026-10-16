@@ -36,34 +36,40 @@ export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
  * message, or many messages) became a deterministic connection reset before
  * these clamps.
  *
- * PARTS_LIST_PAGE_CLAMP and INTERACTIONS_LIST_PAGE_CLAMP are DERIVED, not
- * tuned: the peer may inline up to 4,096 CHARACTERS of text per field (its
- * `INLINE_TEXT_LIMIT`; ≈3 UTF-8 bytes per CJK character) plus a ~0.5 KiB
- * envelope per item, and an interaction record additionally carries a
- * 2,048-character summary. Dividing the 64 KiB record budget (minus a 2 KiB
- * page/margin overhead) by each list's worst-case item gives the clamp.
+ * PARTS_LIST_PAGE_CLAMP and INTERACTIONS_LIST_PAGE_CLAMP are DERIVED from the
+ * strict UTF-8 worst case (4 bytes per character — emoji and CJK extension
+ * planes), not tuned: the peer may inline up to 4,096 CHARACTERS of text per
+ * field (its `INLINE_TEXT_LIMIT`), an interaction record additionally carries
+ * a 2,048-character summary, and each item adds an envelope (ids are
+ * schema-capped at 256 characters each — roughly 1 KiB across an item's id
+ * fields, which the page margin below absorbs). Dividing the 64 KiB record
+ * budget (minus a 2 KiB page/margin overhead) by each list's worst-case item
+ * gives the clamp.
  *
  * LIST_PAGE_CLAMP is pragmatic, not provable: message/session/agent records
- * carry unbounded `partIds`/title fields, so no count alone guarantees a
- * sub-budget record. 16 covers every observed record with ≈4× headroom; the
- * complete fix is byte-budgeted paging on the server (tracked upstream).
+ * carry large schema-bounded fields (`partIds` up to 4,096 entries, titles up
+ * to 4,096 characters), so no count is provably sub-budget. 16 covers every
+ * observed record with headroom; the complete fix is byte-budgeted paging on
+ * the server (tracked upstream).
  */
 
 /** Usable bytes of one wire record after page/margin overhead. */
 const RECORD_BUDGET_BYTES = 65_536 - 2_048
 
-/** Worst-case UTF-8 bytes of one inline text field (4,096 CJK characters). */
-const INLINE_FIELD_BYTES = 4_096 * 3
+/** Strict worst-case UTF-8 bytes of one inline character (astral planes). */
+const CHAR_BYTES = 4
 
-/** Per-item envelope: ids, revisions, kind/state enums, JSON punctuation. */
+/** Per-item envelope: ids (schema-capped), revisions, enums, punctuation. */
 const ITEM_ENVELOPE_BYTES = 512
 
 /** Parts per parts.list page: one inline content field per part. */
-export const PARTS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / (INLINE_FIELD_BYTES + ITEM_ENVELOPE_BYTES))
+export const PARTS_LIST_PAGE_CLAMP = Math.floor(
+  RECORD_BUDGET_BYTES / (4_096 * CHAR_BYTES + ITEM_ENVELOPE_BYTES),
+)
 
 /** Interactions per interactions.list page: inline input + inline summary. */
 export const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(
-  RECORD_BUDGET_BYTES / (INLINE_FIELD_BYTES + 2_048 * 3 + ITEM_ENVELOPE_BYTES),
+  RECORD_BUDGET_BYTES / (4_096 * CHAR_BYTES + 2_048 * CHAR_BYTES + ITEM_ENVELOPE_BYTES),
 )
 
 /** Items per every other aggregated list page (agents/sessions/messages). */

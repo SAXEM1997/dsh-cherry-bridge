@@ -2056,24 +2056,28 @@ const DEFAULT_PER_SESSION_CACHE_BYTES = 2097152;
 * message, or many messages) became a deterministic connection reset before
 * these clamps.
 *
-* PARTS_LIST_PAGE_CLAMP and INTERACTIONS_LIST_PAGE_CLAMP are DERIVED, not
-* tuned: the peer may inline up to 4,096 CHARACTERS of text per field (its
-* `INLINE_TEXT_LIMIT`; ≈3 UTF-8 bytes per CJK character) plus a ~0.5 KiB
-* envelope per item, and an interaction record additionally carries a
-* 2,048-character summary. Dividing the 64 KiB record budget (minus a 2 KiB
-* page/margin overhead) by each list's worst-case item gives the clamp.
+* PARTS_LIST_PAGE_CLAMP and INTERACTIONS_LIST_PAGE_CLAMP are DERIVED from the
+* strict UTF-8 worst case (4 bytes per character — emoji and CJK extension
+* planes), not tuned: the peer may inline up to 4,096 CHARACTERS of text per
+* field (its `INLINE_TEXT_LIMIT`), an interaction record additionally carries
+* a 2,048-character summary, and each item adds an envelope (ids are
+* schema-capped at 256 characters each — roughly 1 KiB across an item's id
+* fields, which the page margin below absorbs). Dividing the 64 KiB record
+* budget (minus a 2 KiB page/margin overhead) by each list's worst-case item
+* gives the clamp.
 *
 * LIST_PAGE_CLAMP is pragmatic, not provable: message/session/agent records
-* carry unbounded `partIds`/title fields, so no count alone guarantees a
-* sub-budget record. 16 covers every observed record with ≈4× headroom; the
-* complete fix is byte-budgeted paging on the server (tracked upstream).
+* carry large schema-bounded fields (`partIds` up to 4,096 entries, titles up
+* to 4,096 characters), so no count is provably sub-budget. 16 covers every
+* observed record with headroom; the complete fix is byte-budgeted paging on
+* the server (tracked upstream).
 */
 /** Usable bytes of one wire record after page/margin overhead. */
 const RECORD_BUDGET_BYTES = 63488;
 /** Parts per parts.list page: one inline content field per part. */
-const PARTS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 12800);
+const PARTS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 16896);
 /** Interactions per interactions.list page: inline input + inline summary. */
-const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 18944);
+const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 //#endregion
 //#region src/urlHost.ts
 /**

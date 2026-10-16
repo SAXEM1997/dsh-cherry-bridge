@@ -274,10 +274,28 @@ describe('read-only cherry tools over a real loopback channel', () => {
       expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
       expect(call['limit'] as number).toBeLessThanOrEqual(LIST_PAGE_CLAMP)
     }
-    // Page 1 carries no cursor; pages 2/3 carry the numeric offsets.
+    // Page 1 carries no cursor; later pages carry the numeric offsets.
     expect(calls[0]!['cursor']).toBeUndefined()
     expect(calls[1]!['cursor']).toBe('16')
     expect(calls[2]!['cursor']).toBe('32')
+  })
+
+  it('②c a negotiated pageItems smaller than the byte-safe clamp still binds every page', async () => {
+    // The effective page size is min(negotiated, clamp): a peer that already
+    // pages smaller keeps ITS size — the byte-safe clamp never widens a page.
+    const agents = Array.from({ length: 10 }, (_unused, index) => ({
+      agentId: `agent-${index}`,
+      name: `Agent ${index}`,
+    }))
+    const rig = await makeRig({ hello: { limits: { pageItems: 2 } }, agent: { agents } })
+
+    const result = (await rig.call('cherry_agents', { device: 'dev-A', limit: 10 })) as {
+      items: Array<{ agentId: string }>
+    }
+    expect(result.items).toHaveLength(10)
+    const calls = rig.fake.readCallsFor('agent.agents.list')
+    expect(calls).toHaveLength(5)
+    for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(2)
   })
 
   it('②b cherry_agents stops at the caller limit without over-fetching the last page', async () => {
@@ -470,8 +488,8 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // part walk bounded by the plugin's own tool-limit constant would drop a
     // third of the snapshot while claiming completion, so every part must
     // arrive and the result must NOT advertise truncation — while every page
-    // request stays at or below PARTS_LIST_PAGE_CLAMP, the count of fat inline
-    // parts that provably fit one 64 KiB wire record.
+    // request stays at or below PARTS_LIST_PAGE_CLAMP, the strict-worst-case
+    // count of fat inline parts that fits one 64 KiB wire record.
     const parts = Array.from({ length: 60 }, (_unused, index) => ({
       kind: 'text' as const,
       text: `part-${index}`,
@@ -498,7 +516,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(result.messages[0]!.partsTruncated).toBeUndefined()
 
     const calls = rig.fake.readCallsFor('agent.parts.list')
-    expect(calls).toHaveLength(15)
+    expect(calls).toHaveLength(20)
     for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PARTS_LIST_PAGE_CLAMP)
     expect(calls[0]!['cursor']).toBeUndefined()
     expect(calls[1]!['cursor']).toBe(String(PARTS_LIST_PAGE_CLAMP))
@@ -539,21 +557,22 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // exactly where the walk stopped, not where its last page began.
     expect(result.messages[0]!.partsResumeCursor).toBe('25')
     // It stopped at the breaker, not at the peer's end of data (which would
-    // take ceil(60 / PARTS_LIST_PAGE_CLAMP) = 15 pages at the byte-safe size).
-    expect(rig.fake.readCallsFor('agent.parts.list').length).toBe(7)
+    // take ceil(60 / PARTS_LIST_PAGE_CLAMP) = 20 pages at the byte-safe size).
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBe(9)
   })
 
   it('④m the byte-safe page clamps are derived from the 64 KiB record budget', async () => {
     // WIRE MATH (see src/defaults.ts): every JSON-RPC record is capped at
     // 65,536 bytes and the peer may inline up to 4,096 CHARACTERS of part
-    // text (~12 KiB UTF-8 for CJK) plus a ~0.5 KiB envelope, so at most
-    // floor((65,536 − 2,048 margin) / 12.8 KiB) = 4 parts fit one record;
-    // an interaction record also carries a 2,048-character summary
-    // (~18.7 KiB worst case), leaving room for 3. These are derived, not
-    // tuned — pinning them here keeps a silent re-tune from reintroducing
-    // the "JSON-RPC channel closed" class of failure.
-    expect(PARTS_LIST_PAGE_CLAMP).toBe(4)
-    expect(INTERACTIONS_LIST_PAGE_CLAMP).toBe(3)
+    // text (strict UTF-8 worst case 4 B/char — astral planes) plus envelope,
+    // so at most floor((65,536 − 2,048 margin) / 16.9 KiB) = 3 parts fit one
+    // record; an interaction record also carries a 2,048-character summary
+    // (~25.1 KiB worst case), leaving room for 2. These are derived at the
+    // strict per-character worst case, not tuned — pinning them here keeps a
+    // silent re-tune from reintroducing the "JSON-RPC channel closed" class
+    // of failure.
+    expect(PARTS_LIST_PAGE_CLAMP).toBe(3)
+    expect(INTERACTIONS_LIST_PAGE_CLAMP).toBe(2)
     expect(LIST_PAGE_CLAMP).toBe(16)
 
     // The messages walk rides the list clamp too: 40 messages paginate as
@@ -622,8 +641,8 @@ describe('read-only cherry tools over a real loopback channel', () => {
     async () => {
       // DISCRIMINATOR for the parts bound: 1001 parts exceeds any plausible
       // single-page or tool-limit constant, so a walk still bounded by one stops
-      // short and says so. Parts are tiny; the byte-safe page clamp (4/page)
-      // makes this a 251-page walk, so the test takes a few seconds.
+      // short and says so. Parts are tiny; the byte-safe page clamp (3/page)
+      // makes this a 334-page walk, so the test takes a few seconds.
       const PARTS = 1001
       const parts = Array.from({ length: PARTS }, (_unused, index) => ({
         kind: 'text' as const,
@@ -648,10 +667,10 @@ describe('read-only cherry tools over a real loopback channel', () => {
       expect(result.messages[0]!.parts[PARTS - 1]!.content).toBe(`p${PARTS - 1}`)
       expect(result.messages[0]!.partsTruncated).toBeUndefined()
 
-      // 251 pages of 4 (the last holds the single leftover part).
+      // 334 pages of 3 (the last holds the two leftover parts).
       const calls = rig.fake.readCallsFor('agent.parts.list')
-      expect(calls).toHaveLength(251)
-      expect(calls[250]!['cursor']).toBe('1000')
+      expect(calls).toHaveLength(334)
+      expect(calls[333]!['cursor']).toBe('999')
       for (const call of calls) {
         expect(call['limit'] as number).toBeLessThanOrEqual(PARTS_LIST_PAGE_CLAMP)
       }

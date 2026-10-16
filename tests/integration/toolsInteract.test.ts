@@ -653,7 +653,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     expect(result.items[0]!.summary).toBe('The agent needs two answers')
 
     // The peer was really asked for the whole set — at the byte-safe page
-    // clamp (3/page) that is two pages, walked to completion.
+    // clamp (2/page) that is two pages, walked to completion.
     expect(rig.fake.commandCallsFor('agent.interactions.list')).toHaveLength(2)
 
     // Now every interaction is answered: the pending filter yields EMPTY.
