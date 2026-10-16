@@ -20,25 +20,11 @@ answer approval and question cards, cancel executions — plus a same-origin
 settings page for device and tool-scope management.
 
 ```mermaid
-flowchart LR
-    classDef dsh fill:#ddf4ff,stroke:#0969da,stroke-width:2px,color:#0a3069
-    classDef plug fill:#f6f8fa,stroke:#8c959f,stroke-width:2px,color:#57606a
-    classDef cherry fill:#fff8c5,stroke:#9a6700,stroke-width:2px,color:#7d4e00
-
-    subgraph HOST["DeepSeek Harness host"]
-        S["DSH sessions<br/>14 cherry_* tools (per-workspace)"]:::dsh
-        W["Settings page · cherry-remote namespace<br/>device cards / pairing wizard / scope"]:::dsh
-        H["Same-origin HTTP prefix<br/>/cherry-remote/api"]:::dsh
-    end
-
-    P["dsh-cherry-bridge<br/>connection pool · subscription cache · scope layer<br/>0600 device archive (Noise key pinning)"]:::plug
-
-    C["Cherry Studio desktop<br/>remote access (QR pairing · 6-digit code · approval)"]:::cherry
-
-    S -->|tools.register / restrict| P
-    W -->|REST + SSE| H
-    H --> P
-    P <-->|"ws:// · Noise XX · heartbeat · rate shaping · reconnect"| C
+flowchart TB
+    T["DSH sessions<br/>14 cherry_* tools"] --> P
+    W["Settings page<br/>devices · pairing · scope"] --> P
+    P["dsh-cherry-bridge<br/>pool · subscriptions · scope"]
+    P <-->|"ws:// · Noise XX"| C["Cherry Studio desktop<br/>QR pairing · approvals"]
 ```
 
 - Package: `dsh-cherry-bridge`

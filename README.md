@@ -18,25 +18,11 @@
 发消息并等待终态、应答审批与提问卡、取消执行；附一个同源设置页管理设备与工具启用范围。
 
 ```mermaid
-flowchart LR
-    classDef dsh fill:#ddf4ff,stroke:#0969da,stroke-width:2px,color:#0a3069
-    classDef plug fill:#f6f8fa,stroke:#8c959f,stroke-width:2px,color:#57606a
-    classDef cherry fill:#fff8c5,stroke:#9a6700,stroke-width:2px,color:#7d4e00
-
-    subgraph HOST["DeepSeek Harness 宿主"]
-        S["DSH 会话<br/>14 个 cherry_* 工具（按工作区启用）"]:::dsh
-        W["设置页 · cherry-remote 命名空间<br/>设备卡片 / 配对向导 / 启用范围"]:::dsh
-        H["同源 HTTP 前缀<br/>/cherry-remote/api"]:::dsh
-    end
-
-    P["dsh-cherry-bridge<br/>连接池 · 订阅缓存 · 作用域层<br/>0600 设备档案（Noise 公钥 pin）"]:::plug
-
-    C["Cherry Studio 桌面端<br/>remote access（二维码配对 · 6 位验证码 · 审批）"]:::cherry
-
-    S -->|tools.register / restrict| P
-    W -->|REST + SSE| H
-    H --> P
-    P <-->|"ws:// · Noise XX · 心跳 · 限速 · 断线重连"| C
+flowchart TB
+    T["DSH 会话<br/>14 个 cherry_* 工具"] --> P
+    W["设置页<br/>设备 · 配对 · 启用范围"] --> P
+    P["dsh-cherry-bridge<br/>连接池 · 订阅缓存 · 作用域"]
+    P <-->|"ws:// · Noise XX"| C["Cherry Studio 桌面端<br/>二维码配对 · 审批"]
 ```
 
 - 包名：`dsh-cherry-bridge`
