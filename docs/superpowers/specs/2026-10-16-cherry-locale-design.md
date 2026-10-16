@@ -260,6 +260,7 @@ export interface ClientContext {
 - `meta.title` **逐字等于** `dictionaries[lang]['app.title']`
 - 目录内无多余 `*.json`、文件名为合法语言 id
 - `package.json` 的 `exports` 含那两个精确 specifier、`files` 含 `locale`
+- **驱动宿主真实解析器（不是只断言结构）**：沿用 `clientBundle.test.ts` 直接 import 宿主已安装产物的先例，调用 `@deepseek-ai/dsh-app-boot` 的 `readPluginMeta(specifier, parentURL)` 一次，断言取回 `{title:{en,zh}, description:{en,zh}}` 且与字典一致。这把"exports/files 放行对不对、目录里每个 json 是否都能被解析"从结构断言升级为**真实路径断言**（宿主解析失败时会把插件行标成 meta 错误，只有真跑一遍才能发现）
 
 **③ `tests/unit/i18nUsage.test.ts`（key 引用完整性）**
 - 扫 `ui/src/*.tsx` 的 `t('…')` 字面量 ⇒ 全部存在于字典
@@ -275,11 +276,22 @@ export interface ClientContext {
 - en 下渲染四个组件，断言关键文本为英文，并断言渲染出的 `textContent` **不含任何 CJK**
 - fixture 的服务端 `reason` 在这些用例里换成英文标记串（reason 本是透传，不归我们管），把断言限定在我们能控制的部分
 
-### 8.2 既有用例的改动面（只有 2 处）
+### 8.2 既有用例的改动面（3 处 `apply` 调用点）
 
-- `ui.test.ts:800` 与 `:811-828` 一带：fake ctx 升级为**带 zh locale 服务**（顺带覆盖主路径）；英文分支由新增用例覆盖。
-- 其余约 140 处中文断言**零改动**（模块默认 `zh` 且模块加载不读 navigator）。
-- `clientBundle.test.ts:317`（`inject === ['slots']`）**保持原样**；另加一条：该 fake ctx 下注册项不含 `locale`。
+`apply()` 会写模块级单例 `localeStore`，而 **jsdom 的 `navigator.language` 是 `en-US`** ⇒ 任何"调用 apply 但不提供 locale 宿主"的用例都会把全局语言置成 en，**污染同文件其后的中文断言**（模块级单例的跨用例污染是结构性的）。
+
+已核实共有 3 处这样的调用点，全部按"补一个 zh locale 服务"处理。**不采用**"给 `i18n.ts` 加测试专用复位入口"：那会扩张 §6.1 的公共导出面，而给宿主建模本来就是这些用例该做的事。
+
+| 调用点 | 处理 |
+|---|---|
+| `ui.test.ts:782` | fake ctx 补 zh locale 服务；顺带断言注册项带 `locale`、字典与 `i18n.ts` 引用相等 |
+| `ui.test.ts:815` | 同上（该用例随后渲染 Section 并断言中文） |
+| `uiScopePanel.test.ts:606` | 同上（其后的 ⑫⑬⑭ 仍断言中文） |
+| `clientBundle.test.ts:328/:371/:379` | 该文件只断言信封 / `inject` / 注册面形状，不涉文本 ⇒ 无需改动；将来若出现文本断言，按同一规则处理 |
+
+其余约 140 处中文断言**零改动**：模块默认语言是 `zh`，且**模块加载时不读 navigator**，只有 `apply()` 才嗅探。
+
+`clientBundle.test.ts:317`（`inject === ['slots']`）**保持原样**——它正好证明我们没声明 `locale`；另加一条断言：该 fake ctx 下注册项不含 `locale`。
 
 ### 8.3 不测的
 
@@ -288,7 +300,9 @@ export interface ClientContext {
 
 ### 8.4 收口条件
 
-`npm run typecheck` + `npm test` 全绿；`lib/client.js` 重建产物与源码进**同一个 commit**（本仓库 `artifactFreshness` 是字节比对，硬约束）。
+- `npm run typecheck` + `npm test` 全绿。
+- **新增测试文件必须进 tsconfig 分区**：`tests/unit/projectCoverage.test.ts` 断言 `tests/**/*.test.ts` 恰好被一个 tsconfig 项目覆盖；带 jsdom/JSX 的用例要**同时**加进 `tsconfig.ui.json` 的 `include` 与 `tsconfig.json` 的 `exclude`，否则 `npm run typecheck` 直接红。
+- `lib/client.js` 重建产物与源码进**同一个 commit**（本仓库 `artifactFreshness` 是字节比对，硬约束）。
 
 ---
 
