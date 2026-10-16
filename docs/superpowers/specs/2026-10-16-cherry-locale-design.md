@@ -4,7 +4,7 @@
 - 需求真相源：`docs/superpowers/clarifications/cherry-locale.md`（下称「澄清文档」）
 - 模式：复杂（20-49 文件，运行时升级）
 - 日期：2026-10-16
-- 状态：五段设计已经用户逐段审批（PP-02 第一实例），**整体审批已通过**；当前处于 **Gate 0 审查修复中**（第 1 轮，27 项发现按批修复）
+- 状态：五段设计已经用户逐段审批（PP-02 第一实例），**整体审批已通过**；Gate 0 审查通过（2026-10-16，用户终止出口）；Gate 2 审查通过（2026-10-16，用户终止出口，§8.1⑥/§8.4/§9 引用随计划评审做了三处澄清性修正）
 - 变更文件面（共 **23** 个：新增 9 + 修改 13 + 构建产物 1）
   - 新增 9：`ui/src/i18n.ts`；`locale/en.json`、`locale/zh.json`；`tests/unit/i18n.test.ts`、`localeMeta.test.ts`、`i18nUsage.test.ts`、`localeWiring.test.ts`、`localeRender.test.ts`、`i18nAssets.test.ts`
   - 修改 13：`ui/src/{App,DeviceCard,PairingWizard,ToolScopePanel}.tsx`（4）、`ui/src/types.ts`、`ui/src/main.tsx`、`package.json`、`tsconfig.json`、`tsconfig.ui.json`、`tests/unit/ui.test.ts`、`tests/unit/uiScopePanel.test.ts`、`tests/integration/clientBundle.test.ts`、`docs/e2e-checklist.md`
@@ -32,7 +32,7 @@
 5. 现有测试的既有断言尽量不动——只在"行为确实变了"的地方改，并补上覆盖新行为的用例。
 
 ### 非目标（本次不做）
-- **服务端诊断/告警/降级文案不翻译**（`src/` 的 63 条非注释中文串，其中一部分经 HTTP 到达界面）。用户裁决原话：「告警等先不管」。因此英文界面会出现中英混排（到达面见 §9.1）。
+- **服务端诊断/告警/降级文案不翻译**（`src/` 的 63 条非注释中文串，其中一部分经 HTTP 到达界面）。用户裁决原话：「告警等先不管」。因此英文界面会出现中英混排（到达面见 §9 第 1 项）。
 - **HTTP API 契约不改**（不引入 `Accept-Language`、不把 reason 改成错误码）。
 - **既有文档不翻译**（README / `docs/e2e-checklist.md` 的**既有内容**照旧，用户裁决原话：「readme后续单独处理」）；**但 `docs/e2e-checklist.md` 需新增一节**操作者验收步骤（见 §8.4 交付物）——这是交付物，不是翻译。
 - **不新增插件自己的语言切换入口**。语言选择属于宿主 General 设置里的「语言」行，由宿主的 locale 插件拥有。
@@ -174,7 +174,7 @@ apply(ctx)
 
 1. **运行时界面**：`i18n.ts` 字典 → `localeStore` → 组件（我们全权控制）。
 2. **插件列表元数据**：`locale/{en,zh}.json` → 宿主 **Node 侧** `readPluginMeta` → inventory API → 宿主客户端 `resolveText` 渲染。**不经过我们的 store**，纯文件驱动。
-3. **服务端返回的 `message`/`reason` 文本**：不经过任何本地化通道，原样中文（Q3 已排除；到达面见 §9.1）。
+3. **服务端返回的 `message`/`reason` 文本**：不经过任何本地化通道，原样中文（Q3 已排除；到达面见 §9 第 1 项）。
 
 ### 5.5 生命周期
 
@@ -289,7 +289,7 @@ export interface ClientContext {
 - 目录内无多余 `*.json`、文件名为合法语言 id
 - `package.json` 的 `exports` 含 `locale` 目录的**通配**子路径（`"./locale/*.json"`）、`files` 含 `locale`，且目录内**每个** `*.json` 都可被宿主解析（宿主探测到 `en.json` 后会枚举目录逐个解析，任一解析失败即把插件行标成 meta 错误）
 - **驱动宿主真实解析器（不是只断言结构）**：沿用 `clientBundle.test.ts` 直接 import 宿主已安装产物的先例，调用 `@deepseek-ai/dsh-app-boot` 的 `readPluginMeta(specifier, parentURL)` 一次，断言取回 `{title:{en,zh}, description:{en,zh}}` 且与字典一致。这把"exports/files 放行对不对、目录里每个 json 是否都能被解析"从结构断言升级为**真实路径断言**（宿主解析失败时会把插件行标成 meta 错误，只有真跑一遍才能发现）
-- **宿主产物的解析基址与缺席策略**：`specifier = 'dsh-cherry-bridge'`、`parentURL = import.meta.url`（以仓库内文件为基址可自引用解析）；宿主产物缺席时**沿用 `clientBundle.test.ts:38-67` 的先例**——绝对路径候选 + `describeIfHost` **带理由 skip**，使"`npm test` 全绿"在无宿主环境下仍成立
+- **宿主产物的解析基址与缺席策略**：`specifier = 'dsh-cherry-bridge'`、`parentURL = import.meta.url`（以仓库内文件为基址可自引用解析）；宿主产物缺席时**参照 `clientBundle.test.ts:38-67` 的"绝对路径候选 + 带理由 skip"机制**（注意：该先例解析的是 `dsh-client-modules`，与本用例的 `dsh-app-boot` 是两个包、两种缺席语义——**候选路径表须独立给出**，实现细节见计划 Task 6）
 
 **③ `tests/unit/i18nUsage.test.ts`（key 引用完整性）**
 - 扫描范围 `ui/src/**/*.{ts,tsx}`；**判据 = 扫描到的 `t('…')` 字面量 ∪ `Object.values(STAGE_KEYS)` ∪ `Object.values(STATE_KEYS)`** ⇒ 全部存在于字典
@@ -306,14 +306,15 @@ export interface ClientContext {
 
 **⑤ `tests/unit/localeRender.test.ts`（英文渲染基线，4 条，一组件一条）**
 - en 下渲染四个组件，断言关键文本为英文，并断言**我方自有文案零中文**——判据**不是**全树 `textContent` 不含 CJK（那会误伤下面这些**非我方**文本源，它们在本用例 fixture 里换成英文标记串）：
-  - 服务端返回的 message / `reason` / 降级注记（透传，Q3 已排除；到达面见 §9.1）
+  - 服务端返回的 message / `reason` / 降级注记（透传，Q3 已排除；到达面见 §9 第 1 项）
   - 注册表提供的工作区名与路径（数据面）
   - 透传的 `Error.message`
 - **`afterEach` 用公开的 `localeStore.setLocale('zh')` 复位**，防 en 用例污染同文件/其后文件的中文断言；**不新增任何测试专用导出**
 
 **⑥ `tests/unit/i18nAssets.test.ts`（源码级中文字面量守卫，TypeScript 编译器 API）**
-- 用 TS 编译器 API 遍历 `ui/src/{App,DeviceCard,PairingWizard,ToolScopePanel,main,types}.ts(x)` 的**字符串字面量与 JSX 文本**，断言**无 CJK**
-- **唯一例外 `i18n.ts`**（zh 字典的唯一来源）；`types.ts` 经 §4.5 改造后表值取自 `dictionaries.zh`，同样不含中文字面量
+- 用 TS 编译器 API 遍历 **`ui/src/**/*.{ts,tsx}` 全域**的**字符串字面量与 JSX 文本**，断言**无 CJK**
+- **唯一例外 `i18n.ts`**（zh 字典的唯一来源，ui/src 全域唯一允许 CJK 的文件）；`types.ts` 经 §4.5 改造后表值取自 `dictionaries.zh`，同样不含中文字面量
+- **扫描范围是全域而非具名清单**：具名名单 ≠ "全域唯一白名单"的意图——`api.ts`/`dev.tsx`/`vite-env.d.ts` 等灰区文件当前 CJK=0，但具名名单**不设防**，将来往它们里写中文不会被发现
 - **动机**：⑤ 的渲染判据受 fixture 覆盖面限制（没渲染到的分支、从未进入字典的中文它看不见）；**源码级守卫才能抓住"从未进入字典的中文"**
 
 ### 8.2 既有用例的改动面（全仓 6 处 `apply` 调用点）
@@ -341,9 +342,9 @@ export interface ClientContext {
 ### 8.4 收口条件
 
 - `npm run typecheck` + `npm test` 全绿。
-- **新增测试文件必须进 tsconfig 分区**（`tsconfig.ui.json` 的 include 与 `tsconfig.json` 的 exclude 都是**逐文件列举**，缺一个 `npm run typecheck` 直接红；`tests/unit/projectCoverage.test.ts` 断言 `tests/**/*.test.ts` 恰好被一个 tsconfig 项目覆盖）：
-  - **进 UI 分区**（含 jsdom/JSX 渲染，须**同时**加进 `tsconfig.ui.json` 的 `include` 与 `tsconfig.json` 的 `exclude`）：`tests/unit/localeRender.test.ts`、`tests/unit/localeWiring.test.ts`
-  - **由 server 项目默认覆盖**（纯逻辑 / 读文件 / TS 编译器 API，无 DOM）：`tests/unit/i18n.test.ts`、`tests/unit/localeMeta.test.ts`、`tests/unit/i18nUsage.test.ts`、`tests/unit/i18nAssets.test.ts`
+- **新增测试文件必须进 tsconfig 分区**（`tsconfig.ui.json` 的 include 与 `tsconfig.json` 的 exclude 都是**逐文件列举**，缺一个 `npm run typecheck` 直接红；`tests/unit/projectCoverage.test.ts` 断言 `tests/**/*.test.ts` 恰好被一个 tsconfig 项目覆盖）。**判据是"是否 import `ui/src/**`"，不是"是否 jsdom/JSX 渲染"**，论据三点：① `tsconfig.json` 的 `exclude` 含 `"ui"`，两项目的 include/exclude 集是对 `tests/**/*.test.ts` 的**划分**（"每文件恰检一次"），跨项目 import 会让同一份 `ui/src/**` 同时进两个 program、被两套互斥选项各检一次；② 全仓**零反例**——只有 `tests/unit/ui.test.ts` 与 `tests/unit/uiScopePanel.test.ts` import `ui/src/**`，两者都在 UI 分区（`clientBundle.test.ts` 虽在 UI 分区但不静态 import ui）；③ server 项目是 `moduleResolution: nodenext`，**相对 import 必须带 `.js` 后缀**，按 UI 侧自然风格（bundler、无后缀）写的 test 进 server 分区直接 **TS2835** 红。
+  - **进 UI 分区**（import `ui/src/**`，须**同时**加进 `tsconfig.ui.json` 的 `include` 与 `tsconfig.json` 的 `exclude`）：`tests/unit/i18n.test.ts`、`tests/unit/localeWiring.test.ts`、`tests/unit/localeRender.test.ts`、`tests/unit/localeMeta.test.ts`、`tests/unit/i18nUsage.test.ts`
+  - **由 server 项目默认覆盖**（不 import ui 模块，纯文本扫描 / 读文件 / TS 编译器 API）：`tests/unit/i18nAssets.test.ts`
 - `lib/client.js` 重建产物与源码进**同一个 commit**（本仓库 `artifactFreshness` 是字节比对，硬约束）。
 - **交付物包含 `docs/e2e-checklist.md` 新增一节**（用户已确认的收口范围）：放在「第二部分：真机主流程」中，紧随 F「工具启用范围（`/scope`）」之后，形如 `### G. 语言切换与降级`。验收步骤至少覆盖两点：
   1. 在宿主 General 设置里切换语言（中 ↔ 英），核对**导航标签 / 页面正文 / 插件列表的标题与描述**三处**无需刷新**跟随；
