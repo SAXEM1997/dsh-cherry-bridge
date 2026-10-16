@@ -111,7 +111,7 @@ const DEGRADED_LABELS: Record<DegradedSource, string> = {
 const SAVE_FAILURE_LABELS: Record<string, string> = {
   'scope-revision-conflict': '配置已被他处修改，请重新读取后再保存。',
   'scope-version-unsupported':
-    '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫），本文档的版本高于本插件支持：重读不会改变文档版本，请升级宿主 / DSH 或本插件后再试。',
+    '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫），文档版本高于本插件支持、或低于本插件支持：重读不会改变文档版本，请升级宿主 / DSH 或本插件后再试。',
   'invalid-scope': '保存被拒绝：作用域字段非法（mode 必须是 global 或 selected，workspaceIds 必须是字符串数组）。',
   'missing-expected-revision': '保存被拒绝：请求缺少基准 expectedRevision，请重新读取后再保存。',
   'workspace-list-unavailable': '工作区列表当前读不到，无法保存；已存勾选与 mode 一位不动。',
