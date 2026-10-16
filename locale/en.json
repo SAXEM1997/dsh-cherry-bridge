@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Cherry Studio Bridge",
+    "description": "DeepSeek Harness plugin bridging to Cherry Studio desktop instances over remote transport"
+  }
+}

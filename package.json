@@ -29,6 +29,7 @@
       "default": "./dist/index.mjs"
     },
     "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
     "./package.json": {
       "default": "./package.json"
     }
@@ -47,6 +48,7 @@
     "dist",
     "src",
     "ui",
+    "locale",
     "docs/e2e-checklist.md",
     "cordis.patch.yml",
     "README.md"
