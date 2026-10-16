@@ -162,6 +162,12 @@ describe('T4 host integration: tri-state, injection gate and co-lifecycle', () =
     // so in the two fixtures whose suites only assert those faces a typo would
     // otherwise be swallowed — the recorded key set above is the loud half.
     expect(() => asksForScopeKeys(['agents', 'workspaceRegistr'])).toThrow(/PARTIAL match/)
+    // R2-N15: a TWO-key typo is the other half of the same gate. Classifying it
+    // by the ABSENCE of the scope keys alone would route it to the web-only ctx,
+    // and the misrouted fixture would report the wrong diagnosis; the web-only
+    // call is a positive match against its own literal instead.
+    expect(() => asksForScopeKeys(['agent', 'workspaceRegistr'])).toThrow(/NEITHER tool-scope key/)
+    expect(asksForScopeKeys(['webServer', 'webRuntime'])).toBe(false)
   })
 
   it('② unsupported: register / restrict / schemas are each a hard gate (static failure wins)', () => {
@@ -2497,6 +2503,57 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
     expect(blind.scope.layer('agent-blind')?.deny).toHaveLength(14)
     expect(blind.host.agentView('agent-blind')).toEqual([])
     expect(blind.host.verdict('agent-blind', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+
+    // ── (c2) the OTHER arm of "no usable generation": 未读. The same `!== 'read'`
+    // predicate in `resolveNow`, reached the other way — the list was never read
+    // at all (the injection arrives with the agent already live) rather than read
+    // and failed. The document ENABLES the workspace and the registry holds it
+    // with this agent as a MEMBER, so the synchronous deny below is explainable
+    // ONLY by the absent generation: the round that lands right behind it
+    // resolves the very same agent visible and releases the layer. ──
+    const unread = rig({
+      deferInjection: true,
+      patchRoot: (fake) => {
+        // Both the registry entry and the session membership are in place BEFORE
+        // the injection callback is even delivered, so no pass can have read them.
+        fake.setWorkspaces([entity('w-oa', '/w/oa', ['agent-unread'])])
+        fake.addAgent({ id: 'agent-unread', cwd: '/w/oa' })
+      },
+    })
+    // 未读 is not 读失败: the write side is open and prunes nothing (N1 keeps
+    // this true after a teardown as well).
+    saveScope(unread.scope, 'selected', ['w-oa'])
+    unread.host.deliverInjection()
+
+    // SYNCHRONOUSLY, with no await: with no list of its own yet, the first pass
+    // denies instead of releasing — even though the agent is a member of an
+    // ENABLED workspace.
+    expect(unread.scope.judgement('agent-unread')).toBeUndefined()
+    expect(unread.host.layerCount('agent-unread')).toBe(1)
+    expect(unread.scope.layer('agent-unread')?.deny).toHaveLength(14)
+    expect(unread.host.agentView('agent-unread')).toEqual([])
+    expect(unread.host.verdict('agent-unread', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+    // The record's REASON is already the member conclusion, and that is the real
+    // ordering rather than a leak: installing a layer calls `restrict()`, the host
+    // emits `tools/change` on that call, the plugin's own listener starts a round,
+    // and that round's SYNCHRONOUS HEAD reads the list — all before `reasonFor`
+    // runs at the end of this same pass. 未读 is therefore a property of the PASS
+    // (what `resolveNow` could answer when the deny was DECIDED), not of the
+    // record. The discriminating pin for it is the unit-level
+    // `resolveNow(...) === undefined` in toolScopeJudge ⑦: an empty list makes
+    // rule two conclude `no-match`, so this arm's deny would look identical if
+    // the `!== 'read'` guard were widened (verified by mutation while writing it).
+    expect(unread.scope.layer('agent-unread')?.reason).toContain('会话成员命中')
+
+    // The round behind it reads both and releases the same agent: the deny was
+    // the missing generation, never a fact about the registry.
+    await drain()
+    expect(unread.scope.judgement('agent-unread')?.status).toBe('resolved')
+    expect(unread.scope.judgement('agent-unread')?.visible).toBe(true)
+    expect(unread.scope.layer('agent-unread')).toBeUndefined()
+    expect(unread.host.layerCount('agent-unread')).toBe(0)
+    expect(unread.host.agentView('agent-unread')).toEqual([...CHERRY_TOOL_NAMES])
+    expect(unread.host.verdict('agent-unread', CHERRY_TOOL_NAMES[0]!)).toBeUndefined()
   })
 })
 

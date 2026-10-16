@@ -211,10 +211,16 @@ describe('F6: the two tsconfig projects partition tests/**/*.test.ts', () => {
   })
 
   it('routes the three UI-environment tests to the UI project specifically', () => {
-    // The point of the split, stated directly: these three need DOM libs / jsdom
-    // and must be the UI project's, not the server's. Named one by one for the
-    // same reason the partition test names what slipped: a title that says three
-    // while the body checks two is the drift this file exists to catch.
+    // The split's own reason, stated directly: these three are ONE
+    // UI-environment partition, and what the UI project supplies them is the DOM
+    // libs plus `jsx: react-jsx`. Only two of the three need jsdom
+    // (`ui.test.ts`, `uiScopePanel.test.ts`); `clientBundle.test.ts` is NOT a
+    // jsdom test — it runs in the node environment, declares its own `window` /
+    // `document` fixtures and hands them to a browser-shaped `node:vm` (the
+    // `tsconfig.ui.json` header says the same). The point of the partition is
+    // that each of the three is checked by exactly ONE project. Named one by one
+    // for the same reason the partition test names what slipped: a title that
+    // says three while the body checks two is the drift this file exists to catch.
     for (const file of [
       'tests/unit/ui.test.ts',
       'tests/unit/uiScopePanel.test.ts',

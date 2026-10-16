@@ -34,9 +34,10 @@
     "noEmit": true
   },
   "include": ["src", "tests", "vitest.config.ts", "tsdown.config.ts"],
-  // `ui/**` and the three UI-environment tests belong to tsconfig.ui.json (see
-  // its header); `_research/**` is a vendored upstream checkout, not this
-  // plugin's source, so it is neither built nor typechecked here.
+  // `ui/**` and the three UI-environment test files belong to tsconfig.ui.json
+  // (see its header — one of the three, `tests/integration/clientBundle.test.ts`,
+  // is NOT a jsdom test); `_research/**` is a vendored upstream checkout, not
+  // this plugin's source, so it is neither built nor typechecked here.
   "exclude": [
     "ui",
     "tests/unit/ui.test.ts",

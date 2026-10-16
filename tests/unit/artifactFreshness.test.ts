@@ -11,11 +11,17 @@ import { describe, expect, it } from 'vitest'
  * `dist/index.mjs`, `dist/index.d.mts` and `lib/client.js` are committed — the
  * host loads them directly when this plugin is installed from git, so a stale
  * artifact is not a cosmetic problem: it is a plugin that does not contain the
- * fix its own source claims (and, for `.d.mts`, a published type face that
- * denies a method the runtime actually has). Nothing else in the suite catches
- * that. `clientBundle.test.ts` does run `build:client`, but it then asserts on
- * the bundle it JUST produced, so a stale committed file and a fresh one are
- * indistinguishable to it; and nothing rebuilds the server half at all.
+ * fix its own source claims. The `.d.mts` arm exists for the same reason on the
+ * TYPE face: `exports.types` resolves to it, so a stale copy describes a public
+ * surface the shipped `.mjs` no longer implements — a consumer typechecks
+ * against a signature the runtime does not have, or misses one it does. (The
+ * committed file happens to be byte-identical to the base commit today, which is
+ * exactly what this arm is here to keep true through the next source change; it
+ * is not evidence that some method is currently missing.) Nothing else in the
+ * suite catches that. `clientBundle.test.ts` does run `build:client`, but it
+ * then asserts on the bundle it JUST produced, so a stale committed file and a
+ * fresh one are indistinguishable to it; and nothing rebuilds the server half at
+ * all.
  *
  * The check is the strong one — REBUILD AND COMPARE BYTES — rather than a
  * checked-in hash manifest, and the tradeoff is worth stating because it is the

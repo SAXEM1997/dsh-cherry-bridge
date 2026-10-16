@@ -3,8 +3,13 @@
  * `degraded` set and the write-side guard rails (§6.1 first half; B9/B14/B16
  * storage side).
  *
- * Every name imported here is consumed verbatim by a later task (…), so these
- * assertions are a contract, not a smoke test. Three behaviours are easy to get
+ * Every name imported here is consumed verbatim by a later task —
+ * `ToolScopeState` by the HTTP face, the host integration layer and the settings
+ * page; `DEFAULT_SCOPE`/`SCOPE_DOC_VERSION`/`normalizeScope` by the document's
+ * wire shape; `isVisible` by the one visibility rule; `toScopeWorkspace`/
+ * `normalizeWorkspaceId` by the registry boundary; `writeFileAtomicSync` by the
+ * device archive it replicates — so these assertions are a contract, not a smoke
+ * test. Three behaviours are easy to get
  * subtly wrong and are therefore pinned as SEPARATE cases rather than folded
  * into one "save works" case:
  *
