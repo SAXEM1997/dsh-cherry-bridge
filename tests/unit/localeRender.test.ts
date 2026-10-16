@@ -576,18 +576,49 @@ describe('ToolScopePanel renders its own copy in English', () => {
     fireEvent.click(screen.getByRole('button', { name: tr('scope.save') }))
 
     // `scope.saveFailure.scope-revision-conflict` — the table lookup, not a literal.
-    const failure = await screen.findByText(tr('scope.saveFailure.scope-revision-conflict'))
+    //
+    // EXACT equality on the alert node, for the same reason as the unknown-code
+    // case below: `findByText` matches a normalised SUBSTRING, so a superset
+    // like `Save failed: <message>` satisfies a `findByText` expectation of this
+    // sentence's own prefix. Pinning `textContent` makes the table lookup's WHOLE
+    // sentence — the code's own copy, with no glue — the assertion.
+    //
+    // This arm is ALSO the one that catches the glue mutation applied to the
+    // SHARED `?? SAVE_FAILED_KEY` fallback, which is worth recording because it
+    // is not obvious: for the unknown-code arm that mutation is textually
+    // INVISIBLE (see the note below), so before this assertion existed nothing
+    // caught it — the reviewer's finding, reproduced. The known code reaches the
+    // same fallback expression, so a glue splice corrupts this sentence into a
+    // CONCATENATION and is caught here.
+    const failure = await screen.findByRole('alert')
+    const conflictCopy = tr('scope.saveFailure.scope-revision-conflict')
+    expect(failure.textContent).toBe(conflictCopy)
     expect(failure.textContent).not.toContain(zh['scope.saveFailure.scope-revision-conflict']!)
     // The conflict's own recovery control, in English.
     expect(screen.getByRole('button', { name: tr('scope.reread') })).toBeTruthy()
 
     // `scope.serverSaid` is the OTHER merged template: `{code}` and `{status}`
     // both interpolated into one sentence, not "The server answered " + a code.
-    const detail = document.querySelector('.cherry-scope-save .cherry-hint.cherry-mono')
-    expect(document.body.textContent).toContain(
+    // Asserted on the DETAIL NODE's exact text — `body.textContent` containment
+    // would pass for the split shape `'The server answered ' + code`, which is
+    // the assembly this key exists to forbid.
+    //
+    // Scoped by `[data-scope-save-error]` rather than by a class selector: the
+    // revision line wears the SAME `cherry-hint cherry-mono` pair, so
+    // `.cherry-scope-save .cherry-hint.cherry-mono` silently resolves to the
+    // revision paragraph — which is why the original containment form, whose
+    // only structural check was `detail !== null`, could never have pinned this
+    // sentence at all.
+    const detail = document.querySelector('[data-scope-save-error] .cherry-hint.cherry-mono')
+    expect(detail?.textContent).toBe(
       tr('scope.serverSaid').replace('{code}', 'scope-revision-conflict').replace('{status}', '409'),
     )
-    expect(detail).not.toBeNull()
+    // No placeholder survives unfilled in EITHER merged template. `body` is the
+    // right scope here: if a param were dropped the literal `{code}`/`{status}`
+    // would stand wherever the template rendered.
+    expect(document.body.textContent).not.toContain('{code}')
+    expect(document.body.textContent).not.toContain('{status}')
+    expect(document.body.textContent).not.toContain('{cause}')
   })
 
   it('translates the UNKNOWN refusal into the whole `scope.saveFailed` sentence with {cause} filled', async () => {
@@ -611,13 +642,41 @@ describe('ToolScopePanel renders its own copy in English', () => {
       fireEvent.click(screen.getByRole('button', { name: tr('scope.save') }))
 
       // The fallback arm: a code the table has no copy for lands on the ONE
-      // `scope.saveFailed` template with the message interpolated. The zh half
-      // lives in `dictionaries.zh`, so the `t(表[code] ?? 'scope.saveFailed',
-      // { cause })` shape is what makes this English at all — and the template
-      // itself is what keeps it ONE sentence.
-      expect(await screen.findByText(tr('scope.saveFailed').replace('{cause}', cause.message))).toBeTruthy()
-      expect(screen.queryByText(zh['scope.saveFailed']!.replace('{cause}', cause.message))).toBeNull()
-      // No placeholder survives unfilled.
+      // `scope.saveFailed` template with the message interpolated.
+      //
+      // THE SHAPE IS PINNED BY EXACT EQUALITY, not by `findByText`. Testing
+      // Library's text matcher is a normalised SUBSTRING match, so
+      // `findByText(tr(...).replace('{cause}', message))` accepts any SUPERSET —
+      // `Save failed: ` is a substring of `Save failed: <message>`. `i18nAssets`
+      // only guarantees "no Chinese", not whole-sentence form, so this assertion
+      // is the only guard on the shape.
+      //
+      // HONEST LIMIT, measured rather than assumed: for THIS arm the glue splice
+      // `` `${t(KEY).replace('{cause}','')}${describeCause(cause)}` `` is
+      // textually INDISTINGUISHABLE from the template, in both locales. The
+      // en template's `Save failed: {cause}` and `ApiError.message`'s own
+      // `"<code>: <message>"` (api.ts:32) put the SAME `": "` in front of the
+      // cause, and in zh the splice leaves the template's `：` behind, which the
+      // correct render also has. So the unknown arm alone cannot bite that
+      // mutation; the KNOWN arm's exact-equality assertion is what does, because
+      // it reaches the same shared fallback and lacks the coincidence. Together
+      // the two arms cover it. What this arm DOES bite is the dropped-param
+      // shape (`{cause}` left literal) and any glue that changes the sentence.
+      const alert = await screen.findByRole('alert')
+      expect(alert.textContent).toBe(tr('scope.saveFailed').replace('{cause}', cause.message))
+
+      // The cause must appear EXACTLY ONCE. This is the guard that survives the
+      // coincidence: a glue form that re-emits the sentence prefix rather than
+      // substituting into it would duplicate the cause, and the exact-equality
+      // assertion above would have to be satisfied by accident for this to pass.
+      expect(alert.textContent!.split(cause.message)).toHaveLength(2)
+      // The zh half must be GONE, and no placeholder may survive unfilled: a
+      // dropped param leaves the literal `{cause}` standing, which is the
+      // half-sentence shape the brief names (t() returns the template untouched
+      // when no params are passed).
+      expect(alert.textContent).not.toContain(zh['scope.saveFailed']!.replace('{cause}', cause.message))
+      expect(alert.textContent).not.toContain('{cause}')
+      // No placeholder survives unfilled ANYWHERE in the tree.
       expect(document.body.textContent).not.toContain('{cause}')
     }
   })

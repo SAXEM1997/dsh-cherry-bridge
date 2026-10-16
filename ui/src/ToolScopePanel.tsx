@@ -395,8 +395,22 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
             <li key={`${note.source}:${index}`} data-degraded-source={note.source}>
               {/* ONE node, ONE sentence: the label and the server's reason are
                   merged by the template rather than by two adjacent elements.
-                  `?? note.source` keeps an unknown source visible as itself. */}
-              {t('scope.degradedLine', { label: t(DEGRADED_KEYS[note.source] ?? note.source), reason: note.reason })}
+                  `?? note.source` keeps an unknown source visible as itself.
+                  The single text node still wears `cherry-hint` (styles.css:
+                  12px / opacity .7), because the base rendered this line as a
+                  HINT — dropping the class left it full-size and full-opacity,
+                  a hierarchy regression on the warning list. The wrapper is a
+                  `<span>`, NOT the old `<strong>`: the class carries the
+                  de-emphasis, and re-adding `<strong>` would restore the very
+                  two-node emphasis split this merge removed. `slotText()` reads
+                  the `li`'s whole `textContent`, so the wrapper is invisible to
+                  the existing assertions. */}
+              <span className="cherry-hint">
+                {t('scope.degradedLine', {
+                  label: t(DEGRADED_KEYS[note.source] ?? note.source),
+                  reason: note.reason,
+                })}
+              </span>
             </li>
           ))}
         </ul>
