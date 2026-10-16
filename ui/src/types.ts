@@ -8,7 +8,14 @@
  * No `import` statements live here on purpose: this module is imported by the
  * callers' type positions as well as by value (`API_BASE`, the label maps), and
  * keeping it dependency-free means the vite bundle inlines it exactly once.
+ *
+ * The one EXCEPTION is `./i18n`, imported for the two re-exported label tables
+ * below: the Chinese strings the page shows must have exactly one home, and that
+ * home is the zh dictionary. `i18n.ts` pulls in nothing but `react`, and the
+ * label tables take their values at MODULE LOAD (not per render), so the
+ * inlining story above is unchanged — `types.ts` still has no host dependency.
  */
+import { dictionaries } from './i18n'
 
 /** The plugin's same-origin route prefix; relative, never absolute. */
 export const API_BASE = '/cherry-remote/api'
@@ -108,24 +115,56 @@ export const VERIFICATION_CODE_STAGE = 'verification-code'
  * user is standing in front of two windows, and "被拒绝" without "go compare the
  * code" leaves them with nothing to do but retry blindly. The wording mirrors
  * the server's own verdict messages (`src/pairing.ts`).
+ *
+ * The VALUES are the zh dictionary's entries, not a second copy of them:
+ * `ui/src/i18n.ts` is the single source of truth for every Chinese string the
+ * page shows, so the Chinese rendering of this table is unchanged by
+ * construction and the ~140 existing assertions against these literals in
+ * `tests/unit/ui.test.ts` keep holding. The RENDER side uses {@link STAGE_KEYS}
+ * (see below), which picks the same entry for whichever language is active.
  */
 export const STAGE_LABELS: Record<string, string> = {
-  validate: '正在校验配对信息…',
-  connect: '正在连接 Cherry Studio…',
-  claim: '正在交换凭据…',
-  waiting: '等待在 Cherry Studio 上确认…',
-  'pairing-failed': '配对失败',
+  validate: dictionaries.zh['wizard.stage.validate']!,
+  connect: dictionaries.zh['wizard.stage.connect']!,
+  claim: dictionaries.zh['wizard.stage.claim']!,
+  waiting: dictionaries.zh['wizard.stage.waiting']!,
+  'pairing-failed': dictionaries.zh['wizard.stage.pairing-failed']!,
   // Refused: the overwhelmingly common cause is a code mismatch, so the label
   // names the comparison and the way out (a fresh payload).
-  rejected: '配对被拒绝——请核对桌面端显示的 6 位验证码是否与本页一致，并在 Cherry Studio 重新生成配对码后重试',
-  expired: '配对邀请已过期——请在 Cherry Studio 重新生成配对码后重试',
+  rejected: dictionaries.zh['wizard.stage.rejected']!,
+  expired: dictionaries.zh['wizard.stage.expired']!,
   // The everyday failure: the desktop is off, asleep, or off the network.
-  unreachable: '无法连接 Cherry Studio，请确认桌面端已启动且与本机同网',
-  'invalid-payload': '配对信息无效或已过期，请在 Cherry Studio 重新生成后重试',
+  unreachable: dictionaries.zh['wizard.stage.unreachable']!,
+  'invalid-payload': dictionaries.zh['wizard.stage.invalid-payload']!,
   // The plugin's own archive is unreadable: nothing here can fix it, and a
   // retry will fail identically until an operator moves the bad file aside.
-  'archive-quarantined':
-    '设备档案无法读取（已保留为 .corrupt 副本）。请将该文件移开后重启或重新加载插件，再重试配对',
+  'archive-quarantined': dictionaries.zh['wizard.stage.archive-quarantined']!,
+}
+
+/**
+ * The dictionary KEYS behind {@link STAGE_LABELS}, one per stage.
+ *
+ * Same shape and same key set as the label table — `Record<string, string>`
+ * rather than a union-keyed map, because a stage arrives as an arbitrary string
+ * off the wire and the render side falls back to the raw stage for one this
+ * build does not know.
+ *
+ * Why both tables exist: a component labels a verdict with `t(STAGE_KEYS[stage]
+ * ?? stage)`, which needs a KEY, while assertions and any non-translating caller
+ * need the Chinese TEXT. Pinning the text to `dictionaries.zh` and exposing the
+ * key separately is what keeps those two in step.
+ */
+export const STAGE_KEYS: Record<string, string> = {
+  validate: 'wizard.stage.validate',
+  connect: 'wizard.stage.connect',
+  claim: 'wizard.stage.claim',
+  waiting: 'wizard.stage.waiting',
+  'pairing-failed': 'wizard.stage.pairing-failed',
+  rejected: 'wizard.stage.rejected',
+  expired: 'wizard.stage.expired',
+  unreachable: 'wizard.stage.unreachable',
+  'invalid-payload': 'wizard.stage.invalid-payload',
+  'archive-quarantined': 'wizard.stage.archive-quarantined',
 }
 
 // ---------------------------------------------------------------------------
@@ -237,9 +276,24 @@ export interface ScopeClient {
 
 /** Human labels for the five states, shared by the light and the light's name. */
 export const STATE_LABELS: Record<DeviceState, string> = {
-  connected: '已连接',
-  connecting: '连接中',
-  offline: '离线',
-  disabled: '已停用',
-  'identity-mismatch': '身份不匹配',
+  connected: dictionaries.zh['device.state.connected']!,
+  connecting: dictionaries.zh['device.state.connecting']!,
+  offline: dictionaries.zh['device.state.offline']!,
+  disabled: dictionaries.zh['device.state.disabled']!,
+  'identity-mismatch': dictionaries.zh['device.state.identity-mismatch']!,
+}
+
+/**
+ * The dictionary KEYS behind {@link STATE_LABELS}, one per device state.
+ *
+ * Same shape as the label table (`Record<DeviceState, string>`), so a component
+ * can translate a state with `t(STATE_KEYS[state] ?? state)` and stay exhaustive
+ * over {@link DeviceState} at compile time.
+ */
+export const STATE_KEYS: Record<DeviceState, string> = {
+  connected: 'device.state.connected',
+  connecting: 'device.state.connecting',
+  offline: 'device.state.offline',
+  disabled: 'device.state.disabled',
+  'identity-mismatch': 'device.state.identity-mismatch',
 }

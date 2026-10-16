@@ -40,6 +40,7 @@
   // this plugin's source, so it is neither built nor typechecked here.
   "exclude": [
     "ui",
+    "tests/unit/i18n.test.ts",
     "tests/unit/ui.test.ts",
     "tests/unit/uiScopePanel.test.ts",
     "tests/integration/clientBundle.test.ts",
