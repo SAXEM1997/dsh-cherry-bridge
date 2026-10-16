@@ -2043,6 +2043,37 @@ function buildDiagnostics(sources, identity = DEFAULT_IDENTITY) {
 const DEFAULT_RATE_BUDGET_PER_SECOND = 32;
 /** 2 MiB of event text cached per session (spec §3.5). */
 const DEFAULT_PER_SESSION_CACHE_BYTES = 2097152;
+/**
+* Byte-safe per-page clamps for the aggregated `agent.*.list` walks.
+*
+* WHY THESE EXIST: every JSON-RPC record on the wire is hard-capped at
+* `remoteLimits.recordBytes` = 65,536 bytes — the transport refuses a larger
+* record by aborting the connection, so every in-flight request then fails
+* with "JSON-RPC channel closed". The Cherry Studio desktop's `pageOf`
+* (src/main/services/remoteAccess/agentQueries.ts) slices pages by COUNT
+* alone, so a client that asks for `pageItems` (100) fat parts receives a
+* record the transport must kill: reading a complex session (many parts per
+* message, or many messages) became a deterministic connection reset before
+* these clamps.
+*
+* PARTS_LIST_PAGE_CLAMP and INTERACTIONS_LIST_PAGE_CLAMP are DERIVED, not
+* tuned: the peer may inline up to 4,096 CHARACTERS of text per field (its
+* `INLINE_TEXT_LIMIT`; ≈3 UTF-8 bytes per CJK character) plus a ~0.5 KiB
+* envelope per item, and an interaction record additionally carries a
+* 2,048-character summary. Dividing the 64 KiB record budget (minus a 2 KiB
+* page/margin overhead) by each list's worst-case item gives the clamp.
+*
+* LIST_PAGE_CLAMP is pragmatic, not provable: message/session/agent records
+* carry unbounded `partIds`/title fields, so no count alone guarantees a
+* sub-budget record. 16 covers every observed record with ≈4× headroom; the
+* complete fix is byte-budgeted paging on the server (tracked upstream).
+*/
+/** Usable bytes of one wire record after page/margin overhead. */
+const RECORD_BUDGET_BYTES = 63488;
+/** Parts per parts.list page: one inline content field per part. */
+const PARTS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 12800);
+/** Interactions per interactions.list page: inline input + inline summary. */
+const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 18944);
 //#endregion
 //#region src/urlHost.ts
 /**
@@ -4114,11 +4145,16 @@ var CherryToolEngine = class {
 	}
 	/**
 	* Walks pages until `limit` items are collected or the peer runs out,
-	* clamping EVERY page to the negotiated `pageItems`.
+	* clamping EVERY page to the byte-safe page budget.
 	*
-	* The clamp is the whole point: `limit: 150` means "at most 150 items
-	* total", never "ask the peer for 150 in one page" — the protocol's
-	* single-page cap is a hard wire limit the plugin cannot override.
+	* TWO clamps bound every page request. `limits.pageItems` is the
+	* peer-negotiated COUNT cap (the protocol's single-page hard limit, whatever
+	* the caller asks for), and `maxPerPage` is the plugin's own WIRE-SAFETY
+	* clamp: one JSON-RPC record may not exceed `remoteLimits.recordBytes`
+	* (64 KiB), the desktop's `pageOf` budgets pages by count alone, and a page
+	* of fat inline items is a record the transport answers by killing the
+	* connection. The clamps live in `defaults.ts` with their derivation; the
+	* effective page size is whichever of the two is smaller.
 	*
 	* `limit` is a CALLER contract, and reaching it is reported as
 	* `truncationReason: 'limit'`. `safetyBound` is different in kind: it is an
@@ -4130,8 +4166,9 @@ var CherryToolEngine = class {
 	* not a slow walk: no item ceiling can ever be reached, so it is detected
 	* directly and thrown (see {@link MAX_AGGREGATE_PAGES} for the backstop).
 	*/
-	async #aggregate(connection, method, params, extract, limit, safetyBound = MAX_AGGREGATE_LIMIT) {
-		const pageItems = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK));
+	async #aggregate(connection, method, params, extract, limit, safetyBound = MAX_AGGREGATE_LIMIT, maxPerPage = 16) {
+		const negotiated = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK));
+		const pageItems = Math.min(negotiated, Math.max(1, Math.floor(maxPerPage)));
 		const aggregate = Math.max(1, Math.floor(limit));
 		const bound = Math.max(1, Math.floor(safetyBound));
 		const ceiling = Math.min(aggregate, bound);
@@ -4449,7 +4486,7 @@ var CherryToolEngine = class {
 		}, (result) => ({
 			items: arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), Number.POSITIVE_INFINITY, this.#partsSafetyBound);
+		}), Number.POSITIVE_INFINITY, this.#partsSafetyBound, PARTS_LIST_PAGE_CLAMP);
 		const parts = [];
 		for (const part of page.items) parts.push(await this.#projectPart(connection, sessionId, part));
 		return {
@@ -4918,7 +4955,7 @@ var CherryToolEngine = class {
 				const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
 					items: arrayOf(result["items"]),
 					nextCursor: result["nextCursor"]
-				}), aggregateLimit(args["limit"]));
+				}), aggregateLimit(args["limit"]), MAX_AGGREGATE_LIMIT, INTERACTIONS_LIST_PAGE_CLAMP);
 				const includeAnswered = args["includeAnswered"] === true;
 				const items = page.items.filter((item) => includeAnswered || item["status"] === "pending").map((item) => this.#interactionView(item));
 				for (const item of page.items) this.#rememberInteraction(record.deviceId, sessionId, item);
@@ -5388,7 +5425,7 @@ var CherryToolEngine = class {
 		const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
 			items: arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), MAX_AGGREGATE_LIMIT);
+		}), MAX_AGGREGATE_LIMIT, MAX_AGGREGATE_LIMIT, INTERACTIONS_LIST_PAGE_CLAMP);
 		for (const item of page.items) this.#rememberInteraction(deviceId, sessionId, item);
 		return this.#interactionCache.get(this.#interactionKey(deviceId, sessionId, interactionId));
 	}

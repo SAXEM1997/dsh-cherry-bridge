@@ -4,6 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
+import {
+  INTERACTIONS_LIST_PAGE_CLAMP,
+  LIST_PAGE_CLAMP,
+  PARTS_LIST_PAGE_CLAMP,
+} from '../../src/defaults.js'
 import { DeviceConnection, DeviceUnavailableError } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
@@ -243,15 +248,16 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(rig.fake.connectionCount).toBe(1)
   })
 
-  it('②a cherry_agents aggregates three 50-item pages into the 150-item aggregate, clamping each page to limits.pageItems', async () => {
-    // The peer holds 150 agents and pages at 50 items. A caller that let the
-    // per-page limit exceed `pageItems` would still be capped by the wire, so
-    // the aggregate must be built from three real pages.
+  it('②a cherry_agents aggregates ten 16-item pages into the 150-item aggregate, clamping each page to the byte-safe page budget', async () => {
+    // The peer holds 150 agents. A per-page limit of `pageItems` (100) would
+    // ask for a page whose serialized record can exceed the transport's 64 KiB
+    // record budget, so every page is ALSO clamped to LIST_PAGE_CLAMP (16) —
+    // the aggregate is then built from ten real pages.
     const agents = Array.from({ length: 150 }, (_unused, index) => ({
       agentId: `agent-${String(index).padStart(3, '0')}`,
       name: `Agent ${index}`,
     }))
-    const rig = await makeRig({ agent: { agents, maxPageSize: 50 } })
+    const rig = await makeRig({ agent: { agents } })
 
     const result = (await rig.call('cherry_agents', { device: 'dev-A', limit: 150 })) as {
       items: Array<{ agentId: string }>
@@ -260,15 +266,18 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(result.items[0]!.agentId).toBe('agent-000')
     expect(result.items[149]!.agentId).toBe('agent-149')
 
-    // Three pages were requested, and EVERY per-page limit is ≤ pageItems —
-    // the aggregate total never lets a single page exceed the protocol cap.
+    // Ten pages were requested, and EVERY per-page limit respects BOTH caps —
+    // the negotiated pageItems AND the byte-safe clamp.
     const calls = rig.fake.readCallsFor('agent.agents.list')
-    expect(calls).toHaveLength(3)
-    for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
+    expect(calls).toHaveLength(10)
+    for (const call of calls) {
+      expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
+      expect(call['limit'] as number).toBeLessThanOrEqual(LIST_PAGE_CLAMP)
+    }
     // Page 1 carries no cursor; pages 2/3 carry the numeric offsets.
     expect(calls[0]!['cursor']).toBeUndefined()
-    expect(calls[1]!['cursor']).toBe('50')
-    expect(calls[2]!['cursor']).toBe('100')
+    expect(calls[1]!['cursor']).toBe('16')
+    expect(calls[2]!['cursor']).toBe('32')
   })
 
   it('②b cherry_agents stops at the caller limit without over-fetching the last page', async () => {
@@ -283,10 +292,11 @@ describe('read-only cherry tools over a real loopback channel', () => {
     }
     expect(result.items).toHaveLength(60)
     const calls = rig.fake.readCallsFor('agent.agents.list')
-    // Page 1 asks for 60 (its clamp is the remaining aggregate, 60 < 100);
-    // there is nothing left to ask for, so no second page is issued.
-    expect(calls).toHaveLength(1)
-    expect(calls[0]!['limit']).toBe(60)
+    // The byte-safe page clamp (16) splits the 60-item aggregate into
+    // 16+16+16+12; the LAST page asks only for what remains of the aggregate.
+    expect(calls).toHaveLength(4)
+    expect(calls[0]!['limit']).toBe(LIST_PAGE_CLAMP)
+    expect(calls[3]!['limit']).toBe(12)
   })
 
   it('②b2 attributes a stop that lands on the safety bound to the BOUND, not to the caller limit', async () => {
@@ -455,11 +465,13 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(texts).toContain(big)
   })
 
-  it('④c cherry_read paginates a message\'s parts to COMPLETION across 3 peer pages', async () => {
-    // 60 parts on one message, and the peer pages at 20 — three real pages. A
+  it('④c cherry_read paginates a message\'s parts to COMPLETION across byte-safe pages', async () => {
+    // 60 parts on one message, and the peer would happily page at 20. A
     // part walk bounded by the plugin's own tool-limit constant would drop a
     // third of the snapshot while claiming completion, so every part must
-    // arrive and the result must NOT advertise truncation.
+    // arrive and the result must NOT advertise truncation — while every page
+    // request stays at or below PARTS_LIST_PAGE_CLAMP, the count of fat inline
+    // parts that provably fit one 64 KiB wire record.
     const parts = Array.from({ length: 60 }, (_unused, index) => ({
       kind: 'text' as const,
       text: `part-${index}`,
@@ -486,11 +498,11 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(result.messages[0]!.partsTruncated).toBeUndefined()
 
     const calls = rig.fake.readCallsFor('agent.parts.list')
-    expect(calls).toHaveLength(3)
-    for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
+    expect(calls).toHaveLength(15)
+    for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PARTS_LIST_PAGE_CLAMP)
     expect(calls[0]!['cursor']).toBeUndefined()
-    expect(calls[1]!['cursor']).toBe('20')
-    expect(calls[2]!['cursor']).toBe('40')
+    expect(calls[1]!['cursor']).toBe(String(PARTS_LIST_PAGE_CLAMP))
+    expect(calls[2]!['cursor']).toBe(String(PARTS_LIST_PAGE_CLAMP * 2))
   })
 
   it('④d a tripped parts circuit-breaker is SURFACED with a resume cursor, never silently truncated', async () => {
@@ -526,8 +538,55 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // The resume cursor is the peer's next-page offset, i.e. the 26th part —
     // exactly where the walk stopped, not where its last page began.
     expect(result.messages[0]!.partsResumeCursor).toBe('25')
-    // It stopped at the breaker, not at the peer's end of data.
-    expect(rig.fake.readCallsFor('agent.parts.list').length).toBeLessThan(3)
+    // It stopped at the breaker, not at the peer's end of data (which would
+    // take ceil(60 / PARTS_LIST_PAGE_CLAMP) = 15 pages at the byte-safe size).
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBe(7)
+  })
+
+  it('④m the byte-safe page clamps are derived from the 64 KiB record budget', async () => {
+    // WIRE MATH (see src/defaults.ts): every JSON-RPC record is capped at
+    // 65,536 bytes and the peer may inline up to 4,096 CHARACTERS of part
+    // text (~12 KiB UTF-8 for CJK) plus a ~0.5 KiB envelope, so at most
+    // floor((65,536 − 2,048 margin) / 12.8 KiB) = 4 parts fit one record;
+    // an interaction record also carries a 2,048-character summary
+    // (~18.7 KiB worst case), leaving room for 3. These are derived, not
+    // tuned — pinning them here keeps a silent re-tune from reintroducing
+    // the "JSON-RPC channel closed" class of failure.
+    expect(PARTS_LIST_PAGE_CLAMP).toBe(4)
+    expect(INTERACTIONS_LIST_PAGE_CLAMP).toBe(3)
+    expect(LIST_PAGE_CLAMP).toBe(16)
+
+    // The messages walk rides the list clamp too: 40 messages paginate as
+    // 16+16+8, and every parts page of every projected message stays at or
+    // below the parts clamp.
+    const messages = Array.from({ length: 40 }, (_unused, index) => ({
+      messageId: `m-${index}`,
+      revision: `100${index}`,
+      role: 'user' as const,
+      status: 'success' as const,
+      parts: [{ kind: 'text' as const, text: `t-${index}` }],
+    }))
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages,
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: unknown[]
+    }
+    expect(result.messages).toHaveLength(40)
+
+    const messageCalls = rig.fake.readCallsFor('agent.messages.list')
+    expect(messageCalls).toHaveLength(3)
+    for (const call of messageCalls) expect(call['limit'] as number).toBeLessThanOrEqual(LIST_PAGE_CLAMP)
+    expect(messageCalls[2]!['limit']).toBe(LIST_PAGE_CLAMP)
+    for (const call of rig.fake.readCallsFor('agent.parts.list')) {
+      expect(call['limit'] as number).toBeLessThanOrEqual(PARTS_LIST_PAGE_CLAMP)
+    }
   })
 
   it('④e a {ref} whose content walk cannot reach eof fails rather than returning a partial value', async () => {
@@ -558,40 +617,47 @@ describe('read-only cherry tools over a real loopback channel', () => {
     )
   })
 
-  it('④f cherry_read reads MORE than a page-cap\'s worth of parts (>1000) without truncating', async () => {
-    // DISCRIMINATOR for the parts bound: 1001 parts exceeds any plausible
-    // single-page or tool-limit constant, so a walk still bounded by one stops
-    // short and says so. Parts are tiny, so this stays cheap.
-    const PARTS = 1001
-    const parts = Array.from({ length: PARTS }, (_unused, index) => ({
-      kind: 'text' as const,
-      text: `p${index}`,
-    }))
-    const rig = await makeRig({
-      agent: {
-        sessions: [
-          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
-        ],
-        messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
-        maxPageSize: 100,
-      },
-    })
+  it(
+    '④f cherry_read reads MORE than a page-cap\'s worth of parts (>1000) without truncating',
+    async () => {
+      // DISCRIMINATOR for the parts bound: 1001 parts exceeds any plausible
+      // single-page or tool-limit constant, so a walk still bounded by one stops
+      // short and says so. Parts are tiny; the byte-safe page clamp (4/page)
+      // makes this a 251-page walk, so the test takes a few seconds.
+      const PARTS = 1001
+      const parts = Array.from({ length: PARTS }, (_unused, index) => ({
+        kind: 'text' as const,
+        text: `p${index}`,
+      }))
+      const rig = await makeRig({
+        agent: {
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+          ],
+          messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
+          maxPageSize: 100,
+        },
+      })
 
-    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
-      messages: Array<{ parts: Array<{ content: string }>; partsTruncated?: string }>
-    }
+      const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+        messages: Array<{ parts: Array<{ content: string }>; partsTruncated?: string }>
+      }
 
-    // All 1001 arrive, the last one included, and nothing claims truncation.
-    expect(result.messages[0]!.parts).toHaveLength(PARTS)
-    expect(result.messages[0]!.parts[PARTS - 1]!.content).toBe(`p${PARTS - 1}`)
-    expect(result.messages[0]!.partsTruncated).toBeUndefined()
+      // All 1001 arrive, the last one included, and nothing claims truncation.
+      expect(result.messages[0]!.parts).toHaveLength(PARTS)
+      expect(result.messages[0]!.parts[PARTS - 1]!.content).toBe(`p${PARTS - 1}`)
+      expect(result.messages[0]!.partsTruncated).toBeUndefined()
 
-    // 11 pages of 100 (the 11th holds the single leftover part).
-    const calls = rig.fake.readCallsFor('agent.parts.list')
-    expect(calls).toHaveLength(11)
-    expect(calls[10]!['cursor']).toBe('1000')
-    for (const call of calls) expect(call['limit'] as number).toBeLessThanOrEqual(PAGE_ITEMS)
-  })
+      // 251 pages of 4 (the last holds the single leftover part).
+      const calls = rig.fake.readCallsFor('agent.parts.list')
+      expect(calls).toHaveLength(251)
+      expect(calls[250]!['cursor']).toBe('1000')
+      for (const call of calls) {
+        expect(call['limit'] as number).toBeLessThanOrEqual(PARTS_LIST_PAGE_CLAMP)
+      }
+    },
+    30_000,
+  )
 
   it('④g an empty page with a dangling nextCursor is a peer fault, refused instead of spun on', async () => {
     // A walk bounded only by item count can never finish here: the item count

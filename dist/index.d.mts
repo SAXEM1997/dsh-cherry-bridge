@@ -15,8 +15,10 @@ import "@cherrystudio/remote-protocol/agent";
  *    structured `{device, state}` verdict of spec §6 — never an implicit dial.
  *  - **Pagination is an aggregate concern** (controller ruling ②): the caller's
  *    `limit` bounds the TOTAL across pages, while every page request is clamped
- *    to the peer-negotiated `limits.pageItems` — the protocol's single-page
- *    hard cap is never exceeded, whatever the caller asks for.
+ *    to BOTH the peer-negotiated `limits.pageItems` AND a byte-safe page budget
+ *    (`defaults.ts`) — the protocol's single-page hard cap is never exceeded
+ *    and no page may serialize past the 64 KiB record budget the transport
+ *    enforces by killing the connection.
  */
 /** One tool's literal JSON Schema parameters, as the host registry stores them. */
 interface ToolParametersSchema {

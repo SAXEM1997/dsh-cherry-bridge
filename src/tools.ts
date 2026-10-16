@@ -3,6 +3,11 @@ import { DeviceUnavailableError } from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
 import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
+import {
+  INTERACTIONS_LIST_PAGE_CLAMP,
+  LIST_PAGE_CLAMP,
+  PARTS_LIST_PAGE_CLAMP,
+} from './defaults.js'
 import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
@@ -23,8 +28,10 @@ import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
  *    structured `{device, state}` verdict of spec §6 — never an implicit dial.
  *  - **Pagination is an aggregate concern** (controller ruling ②): the caller's
  *    `limit` bounds the TOTAL across pages, while every page request is clamped
- *    to the peer-negotiated `limits.pageItems` — the protocol's single-page
- *    hard cap is never exceeded, whatever the caller asks for.
+ *    to BOTH the peer-negotiated `limits.pageItems` AND a byte-safe page budget
+ *    (`defaults.ts`) — the protocol's single-page hard cap is never exceeded
+ *    and no page may serialize past the 64 KiB record budget the transport
+ *    enforces by killing the connection.
  */
 
 // ---------------------------------------------------------------------------
@@ -892,11 +899,16 @@ class CherryToolEngine {
 
   /**
    * Walks pages until `limit` items are collected or the peer runs out,
-   * clamping EVERY page to the negotiated `pageItems`.
+   * clamping EVERY page to the byte-safe page budget.
    *
-   * The clamp is the whole point: `limit: 150` means "at most 150 items
-   * total", never "ask the peer for 150 in one page" — the protocol's
-   * single-page cap is a hard wire limit the plugin cannot override.
+   * TWO clamps bound every page request. `limits.pageItems` is the
+   * peer-negotiated COUNT cap (the protocol's single-page hard limit, whatever
+   * the caller asks for), and `maxPerPage` is the plugin's own WIRE-SAFETY
+   * clamp: one JSON-RPC record may not exceed `remoteLimits.recordBytes`
+   * (64 KiB), the desktop's `pageOf` budgets pages by count alone, and a page
+   * of fat inline items is a record the transport answers by killing the
+   * connection. The clamps live in `defaults.ts` with their derivation; the
+   * effective page size is whichever of the two is smaller.
    *
    * `limit` is a CALLER contract, and reaching it is reported as
    * `truncationReason: 'limit'`. `safetyBound` is different in kind: it is an
@@ -915,8 +927,12 @@ class CherryToolEngine {
     extract: (page: Record<string, unknown>) => { items: T[]; nextCursor: unknown },
     limit: number,
     safetyBound: number = MAX_AGGREGATE_LIMIT,
+    maxPerPage: number = LIST_PAGE_CLAMP,
   ): Promise<CherryPage<T>> {
-    const pageItems = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK))
+    const negotiated = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK))
+    // The byte-safe clamp intersects the negotiated one: a peer that already
+    // pages smaller keeps its size, and no page request ever exceeds either.
+    const pageItems = Math.min(negotiated, Math.max(1, Math.floor(maxPerPage)))
     // `limit` may be Infinity (a walk with NO caller bound), so the two
     // ceilings are intersected rather than maxed: the effective stop is
     // whichever binds first, and Infinity simply never binds.
@@ -1339,6 +1355,9 @@ class CherryToolEngine {
       (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       Number.POSITIVE_INFINITY,
       this.#partsSafetyBound,
+      // Parts records are the fattest per item (inline text), so they ride the
+      // tightest derived clamp.
+      PARTS_LIST_PAGE_CLAMP,
     )
 
     const parts: CherryReadPart[] = []
@@ -2051,6 +2070,10 @@ class CherryToolEngine {
           { sessionId },
           (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
           aggregateLimit(args['limit']),
+          MAX_AGGREGATE_LIMIT,
+          // An interaction record carries an inline input AND an inline
+          // summary, the fattest item of the plain lists.
+          INTERACTIONS_LIST_PAGE_CLAMP,
         )
 
         const includeAnswered = args['includeAnswered'] === true
@@ -2714,6 +2737,8 @@ class CherryToolEngine {
       { sessionId },
       (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       MAX_AGGREGATE_LIMIT,
+      MAX_AGGREGATE_LIMIT,
+      INTERACTIONS_LIST_PAGE_CLAMP,
     )
     for (const item of page.items) this.#rememberInteraction(deviceId, sessionId, item)
 
