@@ -1501,9 +1501,11 @@ describe('③ release configuration', () => {
     // + sources + the settings UI), the bundle patch, and the two documents a
     // consumer needs. `dist` is tsdown's output and `lib` carries the client
     // half — omitting either would publish a package the host cannot load.
-    for (const entry of ['lib', 'dist', 'src', 'ui', 'cordis.patch.yml', 'README.md']) {
+    for (const entry of ['lib', 'dist', 'src', 'ui', 'cordis.patch.yml', 'README.md', 'README.en.md', 'static']) {
       expect(manifest.files).toContain(entry)
     }
+    // `static` carries the README banner; `README.en.md` is the other half of
+    // the language switcher — dropping either breaks the rendered docs on npm.
     // The checklist is the one doc under `docs/` meant for consumers…
     expect(manifest.files).toContain('docs/e2e-checklist.md')
     // …while `docs/` itself must NOT be listed: it would drag the internal

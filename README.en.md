@@ -4,6 +4,12 @@
 
 </div>
 
+<div align="center">
+
+<img src="static/logo.png" alt="dsh-cherry-bridge" width="880">
+
+</div>
+
 # dsh-cherry-bridge
 
 **Bridge DeepSeek Harness to Cherry Studio desktops** — a DSH plugin

@@ -52,7 +52,8 @@
     "docs/e2e-checklist.md",
     "cordis.patch.yml",
     "README.md",
-    "README.en.md"
+    "README.en.md",
+    "static"
   ],
   "scripts": {
     "test": "vitest run",
