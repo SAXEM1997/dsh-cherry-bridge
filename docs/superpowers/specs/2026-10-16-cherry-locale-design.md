@@ -303,6 +303,11 @@ export interface ClientContext {
 - `npm run typecheck` + `npm test` 全绿。
 - **新增测试文件必须进 tsconfig 分区**：`tests/unit/projectCoverage.test.ts` 断言 `tests/**/*.test.ts` 恰好被一个 tsconfig 项目覆盖；带 jsdom/JSX 的用例要**同时**加进 `tsconfig.ui.json` 的 `include` 与 `tsconfig.json` 的 `exclude`，否则 `npm run typecheck` 直接红。
 - `lib/client.js` 重建产物与源码进**同一个 commit**（本仓库 `artifactFreshness` 是字节比对，硬约束）。
+- **交付物包含 `docs/e2e-checklist.md` 新增一节**（用户已确认的收口范围）：放在「第二部分：真机主流程」中，紧随 F「工具启用范围（`/scope`）」之后，形如 `### G. 语言切换与降级`。验收步骤至少覆盖两点：
+  1. 在宿主 General 设置里切换语言（中 ↔ 英），核对**导航标签 / 页面正文 / 插件列表的标题与描述**三处**无需刷新**跟随；
+  2. 在英文界面下遇到服务端中文告警时，按 §9 的已知折中判定（**不算失败**），而不是记成缺陷。
+  **第一部分（契约六项）不得改动**——`tests/contract/contract.test.ts` 的 ⑦ 钉住它。
+  **真机执行留到发布前**，本次交付只到"清单有步骤"为止（用户选择）。
 
 ---
 
