@@ -1391,7 +1391,7 @@ var ToolScopeState = class {
 			ok: false,
 			status: 503,
 			error: "scope-version-unsupported",
-			message: "作用域文档版本高于本插件支持（本插件支持 version 1），不能覆写该文档；已存内容一位不动"
+			message: "作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1，文档版本高于本插件支持或低于本插件支持，不能覆写该文档；已存内容一位不动"
 		};
 		if (this.#listState === "unavailable") return {
 			ok: false,
@@ -1563,7 +1563,7 @@ var ToolScopeState = class {
 			this.#versionUnsupported = true;
 			this.noteDegraded({
 				source: "scope-version",
-				reason: "作用域文档版本高于本插件支持（本插件支持 version 1）；已只读降级并拒绝写入，避免覆写更新格式的文档"
+				reason: "作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1，文档版本高于本插件支持或低于本插件支持；已只读降级并拒绝写入，避免覆写不同格式的文档"
 			});
 		}
 	}

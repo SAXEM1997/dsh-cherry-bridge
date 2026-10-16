@@ -85,8 +85,8 @@ const EFFECT_NOTE =
 const DEGRADED_LABELS: Record<DegradedSource, string> = {
   install: '隐藏层应用曾失败（install）：相关 agent 的隐藏层未生效或无法确认，启用范围对它可能不适用',
   'workspace-list': '注册表列表当前读不到',
-  'visibility-only': '仅可见性降级（缺 tools.guard）：部分会话可能仍看得到这些工具',
-  'scope-version': '作用域文档版本高于本插件支持',
+  'visibility-only': '仅可见性降级（缺 tools.guard）：restrict 仍在装配层移除这 14 个工具，但执行侧没有任何一层拒绝它们的调用（不是渲染层假过滤）；连 restrict 都装不上的 agent 则既隐藏不了、也无人拒绝',
+  'scope-version': '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）',
   'path-normalization': '路径规范化降级：cwd 比对可能不准确',
 }
 
@@ -111,7 +111,7 @@ const DEGRADED_LABELS: Record<DegradedSource, string> = {
 const SAVE_FAILURE_LABELS: Record<string, string> = {
   'scope-revision-conflict': '配置已被他处修改，请重新读取后再保存。',
   'scope-version-unsupported':
-    '作用域文档版本高于本插件支持：重读不会改变文档版本，请升级宿主 / DSH 或本插件后再试。',
+    '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫），本文档的版本高于本插件支持：重读不会改变文档版本，请升级宿主 / DSH 或本插件后再试。',
   'invalid-scope': '保存被拒绝：作用域字段非法（mode 必须是 global 或 selected，workspaceIds 必须是字符串数组）。',
   'missing-expected-revision': '保存被拒绝：请求缺少基准 expectedRevision，请重新读取后再保存。',
   'workspace-list-unavailable': '工作区列表当前读不到，无法保存；已存勾选与 mode 一位不动。',
@@ -329,7 +329,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
       )}
       {scopeVersionDegraded && (
         <p className="cherry-error" role="alert" data-scope-warning="scope-version">
-          作用域文档版本高于本插件支持，已进入只读降级：保存被禁用。重读仍是同一份文档，请升级宿主 / DSH 或本插件后再试。
+          作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：文档版本高于本插件支持、或低于本插件支持，已进入只读降级，保存被禁用。重读仍是同一份文档，请升级宿主 / DSH 或本插件后再试。
         </p>
       )}
       {listUnavailable && (

@@ -153,10 +153,13 @@ profile YAML（避免双真相源）。
 - `workspaces` —— 注册表里的工作区（只投影 `id`/`title`/`path`；浏览器够不到注册表本身）。
 - `staleWorkspaceIds` —— 文档里勾选、但注册表已不存在的 id：**由 `PUT` 修剪是清除它们的唯一
   路径**，界面据 `pruned` 回显清除结果，而**不是**报「校验失败」。
-- `pathUnmatched` —— **解析成功但规范化后不属于任何已注册工作区**的会话（`agentId` + `cwd`）。
+- `pathUnmatched` —— **cwd 与当前一代的规范路径表不匹配**的会话（`agentId` + `cwd`）。两类都记在
+  这里：解析成功、但规范化（realpath）后不属于任何已注册工作区的 cwd（拼写不同 / 符号链接 / 该
+  目录确实未注册，三者在此不可区分）；以及宿主没有 `resolveByPath`（见下面 `path-normalization`
+  一条）时，只按大小写敏感字符串等价比对而没命中的 cwd。
   它们按「无工作区」处理：**`selected` 模式下**这些会话看不到这 14 个工具；`global` 模式下一切照常
-  可见（不看工作区登记），所以这条只在 `selected` 下解释「勾了却无工具」的原因——拼写不同 / 符号
-  链接 / 该目录确实未注册，三者在此不可区分；它**不是**降级，也不改动勾选或 `mode`、不触发写入。
+  可见（不看工作区登记），所以这条只在 `selected` 下解释「勾了却无工具」的原因；它**不是**降级，
+  也不改动勾选或 `mode`、不触发写入。
 - `host` —— 能力三态（`pending` / `unsupported` / `ready`，`capable === (state === 'ready')`）
   与 `degraded` 数组（`{source, reason}`；同一来源只留最新一条，不同来源并存）。五个来源各自是：
   - `install` —— 隐藏层的应用失败过；`reason` 说明是四处里的哪一处：无参 `schemas()` 读不到
@@ -166,9 +169,12 @@ profile YAML（避免双真相源）。
   - `workspace-list` —— 工作区注册表读不到（读取失败或返回空表）：判定 fail-closed、写侧拒绝；
     这是五个来源里**唯一**会在下一次成功读取时被清掉的一个。
   - `visibility-only` —— 宿主没有 `tools.guard`，或安装它时被拒：`restrict` 仍在装配层移除这 14 个
-    工具，但执行侧的兜底没了，只算**可见性**降级、不是执行边界，部分会话可能仍看得到它们。
-  - `scope-version` —— 文档的 `version` 与本插件支持的不一致：只读降级并锁死写入（避免覆写更新
-    格式的文档）。
+    工具（不是渲染层假过滤），但**执行侧兜底**没了——没有任何一层会拒绝这些工具的调用，只算
+    **可见性**降级、不是执行边界。若某个 agent 连 `restrict` 也装不上（同一条 `install` 来源的
+    另一处），那个 agent 的目标工具保持可见、guard 也放行：插件隐藏不了它，只能把这件事记在
+    `degraded` 里。
+  - `scope-version` —— 文档的 `version` 与本插件支持的不一致（高于或低于皆同一条守卫）：只读降级
+    并锁死写入（避免覆写不同格式的文档）。
   - `path-normalization` —— 宿主没有 `resolveByPath`：cwd 比对退化为大小写敏感字符串等价（不做
     realpath），符号链接或拼写差异下规则二可能不命中。
 
@@ -255,7 +261,7 @@ info 级只记**阶段名与标识符**（`deviceId`/`sessionId`/配对阶段）
 ```bash
 npm test            # vitest 全量（含 tests/contract/）
 npm run typecheck   # 服务端 + UI 两侧
-npm run build       # tsdown → dist/index.mjs
+npm run build       # tsdown → dist/index.mjs + dist/index.d.mts
 npm run build:client # vite → lib/client.js
 npm run dev:ui      # 设置页 dev server（需宿主在 127.0.0.1:23023 运行，见上）
 npm run prepublishOnly # 发布前闸门：typecheck + test + build + build:client
@@ -306,7 +312,10 @@ npm run prepublishOnly # 发布前闸门：typecheck + test + build + build:clie
 > `dist/index.d.mts` 走的是 TS 7 的实验性 dts API，该面在 minor 版本间可能变动；
 > 限定为 patch-only 区间意味着 minor 不会在区间内静默改变这个面，升级必须显式改
 > `package.json` 并重跑 `npm run build` + 全量测试。类型面的产物随仓库提交，所以一次
-> 坏升级会立刻在契约套件里现形，而不是等下游消费方撞上。
+> 坏升级会立刻在**逐字节的产物闸门**里现形，而不是等下游消费方撞上：
+> `tests/unit/artifactFreshness.test.ts` 按当前源码重建 `dist/index.mjs`、`dist/index.d.mts`
+> 与 `lib/client.js`，再与**已提交**的版本逐字节比对（契约套件的「clean clone → pack」用例只
+> 断言这三个文件**存在**，看不到字节级的腐坏）。
 
 > 说明：本仓库的 `tests/loopback/fakeCherry.ts` 是**测试内**的自环假对端，不是发布物；
 > 文档与代码注释中出现的 `Task N`、`spec §x`、`controller ruling`、`UltraReview` 等编号，
