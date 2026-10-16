@@ -1560,7 +1560,7 @@ describe('③ release configuration', () => {
     }
     expect(pkg.repository).toEqual({
       type: 'git',
-      url: 'https://gitlab.ai.isv.iridesc.cn:23000/zyx/dsh-cherry-bridge',
+      url: 'https://github.com/SAXEM1997/dsh-cherry-bridge',
     })
     // E1-2: `access` alone leaves the TARGET registry to whichever mirror the
     // publishing machine happens to have configured — the lockfile pins

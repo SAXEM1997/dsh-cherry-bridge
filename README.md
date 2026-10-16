@@ -1,9 +1,37 @@
+<div align="center">
+
+[English](README.en.md) | **简体中文**
+
+</div>
+
 # dsh-cherry-bridge
 
-把本机 **DeepSeek Harness** 桥接到局域网内的 **Cherry Studio 桌面端**（remote
-access）。插件在 DSH 侧维护设备连接池与订阅缓存，对外暴露 `cherry_*` 工具面与一个
-同源设置页，让你可以在 DSH 会话里驱动 Cherry 端的 agent：列设备/列会话、读历史、
-发消息并等待终态、应答审批与提问卡、取消执行。
+**把 DeepSeek Harness 桥接到 Cherry Studio 桌面端** — DSH 插件
+
+在 DSH 会话里直接驱动局域网内 Cherry Studio 的 agent：配对、列设备/会话、读历史、
+发消息并等待终态、应答审批与提问卡、取消执行；附一个同源设置页管理设备与工具启用范围。
+
+```mermaid
+flowchart LR
+    classDef dsh fill:#ddf4ff,stroke:#0969da,stroke-width:2px,color:#0a3069
+    classDef plug fill:#f6f8fa,stroke:#8c959f,stroke-width:2px,color:#57606a
+    classDef cherry fill:#fff8c5,stroke:#9a6700,stroke-width:2px,color:#7d4e00
+
+    subgraph HOST["DeepSeek Harness 宿主"]
+        S["DSH 会话<br/>14 个 cherry_* 工具（按工作区启用）"]:::dsh
+        W["设置页 · cherry-remote 命名空间<br/>设备卡片 / 配对向导 / 启用范围"]:::dsh
+        H["同源 HTTP 前缀<br/>/cherry-remote/api"]:::dsh
+    end
+
+    P["dsh-cherry-bridge<br/>连接池 · 订阅缓存 · 作用域层<br/>0600 设备档案（Noise 公钥 pin）"]:::plug
+
+    C["Cherry Studio 桌面端<br/>remote access（二维码配对 · 6 位验证码 · 审批）"]:::cherry
+
+    S -->|tools.register / restrict| P
+    W -->|REST + SSE| H
+    H --> P
+    P <-->|"ws:// · Noise XX · 心跳 · 限速 · 断线重连"| C
+```
 
 - 包名：`dsh-cherry-bridge`
 - 插件 id：`cherry-remote`（呼应协议发现类型 `remoteDiscoveryType` 的 mDNS 服务标识）
@@ -15,7 +43,15 @@ access）。插件在 DSH 侧维护设备连接池与订阅缓存，对外暴露
 ## 安装
 
 ```bash
-# DSH profile 方式安装（推荐）
+# 从 GitHub 安装（推荐）
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge
+
+# 钉住版本标签（生产推荐）
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.0
+```
+
+```bash
+# 或从 npm registry 安装
 dsh plugin --profile <name> add dsh-cherry-bridge
 ```
 

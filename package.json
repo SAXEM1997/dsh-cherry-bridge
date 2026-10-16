@@ -8,7 +8,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://gitlab.ai.isv.iridesc.cn:23000/zyx/dsh-cherry-bridge"
+    "url": "https://github.com/SAXEM1997/dsh-cherry-bridge"
   },
   "publishConfig": {
     "access": "public",
@@ -51,7 +51,8 @@
     "locale",
     "docs/e2e-checklist.md",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "scripts": {
     "test": "vitest run",
