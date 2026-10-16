@@ -1,10 +1,15 @@
 {
-  // The UI project: the settings page (`ui/**`) and the three tests that must
-  // run in a UI environment — `tests/unit/ui.test.ts` and
+  // The UI project: the settings page (`ui/**`) and the three test files the
+  // split routes here — `tests/unit/ui.test.ts` and
   // `tests/unit/uiScopePanel.test.ts` (both jsdom + testing-library; the second
   // covers the 「启用范围」 settings section) plus
-  // `tests/integration/clientBundle.test.ts` (it loads the built bundle in a
-  // browser-shaped VM). Its counterpart is `tsconfig.json`; the split is
+  // `tests/integration/clientBundle.test.ts`, which is NOT a jsdom test: it runs
+  // in the node environment (no `@vitest-environment` docblock) and typechecks
+  // under the server project's option set too — it declares its own `window` /
+  // `document` fixtures and hands them to a browser-shaped `node:vm`. It is
+  // routed here because the partition must place every one of the three
+  // UI-environment files in exactly one project. Its counterpart is
+  // `tsconfig.json`; the split is
   // load-bearing because this project adds the DOM libs and `jsx: react-jsx`,
   // and the server project deliberately excludes exactly these files so each is
   // checked by exactly one project (see `tests/unit/projectCoverage.test.ts`).

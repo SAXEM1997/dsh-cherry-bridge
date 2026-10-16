@@ -8,13 +8,14 @@ import { describe, expect, it } from 'vitest'
 /**
  * R3-F2 (routed from F1): the committed build artifacts must stay FRESH.
  *
- * `dist/index.mjs` and `lib/client.js` are committed — the host loads them
- * directly when this plugin is installed from git, so a stale artifact is not a
- * cosmetic problem: it is a plugin that does not contain the fix its own source
- * claims. Nothing else in the suite catches that. `clientBundle.test.ts` does
- * run `build:client`, but it then asserts on the bundle it JUST produced, so a
- * stale committed file and a fresh one are indistinguishable to it; and nothing
- * rebuilds the server half at all.
+ * `dist/index.mjs`, `dist/index.d.mts` and `lib/client.js` are committed — the
+ * host loads them directly when this plugin is installed from git, so a stale
+ * artifact is not a cosmetic problem: it is a plugin that does not contain the
+ * fix its own source claims (and, for `.d.mts`, a published type face that
+ * denies a method the runtime actually has). Nothing else in the suite catches
+ * that. `clientBundle.test.ts` does run `build:client`, but it then asserts on
+ * the bundle it JUST produced, so a stale committed file and a fresh one are
+ * indistinguishable to it; and nothing rebuilds the server half at all.
  *
  * The check is the strong one — REBUILD AND COMPARE BYTES — rather than a
  * checked-in hash manifest, and the tradeoff is worth stating because it is the
@@ -27,8 +28,9 @@ import { describe, expect, it } from 'vitest'
  *    sweep leaves the manifest green over an artifact that no longer matches
  *    `src` — the exact failure this exists to catch.
  *  - A real rebuild is the ground truth: it compares the committed artifact
- *    against what the CURRENT source actually produces. It costs ~2.5s for both
- *    halves on this repo (measured), which is within the suite's budget.
+ *    against what the CURRENT source actually produces. It costs a couple of
+ *    seconds per server artifact plus the client build on this repo (measured),
+ *    which is within the suite's budget.
  *
  * TWO THINGS MAKE THIS SOUND, and both are load-bearing rather than stylistic:
  *
@@ -62,6 +64,13 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
  */
 const ARTIFACTS: ReadonlyArray<{ label: string; path: string; script: string; entry: string; args: string[] }> = [
   { label: 'server (dist/index.mjs)', path: 'dist/index.mjs', script: 'build', entry: 'index.mjs', args: ['--out-dir'] },
+  {
+    label: 'types (dist/index.d.mts)',
+    path: 'dist/index.d.mts',
+    script: 'build',
+    entry: 'index.d.mts',
+    args: ['--out-dir'],
+  },
   { label: 'client (lib/client.js)', path: 'lib/client.js', script: 'build:client', entry: 'client.js', args: [] },
 ]
 

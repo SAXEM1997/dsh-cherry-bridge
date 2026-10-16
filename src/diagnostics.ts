@@ -232,6 +232,14 @@ export interface DiagnosticsScopeHost {
   capable: boolean
   reason: string
   degraded: DegradedNote[]
+  /**
+   * B7①'s upgrade hint, for a developer reading the report: what to do about an
+   * `unsupported` host. A server-side LITERAL, not an import of the settings
+   * panel's page copy (`ui/src/ToolScopePanel.tsx` is a different bundle and its
+   * wording is free to move); empty unless `state === 'unsupported'`, because
+   * B7 forbids reading `pending` as "the host does not support this".
+   */
+  upgradeHint: string
 }
 
 /**
@@ -297,6 +305,16 @@ export interface ScopeReadSource {
 }
 
 /**
+ * B7①'s upgrade hint, as the diagnostics face states it.
+ *
+ * Terse because this is a developer surface, and a server-side literal because
+ * the settings panel's copy lives in another bundle (see
+ * {@link DiagnosticsScopeHost.upgradeHint}). It is only ever attached to an
+ * `unsupported` host.
+ */
+export const SCOPE_UPGRADE_HINT = '请升级宿主 / DSH 以获得该能力后再试；升级前本插件不会注册这些工具。'
+
+/**
  * The host projection, and the ONE place `capable` is decided.
  *
  * `capable` is deliberately not carried alongside `state`: the spec defines it
@@ -315,6 +333,7 @@ function projectHostFace(
     capable: host.state === 'ready',
     reason: host.reason,
     degraded: degraded.map((note) => ({ source: note.source, reason: note.reason })),
+    upgradeHint: host.state === 'unsupported' ? SCOPE_UPGRADE_HINT : '',
   }
 }
 

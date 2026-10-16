@@ -602,6 +602,7 @@ export class ToolScopeState {
         // the host owns no such directory, so there is no key to record.
         const resolved = entity === undefined ? undefined : toScopeWorkspace(entity)
         if (resolved === undefined) continue
+        // A duplicate path silently overwrites: the map is last-wins per key.
         pathMap.set(resolved.path, resolved.id)
       }
     } else {

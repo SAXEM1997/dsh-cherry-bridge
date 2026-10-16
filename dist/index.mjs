@@ -1606,6 +1606,15 @@ const CONTRACT_DIFFERENCES = [
 	}
 ];
 /**
+* B7①'s upgrade hint, as the diagnostics face states it.
+*
+* Terse because this is a developer surface, and a server-side literal because
+* the settings panel's copy lives in another bundle (see
+* {@link DiagnosticsScopeHost.upgradeHint}). It is only ever attached to an
+* `unsupported` host.
+*/
+const SCOPE_UPGRADE_HINT = "请升级宿主 / DSH 以获得该能力后再试；升级前本插件不会注册这些工具。";
+/**
 * The host projection, and the ONE place `capable` is decided.
 *
 * `capable` is deliberately not carried alongside `state`: the spec defines it
@@ -1623,7 +1632,8 @@ function projectHostFace(host, degraded) {
 		degraded: degraded.map((note) => ({
 			source: note.source,
 			reason: note.reason
-		}))
+		})),
+		upgradeHint: host.state === "unsupported" ? SCOPE_UPGRADE_HINT : ""
 	};
 }
 /**
