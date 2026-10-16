@@ -133,7 +133,9 @@ profile 手工加行等价于：
 ### 作用域文档与端点
 
 作用域文档落在插件数据目录：`<dataDir>/scope.json`（默认 `$DSH_HOME/cherry-remote/scope.json`），
-权限 `0600`、原子写入、`revision` 单调递增；它**不进** profile YAML（避免双真相源）。
+权限 `0600`、原子写入、`revision` 单调递增——**唯一的例外**是文档解析失败或字段非法：此时按更严的
+一侧（`selected` + 空列表）重建并**把 `revision` 归 0**，文档仍可被正常写入覆盖；它**不进**
+profile YAML（避免双真相源）。
 
 `GET /cherry-remote/api/scope` 一次返回整份状态：
 
@@ -152,11 +154,23 @@ profile 手工加行等价于：
 - `staleWorkspaceIds` —— 文档里勾选、但注册表已不存在的 id：**由 `PUT` 修剪是清除它们的唯一
   路径**，界面据 `pruned` 回显清除结果，而**不是**报「校验失败」。
 - `pathUnmatched` —— **解析成功但规范化后不属于任何已注册工作区**的会话（`agentId` + `cwd`）。
-  它们按「无工作区」处理（不可见），这条只解释「勾了却无工具」的原因——拼写不同 / 符号链接 /
-  该目录确实未注册，三者在此不可区分；它**不是**降级，也不改动勾选或 `mode`、不触发写入。
+  它们按「无工作区」处理：**`selected` 模式下**这些会话看不到这 14 个工具；`global` 模式下一切照常
+  可见（不看工作区登记），所以这条只在 `selected` 下解释「勾了却无工具」的原因——拼写不同 / 符号
+  链接 / 该目录确实未注册，三者在此不可区分；它**不是**降级，也不改动勾选或 `mode`、不触发写入。
 - `host` —— 能力三态（`pending` / `unsupported` / `ready`，`capable === (state === 'ready')`）
-  与 `degraded` 数组（`{source, reason}`；同一来源只留最新一条，不同来源并存：`install` /
-  `workspace-list` / `visibility-only` / `scope-version` / `path-normalization`）。
+  与 `degraded` 数组（`{source, reason}`；同一来源只留最新一条，不同来源并存）。五个来源各自是：
+  - `install` —— 隐藏层的应用失败过；`reason` 说明是四处里的哪一处：无参 `schemas()` 读不到
+    （本轮既不装也不释放任何层）、某层的释放抛错（旧层可能仍在生效）、agent 缺
+    `agent.ctx.tools.restrict`、宿主拒绝了 `restrict()`。它**只累积、不被任何成功路径清除**
+    （同来源被后一条覆盖），所以恢复之后它仍然只表示「本次会话中曾失败过一次」。
+  - `workspace-list` —— 工作区注册表读不到（读取失败或返回空表）：判定 fail-closed、写侧拒绝；
+    这是五个来源里**唯一**会在下一次成功读取时被清掉的一个。
+  - `visibility-only` —— 宿主没有 `tools.guard`，或安装它时被拒：`restrict` 仍在装配层移除这 14 个
+    工具，但执行侧的兜底没了，只算**可见性**降级、不是执行边界，部分会话可能仍看得到它们。
+  - `scope-version` —— 文档的 `version` 与本插件支持的不一致：只读降级并锁死写入（避免覆写更新
+    格式的文档）。
+  - `path-normalization` —— 宿主没有 `resolveByPath`：cwd 比对退化为大小写敏感字符串等价（不做
+    realpath），符号链接或拼写差异下规则二可能不命中。
 
 `PUT /cherry-remote/api/scope` 是读-改-写：body 为 `{mode, workspaceIds, expectedRevision}`，
 `expectedRevision` **必填**，就是上一次读到的 `revision`。成功返回 `200 {scope, pruned}`：
@@ -166,10 +180,10 @@ profile 手工加行等价于：
 | HTTP | `error` | 含义 |
 | --- | --- | --- |
 | 400 | `invalid-scope` | 字段非法：`mode` 不是 `global`/`selected`，或 `workspaceIds` 不是字符串数组。 |
-| 400 | `missing-expected-revision` | 请求没带基准 `expectedRevision`。 |
+| 400 | `missing-expected-revision` | 请求没带基准 `expectedRevision`，**或它不是有限数字**（类型/取值都由同一条守卫判定）。 |
 | 409 | `scope-revision-conflict` | 基准 `revision` 已过期（配置被他处改过）；`message` 内含当前 `revision`。 |
 | 503 | `workspace-list-unavailable` | 工作区注册表读不到：拒绝写入，已存勾选与 `mode` **一位不动**（也不修剪）。 |
-| 503 | `scope-version-unsupported` | 作用域文档的 `version` 高于本插件支持：只读降级；**重读仍是同一份文档**。 |
+| 503 | `scope-version-unsupported` | 作用域文档的 `version` 与本插件支持的**不一致**（高于或低于都会命中同一条守卫）：只读降级；**重读仍是同一份文档**。 |
 
 > 请求体**整个**读不出来（非法 JSON）时仍走本模块既有的 `400 invalid-request`——那不是作用域
 > 字段的裁决，故不在上表内。

@@ -3842,9 +3842,11 @@ function jsonRender(_args, value) {
 /**
 * The 14 `cherry_*` tool names, in the family's documented order.
 *
-* THE one list: tool visibility (`deny` sets), the dispatch guard's scope, the
-* diagnostics face and the contract suite all read this constant instead of
-* keeping a copy of their own.
+* THE one list: the plugin assembly (`src/index.ts` hands it to the scope host
+* as `names`, which is where the visibility `deny` sets and the dispatch
+* guard's scope come from) and the contract suite read this constant instead of
+* keeping a copy of their own. The diagnostics face does NOT read it — its
+* scope segment reports the live scope state, not this list.
 *
 * {@link CherryToolEngine.definitions()} still spells each name inside its own
 * declaration — that literal is what the host registry receives — so the two
