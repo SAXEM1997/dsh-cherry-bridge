@@ -5991,8 +5991,10 @@ function lastAssistantMessage(messages) {
 *     release side of `register`/`restrict` also emits `tools/change`, and a
 *     recompute running in that window would re-install a layer whose disposer
 *     the map no longer holds — an ownerless layer, unrecoverable under
-*     intersection semantics), then releases registrations, then restrictions,
-*     and finally the guard (which notifies nobody).
+*     intersection semantics), then clears the pending recheck timers (they are
+*     the last thing outside a dispatch that could still reach into this
+*     generation), then releases registrations, then restrictions, and finally
+*     the guard (which notifies nobody).
 *
 *  4. **State ownership stays with {@link ToolScopeState}.** This module keeps
 *     no copy of the document, the degradation set, the judgement generation or
