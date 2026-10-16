@@ -470,12 +470,18 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     // The same synchronous fallback, for the arm that matters: a layer installed
     // on a cache miss while the CURRENT generation already NAMES the agent's
     // workspace must stop reporting a miss. A resolution that names NO workspace
-    // (`no-cwd` / `no-match`) keeps the miss wording: that text describes the
-    // cache rather than the conclusion, and the round that lands the judgement
-    // rewrites this record in place (T5b ⑬ pins both halves of that).
+    // (`no-cwd` / `no-match`) keeps the miss wording FIRST: that half is what
+    // explains installing without awaiting, and T5b ⑬ / ⑥ pin it for exactly
+    // those two states. R2-N17: it is no longer the ONLY half — when the window
+    // could already state a conclusion, the record carries that too, so the
+    // operator is not left with the cache's story alone. The round that lands
+    // the judgement still rewrites this record in place.
     const sync = scope.resolveNow(agent)
-    if (sync?.workspaceId !== undefined) return sync.reason
-    return '判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）'
+    if (sync === undefined) {
+      return '判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）'
+    }
+    if (sync.workspaceId !== undefined) return sync.reason
+    return `判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）；本窗口的同步判定：${sync.reason}`
   }
 
   /** §4 ②'s 同名短路: two deny sets holding exactly the same names. */
@@ -796,8 +802,17 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     // ④ Then every restriction (record cleared before its layer's disposer —
     //    the ONE release path, so a disposer that throws is contained and
     //    recorded rather than only logged).
+    //
+    //    N3: the record is cleared only by the generation that is still
+    //    `current`. The layer RECORD is shared state keyed by agent id, so an
+    //    OLDER generation's late teardown reaching an agent that a NEWER
+    //    generation has since re-installed a layer for would delete the newer
+    //    generation's record while its layer stays installed — the guard's
+    //    「层在 ⇒ 拒绝」 mirror would have nothing left to read. The layer this
+    //    generation OWNS is disposed either way: releasing what we installed is
+    //    not conditional on who is current.
     for (const [agentId, dispose] of [...state.layers]) {
-      scope.clearLayer(agentId)
+      if (current === state) scope.clearLayer(agentId)
       disposeQuietly(agentId, dispose)
     }
     state.layers.clear()

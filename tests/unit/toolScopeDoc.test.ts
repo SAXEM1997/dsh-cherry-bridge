@@ -721,6 +721,30 @@ describe('writeFileAtomicSync — the replicated atomic write', () => {
     expect(existsSync(`${file}.tmp`)).toBe(false)
   })
 
+  it('removes the temp file when a step BEFORE the rename fails too', () => {
+    const file = makeScopeFile()
+    writeFileSync(file, 'old\n')
+
+    // The failure is forced at `writeSync` — AFTER `openSync` created the temp
+    // and BEFORE the rename — because that is the window the cleanup used to
+    // miss: a non-string payload makes the write throw deterministically, and
+    // the header's "never leave a half-written temp behind" has to hold for
+    // EVERY step of the sequence, not just the switch.
+    let thrown: unknown
+    try {
+      writeFileAtomicSync(file, 42 as unknown as string)
+    } catch (error) {
+      thrown = error
+    }
+
+    // The error is the WRITE's, not the open's or the rename's: only then does
+    // the cleanup assertion below say anything about this window.
+    expect((thrown as NodeJS.ErrnoException).code).toBe('ERR_INVALID_ARG_TYPE')
+    expect(existsSync(`${file}.tmp`)).toBe(false)
+    // The target was never touched: the old bytes are still the whole file.
+    expect(readText(file)).toBe('old\n')
+  })
+
   it('removes the temp file and rethrows when the rename fails', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-tool-scope-'))
     tempDirs.push(dir)

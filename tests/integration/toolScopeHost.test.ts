@@ -1495,6 +1495,10 @@ describe('T5b the tools/change subscription and the coalescing gate (§4)', () =
     host.addAgent({ id: 'agent-b' })
     expect(host.layerCount('agent-b')).toBe(1)
     expect(scope.layer('agent-b')?.reason).toContain('缓存未命中')
+    // R2-N17: the miss stays — it is what explains installing without awaiting —
+    // but the record also carries the conclusion this window could already state
+    // (`no-cwd`), instead of leaving the operator with only the cache's story.
+    expect(scope.layer('agent-b')?.reason).toContain('会话 header 无 cwd')
 
     await settle()
 
@@ -2734,5 +2738,100 @@ describe('Wave 1 review fixes: generation-scoped teardown, contained releases, r
     // …and the fail-open the plugin cannot prevent is on the record rather than
     // hidden: with no layer there is nothing for the guard to reject.
     expect(fresh.host.verdict('agent-no-restrict', CHERRY_TOOL_NAMES[0]!)).toBeUndefined()
+  })
+})
+
+describe('Gate 3 round 2 fixes: an empty generation on re-mount, a shared record that survives', () => {
+  it('① a re-mount across a CHANGED registry DENIES in its first synchronous pass', async () => {
+    const { host, scope, tools } = rig()
+    // Mount 1's generation: `agent-a` is a MEMBER of `w-oa` (rule one) and the
+    // document enables that workspace, so this mount answers "visible" for it
+    // without consulting the path map at all.
+    host.setWorkspaces([entity('w-oa', '/w/oa', ['agent-a'])])
+    tools.refresh()
+    await drain()
+    saveScope(scope, 'selected', ['w-oa'])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+
+    // RELEASE, synchronously, from rule one of the list mount 1 read — and no
+    // layer for the agent. That is the state the re-mounted generation must not
+    // inherit as a fact about the new registry.
+    expect(scope.judgement('agent-a')).toBeUndefined()
+    expect(host.layerCount('agent-a')).toBe(0)
+    await drain()
+    expect(scope.judgement('agent-a')?.visible).toBe(true)
+
+    // The window between the two mounts: the registry CHANGED — the membership
+    // is gone and the old cwd is registered nowhere.
+    host.unloadDependencies()
+    host.setWorkspaces([entity('w-other', '/w/other')])
+    host.reloadDependencies()
+
+    // The FIRST synchronous pass of the new mount, with NO await in between:
+    // with no generation of its own yet, the only safe answer is the deny.
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+    expect(host.agentView('agent-a')).toEqual([])
+    expect(host.verdict('agent-a', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+
+    // The round that lands confirms it: the cwd now resolves outside every
+    // registered workspace, so the layer stays.
+    await drain()
+    expect(scope.judgement('agent-a')?.status).toBe('no-match')
+    expect(scope.judgement('agent-a')?.visible).toBe(false)
+    expect(host.layerCount('agent-a')).toBe(1)
+    expect(scope.layer('agent-a')?.deny).toHaveLength(14)
+    expect(host.effectFailures).toEqual([])
+  })
+
+  it('② an OLDER generation’s teardown leaves the NEWER generation’s shared record in place', async () => {
+    const generations: Array<() => void> = []
+    const fresh = rig({
+      registerTools: () => () => {},
+      patchRoot: (fake) => {
+        fake.setWorkspaces([entity('w-oa', '/w/oa')])
+        // 13 of the 14 names are in the scene at the FIRST delivery, so the older
+        // generation's layer carries a 13-name deny set…
+        registerOn(fake, CHERRY_TOOL_NAMES.slice(0, 13))
+        // …and the agent is live BEFORE that delivery, so the older generation's
+        // own first pass installs a layer for it. That generation owns no
+        // `agent/created` / `tools/change` subscription, so the 14th registration
+        // below cannot make it re-apply.
+        captureGenerations(fake, generations, ['agent/created', 'tools/change'])
+        fake.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+      },
+    })
+    await drain()
+    expect(fresh.tools.state().state).toBe('ready')
+    expect(generations).toHaveLength(1)
+    // The older generation owns the layer AND the shared record.
+    expect(fresh.host.layerCount('agent-b')).toBe(1)
+    expect(fresh.scope.layer('agent-b')?.deny).toHaveLength(13)
+
+    // The scene gains the 14th name, so the newer generation's target DIFFERS
+    // from the older record: its first pass installs its OWN layer and rewrites
+    // the shared record — the double-install overlap.
+    registerOn(fresh.host, CHERRY_TOOL_NAMES.slice(13))
+    fresh.host.reloadDependencies()
+    expect(generations).toHaveLength(2)
+    await drain()
+    expect(fresh.host.layerCount('agent-b')).toBe(2)
+    expect(fresh.scope.layer('agent-b')?.deny).toHaveLength(14)
+
+    // NOW the older generation is torn down, late.
+    generations[0]!()
+
+    // It releases the layer it owned…
+    expect(fresh.host.layerCount('agent-b')).toBe(1)
+    // …and must NOT delete the record of the layer the newer generation still
+    // has installed: the guard's 「层在 ⇒ 拒绝」 mirror reads exactly that record,
+    // so clearing it would leave the newer layer unrecorded — and therefore
+    // allowed.
+    expect(fresh.scope.layer('agent-b')?.deny).toHaveLength(14)
+    expect(fresh.host.verdict('agent-b', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+    // The newer generation itself is untouched: still current, still ready.
+    expect(fresh.scope.judgement('agent-b')).toBeDefined()
+    expect(fresh.tools.state().state).toBe('ready')
+    expect(fresh.host.effectFailures).toEqual([])
   })
 })

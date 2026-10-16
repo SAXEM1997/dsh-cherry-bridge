@@ -878,10 +878,13 @@ function toRemoteSocket(ws) {
 *    halves of the swap exactly `mode` and re-tightens a pre-existing looser
 *    file instead of leaving it as it was.
 *  - `renameSync(temp, file)` — the switch itself: a reader sees either the
-*    complete old file or the complete new one, never a truncated one. On
-*    failure the temp file is dropped (best effort) so a half-written file is
-*    not left for the next reader to trip over, and the original error is what
-*    propagates — the target was never touched.
+*    complete old file or the complete new one, never a truncated one. The
+*    WHOLE sequence from the `open` that creates the temp to the `rename` that
+*    consumes it sits inside ONE cleanup window: any throw in between — the
+*    write, the fsync, the close, the chmod, not just the rename — drops the
+*    temp file (best effort) so a half-written file is not left for the next
+*    reader to trip over, and the original error is what propagates — the
+*    target was never touched.
 *
 * Synchronous by design: the scope document's write path must complete inside
 * one uninterruptible critical section (no `await` between validating the
@@ -890,15 +893,15 @@ function toRemoteSocket(ws) {
 function writeFileAtomicSync(file, text, mode = 384) {
 	mkdirSync(dirname(file), { recursive: true });
 	const temp = `${file}.tmp`;
-	const fd = openSync(temp, "w", mode);
 	try {
-		writeSync(fd, text, void 0, "utf8");
-		fsyncSync(fd);
-	} finally {
-		closeSync(fd);
-	}
-	chmodSync(temp, mode);
-	try {
+		const fd = openSync(temp, "w", mode);
+		try {
+			writeSync(fd, text, void 0, "utf8");
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		chmodSync(temp, mode);
 		renameSync(temp, file);
 	} catch (error) {
 		try {
@@ -1196,9 +1199,10 @@ var ToolScopeState = class {
 			reason: note.reason
 		});
 	}
-	/** The host capability tri-state, as written by the host integration layer. */
+	/** The host capability tri-state, as written by the host integration layer.
+	* Returned as a COPY under a `Readonly` type: `setHost` is its only writer. */
 	host() {
-		return this.#host;
+		return { ...this.#host };
 	}
 	setHost(next) {
 		this.#host = next;
@@ -1227,9 +1231,19 @@ var ToolScopeState = class {
 		this.#clearDegraded("workspace-list");
 		this.#workspaces = list.map((raw) => toScopeWorkspace(raw)).filter((workspace) => workspace !== void 0);
 	}
-	/** The normalized registry list; `[]` for both 未读 and 读失败. */
+	/**
+	* The normalized registry list; `[]` for both 未读 and 读失败.
+	*
+	* A DETACHED copy (`readonly` on the outside, fresh objects inside), like the
+	* sibling reader `degraded()`: the live generation may only be changed by its
+	* own writers (`setWorkspaces`, `rebuild`), never by a caller that happens to
+	* hold the array.
+	*/
 	workspaces() {
-		return this.#workspaces;
+		return this.#workspaces.map((workspace) => ({
+			...workspace,
+			sessionIds: [...workspace.sessionIds]
+		}));
 	}
 	/**
 	* Document ids the registry no longer has (B14), for the settings page.
@@ -1335,8 +1349,8 @@ var ToolScopeState = class {
 	* A read that was never taken, or that failed / returned an empty table, has
 	* no generation to read: `'unread'` and `'unavailable'` both mean exactly that.
 	* One consequence: this window cannot await a `resolveByPath` realpath, so a
-	* `cwd` that would only match after one concludes `no-match` here and is
-	* corrected by the asynchronous round.
+	* `cwd` that would match only AFTER one is concluded `no-match` here, and the
+	* asynchronous round is what corrects it.
 	*/
 	resolveNow(agent) {
 		if (this.#listState !== "read") return void 0;
@@ -1345,7 +1359,7 @@ var ToolScopeState = class {
 		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
 		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）");
 		const workspaceId = this.#pathMap.get(agent.cwd);
-		return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 与当前一代的规范路径表不匹配（本窗口无法 await resolveByPath 的 realpath；异步轮次会纠正）`) : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`);
+		return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`) : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`);
 	}
 	/**
 	* Agents whose `cwd` resolved outside every registered workspace, with the
@@ -1442,12 +1456,28 @@ var ToolScopeState = class {
 	* and the whole judgement generation — the canonical path map, the per-agent
 	* judgements and the `pathUnmatched` diagnostics (Task 4's teardown asserts
 	* exactly this).
+	*
+	* N1: the workspace LIST is part of that generation, so `#listState` and
+	* `#workspaces` are reset with it. Keeping the previous mount's list made
+	* 「no usable generation」 false for {@link resolveNow}: a re-mounted
+	* generation's FIRST synchronous pass runs before its own round has read
+	* anything, so it would answer §4's rule one from the OLD registry and
+	* RELEASE a layer instead of denying — and `GET /scope` would serve that list
+	* until the round landed.
+	*
+	* `'unread'` and not `'unavailable'` on purpose: nothing FAILED here, so no
+	* `workspace-list` note is recorded, and `save()` keeps the never-read
+	* behaviour (a write is accepted and prunes NOTHING — an invalidated list is
+	* no more authoritative than one never read). `staleWorkspaceIds()` answers
+	* `[]` for the same reason.
 	*/
 	invalidateDerived() {
 		this.#layers.clear();
 		this.#pathMap = /* @__PURE__ */ new Map();
 		this.#judgements = /* @__PURE__ */ new Map();
 		this.#pathUnmatched = [];
+		this.#listState = "unread";
+		this.#workspaces = [];
 	}
 	/**
 	* One agent's judgement against the generation being built, following §4's
@@ -6250,8 +6280,9 @@ function createToolScopeHost(deps) {
 		const cached = scope.judgement(agent.id);
 		if (cached !== void 0) return cached.reason;
 		const sync = scope.resolveNow(agent);
-		if (sync?.workspaceId !== void 0) return sync.reason;
-		return "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
+		if (sync === void 0) return "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
+		if (sync.workspaceId !== void 0) return sync.reason;
+		return `判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）；本窗口的同步判定：${sync.reason}`;
 	}
 	/** §4 ②'s 同名短路: two deny sets holding exactly the same names. */
 	function sameDenySet(a, b) {
@@ -6492,7 +6523,7 @@ function createToolScopeHost(deps) {
 			log("[cherry-remote] 释放 cherry_* 工具注册失败", error);
 		}
 		for (const [agentId, dispose] of [...state.layers]) {
-			scope.clearLayer(agentId);
+			if (current === state) scope.clearLayer(agentId);
 			disposeQuietly(agentId, dispose);
 		}
 		state.layers.clear();

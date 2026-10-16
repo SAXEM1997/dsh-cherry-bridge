@@ -459,6 +459,19 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     expect(state.judgement('a1')).toBeUndefined()
     expect(state.pathUnmatched()).toEqual([])
     expect(state.layer('a1')).toBeUndefined()
+
+    // R2-N1: the LIST state is part of that generation too. A surviving
+    // `#workspaces` would let the next mount's synchronous pass answer rule one
+    // from the PREVIOUS mount's registry — a release where the fail-closed
+    // answer is a deny — so 「no usable generation」 has to be literal here.
+    expect(state.workspaces()).toEqual([])
+    expect(state.resolveNow({ id: 'a1', cwd: '/w/link' })).toBeUndefined()
+    expect(state.staleWorkspaceIds()).toEqual([])
+    // …and the write side behaves exactly as it does for a never-read list
+    // (⑩): with no authoritative list, nothing may be pruned.
+    expect(state.save({ mode: 'selected', workspaceIds: ['W', 'GONE'] }, state.doc().revision)).toMatchObject(
+      { ok: true, pruned: [] },
+    )
   })
 })
 

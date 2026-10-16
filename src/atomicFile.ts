@@ -34,10 +34,13 @@ import { dirname } from 'node:path'
  *    halves of the swap exactly `mode` and re-tightens a pre-existing looser
  *    file instead of leaving it as it was.
  *  - `renameSync(temp, file)` — the switch itself: a reader sees either the
- *    complete old file or the complete new one, never a truncated one. On
- *    failure the temp file is dropped (best effort) so a half-written file is
- *    not left for the next reader to trip over, and the original error is what
- *    propagates — the target was never touched.
+ *    complete old file or the complete new one, never a truncated one. The
+ *    WHOLE sequence from the `open` that creates the temp to the `rename` that
+ *    consumes it sits inside ONE cleanup window: any throw in between — the
+ *    write, the fsync, the close, the chmod, not just the rename — drops the
+ *    temp file (best effort) so a half-written file is not left for the next
+ *    reader to trip over, and the original error is what propagates — the
+ *    target was never touched.
  *
  * Synchronous by design: the scope document's write path must complete inside
  * one uninterruptible critical section (no `await` between validating the
@@ -47,24 +50,24 @@ export function writeFileAtomicSync(file: string, text: string, mode = 0o600): v
   mkdirSync(dirname(file), { recursive: true })
 
   const temp = `${file}.tmp`
-  const fd = openSync(temp, 'w', mode)
   try {
-    writeSync(fd, text, undefined, 'utf8')
-    fsyncSync(fd)
-  } finally {
-    closeSync(fd)
-  }
-  chmodSync(temp, mode)
-
-  try {
+    const fd = openSync(temp, 'w', mode)
+    try {
+      writeSync(fd, text, undefined, 'utf8')
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    chmodSync(temp, mode)
     renameSync(temp, file)
   } catch (error) {
-    // Never leave a half-written temp file behind: the target is untouched, so
-    // dropping the temp is safe.
+    // Never leave a half-written temp file behind: the target is untouched by
+    // every arm of this window (the rename is the only step that could have
+    // switched it, and a throw means it did not), so dropping the temp is safe.
     try {
       unlinkSync(temp)
     } catch {
-      // Best effort only — the rename failure below is the real error.
+      // Best effort only — the step's own error below is the real one.
     }
     throw error
   }

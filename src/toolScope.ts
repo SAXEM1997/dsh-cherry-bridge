@@ -479,9 +479,10 @@ export class ToolScopeState {
     this.#degraded.set(note.source, { source: note.source, reason: note.reason })
   }
 
-  /** The host capability tri-state, as written by the host integration layer. */
-  host(): ScopeHostState {
-    return this.#host
+  /** The host capability tri-state, as written by the host integration layer.
+   * Returned as a COPY under a `Readonly` type: `setHost` is its only writer. */
+  host(): Readonly<ScopeHostState> {
+    return { ...this.#host }
   }
 
   setHost(next: ScopeHostState): void {
@@ -522,9 +523,16 @@ export class ToolScopeState {
       .filter((workspace): workspace is ScopeWorkspace => workspace !== undefined)
   }
 
-  /** The normalized registry list; `[]` for both 未读 and 读失败. */
-  workspaces(): ScopeWorkspace[] {
-    return this.#workspaces
+  /**
+   * The normalized registry list; `[]` for both 未读 and 读失败.
+   *
+   * A DETACHED copy (`readonly` on the outside, fresh objects inside), like the
+   * sibling reader `degraded()`: the live generation may only be changed by its
+   * own writers (`setWorkspaces`, `rebuild`), never by a caller that happens to
+   * hold the array.
+   */
+  workspaces(): readonly ScopeWorkspace[] {
+    return this.#workspaces.map((workspace) => ({ ...workspace, sessionIds: [...workspace.sessionIds] }))
   }
 
   /**
@@ -668,8 +676,8 @@ export class ToolScopeState {
    * A read that was never taken, or that failed / returned an empty table, has
    * no generation to read: `'unread'` and `'unavailable'` both mean exactly that.
    * One consequence: this window cannot await a `resolveByPath` realpath, so a
-   * `cwd` that would only match after one concludes `no-match` here and is
-   * corrected by the asynchronous round.
+   * `cwd` that would match only AFTER one is concluded `no-match` here, and the
+   * asynchronous round is what corrects it.
    */
   resolveNow(agent: ScopeAgentLike): AgentJudgement | undefined {
     if (this.#listState !== 'read') return undefined
@@ -699,7 +707,7 @@ export class ToolScopeState {
           agent,
           'no-match',
           undefined,
-          `cwd ${agent.cwd} 与当前一代的规范路径表不匹配（本窗口无法 await resolveByPath 的 realpath；异步轮次会纠正）`,
+          `cwd ${agent.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`,
         )
       : judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`)
   }
@@ -823,12 +831,28 @@ export class ToolScopeState {
    * and the whole judgement generation — the canonical path map, the per-agent
    * judgements and the `pathUnmatched` diagnostics (Task 4's teardown asserts
    * exactly this).
+   *
+   * N1: the workspace LIST is part of that generation, so `#listState` and
+   * `#workspaces` are reset with it. Keeping the previous mount's list made
+   * 「no usable generation」 false for {@link resolveNow}: a re-mounted
+   * generation's FIRST synchronous pass runs before its own round has read
+   * anything, so it would answer §4's rule one from the OLD registry and
+   * RELEASE a layer instead of denying — and `GET /scope` would serve that list
+   * until the round landed.
+   *
+   * `'unread'` and not `'unavailable'` on purpose: nothing FAILED here, so no
+   * `workspace-list` note is recorded, and `save()` keeps the never-read
+   * behaviour (a write is accepted and prunes NOTHING — an invalidated list is
+   * no more authoritative than one never read). `staleWorkspaceIds()` answers
+   * `[]` for the same reason.
    */
   invalidateDerived(): void {
     this.#layers.clear()
     this.#pathMap = new Map()
     this.#judgements = new Map()
     this.#pathUnmatched = []
+    this.#listState = 'unread'
+    this.#workspaces = []
   }
 
   /**
