@@ -38,9 +38,17 @@
   // (see its header — one of the three, `tests/integration/clientBundle.test.ts`,
   // is NOT a jsdom test); `_research/**` is a vendored upstream checkout, not
   // this plugin's source, so it is neither built nor typechecked here.
+  //
+  // `i18nUsage.test.ts` is routed by the same rule as `i18n.test.ts`: it imports
+  // `ui/src/**` (the KEYS tables), so it must be checked by the UI project only.
+  // `i18nAssets.test.ts` is deliberately NOT listed on either side — it imports
+  // no `ui` module (it reads them as text and parses them with the compiler API),
+  // so the server project covers it by default, which is what keeps
+  // `tests/unit/projectCoverage.test.ts`'s "exactly one project" invariant true.
   "exclude": [
     "ui",
     "tests/unit/i18n.test.ts",
+    "tests/unit/i18nUsage.test.ts",
     "tests/unit/localeWiring.test.ts",
     "tests/unit/localeRender.test.ts",
     "tests/unit/ui.test.ts",

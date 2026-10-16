@@ -41,6 +41,7 @@
   "include": [
     "ui",
     "tests/unit/i18n.test.ts",
+    "tests/unit/i18nUsage.test.ts",
     "tests/unit/localeWiring.test.ts",
     "tests/unit/localeRender.test.ts",
     "tests/unit/ui.test.ts",
