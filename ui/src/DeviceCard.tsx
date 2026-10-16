@@ -11,8 +11,8 @@
  * browser hoped for. The live `state` keeps coming from SSE; the patch response
  * only seeds it.
  */
-import { useEffect, useRef, useState } from 'react'
-import type { ChangeEvent, FormEvent, RefObject } from 'react'
+import { useEffect, useState } from 'react'
+import type { ChangeEvent, FormEvent } from 'react'
 import { patchDevice, removeDevice } from './api'
 import { useT } from './i18n'
 import { STATE_KEYS } from './types'
@@ -34,38 +34,6 @@ export interface DeviceCardProps {
   onRemoved(deviceId: string): void
 }
 
-/**
- * Whether focus currently sits INSIDE this card's editors.
- *
- * Read from the document rather than tracked with local state: focus moves
- * between the card's own inputs (name → hosts → port) and out to another card
- * or a button, and a per-input handler would have to coordinate all of those.
- * `document.activeElement` is the single source of truth, and it is only
- * consulted when the effect runs (a prop change), never during a render.
- */
-function useIsFocusedWithin(root: RefObject<HTMLLIElement | null>): boolean {
-  const [focused, setFocused] = useState(false)
-
-  useEffect(() => {
-    const check = (): void => {
-      const node = root.current
-      const active = node?.ownerDocument.activeElement ?? null
-      setFocused(node !== null && node !== undefined && active !== null && node.contains(active))
-    }
-    // The listeners live on the card's OWN document, so a card rendered in a
-    // test's jsdom and a card in the host page both observe real focus moves.
-    const owner = root.current?.ownerDocument ?? globalThis.document
-    owner.addEventListener('focusin', check)
-    owner.addEventListener('focusout', check)
-    return () => {
-      owner.removeEventListener('focusin', check)
-      owner.removeEventListener('focusout', check)
-    }
-  }, [root])
-
-  return focused
-}
-
 /** Splits the comma-separated host box into the whole-replace list the API wants. */
 function parseHosts(raw: string): string[] {
   return raw
@@ -76,7 +44,6 @@ function parseHosts(raw: string): string[] {
 
 export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProps): ReturnType<typeof Object> {
   const t = useT()
-  const root = useRef<HTMLLIElement | null>(null)
   const [editor, setEditor] = useState<Editor>('none')
   const [name, setName] = useState(device.displayName)
   const [hostsText, setHostsText] = useState(device.hosts.join(', '))
@@ -85,30 +52,35 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
   const [busy, setBusy] = useState(false)
 
   /**
-   * RESYNC FROM PROPS. Each editor holds a local draft seeded from the record,
-   * and `device` can change underneath it: a refresh (`GET /devices` after a
-   * pairing settles) replaces the card's record, and another tab's PATCH arrives
-   * the same way. Without this the box would keep showing a value the server no
-   * longer holds, and saving that box would write the STALE value back — the
-   * exact failure the "server's verdict is authoritative" rule elsewhere in
-   * this component exists to prevent.
+   * RESYNC FROM PROPS, but only while NO editor is open. Each editor holds a
+   * local draft seeded from the record, and `device` can change underneath
+   * it: a refresh (`GET /devices` after a pairing settles) replaces the
+   * card's record, and another tab's PATCH arrives the same way. Without
+   * this the box would keep showing a value the server no longer holds, and
+   * saving that box would write the STALE value back — the exact failure
+   * the "server's verdict is authoritative" rule elsewhere in this component
+   * exists to prevent.
    *
-   * Skipped while an editor is OPEN and focus sits inside the card, because there the
-   * user's in-progress typing outranks the server: overwriting a half-typed
-   * address from a background refresh would lose their edit. Closing the editor
-   * clears the guard, and the next prop change resyncs.
+   * While an editor IS open the draft is unconditionally sacred, focus
+   * notwithstanding. The earlier guard also required focus to sit inside the
+   * card, and the live host page proved that focus signal unreliable: a
+   * focus artifact while the editor was open resynced the draft to the OLD
+   * name mid-edit, so the save PATCHed the pre-edit name and the rename
+   * "silently did nothing" (the input kept the typed text because React
+   * never re-rendered after the wipe bailed out on an identical value).
+   * Closing the editor is itself a dep change, so the drafts are always
+   * reseeded fresh for the next open.
    *
    * Keyed on the fields themselves, not the object identity: `listDevices`
-   * rebuilds every record on each refresh, so an identity check would resync on
-   * every poll even when nothing changed.
+   * rebuilds every record on each refresh, so an identity check would resync
+   * on every poll even when nothing changed.
    */
-  const focused = useIsFocusedWithin(root)
   useEffect(() => {
-    if (editor !== 'none' && focused) return
+    if (editor !== 'none') return
     setName(device.displayName)
     setHostsText(device.hosts.join(', '))
     setPortText(String(device.port))
-  }, [device.displayName, device.hosts, device.port, editor, focused])
+  }, [device.displayName, device.hosts, device.port, editor])
 
   /** Runs one mutation, mapping a refusal into the card's error line. */
   const run = async (action: () => Promise<void>): Promise<void> => {
@@ -175,7 +147,7 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
   const label = state === undefined ? t('device.state.unknown') : t(STATE_KEYS[state] ?? state)
 
   return (
-    <li className="cherry-card" data-device-id={device.deviceId} ref={root}>
+    <li className="cherry-card" data-device-id={device.deviceId}>
       <div className="cherry-card-head">
         {state === undefined ? (
           <span className="cherry-state" data-state="unknown" title={label}>

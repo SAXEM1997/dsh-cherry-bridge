@@ -531,10 +531,13 @@ describe('device card status light', () => {
 })
 
 describe('device card actions', () => {
-  it('resyncs the editor drafts when the record changes underneath them', async () => {
-    // An external refresh (the app re-reads /devices after a pairing settles)
-    // replaces the card's record. The editors must show the SERVER's values:
-    // a stale box would write the old value back on the next save.
+  it('does NOT clobber an open editor when the record changes underneath it, and reseeds on close', async () => {
+    // While an editor is OPEN the draft is sacred — even when focus sits
+    // outside the card. Resyncing a live draft was the live-page rename bug:
+    // a focus artifact mid-edit resynced the draft to the OLD name, and the
+    // subsequent save silently PATCHed the pre-edit name. The server's values
+    // return only when the editor CLOSES (the close itself re-runs the sync),
+    // so a reopened editor is always seeded fresh.
     const { rerender } = render(
       createElement(DeviceCard, {
         device: { ...DEVICE, displayName: 'Old Name', hosts: ['10.0.0.1'], port: 1111 } as DeviceSummary,
@@ -547,8 +550,10 @@ describe('device card actions', () => {
     fireEvent.click(screen.getByRole('button', { name: '重命名' }))
     const box = screen.getByLabelText('设备名称') as HTMLInputElement
     expect(box.value).toBe('Old Name')
+    // Focus sits OUTSIDE the card (never entered the box) — the draft still wins.
+    fireEvent.change(box, { target: { value: 'half typed' } })
+    fireEvent.blur(box)
 
-    // The record changes while the editor is OPEN but NOT focused.
     rerender(
       createElement(DeviceCard, {
         device: { ...DEVICE, displayName: 'New Name', hosts: ['10.0.0.9'], port: 2222 } as DeviceSummary,
@@ -557,19 +562,21 @@ describe('device card actions', () => {
         onRemoved: () => {},
       }),
     )
-    await waitFor(() => {
-      expect((screen.getByLabelText('设备名称') as HTMLInputElement).value).toBe('New Name')
-    })
+    expect((screen.getByLabelText('设备名称') as HTMLInputElement).value).toBe('half typed')
 
-    // ...and the address editor too.
+    // Closing the editor re-runs the sync; the address editor then seeds the
+    // SERVER's values, not the stale drafts.
+    fireEvent.click(screen.getByRole('button', { name: '重命名' }))
     fireEvent.click(screen.getByRole('button', { name: '地址维护' }))
     expect((screen.getByLabelText('主机地址') as HTMLInputElement).value).toBe('10.0.0.9')
     expect((screen.getByLabelText('端口') as HTMLInputElement).value).toBe('2222')
   })
 
-  it('does NOT clobber what the user is typing when a refresh lands mid-edit', async () => {
-    // The other half of the rule: while focus is inside the card, the user's
-    // in-progress draft outranks a background refresh.
+  it('a save after a mid-edit refresh PATCHes the TYPED name, never the pre-edit one', async () => {
+    // The live-incident regression: type a new name, let a background
+    // refresh land (carrying the OLD record) while focus is anywhere, save —
+    // the wire body must carry the typed draft. The old focus-consulting
+    // resync wiped the draft on a focus artifact and saved the OLD name.
     const { rerender } = render(
       createElement(DeviceCard, {
         device: { ...DEVICE, displayName: 'Old Name' } as DeviceSummary,
@@ -581,18 +588,29 @@ describe('device card actions', () => {
     fireEvent.click(screen.getByRole('button', { name: '重命名' }))
     const box = screen.getByLabelText('设备名称') as HTMLInputElement
     box.focus()
-    fireEvent.change(box, { target: { value: 'half typed' } })
+    fireEvent.change(box, { target: { value: 'typed name' } })
+    // The focus artifact: focus leaves the card entirely.
+    fireEvent.blur(box)
 
+    // The background refresh lands with the pre-edit record.
     rerender(
       createElement(DeviceCard, {
-        device: { ...DEVICE, displayName: 'Server Name' } as DeviceSummary,
+        device: { ...DEVICE, displayName: 'Old Name' } as DeviceSummary,
         state: 'connected' as const,
         onSaved: () => {},
         onRemoved: () => {},
       }),
     )
 
-    expect((screen.getByLabelText('设备名称') as HTMLInputElement).value).toBe('half typed')
+    const harness = installFetch([
+      ['PATCH', '/cherry-remote/api/devices/dev-1', jsonResponse(200, { ...DEVICE, displayName: 'typed name' })],
+    ])
+    fireEvent.click(screen.getByRole('button', { name: '保存名称' }))
+    await waitFor(() => {
+      expect(harness.calls.some((call) => call.method === 'PATCH')).toBe(true)
+    })
+    const patch = harness.calls.find((call) => call.method === 'PATCH')
+    expect(patch?.body).toEqual({ displayName: 'typed name' })
   })
 
   it('disables an enabled device through PATCH enabled:false', async () => {
