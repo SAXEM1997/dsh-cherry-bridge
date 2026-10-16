@@ -1610,10 +1610,24 @@ const CONTRACT_DIFFERENCES = [
 *
 * Terse because this is a developer surface, and a server-side literal because
 * the settings panel's copy lives in another bundle (see
-* {@link DiagnosticsScopeHost.upgradeHint}). It is only ever attached to an
+* {@link DiagnosticsScopeReport.upgradeHint}). It is only ever attached to an
 * `unsupported` host.
 */
 const SCOPE_UPGRADE_HINT = "请升级宿主 / DSH 以获得该能力后再试；升级前本插件不会注册这些工具。";
+/**
+* Attaches B7①'s hint to the REPORT's scope segment.
+*
+* Deliberately not done in {@link readScopeSegment} or {@link projectScope}:
+* both also build `GET /cherry-remote/api/scope`'s body, whose `host` spec §6.3
+* fixes at four fields (see {@link DiagnosticsScopeReport}). The hint is derived
+* from the state it explains, so a hand-stuffed input cannot smuggle its own.
+*/
+function reportScope(segment) {
+	return {
+		...segment,
+		upgradeHint: segment.host.state === "unsupported" ? SCOPE_UPGRADE_HINT : ""
+	};
+}
 /**
 * The host projection, and the ONE place `capable` is decided.
 *
@@ -1632,8 +1646,7 @@ function projectHostFace(host, degraded) {
 		degraded: degraded.map((note) => ({
 			source: note.source,
 			reason: note.reason
-		})),
-		upgradeHint: host.state === "unsupported" ? SCOPE_UPGRADE_HINT : ""
+		}))
 	};
 }
 /**
@@ -1969,7 +1982,7 @@ function buildDiagnostics(sources, identity = DEFAULT_IDENTITY) {
 		sessions: projected.sessions,
 		stats: projected.stats,
 		recentErrors: projected.recentErrors,
-		scope: projected.scope,
+		scope: reportScope(projected.scope),
 		contractDifferences: CONTRACT_DIFFERENCES.map((entry) => ({
 			id: entry.id,
 			title: entry.title

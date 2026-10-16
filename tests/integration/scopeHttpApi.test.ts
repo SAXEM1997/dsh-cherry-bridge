@@ -375,8 +375,10 @@ describe('GET /cherry-remote/api/scope', () => {
 
     // One whole-object comparison pins every field AND the absence of extras:
     // `workspaces` carries no `sessionIds`, `scope` no `version`/`updatedAt`, and
-    // `degraded` (an ARRAY, empty = no degradation) rides INSIDE `host` beside
-    // B7①'s `upgradeHint` (derived from `state`; empty for a ready host).
+    // `degraded` (an ARRAY, empty = no degradation) rides INSIDE `host` — which
+    // spec §6.3 fixes at exactly these four fields. B7①'s `upgradeHint` is NOT
+    // one of them: it belongs to the diagnostics report's own segment, so this
+    // comparison must keep failing on any field the route does not serve.
     expect(json).toEqual({
       scope: { mode: 'selected', workspaceIds: ['ghost', 'w1'], revision: 2 },
       workspaces: [
@@ -385,7 +387,7 @@ describe('GET /cherry-remote/api/scope', () => {
       ],
       staleWorkspaceIds: ['ghost'],
       pathUnmatched: [{ agentId: 'agent-stray', cwd: '/work/stray' }],
-      host: { state: 'ready', capable: true, reason: expect.any(String), degraded: [], upgradeHint: '' },
+      host: { state: 'ready', capable: true, reason: expect.any(String), degraded: [] },
     })
     expect(Array.isArray(json.host.degraded)).toBe(true)
     expect(json.host.capable).toBe(json.host.state === 'ready')

@@ -232,14 +232,6 @@ export interface DiagnosticsScopeHost {
   capable: boolean
   reason: string
   degraded: DegradedNote[]
-  /**
-   * B7①'s upgrade hint, for a developer reading the report: what to do about an
-   * `unsupported` host. A server-side LITERAL, not an import of the settings
-   * panel's page copy (`ui/src/ToolScopePanel.tsx` is a different bundle and its
-   * wording is free to move); empty unless `state === 'unsupported'`, because
-   * B7 forbids reading `pending` as "the host does not support this".
-   */
-  upgradeHint: string
 }
 
 /**
@@ -264,6 +256,27 @@ export interface DiagnosticsScope {
   pathUnmatched: Array<{ agentId: string; cwd: string }>
 }
 
+/**
+ * The report's OWN scope segment: {@link DiagnosticsScope} plus B7①'s hint.
+ *
+ * The hint lives here and NOT in {@link DiagnosticsScope}, because that shape is
+ * also `GET /cherry-remote/api/scope`'s body: spec §6.3 fixes its `host` at
+ * exactly `{state, capable, reason, degraded}` (four fields), and B7① puts the
+ * upgrade hint on 「诊断与设置页」 — the diagnostics face and the settings panel —
+ * not on the HTTP response. Keeping the two shapes distinct is what lets
+ * `scopeHttpApi.test.ts` keep catching an unexpected field in `host`.
+ */
+export interface DiagnosticsScopeReport extends DiagnosticsScope {
+  /**
+   * B7①'s upgrade hint, for a developer reading the report: what to do about an
+   * `unsupported` host. A server-side LITERAL, not an import of the settings
+   * panel's page copy (`ui/src/ToolScopePanel.tsx` is a different bundle and its
+   * wording is free to move); empty unless `state === 'unsupported'`, because
+   * B7 forbids reading `pending` as "the host does not support this".
+   */
+  upgradeHint: string
+}
+
 /** The full report served by `GET /diagnostics`. */
 export interface DiagnosticsReport {
   generatedAt: string
@@ -275,9 +288,10 @@ export interface DiagnosticsReport {
   /**
    * The enablement scope (Task 9): the same read `GET /scope` serves, so an
    * operator diagnosing 「勾了却无工具」 reads the identical host tri-state and
-   * `pathUnmatched` evidence in both places.
+   * `pathUnmatched` evidence in both places — plus the diagnostics-only
+   * {@link DiagnosticsScopeReport.upgradeHint} (B7①).
    */
-  scope: DiagnosticsScope
+  scope: DiagnosticsScopeReport
   /** The six contract differences, so an operator sees them in the report too. */
   contractDifferences: Array<{ id: string; title: string }>
 }
@@ -309,10 +323,25 @@ export interface ScopeReadSource {
  *
  * Terse because this is a developer surface, and a server-side literal because
  * the settings panel's copy lives in another bundle (see
- * {@link DiagnosticsScopeHost.upgradeHint}). It is only ever attached to an
+ * {@link DiagnosticsScopeReport.upgradeHint}). It is only ever attached to an
  * `unsupported` host.
  */
 export const SCOPE_UPGRADE_HINT = '请升级宿主 / DSH 以获得该能力后再试；升级前本插件不会注册这些工具。'
+
+/**
+ * Attaches B7①'s hint to the REPORT's scope segment.
+ *
+ * Deliberately not done in {@link readScopeSegment} or {@link projectScope}:
+ * both also build `GET /cherry-remote/api/scope`'s body, whose `host` spec §6.3
+ * fixes at four fields (see {@link DiagnosticsScopeReport}). The hint is derived
+ * from the state it explains, so a hand-stuffed input cannot smuggle its own.
+ */
+function reportScope(segment: DiagnosticsScope): DiagnosticsScopeReport {
+  return {
+    ...segment,
+    upgradeHint: segment.host.state === 'unsupported' ? SCOPE_UPGRADE_HINT : '',
+  }
+}
 
 /**
  * The host projection, and the ONE place `capable` is decided.
@@ -333,7 +362,6 @@ function projectHostFace(
     capable: host.state === 'ready',
     reason: host.reason,
     degraded: degraded.map((note) => ({ source: note.source, reason: note.reason })),
-    upgradeHint: host.state === 'unsupported' ? SCOPE_UPGRADE_HINT : '',
   }
 }
 
@@ -783,7 +811,7 @@ export function buildDiagnostics(
     sessions: projected.sessions,
     stats: projected.stats,
     recentErrors: projected.recentErrors,
-    scope: projected.scope,
+    scope: reportScope(projected.scope),
     contractDifferences: CONTRACT_DIFFERENCES.map((entry) => ({ id: entry.id, title: entry.title })),
   }
 }

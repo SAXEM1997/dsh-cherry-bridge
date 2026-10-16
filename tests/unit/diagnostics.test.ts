@@ -158,12 +158,14 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
 
     const report = buildDiagnostics(diagnosticsSources(scopeSeam(scope)))
 
-    // Every field of the segment is present, at both levels.
+    // Every field of the segment is present, at both levels. `upgradeHint` is
+    // the report's OWN extra (B7①); `host` itself keeps the four fields spec
+    // §6.3 fixes for `GET /scope`.
     expect(Object.keys(report.scope).sort()).toEqual(
-      ['host', 'mode', 'pathUnmatched', 'revision', 'workspaceIds'].sort(),
+      ['host', 'mode', 'pathUnmatched', 'revision', 'upgradeHint', 'workspaceIds'].sort(),
     )
     expect(Object.keys(report.scope.host).sort()).toEqual(
-      ['capable', 'degraded', 'reason', 'state', 'upgradeHint'].sort(),
+      ['capable', 'degraded', 'reason', 'state'].sort(),
     )
     // The document's own side of the segment, read from the live default document.
     expect(report.scope).toMatchObject({
@@ -172,17 +174,11 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
       workspaceIds: [],
       pathUnmatched: [],
     })
-    expect(report.scope.host).toEqual({
-      state: 'ready',
-      capable: true,
-      reason: '宿主就绪',
-      degraded: [],
-      upgradeHint: '',
-    })
+    expect(report.scope.host).toEqual({ state: 'ready', capable: true, reason: '宿主就绪', degraded: [] })
+    expect(report.scope.upgradeHint).toBe('')
 
-    // B7①: the upgrade hint belongs to an `unsupported` host ONLY. `pending` is
-    // a wait, and the spec forbids reading it as "the host does not support it",
-    // so a hint there would be the exact misreading the design rules out.
+    // The hint's wording is a server-side literal that promises the consequence
+    // the panel's page copy also promises (B7①).
     expect(SCOPE_UPGRADE_HINT).toContain('升级宿主')
     expect(SCOPE_UPGRADE_HINT).toContain('不会注册')
 
@@ -191,15 +187,17 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
       scope.setHost({ state, capable: state === 'ready', reason: `reason-${state}` })
       const next = buildDiagnostics(diagnosticsSources(scopeSeam(scope)))
       expect(next.scope.host.capable).toBe(next.scope.host.state === 'ready')
-      // The hint is attached by the state, not carried in the input: only the
-      // `unsupported` arm gets it (B7①).
-      expect(next.scope.host.upgradeHint, state).toBe(state === 'unsupported' ? SCOPE_UPGRADE_HINT : '')
+      // The hint is attached by the STATE, not carried in the input: only the
+      // `unsupported` arm gets it, and `pending` — a wait, never "the host does
+      // not support this" — explicitly does not (B7①).
+      expect(next.scope.upgradeHint, state).toBe(state === 'unsupported' ? SCOPE_UPGRADE_HINT : '')
     }
   })
 
   it('① a non-default document and a degraded note reach the report field for field', () => {
     // Typed as the deliverable itself, so this literal is a statement about the
-    // segment's shape and not merely about the values inside it.
+    // segment's shape and not merely about the values inside it. `DiagnosticsScope`
+    // is the SHARED shape (`GET /scope` + this report), so it carries no hint.
     const segment: DiagnosticsScope = {
       mode: 'global',
       revision: 7,
@@ -209,7 +207,6 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
         capable: true,
         reason: '宿主就绪',
         degraded: [{ source: 'install', reason: '安装被拒' }],
-        upgradeHint: '',
       },
       pathUnmatched: [{ agentId: 'agent-1', cwd: '/home/op/other-project' }],
     }
@@ -225,9 +222,10 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
         capable: true,
         reason: '宿主就绪',
         degraded: [{ source: 'install', reason: '安装被拒' }],
-        upgradeHint: '',
       },
       pathUnmatched: [{ agentId: 'agent-1', cwd: '/home/op/other-project' }],
+      // The report adds it; the input does not carry it.
+      upgradeHint: '',
     })
   })
 })
@@ -254,8 +252,13 @@ describe('Task 9②: the report host IS `GET /scope`\'s host, never a second cop
     expect(after.scope.host.state).toBe('unsupported')
     expect(after.scope.host.reason).toBe('宿主未注入 agents')
     expect(after.scope.host).not.toEqual(before.scope.host)
-    // Not just `host`: the whole segment is one read of one object.
-    expect(after.scope).toEqual(scopeFace)
+    // Not just `host`: every member the two faces SHARE is one read of one
+    // object. The report adds exactly one member of its own — B7①'s
+    // `upgradeHint` — so the shared members are compared member by member
+    // instead of by whole-object equality, which would now be false by design.
+    const { upgradeHint, ...shared } = after.scope
+    expect(shared).toEqual(scopeFace)
+    expect(upgradeHint).toBe(SCOPE_UPGRADE_HINT)
 
     // `degraded` is part of the same read, so a state write moves it too.
     scope.noteDegraded({ source: 'install', reason: '安装被拒' })
@@ -301,8 +304,8 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
           { source: BOGUS_SOURCE, reason: BOGUS_REASON, accessToken: 'scope-leaked-3' },
         ],
         identity: 'host-identity-probe',
-        // A smuggled hint: the projection must DERIVE the hint from `state`, not
-        // pass a caller's text through (D2).
+        // A smuggled hint: `host` is a four-field whitelist, and the report's
+        // own hint is DERIVED from `state`, so a caller's text never survives.
         upgradeHint: 'scope-hint-smuggled',
       },
       pathUnmatched: [{ agentId: 'agent-1', cwd: LONG_CWD, accessToken: 'scope-leaked-2' }],
@@ -326,9 +329,11 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
     ]) {
       expect(serialized).not.toContain(secret)
     }
-    // The state is `ready`, so the DERIVED hint is empty — the smuggled text is
-    // gone rather than echoed.
-    expect(sanitized.scope.host.upgradeHint).toBe('')
+    // The `host` whitelist is exactly spec §6.3's four fields: the smuggled text
+    // is gone rather than echoed, and `sanitizeDiagnostics` — the shape
+    // `GET /scope` serves — gains no hint at all.
+    expect('upgradeHint' in sanitized.scope.host).toBe(false)
+    expect('upgradeHint' in sanitized.scope).toBe(false)
 
     // The whitelist is a statement about what MAY appear: an unlisted field is
     // gone from the SHAPE, not merely from a serialized string.
@@ -336,7 +341,7 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
       ['host', 'mode', 'pathUnmatched', 'revision', 'workspaceIds'].sort(),
     )
     expect(Object.keys(sanitized.scope.host).sort()).toEqual(
-      ['capable', 'degraded', 'reason', 'state', 'upgradeHint'].sort(),
+      ['capable', 'degraded', 'reason', 'state'].sort(),
     )
     expect(Object.keys(sanitized.scope.host.degraded[0]!).sort()).toEqual(['reason', 'source'].sort())
     expect(Object.keys(sanitized.scope.pathUnmatched[0]!).sort()).toEqual(['agentId', 'cwd'].sort())
@@ -398,15 +403,18 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
     )
 
     const serialized = JSON.stringify(report.scope)
-    for (const key of ['accessToken', 'desktopIdentity', 'identity', 'smuggled']) {
+    for (const key of ['accessToken', 'desktopIdentity', 'identity', 'smuggled', 'scope-hint-smuggled']) {
       expect(serialized).not.toContain(key)
     }
+    // The report's segment is the sanitized one PLUS its own derived hint — the
+    // state here is `ready`, so that hint is empty, not the smuggled text.
     expect(Object.keys(report.scope).sort()).toEqual(
-      ['host', 'mode', 'pathUnmatched', 'revision', 'workspaceIds'].sort(),
+      ['host', 'mode', 'pathUnmatched', 'revision', 'upgradeHint', 'workspaceIds'].sort(),
     )
     expect(Object.keys(report.scope.host).sort()).toEqual(
-      ['capable', 'degraded', 'reason', 'state', 'upgradeHint'].sort(),
+      ['capable', 'degraded', 'reason', 'state'].sort(),
     )
+    expect(report.scope.upgradeHint).toBe('')
   })
 
   it('③ passes `pathUnmatched[].cwd` through VERBATIM: not summarized, not truncated', () => {
