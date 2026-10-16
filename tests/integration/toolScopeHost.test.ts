@@ -2449,10 +2449,15 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
     expect(fresh.scope.layer('agent-nocwd')?.deny).toHaveLength(14)
     expect(fresh.host.verdict('agent-nocwd', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
 
-    // ── (c) NO usable generation: the registry read FAILED (`unavailable`, never
-    // `read`), so the synchronous accessor must abstain — and the `agent/created`
-    // install stays unconditionally fail-closed. ──
+    // ── (c) NO usable generation: the document ENABLES the workspace (saved while
+    // the list was still readable — the write side refuses once it is not), and
+    // then the registry read FAILS (`unavailable`, never `read`). Only that can
+    // explain the deny below: under ⑩'s generation this very cwd resolves visible. ──
     const blind = rig({ recheckDelaysMs: [30, 60] })
+    blind.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    blind.tools.refresh()
+    await drain()
+    saveScope(blind.scope, 'selected', ['w-oa'])
     blind.host.setWorkspaces([])
     blind.tools.refresh()
     await drain()
@@ -2579,7 +2584,7 @@ describe('Wave 1 review fixes: generation-scoped teardown, contained releases, r
     let observed: ReturnType<typeof observeListeners> | undefined
     const fresh = rig({
       patchRoot: (fake) => {
-        observed = observeListeners(fake, ['agent/created'])
+        observed = observeListeners(fake, ['agent/created', 'agent/disposed'])
       },
     })
     fresh.host.setWorkspaces([entity('w-oa', '/w/oa')])
@@ -2587,9 +2592,9 @@ describe('Wave 1 review fixes: generation-scoped teardown, contained releases, r
     await drain()
 
     /** A real event payload whose restriction can never be released. */
-    const throwingAgent = (id: string) => ({
+    const throwingAgent = (id: string, cwd: string) => ({
       id,
-      session: { header: { cwd: '/w/oa' } },
+      session: { header: { cwd } },
       ctx: {
         tools: {
           restrict: () => () => {
@@ -2604,12 +2609,16 @@ describe('Wave 1 review fixes: generation-scoped teardown, contained releases, r
     // case): `w-oa` is registered but NOT enabled yet, so this first delivery is
     // genuinely invisible and installs the deny layer.
     saveScope(fresh.scope, 'selected', [])
-    expect(() => observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-a') })).not.toThrow()
+    expect(() =>
+      observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-a', '/w/oa') }),
+    ).not.toThrow()
     expect(fresh.scope.layer('agent-throw-a')).toBeDefined()
     saveScope(fresh.scope, 'selected', ['w-oa'])
     // The re-announce resolves visible synchronously ⇒ release only ⇒ the
     // disposer throws.
-    expect(() => observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-a') })).not.toThrow()
+    expect(() =>
+      observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-a', '/w/oa') }),
+    ).not.toThrow()
     expect(fresh.scope.layer('agent-throw-a')).toBeUndefined()
     const released = fresh.scope.degraded().find((entry) => entry.source === 'install')
     expect(released?.reason).toContain('agent agent-throw-a 的 restriction 释放失败')
@@ -2619,21 +2628,40 @@ describe('Wave 1 review fixes: generation-scoped teardown, contained releases, r
       '释放 agent agent-throw-a 的 restriction 失败',
     )
 
-    // ── (b) §6.2's teardown arm: the layer is still installed when the effect ──
-    // is disposed, so the same containment must hold on the way out.
+    // ── (b) the `agent/disposed` arm: `onDisposed`'s own release path ──────────
+    // Delivered through the captured listener rather than `disposeAgent`: the
+    // fake's disposal control only fires for its LIVE records, and a live record
+    // cannot be given a throwing `restrict` (`FakeAgentSeed` has no such hook).
+    // This is the same event, delivered straight into the plugin's listener — so
+    // unlike `#emit`, a rethrow would reach this call.
     expect(() =>
-      observed!.deliver('agent/created', {
-        agent: { ...throwingAgent('agent-throw-b'), session: { header: { cwd: '/nowhere' } } },
-      }),
+      observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-b', '/nowhere') }),
     ).not.toThrow()
     expect(fresh.scope.layer('agent-throw-b')).toBeDefined()
-    expect(() => fresh.dispose()).not.toThrow()
+    expect(() =>
+      observed!.deliver('agent/disposed', { agent: throwingAgent('agent-throw-b', '/nowhere') }),
+    ).not.toThrow()
     expect(fresh.scope.layer('agent-throw-b')).toBeUndefined()
-    const tornDown = fresh.scope.degraded().find((entry) => entry.source === 'install')
-    expect(tornDown?.reason).toContain('agent agent-throw-b 的 restriction 释放失败')
-    expect(tornDown?.reason).toContain('层可能仍在生效，仅重启 DSH 可清除')
+    const disposed = fresh.scope.degraded().find((entry) => entry.source === 'install')
+    expect(disposed?.reason).toContain('agent agent-throw-b 的 restriction 释放失败')
+    expect(disposed?.reason).toContain('层可能仍在生效，仅重启 DSH 可清除')
     expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
       '释放 agent agent-throw-b 的 restriction 失败',
+    )
+
+    // ── (c) §6.2's teardown arm: the layer is still installed when the effect ──
+    // is disposed, so the same containment must hold on the way out.
+    expect(() =>
+      observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-c', '/nowhere') }),
+    ).not.toThrow()
+    expect(fresh.scope.layer('agent-throw-c')).toBeDefined()
+    expect(() => fresh.dispose()).not.toThrow()
+    expect(fresh.scope.layer('agent-throw-c')).toBeUndefined()
+    const tornDown = fresh.scope.degraded().find((entry) => entry.source === 'install')
+    expect(tornDown?.reason).toContain('agent agent-throw-c 的 restriction 释放失败')
+    expect(tornDown?.reason).toContain('层可能仍在生效，仅重启 DSH 可清除')
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+      '释放 agent agent-throw-c 的 restriction 失败',
     )
   })
 

@@ -6231,9 +6231,9 @@ function createToolScopeHost(deps) {
 		return a.length === b.length && a.every((name) => b.includes(name));
 	}
 	/**
-	* THE release path for one installed layer: both callers — the release-only arm
-	* of {@link applyForAgent} and §6.2's teardown — go through here, so the
-	* containment rule has exactly one definition.
+	* THE release path for one installed layer: EVERY caller — the release-only
+	* arm of {@link applyForAgent}, `agent/disposed` and §6.2's teardown — goes
+	* through here, so the containment rule has exactly one definition.
 	*
 	* A release the host refuses is unrecoverable (the layer may still be installed
 	* while its record is already gone, so under intersection semantics it can
@@ -6607,7 +6607,7 @@ function createToolScopeHost(deps) {
 			const dispose = state.layers.get(agent.id);
 			scope.clearLayer(agent.id);
 			state.layers.delete(agent.id);
-			dispose?.();
+			if (dispose !== void 0) disposeQuietly(agent.id, dispose);
 		} catch (error) {
 			log(`[cherry-remote] 释放 agent ${agent.id} 的 restriction 失败（不阻塞处置）`, error);
 		}
