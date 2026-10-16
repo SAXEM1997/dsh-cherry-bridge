@@ -42,13 +42,15 @@
  * source file has to grow a hook for this file to exist.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import { dictionaries, localeStore } from '../../ui/src/i18n'
 import { App } from '../../ui/src/App'
 import { DeviceCard } from '../../ui/src/DeviceCard'
 import { PairingWizard } from '../../ui/src/PairingWizard'
-import type { DeviceSummary, EventSourceLike } from '../../ui/src/types'
+import { ToolScopePanel } from '../../ui/src/ToolScopePanel'
+import { ApiError } from '../../ui/src/api'
+import type { DeviceSummary, EventSourceLike, ScopeClient, ScopeResponse } from '../../ui/src/types'
 
 const en = dictionaries.en
 const zh = dictionaries.zh
@@ -447,5 +449,244 @@ describe('PairingWizard renders its own copy in English', () => {
     expect(screen.getByText(tr('wizard.succeeded'))).toBeTruthy()
     // The success path is not a failure: no verdict paragraph at all.
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ④ ToolScopePanel — notices, the two key tables, and the merged templates
+// ---------------------------------------------------------------------------
+
+/**
+ * The panel's scope document, with every server-supplied string an ENGLISH
+ * MARKER: the host's `reason`, the workspace titles/paths, the degraded notes'
+ * `reason`s and an `Error.message` are DATA — passed through untranslated — so
+ * supplying them in English is what lets the assertions below isolate the
+ * panel's OWN copy as the only thing that could still be Chinese.
+ */
+const SCOPE_REASON = 'host capability probe: workspaceRegistry reachable'
+const WS_EN_A = { id: 'ws-1', title: 'Project Alpha', path: '/srv/alpha' }
+const WS_EN_B = { id: 'ws-2', title: 'Project Beta', path: '/srv/beta' }
+
+function scopeSnapshot(over: Partial<ScopeResponse> = {}): ScopeResponse {
+  return {
+    scope: { mode: 'selected', workspaceIds: ['ws-1'], revision: 7 },
+    workspaces: [WS_EN_A, WS_EN_B],
+    staleWorkspaceIds: [],
+    pathUnmatched: [],
+    host: { state: 'ready', capable: true, reason: SCOPE_REASON, degraded: [] },
+    ...over,
+  }
+}
+
+/**
+ * A `ScopeClient` that answers `get()` with `served` and `put()` with `outcome`.
+ *
+ * The outcome is discriminated by SHAPE, because the panel's two arms are
+ * exactly that: an `Error` (an `ApiError` refusal, or a transport failure) is
+ * REJECTED, while a `{scope, pruned}` commit is RESOLVED. Leaving it out means
+ * "succeed with the served document and prune nothing".
+ */
+function scopeClient(served: ScopeResponse, outcome?: unknown): ScopeClient {
+  return {
+    get: () => Promise.resolve(served),
+    put: () => {
+      if (outcome === undefined) return Promise.resolve({ scope: served.scope, pruned: [] })
+      if (outcome instanceof Error) return Promise.reject(outcome)
+      return Promise.resolve(outcome as { scope: ScopeResponse['scope']; pruned: string[] })
+    },
+  }
+}
+
+describe('ToolScopePanel renders its own copy in English', () => {
+  const renderPanel = (client: ScopeClient): ReturnType<typeof render> =>
+    render(createElement(ToolScopePanel, { client }))
+
+  it('translates the chrome: heading, mode pair, effect note, save and revision line', async () => {
+    localeStore.setLocale('en')
+    renderPanel(scopeClient(scopeSnapshot()))
+
+    expect(await screen.findByText(tr('scope.heading'))).toBeTruthy()
+    // The `revision` line only exists once the read has landed, so awaiting it
+    // here is what makes the assertions below about the LOADED render.
+    await screen.findByText(tr('scope.revision').replace('{revision}', '7'))
+    expect(screen.getByText(tr('scope.mode.legend'))).toBeTruthy()
+    expect(screen.getByRole('radio', { name: tr('scope.mode.global') })).toBeTruthy()
+    expect(screen.getByRole('radio', { name: tr('scope.mode.selected') })).toBeTruthy()
+    expect(screen.getByText(tr('scope.effectNote'))).toBeTruthy()
+    expect(screen.getByRole('button', { name: tr('scope.save') })).toBeTruthy()
+
+    // `scope.revision` is a WHOLE-SENTENCE template: the number is a param, not a
+    // JSX-adjacent literal. Asserted as one node's exact text so a half-sentence
+    // plus a `{revision}` interpolation would fail.
+    const revision = document.querySelector('[data-scope-revision]')
+    expect(revision?.textContent).toBe(tr('scope.revision').replace('{revision}', '7'))
+
+    // The server's own reason is DATA and never translated: the marker survives.
+    // (Nothing renders it while the host is `ready`, so it is asserted absent.)
+    expect(screen.queryByText(SCOPE_REASON)).toBeNull()
+  })
+
+  it('renders the whole-sentence empty state and the degraded line with BOTH params filled', async () => {
+    localeStore.setLocale('en')
+    renderPanel(
+      scopeClient(
+        scopeSnapshot({
+          scope: { mode: 'selected', workspaceIds: [], revision: 2 },
+          host: {
+            state: 'ready',
+            capable: true,
+            reason: SCOPE_REASON,
+            degraded: [{ source: 'path-normalization', reason: 'realpath lookup failed on /srv/alpha' }],
+          },
+        }),
+      ),
+    )
+
+    // The panel's read is a resolved promise: wait for the load to land before
+    // querying, or every assertion below reads a pre-seed render.
+    await screen.findByText(tr('scope.effectNote'))
+
+    // D11's `selected` sentence: one key, no assembly.
+    const empty = document.querySelector('[data-scope-empty]')
+    expect(empty?.textContent).toBe(tr('scope.empty.selected'))
+
+    // THE DEGRADED LINE is the merge this case exists to pin: `scope.degradedLine`
+    // is ONE template carrying the TRANSLATED source label AND the server's own
+    // untranslated reason. A split `<strong>{label}</strong><span>：{reason}</span>`
+    // shape would still render here, so the assertion is on the WHOLE line — and
+    // on the en label + en template rather than their zh halves.
+    const install = document.querySelector('[data-degraded-source="path-normalization"]')
+    expect(install?.textContent).toBe(
+      tr('scope.degradedLine')
+        .replace('{label}', tr('scope.degraded.path-normalization'))
+        .replace('{reason}', 'realpath lookup failed on /srv/alpha'),
+    )
+    // Not the zh label, and not a zh separator: the line is genuinely translated.
+    expect(install?.textContent).not.toContain(zh['scope.degraded.path-normalization']!)
+    expect(install?.textContent).not.toContain('：')
+  })
+
+  it('translates a KNOWN save refusal through the key table, and the server detail line', async () => {
+    localeStore.setLocale('en')
+    renderPanel(
+      scopeClient(scopeSnapshot(), new ApiError(409, 'scope-revision-conflict', 'the document moved on')),
+    )
+
+    await screen.findByText(tr('scope.revision').replace('{revision}', '7'))
+    fireEvent.click(screen.getByRole('button', { name: tr('scope.save') }))
+
+    // `scope.saveFailure.scope-revision-conflict` — the table lookup, not a literal.
+    const failure = await screen.findByText(tr('scope.saveFailure.scope-revision-conflict'))
+    expect(failure.textContent).not.toContain(zh['scope.saveFailure.scope-revision-conflict']!)
+    // The conflict's own recovery control, in English.
+    expect(screen.getByRole('button', { name: tr('scope.reread') })).toBeTruthy()
+
+    // `scope.serverSaid` is the OTHER merged template: `{code}` and `{status}`
+    // both interpolated into one sentence, not "The server answered " + a code.
+    const detail = document.querySelector('.cherry-scope-save .cherry-hint.cherry-mono')
+    expect(document.body.textContent).toContain(
+      tr('scope.serverSaid').replace('{code}', 'scope-revision-conflict').replace('{status}', '409'),
+    )
+    expect(detail).not.toBeNull()
+  })
+
+  it('translates the UNKNOWN refusal into the whole `scope.saveFailed` sentence with {cause} filled', async () => {
+    localeStore.setLocale('en')
+
+    // BOTH ways of "no entry in `SAVE_FAILURE_KEYS`" reach the same template, and
+    // both are exercised because they are different code paths: a plain `Error`
+    // (no `ApiError` at all ⇒ `code === undefined`) and an `ApiError` carrying a
+    // code this build does not know (⇒ the `?? SAVE_FAILED_KEY` arm). Asserting
+    // only the first would leave the second — the one a NEWER SERVER produces —
+    // free to regress into a half-sentence.
+    for (const cause of [
+      new Error('socket closed before the scope write landed'),
+      new ApiError(503, 'some-future-refusal', 'the server learned a new code'),
+    ]) {
+      cleanup()
+      localeStore.setLocale('en')
+      renderPanel(scopeClient(scopeSnapshot(), cause))
+
+      await screen.findByText(tr('scope.revision').replace('{revision}', '7'))
+      fireEvent.click(screen.getByRole('button', { name: tr('scope.save') }))
+
+      // The fallback arm: a code the table has no copy for lands on the ONE
+      // `scope.saveFailed` template with the message interpolated. The zh half
+      // lives in `dictionaries.zh`, so the `t(表[code] ?? 'scope.saveFailed',
+      // { cause })` shape is what makes this English at all — and the template
+      // itself is what keeps it ONE sentence.
+      expect(await screen.findByText(tr('scope.saveFailed').replace('{cause}', cause.message))).toBeTruthy()
+      expect(screen.queryByText(zh['scope.saveFailed']!.replace('{cause}', cause.message))).toBeNull()
+      // No placeholder survives unfilled.
+      expect(document.body.textContent).not.toContain('{cause}')
+    }
+  })
+
+  it('translates the pruned-list success line with the en list separator', async () => {
+    localeStore.setLocale('en')
+    renderPanel(
+      scopeClient(scopeSnapshot(), {
+        scope: { mode: 'selected', workspaceIds: ['ws-1'], revision: 8 },
+        pruned: ['ws-2', 'ws-3'],
+      }),
+    )
+
+    // The save control EXISTS from the first render but is DISABLED until the
+    // read lands, so the click has to wait for the loaded state — clicking the
+    // pre-load button would fire no `PUT` at all and this case would pass
+    // vacuously. The revision line is the loaded marker (it needs the document).
+    await screen.findByText(tr('scope.revision').replace('{revision}', '7'))
+    fireEvent.click(screen.getByRole('button', { name: tr('scope.save') }))
+
+    // `scope.savedPruned` + `list.separator`: the separator is its OWN key, so the
+    // joined list reads correctly per language — an English sentence with an
+    // English-separated list, not the zh `、`.
+    const expected = tr('scope.savedPruned').replace('{list}', ['ws-2', 'ws-3'].join(tr('list.separator')))
+    // Queried INSIDE `waitFor`: the saved paragraph only exists once the `PUT`
+    // resolves, so a query taken before it would pin `null` forever.
+    await waitFor(() => {
+      expect(document.querySelector('[data-scope-saved]')?.textContent).toBe(expected)
+    })
+    expect(document.querySelector('[data-scope-saved]')?.textContent).toBe(
+      'Saved. The server pruned these stale selections: ws-2, ws-3.',
+    )
+  })
+
+  it('translates the stale/unmatched groups and the unknown-workspace row', async () => {
+    localeStore.setLocale('en')
+    renderPanel(
+      scopeClient(
+        scopeSnapshot({
+          // Three distinct ticked ids on purpose: `ws-1` is registered, `ws-gone`
+          // is a SAVED stale pick (its own group), and `ws-nowhere` is in NEITHER
+          // list — the row the panel must keep visible with `scope.workspaceUnknown`
+          // rather than dropping (which would turn "unreadable registry" into
+          // "nothing was ticked").
+          scope: { mode: 'selected', workspaceIds: ['ws-1', 'ws-gone', 'ws-nowhere'], revision: 4 },
+          staleWorkspaceIds: ['ws-gone'],
+          pathUnmatched: [{ agentId: 'agent-7', cwd: '/srv/alpha/./sub' }],
+        }),
+      ),
+    )
+
+    await screen.findByText(tr('scope.stale.heading'))
+    expect(screen.getByText(tr('scope.stale.note'))).toBeTruthy()
+    // Two buttons carry `scope.stale.clear` and `scope.save`; both English.
+    expect(screen.getByRole('button', { name: tr('scope.stale.clear') })).toBeTruthy()
+    expect(screen.getByText(tr('scope.unmatched.heading'))).toBeTruthy()
+    expect(screen.getByText(tr('scope.unmatched.note'))).toBeTruthy()
+    // The unmatched session is DATA: agentId and cwd render verbatim.
+    expect(document.querySelector('[data-scope-unmatched]')?.textContent).toContain('/srv/alpha/./sub')
+    expect(screen.getByText(tr('scope.workspaceUnknown'))).toBeTruthy()
+  })
+
+  it('translates the loading line and the no-workspaces line', async () => {
+    localeStore.setLocale('en')
+    renderPanel({ get: () => new Promise<ScopeResponse>(() => {}), put: () => new Promise<never>(() => {}) })
+    expect(screen.getByText(tr('scope.loading'))).toBeTruthy()
+
+    cleanup()
+    renderPanel(scopeClient(scopeSnapshot({ workspaces: [], scope: { mode: 'global', workspaceIds: [], revision: 1 } })))
+    expect(await screen.findByText(tr('scope.noWorkspaces'))).toBeTruthy()
   })
 })

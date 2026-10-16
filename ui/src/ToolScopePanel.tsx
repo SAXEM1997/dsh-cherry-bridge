@@ -30,6 +30,8 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { ApiError, defaultScopeClient } from './api'
+import { useT } from './i18n'
+import type { T } from './i18n'
 import type {
   DegradedNote,
   DegradedSource,
@@ -47,20 +49,22 @@ export interface ToolScopePanelProps {
 }
 
 /**
- * D11's empty-state wording, one sentence per mode.
+ * D11's empty-state wording, one sentence per mode, as dictionary KEYS.
  *
  * They are NOT interchangeable: under `selected` an empty list means the tools
  * are enabled nowhere, while under `global` the ticks are not judgement input at
  * all (B2). One sentence for both would state the opposite of the truth in one
  * of the two modes.
+ *
+ * Keys, not text: `resolveEmptyHint` is a module-level function and cannot reach
+ * the component's `t`, so it takes the translator as a parameter and looks the
+ * sentence up through these.
  */
-const SELECTED_EMPTY_HINT =
-  '尚未启用任何工作区——此状态下 cherry_* 工具不会出现在任何会话里；勾选后对应工作区的会话（含进行中的）即可使用。'
-const GLOBAL_EMPTY_HINT =
-  '当前为全局模式：这些工具在所有工作区都可用；下面的勾选仅在切到「仅选定工作区」后才生效。'
+const SELECTED_EMPTY_KEY = 'scope.empty.selected'
+const GLOBAL_EMPTY_KEY = 'scope.empty.global'
 
 /**
- * B15's copy boundary, in the positive form.
+ * B15's copy boundary, in the positive form, as a dictionary KEY.
  *
  * The page may only claim that THIS PLUGIN did not shadow the tools. Whether a
  * given session sees them can still be decided upstream by an `allow`-shaped
@@ -68,11 +72,11 @@ const GLOBAL_EMPTY_HINT =
  * "the model can see / call them" phrasing would promise something this plugin
  * cannot keep.
  */
-const EFFECT_NOTE =
-  '生效范围内本插件未遮蔽这些 cherry_* 工具；上游的 allow 型过滤（例如子代理的 toolFilter）仍可能让某个会话看不到它们——本页只说明本插件未遮蔽，不对上层过滤的结果作保证。'
+const EFFECT_NOTE_KEY = 'scope.effectNote'
 
 /**
- * One line per degradation source; the server's own reason is shown beside it.
+ * One line per degradation source, as a module-level PURE KEY table; the
+ * server's own reason is shown beside it.
  *
  * `install` is the general one — its four writers cover a `schemas()` read that
  * could not compute a target, a layer whose release threw, an agent with no
@@ -81,17 +85,22 @@ const EFFECT_NOTE =
  * than any one cause. It says 曾 on purpose: the note is append-only (cleared
  * only by a successful workspace-list read), so after a recovered round the
  * surviving claim is that one application failed earlier in this session.
+ *
+ * The values are KEYS and only keys: the table is read at MODULE scope (the
+ * render below) and inside `resolveEmptyHint`, where no `t` exists, so it must
+ * not close over one. The text itself lives in `ui/src/i18n.ts`, the single
+ * source of truth for every Chinese string the page shows.
  */
-const DEGRADED_LABELS: Record<DegradedSource, string> = {
-  install: '隐藏层应用曾失败（install）：相关 agent 的隐藏层未生效或无法确认，启用范围对它可能不适用',
-  'workspace-list': '注册表列表当前读不到',
-  'visibility-only': '仅可见性降级（缺 tools.guard）：restrict 仍在装配层移除这 14 个工具，但执行侧没有任何一层拒绝它们的调用（不是渲染层假过滤）；连 restrict 都装不上的 agent 则既隐藏不了、也无人拒绝',
-  'scope-version': '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）',
-  'path-normalization': '路径规范化降级：cwd 比对可能不准确',
+const DEGRADED_KEYS: Record<DegradedSource, string> = {
+  install: 'scope.degraded.install',
+  'workspace-list': 'scope.degraded.workspace-list',
+  'visibility-only': 'scope.degraded.visibility-only',
+  'scope-version': 'scope.degraded.scope-version',
+  'path-normalization': 'scope.degraded.path-normalization',
 }
 
 /**
- * The copy for each stable `PUT` refusal code.
+ * The dictionary KEYS for each stable `PUT` refusal code.
  *
  * `scope-revision-conflict` is the ONE refusal whose copy and whose control
  * agree: its message instructs a RE-READ, and its rendering carries the control
@@ -107,15 +116,30 @@ const DEGRADED_LABELS: Record<DegradedSource, string> = {
  * `scope-version-unsupported` gets its own recovery sentence: re-reading cannot
  * change the document's version, so sending the operator round that loop would
  * be an instruction that cannot work (§6.3).
+ *
+ * A key table rather than a text table, for the same reason as
+ * {@link DEGRADED_KEYS}: it is consumed inside `save`'s `useCallback`, which
+ * reads the component's `t` (a dependency of that callback) — a text table here
+ * would be a second copy of the Chinese in a file that is meant to hold none.
+ * An unknown code falls through to {@link SAVE_FAILED_KEY}, whose `{cause}`
+ * placeholder carries the server's own message.
  */
-const SAVE_FAILURE_LABELS: Record<string, string> = {
-  'scope-revision-conflict': '配置已被他处修改，请重新读取后再保存。',
-  'scope-version-unsupported':
-    '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫），文档版本高于本插件支持、或低于本插件支持：重读不会改变文档版本，请升级宿主 / DSH 或本插件后再试。',
-  'invalid-scope': '保存被拒绝：作用域字段非法（mode 必须是 global 或 selected，workspaceIds 必须是字符串数组）。',
-  'missing-expected-revision': '保存被拒绝：请求缺少基准 expectedRevision，请重新读取后再保存。',
-  'workspace-list-unavailable': '工作区列表当前读不到，无法保存；已存勾选与 mode 一位不动。',
+const SAVE_FAILURE_KEYS: Record<string, string> = {
+  'scope-revision-conflict': 'scope.saveFailure.scope-revision-conflict',
+  'scope-version-unsupported': 'scope.saveFailure.scope-version-unsupported',
+  'invalid-scope': 'scope.saveFailure.invalid-scope',
+  'missing-expected-revision': 'scope.saveFailure.missing-expected-revision',
+  'workspace-list-unavailable': 'scope.saveFailure.workspace-list-unavailable',
 }
+
+/**
+ * The refusal copy for a code this panel has no entry for.
+ *
+ * Deliberately NOT in {@link SAVE_FAILURE_KEYS}: it is the `??` arm rather than
+ * a sixth code, and keeping it out is what makes "every entry is a real server
+ * code" checkable by eye.
+ */
+const SAVE_FAILED_KEY = 'scope.saveFailed'
 
 interface SaveFailure {
   code: string
@@ -142,20 +166,29 @@ const describeCause = (cause: unknown): string => (cause instanceof Error ? caus
  *    `selected` list is exactly what a CORRUPT document falls back to (B9), which
  *    is why that warning shares this one slot rather than getting a region of its
  *    own.
+ *
+ * `t` is a PARAMETER rather than a module-level import: this function is called
+ * during a render with the component's own translator, and `t` changes identity
+ * whenever the locale store does — closing over a module-level one would pin the
+ * sentence to whatever language was active when the module first loaded.
  */
-function resolveEmptyHint(input: {
-  loaded: boolean
-  mode: ScopeMode
-  count: number
-  scopeVersionDegraded: boolean
-}): string | undefined {
+function resolveEmptyHint(
+  input: {
+    loaded: boolean
+    mode: ScopeMode
+    count: number
+    scopeVersionDegraded: boolean
+  },
+  t: T,
+): string | undefined {
   if (!input.loaded) return undefined
   if (input.mode === 'selected' && input.scopeVersionDegraded) return undefined
-  if (input.mode === 'global') return GLOBAL_EMPTY_HINT
-  return input.count === 0 ? SELECTED_EMPTY_HINT : undefined
+  if (input.mode === 'global') return t(GLOBAL_EMPTY_KEY)
+  return input.count === 0 ? t(SELECTED_EMPTY_KEY) : undefined
 }
 
 export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelProps): ReturnType<typeof Object> {
+  const t = useT()
   const [data, setData] = useState<ScopeResponse | undefined>(undefined)
   const [loadError, setLoadError] = useState<string | undefined>(undefined)
   // The DRAFT: what the operator has selected on screen. Seeded from the served
@@ -226,10 +259,10 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
     // "I cannot read the list" into "you had nothing ticked".
     for (const id of ids) {
       if (known.has(id) || stale.has(id)) continue
-      list.push({ id, title: id, path: '（注册表里没有该工作区的信息）' })
+      list.push({ id, title: id, path: t('scope.workspaceUnknown') })
     }
     return list
-  }, [data, ids])
+  }, [data, ids, t])
 
   // Stale picks are shown only while they are still part of the served document:
   // once a save prunes them, the group is gone and the `pruned` echo says so.
@@ -240,7 +273,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
    * D11's empty state, or nothing at all — see {@link resolveEmptyHint} for the
    * three cases that must stay silent rather than describe a state wrongly.
    */
-  const emptyHint = resolveEmptyHint({ loaded, mode, count: ids.length, scopeVersionDegraded })
+  const emptyHint = resolveEmptyHint({ loaded, mode, count: ids.length, scopeVersionDegraded }, t)
 
   const toggle = (id: string): void => {
     setIds((current) => (current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id]))
@@ -271,12 +304,19 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
         if (code === 'scope-version-unsupported') setVersionBlocked(true)
         setFailure({
           code: code ?? 'request-failed',
-          label: (code === undefined ? undefined : SAVE_FAILURE_LABELS[code]) ?? `保存失败：${describeCause(cause)}`,
-          detail: status === undefined ? undefined : `服务端返回 ${code}（HTTP ${status}）。`,
+          // ONE whole-sentence template per branch (§5.3): the known code's copy
+          // and the unknown code's `保存失败：{cause}` are each a single key with
+          // its params supplied — never a prefix glued to an interpolated tail.
+          // An unknown code therefore falls to `SAVE_FAILED_KEY`'s template with
+          // `{cause}` filled, not to a bare `保存失败：`.
+          label: code === undefined
+            ? t(SAVE_FAILED_KEY, { cause: describeCause(cause) })
+            : t(SAVE_FAILURE_KEYS[code] ?? SAVE_FAILED_KEY, { cause: describeCause(cause) }),
+          detail: status === undefined ? undefined : t('scope.serverSaid', { code: code!, status }),
         })
       },
     )
-  }, [client, ids, mode, revision])
+  }, [client, ids, mode, revision, t])
 
   /**
    * The operator-requested RE-READ: the conflict's own recovery (§6.4).
@@ -311,37 +351,39 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
 
   return (
     <section className="cherry-panel" aria-labelledby="cherry-scope-title">
-      <h3 id="cherry-scope-title">启用范围</h3>
+      <h3 id="cherry-scope-title">{t('scope.heading')}</h3>
 
       {loadError !== undefined && (
         <p className="cherry-error" role="alert">
-          读取启用范围失败：{loadError}
+          {/* {error} is the server's own message: interpolated, never translated. */}
+          {t('scope.loadError', { error: loadError })}
         </p>
       )}
-      {!loaded && loadError === undefined && <p className="cherry-hint">正在读取启用范围…</p>}
+      {!loaded && loadError === undefined && <p className="cherry-hint">{t('scope.loading')}</p>}
 
       {/* The three independent read-only conditions, each with its own element:
           they can coexist, and none is derived from another (§6.4). */}
       {unsupported && data !== undefined && (
         <p className="cherry-error" role="alert" data-scope-warning="unsupported">
-          宿主不支持工具作用域能力（只读告警）：{data.host.reason}。请升级宿主 / DSH 以获得该能力后再试；升级前本插件不会注册这些工具。
+          {/* {reason} is the host's own prose and stays verbatim. */}
+          {t('scope.unsupported', { reason: data.host.reason })}
         </p>
       )}
       {scopeVersionDegraded && (
         <p className="cherry-error" role="alert" data-scope-warning="scope-version">
-          作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：文档版本高于本插件支持、或低于本插件支持，已进入只读降级，保存被禁用。重读仍是同一份文档，请升级宿主 / DSH 或本插件后再试。
+          {t('scope.versionDegraded')}
         </p>
       )}
       {listUnavailable && (
         <p className="cherry-error" role="alert" data-scope-warning="workspace-list">
-          注册表列表当前读不到，已禁用保存（原因见下方降级标注）。
+          {t('scope.listUnavailable')}
         </p>
       )}
       {/* The NEUTRAL waiting note: it must not read as a refusal, so it carries
           neither "不支持" nor any upgrade instruction (D9). */}
       {pending && (
         <p className="cherry-hint" role="status" data-scope-notice="pending">
-          宿主服务挂载中，稍后自动就绪；此期间的配对与设备管理照常可用。
+          {t('scope.pending')}
         </p>
       )}
 
@@ -351,18 +393,20 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
         <ul className="cherry-scope-degraded">
           {degraded.map((note: DegradedNote, index) => (
             <li key={`${note.source}:${index}`} data-degraded-source={note.source}>
-              <strong>{DEGRADED_LABELS[note.source] ?? note.source}</strong>
-              <span className="cherry-hint">：{note.reason}</span>
+              {/* ONE node, ONE sentence: the label and the server's reason are
+                  merged by the template rather than by two adjacent elements.
+                  `?? note.source` keeps an unknown source visible as itself. */}
+              {t('scope.degradedLine', { label: t(DEGRADED_KEYS[note.source] ?? note.source), reason: note.reason })}
             </li>
           ))}
         </ul>
       )}
 
       <fieldset className="cherry-scope-modes">
-        <legend>模式</legend>
+        <legend>{t('scope.mode.legend')}</legend>
         <label>
           <input type="radio" name="cherry-scope-mode" checked={mode === 'global'} onChange={() => setMode('global')} />
-          全局
+          {t('scope.mode.global')}
         </label>
         <label>
           <input
@@ -371,14 +415,14 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
             checked={mode === 'selected'}
             onChange={() => setMode('selected')}
           />
-          仅选定工作区
+          {t('scope.mode.selected')}
         </label>
       </fieldset>
 
-      <p className="cherry-hint">{EFFECT_NOTE}</p>
+      <p className="cherry-hint">{t(EFFECT_NOTE_KEY)}</p>
 
       {options.length === 0
-        ? !listUnavailable && <p className="cherry-hint">当前没有任何已注册的工作区。</p>
+        ? !listUnavailable && <p className="cherry-hint">{t('scope.noWorkspaces')}</p>
         : (
           <ul className="cherry-scope-options">
             {options.map((workspace) => (
@@ -413,7 +457,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
       {staleShown.length > 0 && (
         <div className="cherry-scope-stale" data-scope-stale="">
           <p>
-            <strong>已失效（工作区已删除）</strong>
+            <strong>{t('scope.stale.heading')}</strong>
           </p>
           <ul>
             {staleShown.map((id) => (
@@ -422,9 +466,9 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
               </li>
             ))}
           </ul>
-          <p className="cherry-hint">这些 id 在注册表里已不存在；保存时由服务端修剪，不会被判为非法输入。</p>
+          <p className="cherry-hint">{t('scope.stale.note')}</p>
           <button type="button" onClick={save} disabled={saveDisabled}>
-            清除已失效选择
+            {t('scope.stale.clear')}
           </button>
         </div>
       )}
@@ -435,7 +479,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
       {unmatched.length > 0 && (
         <div className="cherry-scope-unmatched" data-scope-unmatched="">
           <p>
-            <strong>已勾选但会话 cwd 对不上</strong>
+            <strong>{t('scope.unmatched.heading')}</strong>
           </p>
           <ul>
             {unmatched.map((entry, index) => (
@@ -444,24 +488,22 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
               </li>
             ))}
           </ul>
-          <p className="cherry-hint">
-            这些会话勾选了工作区却拿不到工具：拼写不同 / 符号链接 / 该目录确实未注册，这三种原因在这里无法区分。本条只解释原因，不改动勾选或模式，也不会触发保存。
-          </p>
+          <p className="cherry-hint">{t('scope.unmatched.note')}</p>
         </div>
       )}
 
       <div className="cherry-scope-save">
         <button type="button" onClick={save} disabled={saveDisabled}>
-          保存启用范围
+          {t('scope.save')}
         </button>
         <p className="cherry-hint cherry-mono" data-scope-revision={revision}>
-          当前 revision：{revision}
+          {t('scope.revision', { revision })}
         </p>
         {saved !== undefined && (
           <p className="cherry-ok" role="status" data-scope-saved="">
             {saved.pruned.length === 0
-              ? '保存成功。'
-              : `保存成功，按服务端修剪清除了失效选择：${saved.pruned.join('、')}。`}
+              ? t('scope.saved')
+              : t('scope.savedPruned', { list: saved.pruned.join(t('list.separator')) })}
           </p>
         )}
         {failure !== undefined && (
@@ -478,7 +520,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
                 there would be a button this page can never make useful. */}
             {failure.code === 'scope-revision-conflict' && (
               <button type="button" onClick={reread} disabled={busy}>
-                重新读取
+                {t('scope.reread')}
               </button>
             )}
             {failure.detail !== undefined && <p className="cherry-hint cherry-mono">{failure.detail}</p>}
