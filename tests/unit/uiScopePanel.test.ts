@@ -211,6 +211,20 @@ class FakeSlots implements SlotsService {
   }
 }
 
+/**
+ * The `ctx.get('locale')` half of a fake host context, answering `zh`.
+ *
+ * ⑪ renders the registered `Section`, and its assertions are all Chinese copy.
+ * jsdom's `navigator.language` is `en-US`, so without this the page would render
+ * the navigator fallback (English) and the case would be asserting something
+ * other than the mount path it exists to cover. Stateless by design: ⑪ builds
+ * its ctx inside the loop, and this object is safe to share across rounds.
+ */
+const zhLocaleService = {
+  getLocale: (): { active: string } => ({ active: 'zh' }),
+  subscribe: (): (() => void) => () => {},
+}
+
 const DEVICE_FIXTURE = {
   deviceId: 'dev-1',
   displayName: '工作站',
@@ -603,7 +617,14 @@ describe('启用范围面板 (§6.4)', () => {
       ])
       if (path.section === true) {
         const slots = new FakeSlots()
-        apply({ slots, effect: (callback: () => void | (() => void)) => void callback() })
+        // A zh locale service, rebuilt EVERY round: the callback this `apply`
+        // registers must not capture anything that changes between iterations,
+        // and the service itself is stateless.
+        apply({
+          slots,
+          effect: (callback: () => void | (() => void)) => void callback(),
+          get: (name: string) => (name === 'locale' ? zhLocaleService : undefined),
+        })
         const Section = slots.registrations[0]?.component as ComponentType
         render(createElement(Section))
       } else {

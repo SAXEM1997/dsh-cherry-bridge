@@ -350,6 +350,11 @@ describe('client bundle (build smoke)', () => {
     expect(registrations[0]?.options['order']).toBeTypeOf('number')
     expect(registrations[0]?.options['label']).toBeTypeOf('function')
     expect(registrations[0]?.component).toBeTypeOf('function')
+    // Localization is NOT a second registration path: this ctx has no `get` at
+    // all (the degraded shape), and the entry must still carry no `locale`
+    // field. The host locale is read through `ctx.get('locale')` and reflected
+    // in the label callback, never declared as its own slot option.
+    expect(Object.keys(registrations[0]?.options ?? {})).not.toContain('locale')
     // The styles effect ran, and every teardown the host could call is safe.
     expect(effects).toBe(1)
     expect(disposers.length).toBeGreaterThan(0)

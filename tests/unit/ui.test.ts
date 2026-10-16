@@ -769,6 +769,26 @@ class FakeSlots implements SlotsService {
   }
 }
 
+/**
+ * The `ctx.get('locale')` half of a fake host context, answering `zh`.
+ *
+ * These cases assert CHINESE copy, and jsdom's `navigator.language` is `en-US`,
+ * so a ctx with no locale service would make `apply` resolve the page to English
+ * and the assertions would be testing the navigator fallback instead of the
+ * host's answer. Spread into the ctx: `apply({ slots, ...zhLocaleService() })`.
+ *
+ * The service is stateless and answers `zh` for the life of the test; the
+ * `subscribe` it hands out is never fired, because nothing here changes the
+ * language.
+ */
+function zhLocaleService(): { get: (name: string) => unknown } {
+  const service = {
+    getLocale: () => ({ active: 'zh' }),
+    subscribe: () => () => {},
+  }
+  return { get: (name: string) => (name === 'locale' ? service : undefined) }
+}
+
 describe('settings page registration', () => {
   it('declares the slots service dependency by module short name', () => {
     expect(inject).toEqual(['slots'])
@@ -785,6 +805,10 @@ describe('settings page registration', () => {
         const dispose = callback()
         if (typeof dispose === 'function') disposers.push(dispose)
       },
+      // A zh locale service. Without it `apply` would fall back to the
+      // navigator (jsdom's `en-US`) and the Chinese assertions below would be
+      // testing the fallback rather than the host's answer.
+      ...zhLocaleService(),
     })
 
     // The registration is claimed inside the slot's inject callback, exactly as
@@ -798,6 +822,9 @@ describe('settings page registration', () => {
     expect(typeof registration?.options.order).toBe('number')
     // The label is a callback so the shell can re-resolve it on a locale change.
     expect(registration?.options.label()).toBe('Cherry Studio 互联')
+    // Localization is NOT a second registration path: the host locale is read
+    // through `ctx.get`, so no `locale` field may appear on the entry.
+    expect(Object.keys(registration?.options ?? {})).not.toContain('locale')
 
     // No ad-hoc container: the shell owns where a settings section appears.
     expect(document.body.childElementCount).toBe(before)
@@ -812,7 +839,11 @@ describe('settings page registration', () => {
     const slots = new FakeSlots()
     installFetch([['GET', '/cherry-remote/api/devices', jsonResponse(200, [])]])
 
-    apply({ slots, effect: (callback: () => void | (() => void)) => void callback() })
+    apply({
+      slots,
+      effect: (callback: () => void | (() => void)) => void callback(),
+      ...zhLocaleService(),
+    })
 
     const Section = slots.registrations[0]?.component
     expect(Section).toBeTypeOf('function')
