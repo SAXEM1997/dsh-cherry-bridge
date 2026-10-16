@@ -155,7 +155,7 @@ apply(ctx)
 | 纯静态 | `t('device.port')` |
 | 带插值 | **整句一个 key + 占位符**：`t('scope.revision', { revision })` → `当前 revision：{revision}` / `Revision: {revision}` |
 | 被插值**切成前后两段**的长句（如 `ToolScopePanel.tsx:327`；以及 `:274`/`:275` 的模板串、`:462-464` 的模板 + `join`） | 合并为**一个整句 key**，服务端 `reason` 作为参数注入 ⇒ 英文可自由重排语序，不出现"半句中文 + 半句英文" |
-| 静态文本**夹 JSX 子元素**（`PairingWizard.tsx:150-153` 的 `<strong>二维码</strong>`） | 拆为前段/后段两个 key，`<strong>{t('wizard.qrCode')}</strong>` 夹在中间；**禁止 `dangerouslySetInnerHTML`** |
+| 静态文本**夹 JSX 子元素**（`PairingWizard.tsx:150-153` 的 `<strong>二维码</strong>`） | 拆为前段/后段两个 key，`<strong>{t('wizard.qrCode')}</strong>` 夹在中间（Gate 3 勘误：实建为 `wizard.hint.{before,qrCode,after}` 三个 key）；**禁止 `dangerouslySetInnerHTML`** |
 | 列表分隔符 | 进字典：`t('list.separator')`（zh `、` / en `, `），供 `saved.pruned.join(...)`；`aria-label` 的 `' '` 保持不变（两种语言都是空格，且被测试钉住） |
 | **标签＋原因**的整句（如 `ToolScopePanel.tsx:355` 的全角 `：`） | 该全角冒号是**静态文案**、不是插值数据 ⇒ 整行改为**整句模板** `t('scope.degradedLine', { label, reason })`（`label` = 已翻译的降级标签，`reason` = 服务端原文透传）；**不得**在代码里硬编码 `"："`，否则会漏进英文界面 |
 
@@ -316,6 +316,7 @@ export interface ClientContext {
 - **唯一例外 `i18n.ts`**（zh 字典的唯一来源，ui/src 全域唯一允许 CJK 的文件）；`types.ts` 经 §4.5 改造后表值取自 `dictionaries.zh`，同样不含中文字面量
 - **扫描范围是全域而非具名清单**：具名名单 ≠ "全域唯一白名单"的意图——`api.ts`/`dev.tsx`/`vite-env.d.ts` 等灰区文件当前 CJK=0，但具名名单**不设防**，将来往它们里写中文不会被发现
 - **动机**：⑤ 的渲染判据受 fixture 覆盖面限制（没渲染到的分支、从未进入字典的中文它看不见）；**源码级守卫才能抓住"从未进入字典的中文"**
+- **解析入口的机制适配（Gate 3 勘误）**：本文档 §8.1⑥ 与计划 Task 5 提到的 `ts.createSourceFile` 在**实装的 typescript@7 上已不存在**（`'typescript'` 具名空间只剩 `lib/version.cjs`，无 `createSourceFile`）。守卫改用 `typescript/unstable/sync` 的 `API` 解析同一批节点类型（StringLiteral/NoSubstitutionTemplateLiteral/JsxText）；**语义不变**，仅解析入口随编译器版本适配（实测记录见 `tests/unit/i18nAssets.test.ts` 文件头）。
 
 ### 8.2 既有用例的改动面（全仓 6 处 `apply` 调用点）
 

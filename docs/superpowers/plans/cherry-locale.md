@@ -206,7 +206,7 @@
 - [ ] **Step 3: 三个组件字面量替换为 `t(...)`**
 
   - 每组件顶部 `const t = useT()`；静态文本/错误串/三元/`STATE_LABELS[state]` → `t(...)`（状态与阶段走 `t(STAGE_KEYS[x] ?? x)` 形态，`?? 原值` 兜底保留枚举不泄漏 key）。
-  - `PairingWizard.tsx:150-153`：拆两个 key 夹 `<strong>{t('wizard.qrCode')}</strong>`；`:201` 配对失败整句模板 `t('wizard.failed', { stage })`——**pin 死**（见下）。
+  - `PairingWizard.tsx:150-153`：拆两个 key 夹 `<strong>{t('wizard.qrCode')}</strong>`（Gate 3 勘误：实建为 `wizard.hint.{before,qrCode,after}` 三个 key）；`:201` 配对失败整句模板 `t('wizard.failed', { stage })`——**pin 死**（见下）。
   - `App.tsx:53` 英文串改走 `t`（key 在 Task 1 已建）。
   - `DeviceCard` 的 `hosts.join(', ')`、`id=`、`data-*` **一律不动**（Global Constraint 9）。
   - 缺的 key 回补进 `i18n.ts` 双语（保持 parity）。
@@ -304,7 +304,7 @@
 - [ ] **Step 1: 写两个守卫测试（`i18nUsage` 为失败测试，`i18nAssets` 为回归守卫）**
 
   - `i18nUsage`（§8.1③）：扫 `ui/src/**/*.{ts,tsx}` 的 `t('…')` 字面量 ∪ `Object.values(STAGE_KEYS)` ∪ `Object.values(STATE_KEYS)` ⇒ 全在字典；反向：字典每个 key 至少被该并集引用一次。**扫描模式须覆盖 `t('…')` 的任意出现位置**（含**实参内**形态，如 `join(t('list.separator'))`）——只匹配"语句独立成行"的正则会漏报；并在本测试里放一条 `join(t('list.separator'))` 形态的**正例断言**（防扫描器漏报）。
-  - `i18nAssets`（§8.1⑥）：TypeScript 编译器 API（`ts.createSourceFile` 遍历 StringLiteral/NoSubstitutionTemplateLiteral/JsxText）扫 **`ui/src/**/*.{ts,tsx}` 全域**，断言无 CJK——**白名单仅 `i18n.ts`**（ui/src 全域唯一允许 CJK 的文件）。**不得退回"6 个具名文件"清单**：具名名单 ≠ "全域唯一白名单"的意图——灰区（`api.ts`/`dev.tsx`/`vite-env.d.ts`）当前 CJK=0，但具名名单**不设防**，将来往它们里写中文不会被发现。
+  - `i18nAssets`（§8.1⑥）：TypeScript 编译器 API（`ts.createSourceFile` 遍历 StringLiteral/NoSubstitutionTemplateLiteral/JsxText）扫 **`ui/src/**/*.{ts,tsx}` 全域**，断言无 CJK——**白名单仅 `i18n.ts`**（ui/src 全域唯一允许 CJK 的文件）。（Gate 3 勘误：实装的 typescript@7 已不暴露 `ts.createSourceFile`，守卫改用 `typescript/unstable/sync` 解析同一批节点类型，**语义不变**。）**不得退回"6 个具名文件"清单**：具名名单 ≠ "全域唯一白名单"的意图——灰区（`api.ts`/`dev.tsx`/`vite-env.d.ts`）当前 CJK=0，但具名名单**不设防**，将来往它们里写中文不会被发现。
   - `tsconfig.ui.json` include 与 `tsconfig.json` exclude 同时加 `tests/unit/i18nUsage.test.ts`（本文件 import `ui/src/**` 的 KEYS/LABELS ⇒ UI 分区，见 Global Constraint 12）。`i18nAssets` 不 import ui 模块（只 fs + TS API）⇒ **server 项目默认覆盖，不改 tsconfig**。
   - **`localeRender.test.ts` 本 task 不再创建**：该文件已在 Task 3 创建并登记双 tsconfig，Task 4 追加了第 4 条；本 task 只把它拉进回归命令（Step 4）。
 
@@ -415,3 +415,5 @@
 Task 1 → Task 2 →（Task 3 → Task 4）→ Task 5 → Task 6。**Task 3 → Task 4 串行**（两者都会回补 `ui/src/i18n.ts` 的 key，**同文件禁止并发写**）；其余串行。
 
 > 携带**双 tsconfig 改动**的 commit 共 5 处，逐一标注在对应 task：Task 1（`i18n.test.ts`）、Task 2（`localeWiring.test.ts`）、Task 3（`localeRender.test.ts`）、Task 5（`i18nUsage.test.ts`）、Task 6（`localeMeta.test.ts`）。`i18nAssets.test.ts` 是唯一走 server 默认的测试（不 import ui 模块）。
+
+> **Gate 3 注记**：Task 2 的 commit subject 未带「双 tsconfig 分区」标签（另 4 处的 subject 都带了）——改动本身正确（`localeWiring.test.ts` 的双 tsconfig 登记齐全），仅标签缺失，已是既成事实，不回改历史。
