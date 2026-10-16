@@ -6231,14 +6231,26 @@ function createToolScopeHost(deps) {
 		return a.length === b.length && a.every((name) => b.includes(name));
 	}
 	/**
-	* Calls one layer's disposer. A release the host refuses is unrecoverable, but
-	* it must not travel into the caller either (B12②'s "不抛到调用方" is the same
-	* rule on both sides of the pair) — it is reported and the round continues.
+	* THE release path for one installed layer: both callers — the release-only arm
+	* of {@link applyForAgent} and §6.2's teardown — go through here, so the
+	* containment rule has exactly one definition.
+	*
+	* A release the host refuses is unrecoverable (the layer may still be installed
+	* while its record is already gone, so under intersection semantics it can
+	* never be released again and only a DSH restart clears it), but it must not
+	* travel into the caller either (B12②'s "不抛到调用方" is the same rule on both
+	* sides of the pair). So it is contained AND recorded: a `log` alone would leave
+	* the orphaned layer absent from `degraded` and from every diagnostics face.
+	* The wording names the agent and the consequence.
 	*/
 	function disposeQuietly(agentId, dispose) {
 		try {
 			dispose();
 		} catch (error) {
+			scope.noteDegraded({
+				source: "install",
+				reason: `agent ${agentId} 的 restriction 释放失败（层可能仍在生效，仅重启 DSH 可清除）：${describeError(error)}`
+			});
 			log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error);
 		}
 	}
@@ -6263,6 +6275,10 @@ function createToolScopeHost(deps) {
 			return "skipped";
 		}
 		if (agent.restrict === void 0) {
+			scope.noteDegraded({
+				source: "install",
+				reason: `agent ${agent.id} 缺少 agent.ctx.tools.restrict，无法安装 restriction：目标工具保持可见且 guard 放行（无 scoped ctx 的 agent；配置保存 / 下一次重算会重试）`
+			});
 			log(`[cherry-remote] agent ${agent.id} 没有 agent.ctx.tools.restrict，无法安装 restriction；跳过该 agent`);
 			return "skipped";
 		}
@@ -6450,11 +6466,7 @@ function createToolScopeHost(deps) {
 		}
 		for (const [agentId, dispose] of [...state.layers]) {
 			scope.clearLayer(agentId);
-			try {
-				dispose();
-			} catch (error) {
-				log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error);
-			}
+			disposeQuietly(agentId, dispose);
 		}
 		state.layers.clear();
 		const releaseGuard = state.releaseGuard;
@@ -6464,13 +6476,15 @@ function createToolScopeHost(deps) {
 		} catch (error) {
 			log("[cherry-remote] 释放 tools.guard 失败", error);
 		}
-		scope.invalidateDerived();
-		if (current === state) current = void 0;
-		if (scope.host().state === "ready") scope.setHost({
-			state: "pending",
-			capable: false,
-			reason: `${PENDING_REASON}（注入回调已卸载）`
-		});
+		if (current === state) {
+			scope.invalidateDerived();
+			current = void 0;
+			if (scope.host().state === "ready") scope.setHost({
+				state: "pending",
+				capable: false,
+				reason: `${PENDING_REASON}（注入回调已卸载）`
+			});
+		}
 	}
 	function setup(agentCtx) {
 		if (mountTornDown) return () => {};

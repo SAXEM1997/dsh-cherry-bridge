@@ -1766,6 +1766,39 @@ function holdResolveByPath(fake: FakeToolHost) {
 }
 
 /**
+ * Makes ONE cwd reach a registry entity under a DIFFERENT canonical path — the
+ * symlink / realpath case D14 names. `resolveByPath(alias)` resolves to the
+ * entity (`{ id, path: <canonical> }`), which splits the two windows apart:
+ *
+ *  - the SYNCHRONOUS window reads a `#pathMap` keyed by the ENTITY path, so the
+ *    alias misses there and the honest answer is "not concluded yet";
+ *  - the ASYNCHRONOUS round awaits `resolveByPath` and does see the hit.
+ *
+ * That is the one branch where "fail-closed now, corrected by the round" is the
+ * correct behaviour rather than a stale cache.
+ */
+function aliasPath(fake: FakeToolHost, alias: string, canonical: string): void {
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      const injected = ctx as {
+        workspaceRegistry?: { list(): unknown; resolveByPath?(path: string): Promise<unknown> }
+      }
+      const registry = injected.workspaceRegistry
+      const realResolve = registry?.resolveByPath
+      if (registry === undefined || realResolve === undefined) return cb(ctx)
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        workspaceRegistry: {
+          ...registry,
+          resolveByPath: async (path: string) =>
+            await realResolve.call(registry, path === alias ? canonical : path),
+        },
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+}
+
+/**
  * Rejects `resolveByPath` for exactly ONE path — the fake host's own
  * `resolveByPathThrows` flag is all-or-nothing, and ④(b) needs the one agent
  * whose resolution FAILS next to the three states that must never be rechecked.
@@ -2009,6 +2042,10 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
       patchRoot: (fake) => {
         observed = observeListeners(fake, ['agent/created'])
         held = holdResolveByPath(fake)
+        // The agent's cwd is the ALIAS of the registered path: only the awaiting
+        // `resolveByPath` can conclude it, so the synchronous window is the one
+        // D14 describes — it may not block, and it is not wrong to abstain.
+        aliasPath(fake, '/w/link', '/w/oa')
       },
     })
     selected.host.setWorkspaces([entity('w-oa', '/w/oa')])
@@ -2020,8 +2057,10 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
     held!.hold()
     // The judgement cache is EMPTY and the recompute that would fill it never
     // settles: the listener must still return, synchronously, and install the
-    // fail-closed layer in the SAME round.
-    selected.host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    // fail-closed layer in the SAME round. The cache cannot be warm for this cwd
+    // either — the synchronous window has no realpath, and the canonical map it
+    // reads is keyed by the ENTITY path (`/w/oa`), never by the alias.
+    selected.host.addAgent({ id: 'agent-a', cwd: '/w/link' })
     expect(selected.host.layerCount('agent-a')).toBe(1)
     expect(selected.scope.layer('agent-a')?.reason).toContain('缓存未命中')
     expect(selected.scope.judgement('agent-a')).toBeUndefined()
@@ -2424,5 +2463,223 @@ describe('T6 the bounded recheck, the synchronous judgement and the remaining as
     expect(blind.scope.layer('agent-blind')?.deny).toHaveLength(14)
     expect(blind.host.agentView('agent-blind')).toEqual([])
     expect(blind.host.verdict('agent-blind', CHERRY_TOOL_NAMES[0]!)).toBeDefined()
+  })
+})
+
+/**
+ * Captures the teardown disposer of EVERY effect run (one per injection
+ * delivery). It is the only handle that can tear ONE generation down while a
+ * NEWER one is still live — and therefore the only way to reproduce the
+ * late-teardown ordering the host can produce when a dependency fibre disposes
+ * the previous run after the new body has already taken over. `refuseOnFirst`
+ * names the events the FIRST delivery's `on()` refuses (R16's contained shape),
+ * so the older generation owns no subscription and installs no layer of its own.
+ */
+function captureGenerations(
+  fake: FakeToolHost,
+  captured: Array<() => void>,
+  refuseOnFirst: readonly string[] = [],
+): void {
+  let deliveries = 0
+  const realInject = fake.root.inject as NonNullable<ScopeHostContext['inject']>
+  fake.root.inject = ((keys: readonly string[], cb: (ctx: unknown) => void | (() => void)) =>
+    realInject(keys, (ctx: unknown) => {
+      deliveries += 1
+      const refuse = deliveries === 1
+      const injected = ctx as {
+        effect?: (body: () => () => void, label?: string) => unknown
+        on?: (event: string, handler: (payload: unknown) => void) => () => void
+      }
+      const realEffect = injected.effect
+      const realOn = injected.on
+      return cb({
+        ...(ctx as Record<string, unknown>),
+        ...(realEffect === undefined
+          ? {}
+          : {
+              effect: (body: () => () => void, label?: string) => {
+                const handle = realEffect.call(injected, body, label) as { dispose: () => void }
+                captured.push(handle.dispose)
+                return handle
+              },
+            }),
+        ...(realOn === undefined
+          ? {}
+          : {
+              on: (event: string, handler: (payload: unknown) => void) => {
+                if (refuse && refuseOnFirst.includes(event)) {
+                  throw new Error(`the host refused the "${event}" subscription`)
+                }
+                return realOn.call(injected, event, handler)
+              },
+            }),
+      })
+    })) as NonNullable<ScopeHostContext['inject']>
+}
+
+describe('Wave 1 review fixes: generation-scoped teardown, contained releases, recorded fail-opens', () => {
+  it('① an OLDER generation’s teardown leaves the NEWER generation’s records, map and state alone', async () => {
+    const generations: Array<() => void> = []
+    const fresh = rig({
+      // Both generations must complete registration to be LIVE at once; the host
+      // would refuse a duplicate name, so this fixture owns the 14 names itself
+      // and lets each generation succeed. What is under test is the shared
+      // DERIVED generation, not who owns the registration.
+      registerTools: () => () => {},
+      patchRoot: (fake) => {
+        registerOn(fake, CHERRY_TOOL_NAMES)
+        captureGenerations(fake, generations, ['agent/created', 'tools/change'])
+      },
+    })
+    // Let the older generation's own first round settle before anything else.
+    await drain()
+    expect(fresh.tools.state().state).toBe('ready')
+    expect(generations).toHaveLength(1)
+
+    fresh.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    // Both agents exist BEFORE the newer generation: the older one has no
+    // `agent/created` listener (R16 refused it), so only the newer one ever
+    // applies them, and every layer below belongs to the newer generation.
+    fresh.host.addAgent({ id: 'agent-b', cwd: '/w/oa' })
+    fresh.host.addAgent({ id: 'agent-x', cwd: '/nowhere' })
+
+    // A second injection delivery: a NEW generation takes over as `current`.
+    fresh.host.reloadDependencies()
+    expect(generations).toHaveLength(2)
+    expect(fresh.tools.state().state).toBe('ready')
+    await drain()
+
+    // The newer generation's records, judgement cache and path map are in place.
+    expect(fresh.host.layerCount('agent-b')).toBe(1)
+    expect(fresh.scope.layer('agent-b')).toBeDefined()
+    expect(fresh.scope.judgement('agent-b')).toBeDefined()
+    expect(fresh.scope.pathUnmatched()).toEqual([{ agentId: 'agent-x', cwd: '/nowhere' }])
+    expect(fresh.scope.host().state).toBe('ready')
+
+    // …and NOW the OLDER generation is torn down, late.
+    generations[0]!()
+
+    // The newer generation's installed layer, its record, its judgements and its
+    // path map all survive: the guard's 「层在 ⇒ 拒绝」 mirror still has a record
+    // to read, and the newer `ready` generation is not told it was unloaded.
+    expect(fresh.host.layerCount('agent-b')).toBe(1)
+    expect(fresh.scope.layer('agent-b')).toBeDefined()
+    expect(fresh.scope.judgement('agent-b')).toBeDefined()
+    expect(fresh.scope.pathUnmatched()).toEqual([{ agentId: 'agent-x', cwd: '/nowhere' }])
+    expect(fresh.scope.host().state).toBe('ready')
+    // Still the ready wording — not R14's `pending` / 「注入回调已卸载」 pair.
+    expect(fresh.scope.host().reason).toContain('宿主能力齐备')
+    // The older generation released only what it owned: its own guard.
+    expect(fresh.host.guardLive()).toBe(1)
+    expect(fresh.host.liveSubscriptions('agent/created')).toBe(1)
+    expect(fresh.host.effectFailures).toEqual([])
+  })
+
+  it('② a THROWING layer disposer is contained AND recorded, never an orphaned layer without a record', async () => {
+    let observed: ReturnType<typeof observeListeners> | undefined
+    const fresh = rig({
+      patchRoot: (fake) => {
+        observed = observeListeners(fake, ['agent/created'])
+      },
+    })
+    fresh.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    fresh.tools.refresh()
+    await drain()
+
+    /** A real event payload whose restriction can never be released. */
+    const throwingAgent = (id: string) => ({
+      id,
+      session: { header: { cwd: '/w/oa' } },
+      ctx: {
+        tools: {
+          restrict: () => () => {
+            throw new Error('the host refused the release')
+          },
+        },
+      },
+    })
+
+    // ── (a) the release-only arm: invisible first, then the workspace enables ──
+    // The empty selection is a legal document (the panel's SELECTED_EMPTY_HINT
+    // case): `w-oa` is registered but NOT enabled yet, so this first delivery is
+    // genuinely invisible and installs the deny layer.
+    saveScope(fresh.scope, 'selected', [])
+    expect(() => observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-a') })).not.toThrow()
+    expect(fresh.scope.layer('agent-throw-a')).toBeDefined()
+    saveScope(fresh.scope, 'selected', ['w-oa'])
+    // The re-announce resolves visible synchronously ⇒ release only ⇒ the
+    // disposer throws.
+    expect(() => observed!.deliver('agent/created', { agent: throwingAgent('agent-throw-a') })).not.toThrow()
+    expect(fresh.scope.layer('agent-throw-a')).toBeUndefined()
+    const released = fresh.scope.degraded().find((entry) => entry.source === 'install')
+    expect(released?.reason).toContain('agent agent-throw-a 的 restriction 释放失败')
+    expect(released?.reason).toContain('层可能仍在生效，仅重启 DSH 可清除')
+    expect(released?.reason).toContain('the host refused the release')
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+      '释放 agent agent-throw-a 的 restriction 失败',
+    )
+
+    // ── (b) §6.2's teardown arm: the layer is still installed when the effect ──
+    // is disposed, so the same containment must hold on the way out.
+    expect(() =>
+      observed!.deliver('agent/created', {
+        agent: { ...throwingAgent('agent-throw-b'), session: { header: { cwd: '/nowhere' } } },
+      }),
+    ).not.toThrow()
+    expect(fresh.scope.layer('agent-throw-b')).toBeDefined()
+    expect(() => fresh.dispose()).not.toThrow()
+    expect(fresh.scope.layer('agent-throw-b')).toBeUndefined()
+    const tornDown = fresh.scope.degraded().find((entry) => entry.source === 'install')
+    expect(tornDown?.reason).toContain('agent agent-throw-b 的 restriction 释放失败')
+    expect(tornDown?.reason).toContain('层可能仍在生效，仅重启 DSH 可清除')
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+      '释放 agent agent-throw-b 的 restriction 失败',
+    )
+  })
+
+  it('③ an agent without agent.ctx.tools.restrict is RECORDED, not a silent fail-open', async () => {
+    let observed: ReturnType<typeof observeListeners> | undefined
+    const fresh = rig({
+      patchRoot: (fake) => {
+        observed = observeListeners(fake, ['agent/created'])
+      },
+    })
+    fresh.host.setWorkspaces([entity('w-oa', '/w/oa')])
+    fresh.tools.refresh()
+    await drain()
+    saveScope(fresh.scope, 'selected', ['w-oa'])
+
+    const installs = fresh.host.restrictCalls.length
+    const opsBefore = fresh.host.ops.length
+    // The host's own payload shape, minus `ctx.tools.restrict`: a cwd outside
+    // every registered workspace, so the target set is the full deny.
+    expect(() =>
+      observed!.deliver('agent/created', {
+        agent: { id: 'agent-no-restrict', session: { header: { cwd: '/w/other' } }, ctx: { tools: {} } },
+      }),
+    ).not.toThrow()
+
+    // The log still fires…
+    expect(warn.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+      'agent-no-restrict 没有 agent.ctx.tools.restrict',
+    )
+    // …and it is no longer SILENT: `degraded` carries the same `install` source
+    // the refused-install and failed-release arms use, with a reason that names
+    // THIS condition and its consequence.
+    const note = fresh.scope.degraded().find((entry) => entry.source === 'install')
+    expect(note?.reason).toContain('agent-no-restrict')
+    expect(note?.reason).toContain('缺少 agent.ctx.tools.restrict')
+    expect(note?.reason).toContain('目标工具保持可见且 guard 放行')
+
+    // Not one layer-changing host call was attempted for it…
+    expect(fresh.host.restrictCalls.length).toBe(installs)
+    expect(
+      fresh.host.ops.slice(opsBefore).filter((entry) => entry.op === 'restrict' || entry.op === 'release-layer'),
+    ).toEqual([])
+    expect(fresh.host.layerCount('agent-no-restrict')).toBe(0)
+    expect(fresh.scope.layer('agent-no-restrict')).toBeUndefined()
+    // …and the fail-open the plugin cannot prevent is on the record rather than
+    // hidden: with no layer there is nothing for the guard to reject.
+    expect(fresh.host.verdict('agent-no-restrict', CHERRY_TOOL_NAMES[0]!)).toBeUndefined()
   })
 })

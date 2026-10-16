@@ -482,14 +482,26 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   }
 
   /**
-   * Calls one layer's disposer. A release the host refuses is unrecoverable, but
-   * it must not travel into the caller either (B12②'s "不抛到调用方" is the same
-   * rule on both sides of the pair) — it is reported and the round continues.
+   * THE release path for one installed layer: both callers — the release-only arm
+   * of {@link applyForAgent} and §6.2's teardown — go through here, so the
+   * containment rule has exactly one definition.
+   *
+   * A release the host refuses is unrecoverable (the layer may still be installed
+   * while its record is already gone, so under intersection semantics it can
+   * never be released again and only a DSH restart clears it), but it must not
+   * travel into the caller either (B12②'s "不抛到调用方" is the same rule on both
+   * sides of the pair). So it is contained AND recorded: a `log` alone would leave
+   * the orphaned layer absent from `degraded` and from every diagnostics face.
+   * The wording names the agent and the consequence.
    */
   function disposeQuietly(agentId: string, dispose: () => void): void {
     try {
       dispose()
     } catch (error) {
+      scope.noteDegraded({
+        source: 'install',
+        reason: `agent ${agentId} 的 restriction 释放失败（层可能仍在生效，仅重启 DSH 可清除）：${describeError(error)}`,
+      })
       log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error)
     }
   }
@@ -532,6 +544,16 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     }
 
     if (agent.restrict === undefined) {
+      // A "cannot decide" path like every sibling one, and it must not be the ONE
+      // that reports nothing: the target tools stay visible AND the guard allows
+      // (no layer record ⇒ nothing to reject), so the plugin cannot hide for this
+      // agent — `degraded` says so instead of leaving the fact to a `log` line
+      // nobody reads. Same `install` source as the refused-install and
+      // failed-release arms; the reason text distinguishes which condition fired.
+      scope.noteDegraded({
+        source: 'install',
+        reason: `agent ${agent.id} 缺少 agent.ctx.tools.restrict，无法安装 restriction：目标工具保持可见且 guard 放行（无 scoped ctx 的 agent；配置保存 / 下一次重算会重试）`,
+      })
       log(`[cherry-remote] agent ${agent.id} 没有 agent.ctx.tools.restrict，无法安装 restriction；跳过该 agent`)
       return 'skipped'
     }
@@ -769,14 +791,12 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     } catch (error) {
       log('[cherry-remote] 释放 cherry_* 工具注册失败', error)
     }
-    // ④ Then every restriction (record cleared before its layer's disposer).
+    // ④ Then every restriction (record cleared before its layer's disposer —
+    //    the ONE release path, so a disposer that throws is contained and
+    //    recorded rather than only logged).
     for (const [agentId, dispose] of [...state.layers]) {
       scope.clearLayer(agentId)
-      try {
-        dispose()
-      } catch (error) {
-        log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error)
-      }
+      disposeQuietly(agentId, dispose)
     }
     state.layers.clear()
     // ⑤ The guard LAST: it notifies nobody, so it triggers no recompute, and it
@@ -792,12 +812,23 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     // The same teardown invalidates §6.1's derived generation: judgements, the
     // canonical path map, the resolution states, `pathUnmatched` and the
     // installed-layer records — a re-mount starts from a FRESH generation.
-    scope.invalidateDerived()
-    if (current === state) current = undefined
-    if (scope.host().state === 'ready') {
-      // Nothing is mounted any more: `ready` would be a lie (D13's enum has no
-      // "unloaded" member, and `pending` is the neutral waiting side of it).
-      scope.setHost({ state: 'pending', capable: false, reason: `${PENDING_REASON}（注入回调已卸载）` })
+    //
+    // ONLY the generation that is still `current` may do that. An OLDER
+    // generation's teardown arriving after a newer one became `current` must not
+    // wipe the NEWER generation's judgements, path map and installed-layer
+    // records while that newer generation's layers stay installed — the guard's
+    // 「层在 ⇒ 拒绝」 mirror would break with no record left to release — nor may
+    // it tell a newer `ready` generation that it is unloaded. All three
+    // end-of-generation statements therefore ride the one guard; the ordinary
+    // single-generation path is unchanged, including R14's `pending` wording.
+    if (current === state) {
+      scope.invalidateDerived()
+      current = undefined
+      if (scope.host().state === 'ready') {
+        // Nothing is mounted any more: `ready` would be a lie (D13's enum has no
+        // "unloaded" member, and `pending` is the neutral waiting side of it).
+        scope.setHost({ state: 'pending', capable: false, reason: `${PENDING_REASON}（注入回调已卸载）` })
+      }
     }
   }
 
