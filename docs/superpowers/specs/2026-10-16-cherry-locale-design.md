@@ -316,7 +316,7 @@ export interface ClientContext {
 - **唯一例外 `i18n.ts`**（zh 字典的唯一来源，ui/src 全域唯一允许 CJK 的文件）；`types.ts` 经 §4.5 改造后表值取自 `dictionaries.zh`，同样不含中文字面量
 - **扫描范围是全域而非具名清单**：具名名单 ≠ "全域唯一白名单"的意图——`api.ts`/`dev.tsx`/`vite-env.d.ts` 等灰区文件当前 CJK=0，但具名名单**不设防**，将来往它们里写中文不会被发现
 - **动机**：⑤ 的渲染判据受 fixture 覆盖面限制（没渲染到的分支、从未进入字典的中文它看不见）；**源码级守卫才能抓住"从未进入字典的中文"**
-- **解析入口的机制适配（Gate 3 勘误）**：本文档 §8.1⑥ 与计划 Task 5 提到的 `ts.createSourceFile` 在**实装的 typescript@7 上已不存在**（`'typescript'` 具名空间只剩 `lib/version.cjs`，无 `createSourceFile`）。守卫改用 `typescript/unstable/sync` 的 `API` 解析同一批节点类型（StringLiteral/NoSubstitutionTemplateLiteral/JsxText）；**语义不变**，仅解析入口随编译器版本适配（实测记录见 `tests/unit/i18nAssets.test.ts` 文件头）。
+- **解析入口的机制适配（Gate 3 勘误）**：本文档 §8.1⑥ 与计划 Task 5 提到的 `ts.createSourceFile` 在**实装的 typescript@7 上已不存在**（`'typescript'` 具名入口只剩 `version` 与 `versionMajorMinor` 两个版本字段，无 `createSourceFile`）。守卫改用 `typescript/unstable/sync` 的 `API` 解析同一批节点类型（StringLiteral/NoSubstitutionTemplateLiteral/JsxText）；**语义不变**，仅解析入口随编译器版本适配（实测记录见 `tests/unit/i18nAssets.test.ts` 文件头）。
 
 ### 8.2 既有用例的改动面（全仓 6 处 `apply` 调用点）
 

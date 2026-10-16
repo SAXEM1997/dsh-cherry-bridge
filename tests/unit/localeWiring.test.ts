@@ -426,8 +426,8 @@ describe('a host locale service that misbehaves', () => {
 
     // The failed adopt already released the subscription: nothing is live once
     // the probes have finished, so an announcement has nothing of ours to call.
-    // (Pre-fix, this was already 0 here — the leak is what the announcements
-    // below expose.)
+    // (Pre-fix, this was already 2 here — 2 subscribes, 0 disposers — so the
+    // mutation is caught at the assertions above, BEFORE the announcement loop.)
     expect(listeners.size).toBe(0)
     expect(subscribes - unsubscribes).toBe(0)
 
@@ -447,8 +447,13 @@ describe('a host locale service that misbehaves', () => {
       // signature is `subscribes` climbing while `unsubscribes` lags.
       expect(live).toBeGreaterThanOrEqual(0)
     }
-    // The whole point: three announcements never produced a second concurrent
-    // listener. (Pre-fix this peak reached 3, since no disposer ever ran.)
+    // Defense in depth for a fixture shape this test does NOT reach: if a host
+    // ever let `getLocale()` succeed during probe and fail only on later
+    // announcements, this loop would be the sole catcher. For THIS fixture the
+    // pre-fix leak is already visible at :431 (live count 2 after the probe
+    // phase); unreverted, the announcements below would double it per round —
+    // measured pre-fix peak across 3 announcements is 16 (2→4→8→16, each
+    // surviving listener re-subscribing per announcement).
     expect(peakLive).toBeLessThanOrEqual(1)
 
     // Nothing escaped: the degraded path warned and the store holds the fallback
