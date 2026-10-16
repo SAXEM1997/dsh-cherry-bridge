@@ -21,6 +21,7 @@ import { DeviceCard } from './DeviceCard'
 import { PairingWizard } from './PairingWizard'
 import { ToolScopePanel } from './ToolScopePanel'
 import { listDevices } from './api'
+import { useT } from './i18n'
 import { API_BASE } from './types'
 import type {
   DeviceState,
@@ -50,9 +51,23 @@ export interface AppProps {
 /** The production stream opener; the host page always has `EventSource`. */
 const defaultEventSourceFactory: EventSourceFactory = (url) => {
   const source = (globalThis as { EventSource?: new (url: string) => unknown }).EventSource
-  if (source === undefined) throw new Error('EventSource is unavailable in this environment')
+  // Thrown for `apply()`'s error line to translate. The message is an INTERNAL
+  // token, not copy: the component renders `t('app.eventSourceUnavailable')`
+  // and never surfaces this string, so the two cannot drift apart.
+  if (source === undefined) throw new Error(EVENT_SOURCE_UNAVAILABLE)
   return new source(url) as ReturnType<EventSourceFactory>
 }
+
+/**
+ * The marker a missing `EventSource` throws with.
+ *
+ * A constant rather than a sentence, because the USER-VISIBLE wording is the
+ * dictionary's (`app.eventSourceUnavailable`, zh and en) while this string only
+ * travels from the opener to the catch block that recognizes it. Keeping them
+ * separate is what makes the Chinese page finally able to say so in Chinese —
+ * before this task the literal here rendered in English on a zh page.
+ */
+const EVENT_SOURCE_UNAVAILABLE = 'event-source-unavailable'
 
 /** Parses one SSE frame payload, ignoring a malformed one rather than crashing. */
 function parseFrame<T>(data: string): T | undefined {
@@ -68,6 +83,7 @@ export function App({
   codeLifetimeMs,
   scopeClient,
 }: AppProps): ReturnType<typeof Object> {
+  const t = useT()
   const [devices, setDevices] = useState<DeviceSummary[]>([])
   const [states, setStates] = useState<Record<string, DeviceState>>({})
   const [progress, setProgress] = useState<PairingProgressEvent | undefined>(undefined)
@@ -82,7 +98,16 @@ export function App({
     try {
       source = eventSourceFactory(`${API_BASE}/events`)
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      // The opener's own token means "no EventSource here", which has a
+      // sentence of its own in both dictionaries; anything else is a foreign
+      // message and is interpolated verbatim (data, not copy).
+      setError(
+        cause instanceof Error && cause.message === EVENT_SOURCE_UNAVAILABLE
+          ? t('app.eventSourceUnavailable')
+          : cause instanceof Error
+            ? cause.message
+            : String(cause),
+      )
       return undefined
     }
 
@@ -172,10 +197,8 @@ export function App({
   return (
     <div className="cherry-settings">
       <header className="cherry-header">
-        <h2>Cherry Studio 互联</h2>
-        <p className="cherry-hint">
-          通过远程传输把本机 DeepSeek Harness 连接到 Cherry Studio 桌面端；设备档案保存在插件数据目录，页面不接触任何凭据。
-        </p>
+        <h2>{t('app.title')}</h2>
+        <p className="cherry-hint">{t('app.subtitle')}</p>
       </header>
 
       {error !== undefined && (
@@ -197,9 +220,9 @@ export function App({
       <ToolScopePanel {...(scopeClient === undefined ? {} : { client: scopeClient })} />
 
       <section className="cherry-panel" aria-labelledby="cherry-devices-title">
-        <h3 id="cherry-devices-title">已配对设备</h3>
+        <h3 id="cherry-devices-title">{t('app.devices.heading')}</h3>
         {sorted.length === 0 && (
-          <p className="cherry-hint">{listed ? '暂无已配对设备，使用上方向导完成首次配对。' : '正在读取设备列表…'}</p>
+          <p className="cherry-hint">{listed ? t('app.devices.empty') : t('app.devices.loading')}</p>
         )}
         <ul className="cherry-cards">
           {sorted.map((device) => (

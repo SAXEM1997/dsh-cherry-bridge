@@ -17,7 +17,8 @@
 import { useEffect, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
 import { startPairing } from './api'
-import { APPROVED_STAGE, STAGE_LABELS, TERMINAL_STAGES, VERIFICATION_CODE_STAGE } from './types'
+import { useT } from './i18n'
+import { APPROVED_STAGE, STAGE_KEYS, TERMINAL_STAGES, VERIFICATION_CODE_STAGE } from './types'
 import type { PairingPhase, PairingProgressEvent } from './types'
 
 /** The countdown the transient code display gets, in seconds. */
@@ -47,6 +48,7 @@ export function PairingWizard({
   onRunStart,
   onSettled,
 }: PairingWizardProps): ReturnType<typeof Object> {
+  const t = useT()
   const [payload, setPayload] = useState('')
   const [claimId, setClaimId] = useState<string | undefined>(undefined)
   const [phase, setPhase] = useState<PairingPhase>('idle')
@@ -113,7 +115,7 @@ export function PairingWizard({
     event.preventDefault()
     const trimmed = payload.trim()
     if (trimmed === '') {
-      setError('请先粘贴扫码页显示的配对信息')
+      setError(t('wizard.error.payloadRequired'))
       return
     }
     setBusy(true)
@@ -146,59 +148,67 @@ export function PairingWizard({
 
   return (
     <section className="cherry-panel" aria-labelledby="cherry-pairing-title">
-      <h3 id="cherry-pairing-title">配对向导</h3>
+      <h3 id="cherry-pairing-title">{t('wizard.heading')}</h3>
+      {/* The ruled seam: `before` ends bare, ONE literal JSX space supplies the
+          gap, the emphasized words come from their own key, and `after` opens
+          flush with its own punctuation. Both locales' values are shaped for
+          exactly this. */}
       <p className="cherry-hint">
-        在 Cherry Studio 桌面端打开「远程连接 → 添加设备」；该界面显示的是<strong>二维码</strong>。
-        请用微信或浏览器等扫码，把扫码后页面上显示的配对信息复制下来，粘贴到下方。
+        {t('wizard.hint.before')} <strong>{t('wizard.hint.qrCode')}</strong>
+        {t('wizard.hint.after')}
       </p>
 
       <ol className="cherry-steps">
-        <li>Cherry Studio 中打开「添加设备」，屏幕上显示二维码</li>
-        <li>用微信或浏览器等扫码，复制扫码页显示的配对信息（含地址、端口与一次性邀请）</li>
-        <li>粘贴到下方输入框并开始配对，再对照桌面端窗口上的 6 位验证码确认</li>
+        <li>{t('wizard.step.open')}</li>
+        <li>{t('wizard.step.scan')}</li>
+        <li>{t('wizard.step.paste')}</li>
       </ol>
 
       <form className="cherry-pair-form" onSubmit={submit}>
-        <label htmlFor="cherry-payload">配对信息</label>
+        <label htmlFor="cherry-payload">{t('wizard.payload.label')}</label>
         <textarea
           id="cherry-payload"
           value={payload}
           rows={3}
-          placeholder="粘贴扫码后页面上显示的配对信息"
+          placeholder={t('wizard.payload.placeholder')}
           onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setPayload(event.target.value)}
         />
         <button type="submit" disabled={busy || running || !subscribed}>
-          开始配对
+          {t('wizard.submit')}
         </button>
       </form>
 
-      {!subscribed && <p className="cherry-hint">正在建立事件流，稍候即可开始配对…</p>}
+      {!subscribed && <p className="cherry-hint">{t('wizard.streamPending')}</p>}
 
       {running && (
         <div className="cherry-progress" aria-live="polite">
-          <p>配对进行中</p>
+          <p>{t('wizard.running')}</p>
           {claimId !== undefined && <p className="cherry-hint cherry-mono">claim {claimId}</p>}
-          <p>{stage === undefined ? '已提交配对请求…' : (STAGE_LABELS[stage] ?? stage)}</p>
+          <p>{stage === undefined ? t('wizard.submitted') : t(STAGE_KEYS[stage] ?? stage)}</p>
         </div>
       )}
 
       {code !== undefined && (
         <div className="cherry-code" role="status">
-          <p>请在 Cherry Studio 上核对验证码</p>
+          <p>{t('wizard.code.check')}</p>
           <output className="cherry-code-digits">{code}</output>
         </div>
       )}
 
-      {phase === 'done' && <p className="cherry-ok">配对成功</p>}
-      {/* Labelled verdict, never a raw stage string: `STAGE_LABELS` carries copy
-          for every terminal stage, and the fallback keeps an unknown future
-          stage readable without leaking the enum into the UI. The label is read
-          from the wizard's CAPTURED verdict, never from `progress` — the app
-          clears the frame as the run settles, so the frame is already gone by
-          the time this paragraph renders (see the `verdict` state above). */}
+      {phase === 'done' && <p className="cherry-ok">{t('wizard.succeeded')}</p>}
+      {/* Labelled verdict, never a raw stage string: the dictionary carries copy
+          for every terminal stage, and `wizard.unknownError` keeps an unknown
+          future stage readable WITHOUT leaking the enum into the UI — which is
+          exactly why the fallback is a key here rather than the `?? stage`
+          passthrough the in-flight line above uses. The label is read from the
+          wizard's CAPTURED verdict, never from `progress` — the app clears the
+          frame as the run settles, so the frame is already gone by the time this
+          paragraph renders (see the `verdict` state above). */}
       {phase === 'failed' && (
         <p className="cherry-error" role="alert">
-          配对失败：{STAGE_LABELS[verdict ?? ''] ?? '未知错误'}
+          {t('wizard.failed', {
+            stage: STAGE_KEYS[verdict ?? ''] === undefined ? t('wizard.unknownError') : t(STAGE_KEYS[verdict ?? '']!),
+          })}
         </p>
       )}
       {error !== undefined && (

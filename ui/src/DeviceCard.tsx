@@ -14,7 +14,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent, RefObject } from 'react'
 import { patchDevice, removeDevice } from './api'
-import { STATE_LABELS } from './types'
+import { useT } from './i18n'
+import { STATE_KEYS } from './types'
 import type { DeviceState, DeviceSummary } from './types'
 
 /** The mutually exclusive editors a card can have open. */
@@ -74,6 +75,7 @@ function parseHosts(raw: string): string[] {
 }
 
 export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProps): ReturnType<typeof Object> {
+  const t = useT()
   const root = useRef<HTMLLIElement | null>(null)
   const [editor, setEditor] = useState<Editor>('none')
   const [name, setName] = useState(device.displayName)
@@ -132,7 +134,7 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     event.preventDefault()
     const displayName = name.trim()
     if (displayName === '') {
-      setError('设备名称不能为空')
+      setError(t('device.error.nameRequired'))
       return
     }
     void run(async () => {
@@ -145,12 +147,12 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     event.preventDefault()
     const hosts = parseHosts(hostsText)
     if (hosts.length === 0) {
-      setError('至少需要一个主机地址')
+      setError(t('device.error.hostsRequired'))
       return
     }
     const port = Number(portText)
     if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-      setError('端口必须是 1..65535 之间的整数')
+      setError(t('device.error.portInvalid'))
       return
     }
     void run(async () => {
@@ -167,7 +169,10 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     })
   }
 
-  const label = state === undefined ? '状态未知' : STATE_LABELS[state]
+  // `?? state` keeps an unknown future state transparent — the enum is the only
+  // honest thing left to show for one this build has no copy for — while every
+  // state it DOES know renders through the dictionary.
+  const label = state === undefined ? t('device.state.unknown') : t(STATE_KEYS[state] ?? state)
 
   return (
     <li className="cherry-card" data-device-id={device.deviceId} ref={root}>
@@ -187,53 +192,53 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
         </div>
         <div className="cherry-card-actions">
           <button type="button" onClick={toggleEnabled} disabled={busy}>
-            {device.enabled ? '停用' : '启用'}
+            {device.enabled ? t('device.disable') : t('device.enable')}
           </button>
           <button type="button" onClick={() => setEditor(editor === 'rename' ? 'none' : 'rename')} disabled={busy}>
-            重命名
+            {t('device.rename')}
           </button>
           <button type="button" onClick={() => setEditor(editor === 'address' ? 'none' : 'address')} disabled={busy}>
-            地址维护
+            {t('device.addresses')}
           </button>
           <button type="button" onClick={() => setEditor(editor === 'remove' ? 'none' : 'remove')} disabled={busy}>
-            移除
+            {t('device.remove')}
           </button>
         </div>
       </div>
 
       <dl className="cherry-card-facts">
-        <dt>地址</dt>
+        <dt>{t('device.field.addresses')}</dt>
         <dd>{device.hosts.join(', ')}</dd>
-        <dt>端口</dt>
+        <dt>{t('device.field.port')}</dt>
         <dd>{device.port}</dd>
-        <dt>设备 ID</dt>
+        <dt>{t('device.field.id')}</dt>
         <dd className="cherry-mono">{device.deviceId}</dd>
       </dl>
 
       {editor === 'rename' && (
         <form className="cherry-inline-form" onSubmit={saveName}>
-          <label htmlFor={`name-${device.deviceId}`}>设备名称</label>
+          <label htmlFor={`name-${device.deviceId}`}>{t('device.field.name')}</label>
           <input
             id={`name-${device.deviceId}`}
             value={name}
             onChange={(event: ChangeEvent<HTMLInputElement>) => setName(event.target.value)}
           />
           <button type="submit" disabled={busy}>
-            保存名称
+            {t('device.save.name')}
           </button>
         </form>
       )}
 
       {editor === 'address' && (
         <form className="cherry-inline-form" onSubmit={saveAddress}>
-          <label htmlFor={`hosts-${device.deviceId}`}>主机地址</label>
+          <label htmlFor={`hosts-${device.deviceId}`}>{t('device.field.hosts')}</label>
           <input
             id={`hosts-${device.deviceId}`}
             value={hostsText}
             onChange={(event: ChangeEvent<HTMLInputElement>) => setHostsText(event.target.value)}
           />
-          <span className="cherry-hint">多个候选地址用逗号分隔（整体替换）</span>
-          <label htmlFor={`port-${device.deviceId}`}>端口</label>
+          <span className="cherry-hint">{t('device.hosts.hint')}</span>
+          <label htmlFor={`port-${device.deviceId}`}>{t('device.field.port')}</label>
           <input
             id={`port-${device.deviceId}`}
             inputMode="numeric"
@@ -241,19 +246,19 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
             onChange={(event: ChangeEvent<HTMLInputElement>) => setPortText(event.target.value)}
           />
           <button type="submit" disabled={busy}>
-            保存地址
+            {t('device.save.addresses')}
           </button>
         </form>
       )}
 
       {editor === 'remove' && (
         <div className="cherry-inline-form">
-          <p>移除后本机将不再连接该设备，凭据保留在对方一侧。</p>
+          <p>{t('device.remove.warning')}</p>
           <button type="button" onClick={confirmRemove} disabled={busy}>
-            确认移除
+            {t('device.remove.confirm')}
           </button>
           <button type="button" onClick={() => setEditor('none')} disabled={busy}>
-            取消
+            {t('device.cancel')}
           </button>
         </div>
       )}
