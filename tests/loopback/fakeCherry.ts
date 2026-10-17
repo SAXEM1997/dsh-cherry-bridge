@@ -72,6 +72,13 @@ export interface FakeCherryOptions {
    * the IPv6 candidate path, which needs a bare-or-bracketed IPv6 authority.
    */
   bindHost?: string
+  /**
+   * Delay before an accepted socket BEGINS its Noise handshake. The socket is
+   * already counted (`socketCount`) while this runs, so a test can close a
+   * connection at a point that is genuinely "mid-handshake" instead of guessing
+   * a sleep long enough on a cold process and short enough on a warm one.
+   */
+  handshakeDelayMs?: number
   /** Artificial per-request delay; requests stay counted as in-flight while waiting. */
   requestDelayMs?: number
   /**
@@ -1373,12 +1380,20 @@ export class FakeCherry {
   #handleSocket(socket: WebSocket, identity: Uint8Array): void {
     const controller = new AbortController()
     const stream = new RemoteSocketStream(toRemoteSocket(socket), componentLogger.forComponent('fake'), 'inbound')
-    void acceptSecureChannel(stream, {
-      identity,
-      logger: componentLogger,
-      protocolVersions: this.#options.protocolVersions ?? DEFAULT_PROTOCOL_VERSIONS,
-      signal: controller.signal,
-    })
+    // The socket is already counted as accepted; `handshakeDelayMs` holds the
+    // handshake itself back so a test can close a connection at a point that is
+    // genuinely mid-handshake on any machine speed.
+    const begin = async (): Promise<Awaited<ReturnType<typeof acceptSecureChannel>>> => {
+      const delay = this.#options.handshakeDelayMs
+      if (delay !== undefined && delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+      return acceptSecureChannel(stream, {
+        identity,
+        logger: componentLogger,
+        protocolVersions: this.#options.protocolVersions ?? DEFAULT_PROTOCOL_VERSIONS,
+        signal: controller.signal,
+      })
+    }
+    void begin()
       .then((channel) => {
         this.#connectionCount += 1
         const live: LiveConnection = { socket, channel, controller, hello: false, arrivals: [] }

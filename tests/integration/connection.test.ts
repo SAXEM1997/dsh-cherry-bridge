@@ -105,6 +105,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/**
+ * Waits until the fake has ACCEPTED `want` sockets. Gating on the peer's own
+ * count beats a fixed sleep in both directions: a sleep short enough to land
+ * mid-handshake on a cold process lands after the handshake on a warm one.
+ */
+async function waitForSockets(fake: FakeCherry, want: number, timeoutMs = 3_000): Promise<void> {
+  const started = performance.now()
+  while (fake.socketCount < want) {
+    if (performance.now() - started > timeoutMs) throw new Error(`fake never accepted ${want} socket(s)`)
+    await sleep(1)
+  }
+}
+
 function waitForState(connection: DeviceConnection, want: DeviceState | DeviceState[], timeoutMs = 3_000): Promise<void> {
   const wanted = Array.isArray(want) ? want : [want]
   return new Promise((resolve, reject) => {
@@ -968,12 +981,14 @@ describe('DeviceConnection over a real loopback channel', () => {
 
   it('F2-5b close() during a candidate handshake, then a fresh connect(): the NEW cycle\'s link survives', async () => {
     const identity = await createDeviceIdentity()
-    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    // The handshake is HELD BACK by the peer, so "mid-handshake" is a real state
+    // here rather than a guess about how fast this machine is.
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 }, handshakeDelayMs: 250 })
     const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
 
     // First cycle: start it and abandon it mid-handshake.
     const abandoned = connection.connect()
-    await sleep(20)
+    await waitForSockets(fakeInfo.fake, 1)
     await connection.close()
     await expect(abandoned).rejects.toThrow(/closed/)
 
@@ -982,6 +997,11 @@ describe('DeviceConnection over a real loopback channel', () => {
     // its handshake against the epoch the NEW cycle now owns and, on failure,
     // route the teardown into the live link.
     await connection.connect()
+    // The abandoned iteration's handshake only BEGINS once the peer's hold
+    // elapses, so the assertions have to come after that window: checking
+    // earlier would pass without the stale attempt ever having run, which is
+    // exactly the failure this case exists to catch.
+    await sleep(400)
     expect(connection.state).toBe('connected')
     await expect(connection.rpc.request('connection.ping', { nonce: 'alive' })).resolves.toMatchObject({
       nonce: 'alive',
