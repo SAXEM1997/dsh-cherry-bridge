@@ -4333,9 +4333,9 @@ var CherryToolEngine = class {
 				truncated: false
 			};
 			const advanced = String(next);
+			if (advanced === cursor) throw new Error(`${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`);
 			emptyPages = extracted.items.length === 0 ? emptyPages + 1 : 0;
 			if (emptyPages >= MAX_CONSECUTIVE_EMPTY_PAGES) throw new Error(`${method} answered ${emptyPages} consecutive empty page(s) (last nextCursor ${advanced}) for ${JSON.stringify(params)}; refusing to spin on a peer that makes no progress`);
-			if (advanced === cursor) throw new Error(`${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`);
 			cursor = advanced;
 		}
 	}

@@ -10,7 +10,7 @@ import { registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { LIST_PAGE_CLAMP } from '../../src/defaults.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
-import type { FakeCherryOptions, FakeSessionRecord } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions, FakeMessageRecord, FakeSessionRecord } from '../loopback/fakeCherry.js'
 
 /**
  * Issue #11 regression suite: a list walk must accept the upstream desktop's
@@ -19,10 +19,14 @@ import type { FakeCherryOptions, FakeSessionRecord } from '../loopback/fakeCherr
  * `agent.sessions.list` is not a count-only pager upstream: it walks a PINNED
  * section first and then the entity section. When a pin anchor is unpinned or
  * deleted between two page requests, the pin section answers with ZERO rows and
- * a section-start cursor — `{items: [], nextCursor: 'entity:'}` — which
- * upstream's own test pins verbatim (CherryHQ/cherry-studio#21854;
- * `AgentSessionService.listByCursor`, v2.1.6 lines 739-744 in the vendored
- * checkout under `_research/cherry-studio/`). `#aggregate` used to treat EVERY
+ * a section-start cursor — `{items: [], nextCursor: 'entity:'}`. The sessions
+ * side is evidenced by the source itself (`AgentSessionService.listByCursor`,
+ * v2.1.6 lines 739-744 in the vendored checkout under `_research/cherry-studio/`,
+ * where `encodeEntitySectionStart()` returns the literal `'entity:'`); the same
+ * transition is pinned by upstream's own test on the topic rail
+ * (`TopicService.test.ts`, "Cursor points at a pin tuple for a row that no
+ * longer exists"), and CherryHQ/cherry-studio#21854's suite exercises it for
+ * sessions. `#aggregate` used to treat EVERY
  * empty page with a non-null cursor as a peer fault, so `cherry_sessions` failed
  * whenever a pinned session disappeared mid-walk.
  *
@@ -331,6 +335,104 @@ describe('issue #11 T5: the consecutive-empty tolerance is finite', () => {
     expect((error as Error).message).toContain('3 consecutive empty page(s)')
     expect((error as Error).message).toContain('agent.sessions.list')
     // Page 1 plus three empty pages: the fifth scripted page was never asked for.
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(4)
+  })
+})
+
+describe('issue #11 T6: only CONSECUTIVE empty pages count', () => {
+  it('T6 completes a walk whose empty pages are separated by real ones', async () => {
+    // The rule is a RUN, not a total. A peer that interleaves empty pages with
+    // real ones still makes progress and must finish: a counter that ACCUMULATED
+    // instead of resetting would refuse this walk on its third empty page. The
+    // upstream pin→entity transition never repeats, so this is the shape that
+    // distinguishes "resets on any non-empty page" from "counts for ever".
+    const fixture = sessions(16)
+    const rig = await makeRig({ agent: { sessions: fixture } })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      pageOf(fixture, 0, 4, 'c-1'),
+      { items: [], nextCursor: 'c-2' },
+      pageOf(fixture, 4, 8, 'c-3'),
+      { items: [], nextCursor: 'c-4' },
+      pageOf(fixture, 8, 12, 'c-5'),
+      { items: [], nextCursor: 'c-6' },
+      pageOf(fixture, 12, 16, null),
+    ])
+
+    const result = (await rig.call('cherry_sessions', { device: 'dev-A' })) as {
+      items: Array<{ sessionId: string }>
+      truncated?: boolean
+    }
+
+    // Three empty pages in total, none of them consecutive.
+    expect(result.items.map((session) => session.sessionId)).toEqual(fixture.map((session) => session.sessionId))
+    expect(result.truncated).toBe(false)
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(7)
+  })
+})
+
+describe('issue #11 T7: the shared walk accepts it on the MESSAGES face too', () => {
+  it('T7 cherry_read crosses an empty transition page in agent.messages.list', async () => {
+    // #aggregate is shared by every list face; the fix was reasoned on the
+    // sessions rail because that is where the desktop emits the transition, but
+    // the guard it replaced lived in the shared loop. This pins the messages
+    // face of cherry_read, which walks agent.messages.list through the same code.
+    const messages: FakeMessageRecord[] = Array.from({ length: 20 }, (_unused, index) => ({
+      messageId: `m-${String(index).padStart(2, '0')}`,
+      revision: '1',
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      status: 'success',
+      parts: [{ kind: 'text', text: `message ${index}` }],
+    }))
+    const rig = await makeRig({
+      agent: {
+        sessions: [{ sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1' }],
+        messages,
+      },
+    })
+    const wire = messages.map((message) => ({
+      messageId: message.messageId,
+      revision: message.revision,
+      role: message.role,
+      status: message.status,
+      partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
+    }))
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: wire.slice(0, LIST_PAGE_CLAMP), nextCursor: 'm-16' },
+      { items: [], nextCursor: 'entity:' },
+      { items: wire.slice(LIST_PAGE_CLAMP), nextCursor: null },
+    ])
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 20 })) as {
+      messages: Array<{ messageId: string }>
+    }
+
+    expect(result.messages.map((message) => message.messageId)).toEqual(messages.map((message) => message.messageId))
+    // The transition page was really crossed (3 message pages, not 2).
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(3)
+  })
+})
+
+describe('issue #11 T8: the run bound is exactly three', () => {
+  it('T8 completes when two empty pages are followed by a real one', async () => {
+    // The boundary BELOW the limit: two consecutive empty pages are tolerated,
+    // the third is not (T5). Without this case the constant could drift to 2
+    // and only T5 would notice, one test too late.
+    const fixture = sessions(12)
+    const rig = await makeRig({ agent: { sessions: fixture } })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      pageOf(fixture, 0, 4, 'c-1'),
+      { items: [], nextCursor: 'c-2' },
+      { items: [], nextCursor: 'c-3' },
+      pageOf(fixture, 4, 12, null),
+    ])
+
+    const result = (await rig.call('cherry_sessions', { device: 'dev-A' })) as {
+      items: Array<{ sessionId: string }>
+      truncated?: boolean
+    }
+
+    expect(result.items.map((session) => session.sessionId)).toEqual(fixture.map((session) => session.sessionId))
+    expect(result.truncated).toBe(false)
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(4)
   })
 })

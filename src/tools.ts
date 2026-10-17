@@ -1109,6 +1109,15 @@ class CherryToolEngine {
       const next = extracted.nextCursor
       if (next === null || next === undefined) return { items, truncated: false }
       const advanced = String(next)
+      // A cursor that does not move is zero progress whatever the page held, so
+      // this is checked FIRST: when an empty page also echoes the cursor it was
+      // sent, "did not advance" is the precise diagnosis and the empty-page run
+      // would only describe the symptom.
+      if (advanced === cursor) {
+        throw new Error(
+          `${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`,
+        )
+      }
       // An empty page that advances the cursor is PROGRESS: the desktop's
       // pinned-list walk answers `{items: [], nextCursor: 'entity:'}` when a pin
       // anchor vanished between requests. Only a RUN of them is a peer fault —
@@ -1119,11 +1128,6 @@ class CherryToolEngine {
         throw new Error(
           `${method} answered ${emptyPages} consecutive empty page(s) (last nextCursor ${advanced}) ` +
             `for ${JSON.stringify(params)}; refusing to spin on a peer that makes no progress`,
-        )
-      }
-      if (advanced === cursor) {
-        throw new Error(
-          `${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`,
         )
       }
       cursor = advanced
