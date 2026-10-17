@@ -262,7 +262,18 @@ export interface CherryMessageWalkVerdict {
   messagesTruncated?: boolean
   /** Why it stopped, present exactly when `messagesTruncated` is true. */
   messagesTruncationReason?: CherryTruncationReason
-  /** The `agent.messages.list` cursor to resume the walk from. */
+  /**
+   * The `agent.messages.list` cursor to resume the walk from — when, and only
+   * when, resuming there cannot SKIP a message.
+   *
+   * The peer's `nextCursor` points past the whole page it came with, so on a
+   * BYTE stop it is only truthful if that page was consumed completely. A byte
+   * stop in the MIDDLE of a page leaves in-page messages newer than the cursor
+   * and older than the last one returned: chaining `cherry_read` from
+   * `nextCursor` would jump over them, which is why the field is then OMITTED
+   * rather than handed out as a resume point that loses content. Those messages
+   * are reachable only through the result's own `messages` view / `cherry_read`.
+   */
   messagesResumeCursor?: string
 }
 
@@ -3890,6 +3901,17 @@ class CherryToolEngine {
    * reason comes back with the verdict filled in (`messageWalkVerdict`
    * handles the ceiling; `'aggregate-bytes'` is attributed here), and the
    * three callers (terminal, timeout, idle) each surface it.
+   *
+   * A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
+   * points past the entire page it came with, so a byte stop in the MIDDLE of a
+   * page would hand out a cursor whose interval still holds messages this walk
+   * trimmed — newer than the cursor, older than the last one returned. A caller
+   * chaining `cherry_read` from it would never see them, and only `cherry_read`
+   * (or this result's own `messages`) can still fetch them; offering a cursor
+   * that jumps over content is worse than offering none. The cursor is
+   * therefore attached only when the WHOLE page was returned (nothing lies
+   * between it and what this result carries) — see
+   * {@link CherryMessageWalkVerdict.messagesResumeCursor}.
    */
   async #readTerminalMessages(
     connection: DeviceConnection,
@@ -3927,15 +3949,34 @@ class CherryToolEngine {
     // aggregate's own boundary case records).
     const exhausted = outOfBudget && (messages.length < page.items.length || page.truncated)
     if (exhausted) {
-      return {
+      // A RESUME CURSOR IS ONLY OFFERED WHEN IT CANNOT SKIP ANYTHING. The peer's
+      // `nextCursor` points PAST the page it came with (`pageOf` returns
+      // `start + limit`, and `#aggregate` carries the last one it saw). So:
+      //
+      //  - WHOLE PAGE CONSUMED (`messages.length === page.items.length`): every
+      //    message up to the cursor is either on this result or was never
+      //    served by this walk — nothing lies between them, and resuming at
+      //    `nextCursor` continues exactly where the walk stopped.
+      //  - MID-PAGE STOP (fewer messages than the page carried): the trimmed
+      //    in-page messages are NEWER than the cursor and OLDER than the last
+      //    one returned, so a caller chaining `cherry_read` from `nextCursor`
+      //    would never see them again. Handing out a cursor that silently skips
+      //    content is worse than handing out none; those messages are reachable
+      //    only through `cherry_read` (or this result's own `messages` view),
+      //    and `messagesTruncated` still says the walk was cut.
+      //
+      // The EXHAUSTED VERDICT above is unchanged: both stops are truncation.
+      const verdict: { messages: CherryReadMessage[] } & CherryMessageWalkVerdict = {
         messages,
         messagesTruncated: true,
         messagesTruncationReason: 'aggregate-bytes',
-        // Resume from the peer's own cursor when the item ceiling was already
-        // reached; otherwise the messages themselves were the reason, and the
-        // cursor that would continue past them is the page walk's.
-        ...(page.nextCursor === undefined ? {} : { messagesResumeCursor: page.nextCursor }),
       }
+      // The cursor is attached ONLY when the whole page was consumed: on a
+      // mid-page stop it would point past messages this walk trimmed.
+      if (page.nextCursor !== undefined && messages.length === page.items.length) {
+        verdict.messagesResumeCursor = page.nextCursor
+      }
+      return verdict
     }
     return { messages, ...messageWalkVerdict(page) }
   }

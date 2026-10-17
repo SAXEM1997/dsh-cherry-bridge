@@ -39,7 +39,12 @@ import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherr
  * a caller-limit stop is `'limit'`, and here the caller is the tool itself. The
  * assertions below read `'limit'` rather than `'safety-bound'` for that reason,
  * and F2-1e was rewritten: the old fallback anchored the array's TAIL — the
- * OLDEST assistant message — and is now anchored at the NEWEST.
+ * OLDEST assistant message — and is now anchored at the NEWEST. Review
+ * follow-up: F2-1e now honestly describes what it pins (the by-id cut and the
+ * truncation verdict its 25-message fixture really exercises), and F2-1f is
+ * the test that drives the NO-ANCHOR path — `omitExecutionMessageId` makes the
+ * peer's terminals omit `messageId`, so the fallback anchor itself is what
+ * produces the text and a tail anchor turns that test red.
  */
 
 /** One assistant message fixture, page-cheap (a single tiny text part). */
@@ -401,26 +406,26 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     expect(result.text).toBe('')
   })
 
-  it('F2-1e the no-anchor case flags a bounded walk, and the fallback reads the NEWEST end (issue #3)', async () => {
-    // `omitSendExecutionId` makes the wait ADOPT the run, so no terminal
-    // message id is carried and the text falls back to an assistant message
-    // the walk happened to include.
+  it('F2-1e a terminal aggregate within reach is cut BY ID, and a bounded walk still flags its truncation (issue #3)', async () => {
+    // WHAT THIS PINS. The terminal names the message the run persisted, and the
+    // aggregate cuts the session history at THAT id — `messages.length`
+    // therefore equals the number of messages carrying it, and the text is the
+    // named message's own text, not an older run's. The history behind the run
+    // exceeds the tool ceiling (`TERMINAL_AGGREGATE_MESSAGES = 20`), so the walk
+    // stops at 20 and the verdict SAYS so: a WINDOW of the history was
+    // aggregated, never the whole of it.
     //
-    // ISSUE #3 CHANGED WHICH ONE. The fallback used to anchor the array's TAIL
-    // on the assumption that the history read oldest-first; it does not (the
-    // peer walks newest-first), so the tail was the OLDEST assistant message in
-    // the session. It is now anchored at the NEWEST, and the fixture's newest
-    // message is the run's own reply. The flag still matters — the walk stopped
-    // at the tool's ceiling, so the array is a WINDOW, not the history — but
-    // the text it produces is the current run's, not a July message's.
+    // WHAT THIS DOES NOT PIN: the no-anchor fallback. This fake's terminal
+    // names a message, so the text goes through the id filter above and never
+    // reaches the fallback branch; F2-1f is the test that drives the peer into
+    // omitting the message id and so exercises the anchor itself.
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
         sessions: [SESSION],
-        // NEWEST-FIRST: at settlement the fake puts the run's message in front
-        // of whatever the fixture declared, so the run's message becomes the
-        // newest assistant message, with the 60 declared ones behind it — all
-        // OUTSIDE the bounded newest window (issue #3: 20 messages).
+        // NEWEST-FIRST. At settlement the fake PREPENDS the run's message, so
+        // it becomes the newest, with these 25 declared ones behind it — past
+        // the bounded newest window (issue #3: 20 messages).
         messages: fillerHistory(25),
         maxPageSize: 100,
         terminalMessage: {
@@ -441,19 +446,101 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     })) as {
       status: string
       text?: string
+      messages: Array<{ messageId: string }>
       messagesTruncated?: boolean
       messagesTruncationReason?: string
     }
 
+    expect(result.status).toBe('completed')
     // The bound is NEVER silent.
     expect(result.messagesTruncated).toBe(true)
     // The tool's message ceiling binds — see issue #3 and F2-1b above.
     expect(result.messagesTruncationReason).toBe('limit')
-    // The fallback anchor is the NEWEST assistant message — here that is the
-    // run's own (the newest USER turn in front of it has the other role) — so
-    // the answer is the run's text, reached without the terminal naming it.
-    // The OLD anchor, which read the array's tail, would have reported the
-    // 60-messages-old `old-59` instead.
+    // The id really is on the wire (this is the path F2-1e pins)...
+    expect(rig.fake.executionUpdates.at(-1)?.messageId).toBe('m-run')
+    // ...and the cut is BY ID: the named message is the one the text comes
+    // from, even though 19 older assistant messages ride the same window and
+    // say something else. (`messages` itself is the WINDOW, context only.)
+    expect(result.messages.map((message) => message.messageId)).toContain('m-run')
+    expect(result.messages.length).toBe(20)
     expect(result.text).toBe('the run reply')
+  })
+
+  it('F2-1f a terminal that does NOT name its message falls back to the NEWEST assistant message (issue #3)', async () => {
+    // WHAT THIS PINS: the FALLBACK ANCHOR. `omitExecutionMessageId` makes every
+    // `execution.updated` omit `messageId` — a legal wire shape (the field is
+    // optional in `agentJournal.ts`'s payload and in `executionSchema`). With no
+    // name to cut at, the text can only come from the anchor in
+    // `aggregateAssistantText`, so this test is red exactly when that anchor
+    // reads the wrong end of the array.
+    //
+    // The fixture is built so the two ends DISAGREE about which message is an
+    // assistant's: the newest entry is a USER message with a stale-looking
+    // line, and the OLDEST end carries a "july answer". Anchoring the NEWEST
+    // assistant message (index 1) yields the run's reply; the old tail anchor
+    // would have produced the july text, and a naive "index 0" anchor the user's
+    // line. The intervening filler is noise neither answer may come from.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        // NEWEST-FIRST. The run's message is PREPENDED at settlement, so the
+        // final order is: m-run, user turn, 25 fillers, july answer — 28
+        // messages against the 20-message ceiling, so the walk is a WINDOW.
+        messages: [
+          {
+            messageId: 'm-user',
+            revision: '1',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'the user prompt' }],
+          },
+          ...fillerHistory(25),
+          assistantMessage(900, 'july answer'),
+        ],
+        maxPageSize: 100,
+        terminalMessage: {
+          messageId: 'm-run',
+          revision: '1',
+          role: 'assistant',
+          status: 'success',
+          parts: [{ kind: 'text', text: 'the run reply' }],
+        },
+        // THE POINT OF THE TEST: no terminal event names a message.
+        omitExecutionMessageId: true,
+      },
+    })
+
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'hello',
+      timeoutMs: 10_000,
+    })) as {
+      status: string
+      text?: string
+      messages: Array<{ messageId: string; role: string }>
+      messagesTruncated?: boolean
+      messagesTruncationReason?: string
+    }
+
+    expect(result.status).toBe('completed')
+    // The knob really took effect: the last terminal carries no message id, so
+    // nothing below can have come from the id filter.
+    expect(rig.fake.executionUpdates.at(-1)?.messageId).toBeUndefined()
+    // The fallback found the NEWEST assistant message — the run's own reply.
+    expect(result.text).toBe('the run reply')
+    expect(result.text).not.toContain('july answer')
+    expect(result.text).not.toContain('the user prompt')
+    // The bounded window SURVIVED from the newest end: index 0 is the run's
+    // assistant message, and the walk's cut is surfaced rather than silent.
+    expect(result.messages[0]?.messageId).toBe('m-run')
+    expect(result.messages[0]?.role).toBe('assistant')
+    // The window really is bounded (the filler pushed the july answer and the
+    // walk's own cut out of it), so the flag cannot be delivered vacuously.
+    expect(result.messages.map((message) => message.messageId)).not.toContain('m-old-900')
+    expect(result.messages.length).toBe(20)
+    expect(result.messagesTruncated).toBe(true)
+    expect(result.messagesTruncationReason).toBe('limit')
   })
 })

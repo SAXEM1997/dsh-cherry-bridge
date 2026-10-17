@@ -305,6 +305,24 @@ export interface FakeAgentOptions {
    * that appears after its own baseline instead of parking until the timeout.
    */
   omitSendExecutionId?: boolean
+  /**
+   * OMIT the `messageId` from `execution.updated` events.
+   *
+   * Models a peer that reports a run's lifecycle without naming the message it
+   * pertains to. The protocol makes `messageId` optional on the event
+   * (`agentJournal.ts` / `executionSchema`), so this is a legal wire shape —
+   * and the one a waiter has to survive: with no message name, a terminal
+   * aggregate cannot cut the session history BY ID, so it must fall back to an
+   * anchor of its own (the NEWEST assistant message; see
+   * `aggregateAssistantText` in `src/tools.ts`). Without this knob every fake
+   * terminal names a message, and a fallback anchor would be exercised only
+   * through code paths that in fact never run.
+   *
+   * NOTE: once these events omit `messageId`, the fake's own filtered views
+   * (`executionUpdates[].messageId`) report `undefined` for every update —
+   * the omission is faithful, not cosmetic.
+   */
+  omitExecutionMessageId?: boolean
   /** Same injection for `agent.executions.cancel` (Task 9⑮ covers both verbs). */
   cancelOutcome?: 'applied' | 'target-unavailable'
   /**
@@ -2656,17 +2674,21 @@ export class FakeCherry {
    */
   #emitExecutionUpdated(sessionId: string, executionId: string, status: string, messageId: string): void {
     const terminal = status === 'completed' || status === 'failed' || status === 'cancelled' || status === 'interrupted'
+    // `messageId` is SCHEMA-OPTIONAL on `execution.updated` (`agentJournal.ts`);
+    // `omitExecutionMessageId` models a peer that leaves it off, so a waiter with
+    // no id to cut the history at has to anchor the fallback itself.
+    const namesMessage = this.#agent().omitExecutionMessageId !== true
     const payload: Record<string, unknown> = {
       executionId,
       status,
-      messageId,
+      ...(namesMessage ? { messageId } : {}),
       durable: terminal,
       ...(terminal ? { history: { messageRevision: '1', historyRevision: '1' } } : {}),
       ...(status === 'failed'
         ? { error: { reason: 'INTERNAL', message: 'Run failed' } }
         : {}),
     }
-    this.#executionUpdates.push({ executionId, status, messageId })
+    this.#executionUpdates.push({ executionId, status, messageId: namesMessage ? messageId : undefined })
     // The run's assistant message reaches the read fixtures exactly when the
     // run SETTLES — the real peer persists it on completion, not on admission.
     // Every settle path (direct, parked-then-answered, cancel) funnels through

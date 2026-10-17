@@ -354,6 +354,99 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
     expect(idle.messages.map((message) => message.messageId)).not.toContain('f-2')
     expect(idle.messages.length).toBeLessThan(3)
   })
+
+  it('T5c a byte stop offers a resume cursor ONLY when it did not stop mid-page', async () => {
+    // A resume cursor is a PROMISE that resuming there loses nothing. The
+    // peer's `nextCursor` points past the WHOLE aggregate page it came with,
+    // and the byte budget runs over the aggregate's already-collected window
+    // (`#aggregate` fills up to TERMINAL_AGGREGATE_MESSAGES items FIRST, then
+    // the projection applies the budget), so the promise holds only when the
+    // budget spent itself exactly on the window's LAST item. A stop earlier
+    // than that leaves in-window messages — newer than the cursor, older than
+    // the last one returned — that a caller chaining `cherry_read` from the
+    // cursor would never see again.
+    //
+    // (a) WHOLE-WINDOW STOP: 19 tiny messages then ONE fat message as the 20th
+    //     (last) item of the aggregate window, with a 21st message behind the
+    //     ceiling so the walk is truncated. The budget trips on the fat item,
+    //     every collected item is returned, and nothing lies between the
+    //     cursor and the result — the cursor is honest and must be present.
+    // (b) MID-WINDOW STOP: the fat message is FIRST, so the budget trips on
+    //     item 1 of a 3-item window. The cursor would point past `m-1`/`m-2`,
+    //     silently skipping them, so it must be OMITTED — the walk is still
+    //     flagged as truncated, just without a jump-over resume point.
+    const fat = (messageId: string, kib: number): FakeMessageRecord => ({
+      messageId,
+      revision: '1',
+      role: 'assistant',
+      status: 'success',
+      parts: [{ kind: 'text', text: 'F'.repeat(kib * 1024) }],
+    })
+
+    const wholeWindowStop = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        // NEWEST-FIRST: the fat message sits at index 19 — the LAST item the
+        // 20-message window collects — and `t-0` sits just past the ceiling so
+        // the aggregate answers truncated with a next page to continue at.
+        messages: Array.from({ length: 19 }, (_unused, index) => fat(`w-${index}`, 1))
+          .concat([fat('w-fat', 245), fat('t-0', 1)]),
+      },
+      hello: { limits: { pageItems: 100 } },
+    })
+    const whole = (await wholeWindowStop.call('cherry_wait', { device: 'dev-A', sessionId: 's-1' })) as {
+      status: string
+      messages: Array<{ messageId: string }>
+      messagesTruncated?: boolean
+      messagesTruncationReason?: string
+      messagesResumeCursor?: string
+    }
+
+    expect(whole.status).toBe('idle')
+    expect(whole.messagesTruncated).toBe(true)
+    expect(whole.messagesTruncationReason).toBe('aggregate-bytes')
+    // The budget spent itself on the window's LAST item: everything collected
+    // is on the result, fat message and all.
+    expect(whole.messages).toHaveLength(20)
+    expect(whole.messages[19]!.messageId).toBe('w-fat')
+    // Nothing lies between the cursor and what was returned: resuming is safe,
+    // and it points at the first message this walk did NOT take (`t-0`).
+    expect(typeof whole.messagesResumeCursor).toBe('string')
+    expect(Number(whole.messagesResumeCursor)).toBe(20)
+
+    const midWindowStop = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        // The fat message is FIRST and the peer holds 20 more behind it: the
+        // aggregate window FILLS (20 items, `nextCursor` past them), and the
+        // budget trips on item 1 — leaving items 2..20 collected but
+        // unreturned. This is the state where the parent commit still handed
+        // out the cursor, silently promising a resume that jumps items 2..20.
+        messages: [fat('m-0', 260)].concat(Array.from({ length: 20 }, (_unused, index) => fat(`m-${index + 1}`, 1))),
+      },
+      hello: { limits: { pageItems: 100 } },
+    })
+    const mid = (await midWindowStop.call('cherry_wait', { device: 'dev-A', sessionId: 's-1' })) as {
+      status: string
+      messages: Array<{ messageId: string }>
+      messagesTruncated?: boolean
+      messagesTruncationReason?: string
+      messagesResumeCursor?: string
+    }
+
+    expect(mid.status).toBe('idle')
+    expect(mid.messagesTruncated).toBe(true)
+    expect(mid.messagesTruncationReason).toBe('aggregate-bytes')
+    // The walk stopped BEFORE the end of its window: items 2..20 were
+    // collected but are not on the result.
+    expect(mid.messages.map((message) => message.messageId)).toEqual(['m-0'])
+    // So no cursor is offered: the peer's `nextCursor` would be past item 20,
+    // and resuming there would skip items 2..20 forever. (The parent commit
+    // attached it here — this assertion is the red line for that behaviour.)
+    expect(mid.messagesResumeCursor).toBeUndefined()
+  })
 })
 
 describe('issue #3 T2: the text anchor is the NEWEST assistant message, never the oldest', () => {

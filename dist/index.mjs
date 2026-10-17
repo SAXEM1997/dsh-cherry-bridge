@@ -6196,6 +6196,17 @@ var CherryToolEngine = class {
 	* reason comes back with the verdict filled in (`messageWalkVerdict`
 	* handles the ceiling; `'aggregate-bytes'` is attributed here), and the
 	* three callers (terminal, timeout, idle) each surface it.
+	*
+	* A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
+	* points past the entire page it came with, so a byte stop in the MIDDLE of a
+	* page would hand out a cursor whose interval still holds messages this walk
+	* trimmed — newer than the cursor, older than the last one returned. A caller
+	* chaining `cherry_read` from it would never see them, and only `cherry_read`
+	* (or this result's own `messages`) can still fetch them; offering a cursor
+	* that jumps over content is worse than offering none. The cursor is
+	* therefore attached only when the WHOLE page was returned (nothing lies
+	* between it and what this result carries) — see
+	* {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*/
 	async #readTerminalMessages(connection, sessionId, session) {
 		const historyRevision = optionalString(session["historyRevision"]);
@@ -6219,12 +6230,15 @@ var CherryToolEngine = class {
 				break;
 			}
 		}
-		if (outOfBudget && (messages.length < page.items.length || page.truncated)) return {
-			messages,
-			messagesTruncated: true,
-			messagesTruncationReason: "aggregate-bytes",
-			...page.nextCursor === void 0 ? {} : { messagesResumeCursor: page.nextCursor }
-		};
+		if (outOfBudget && (messages.length < page.items.length || page.truncated)) {
+			const verdict = {
+				messages,
+				messagesTruncated: true,
+				messagesTruncationReason: "aggregate-bytes"
+			};
+			if (page.nextCursor !== void 0 && messages.length === page.items.length) verdict.messagesResumeCursor = page.nextCursor;
+			return verdict;
+		}
 		return {
 			messages,
 			...messageWalkVerdict(page)
