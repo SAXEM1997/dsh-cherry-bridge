@@ -41,7 +41,7 @@ flowchart TB
 npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge
 
 # Pinned to a version tag (recommended for production)
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.0
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.1
 ```
 
 ```bash
