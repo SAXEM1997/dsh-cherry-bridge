@@ -266,6 +266,21 @@ export interface FakeAgentOptions {
    */
   sendOutcome?: 'applied' | 'accepted' | 'busy' | 'target-unavailable' | 'resource-exhausted'
   /**
+   * Enforce the `expectedIdleRevision` admission gate on `agent.messages.send`
+   * (DEFAULT `true`, matching the real `agentHandlers.ts`).
+   *
+   * With the gate on, an idle session whose peer-side `idleRevision` differs
+   * from the caller's `expectedIdleRevision` answers the rejected receipt
+   * CONFLICT "Session is not idle at the expected revision"; a session with a
+   * run in flight answers CONFLICT "Session is busy" instead (the busy check
+   * precedes the revision check, as it does on the peer).
+   *
+   * Set `false` only for a fixture about a DIFFERENT face of the send command
+   * (the receipt shape, the target routing failure) that deliberately does not
+   * want to model admission.
+   */
+  sendEnforcesIdleRevision?: boolean
+  /**
    * OMIT the `executionId` from an accepted `agent.messages.send` receipt while
    * the run still proceeds normally on the event stream.
    *
@@ -624,6 +639,8 @@ export class FakeCherry {
   #readCalls: Array<{ method: string; params: Record<string, unknown> }> = []
   /** One-shot read-face failures, consumed by the first matching call. */
   #readFailNext: Map<string, FakeFailure>
+  /** One-shot hooks that fire AFTER the next successful read of a method. */
+  #afterReadOnce = new Map<string, () => void>()
   /** Externalized content bytes, keyed `<contentId>:<revision>` (the peer's pins). */
   #contentBytes = new Map<string, Uint8Array>()
   /**
@@ -961,6 +978,36 @@ export class FakeCherry {
     session.historyRevision = revision
   }
 
+  /**
+   * Advances one session's revision the way the PEER does when a run settles —
+   * `historyRevision` bumped by one, `updatedAt` moved forward — WITHOUT
+   * pushing any `agent.events` traffic.
+   *
+   * This is the shape of the production hazard behind issue #1 (「send 永久
+   * CONFLICT」): the harness's event buffer is dropped wholesale when its epoch
+   * rotates, a re-subscribe rebuilds it, or an LRU evicts it, while the
+   * session's revision has moved on. A client that reads the stream first, then
+   * falls back to a CACHED revision, therefore sends a stale
+   * `expectedIdleRevision` and the peer refuses admission — with nothing on the
+   * wire to tell it why.
+   *
+   * Deliberately silent: `setSessionRevision` moves the value too, but this one
+   * also moves `updatedAt` and models "the bridge's view went blind", which is
+   * the half a test needs in order to prove the recovery is a `sessions.get`
+   * rather than an event.
+   *
+   * @returns the new `historyRevision`.
+   */
+  silentIdleBump(sessionId: string): string {
+    const session = (this.#options.agent?.sessions ?? []).find((entry) => entry.sessionId === sessionId)
+    if (session === undefined) throw new Error(`no session ${sessionId}`)
+    const previous = Number(session.historyRevision)
+    const next = Number.isFinite(previous) ? String(previous + 1) : String(Date.now())
+    session.historyRevision = next
+    session.updatedAt = new Date(Date.now()).toISOString()
+    return next
+  }
+
   /** The interaction view the peer currently serves, in fixture order. */
   get interactions(): readonly FakeInteractionView[] {
     return this.#interactions.map((interaction) => this.#interactionView(interaction))
@@ -994,6 +1041,18 @@ export class FakeCherry {
    */
   readCallsFor(method: string): readonly Record<string, unknown>[] {
     return this.#readCalls.filter((entry) => entry.method === method).map((entry) => entry.params)
+  }
+
+  /**
+   * Run `hook` immediately AFTER the next successful call to one read-face
+   * method — the only way to model the peer moving on BETWEEN a client's read
+   * and the command it issues from it.
+   *
+   * Deliberately NOT a failure injection: the call answers normally, the
+   * world just changes once it has. One-shot.
+   */
+  afterNextRead(method: string, hook: () => void): void {
+    this.#afterReadOnce.set(method, hook)
   }
 
   /** Install a one-shot read-face failure (consumed by the first match). */
@@ -1815,6 +1874,17 @@ export class FakeCherry {
 
   /** One read-face call: inject a failure, then serve the ported semantics. */
   #handleRead(method: string, params: Record<string, unknown>): Record<string, unknown> {
+    const result = this.#serveRead(method, params)
+    const hook = this.#afterReadOnce.get(method)
+    if (hook !== undefined) {
+      this.#afterReadOnce.delete(method)
+      hook()
+    }
+    return result
+  }
+
+  /** The read face's own semantics, with no post-call hook bookkeeping. */
+  #serveRead(method: string, params: Record<string, unknown>): Record<string, unknown> {
     this.#readCalls.push({ method, params })
     const always = this.#agent().failAlways?.[method]
     if (always !== undefined) throw new FakeRpcError(always)
@@ -1869,7 +1939,7 @@ export class FakeCherry {
     // The LIVE active execution wins over the fixture's static field: an
     // accepted run really does make the session busy, and its terminal event
     // really does return it to idle (the real `toSessionSummary(…, activeExecutionId)`).
-    const activeExecutionId = this.#activeExecutionId ?? session.activeExecutionId
+    const activeExecutionId = this.#activeExecutionIdFor(session)
     return {
       sessionId: session.sessionId,
       agentId: session.agentId,
@@ -2185,13 +2255,14 @@ export class FakeCherry {
   }
 
   /**
-   * `agent.messages.send`, faithful to the real handler: the §6 rejected
-   * receipts (`busy` → CONFLICT "Session is busy", target routing failure →
-   * TARGET_UNAVAILABLE), otherwise `applied` + an executionId, and the run
-   * drives the session's events.
+   * `agent.messages.send`, faithful to the real handler (`agentHandlers.ts`):
+   * the §6 rejected receipts (`busy` → CONFLICT "Session is busy", target
+   * routing failure → TARGET_UNAVAILABLE), the ADMISSION gate on
+   * `expectedIdleRevision` (see {@link #sendAdmissionRefusal}), otherwise
+   * `applied` + an executionId, and the run drives the session's events.
    */
   async #runSend(sessionId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    this.#requireSession(sessionId)
+    const session = this.#requireSession(sessionId)
     const outcome = this.#agent().sendOutcome ?? 'applied'
     if (outcome === 'busy') {
       return this.#rejectedReceipt(params, 'agent.messages.send', {
@@ -2216,6 +2287,9 @@ export class FakeCherry {
       })
     }
 
+    const refusal = this.#sendAdmissionRefusal(session, params)
+    if (refusal !== undefined) return this.#rejectedReceipt(params, 'agent.messages.send', refusal)
+
     const executionId = `exec-${randomUUID().slice(0, 8)}`
     this.#activeExecutionId = executionId
     const status = this.#agent().runTerminalStatus ?? 'completed'
@@ -2238,6 +2312,53 @@ export class FakeCherry {
       // by id is (see `omitSendExecutionId`).
       ...(this.#agent().omitSendExecutionId === true ? {} : { executionId }),
     }
+  }
+
+  /**
+   * The real peer's ADMISSION gate on `agent.messages.send`, verbatim.
+   *
+   * `agentHandlers.ts` runs `startRun(…, guard, …)` before a run exists:
+   *
+   *  - when an execution is already in flight the peer never consults the
+   *    revision — it answers the rejected receipt "Session is busy"
+   *    (`started.reason === 'busy'`);
+   *  - when the session IS idle, the guard compares the peer's own
+   *    `idleRevision` with the caller's `expectedIdleRevision` and throws
+   *    CONFLICT "Session is not idle at the expected revision" otherwise. The
+   *    `command()` wrapper turns that throw into a REJECTED RECEIPT, so it is
+   *    an in-band answer, not an RPC error.
+   *
+   * Both are RECEIPTS. The distinction matters to a caller: the first says
+   * "the session is genuinely busy, retrying changes nothing", the second says
+   * "your baseline is stale, and the session is idle right now".
+   *
+   * Enabled by default: a fake that ACCEPTED a stale revision would hide the
+   * very defect this gate exists to model (issue #1). `sendEnforcesIdleRevision:
+   * false` opts a fixture out.
+   */
+  #sendAdmissionRefusal(
+    session: FakeSessionRecord,
+    params: Record<string, unknown>,
+  ): { reason: string; message: string } | undefined {
+    if (this.#agent().sendEnforcesIdleRevision === false) return undefined
+    // The busy answer is the peer's FIRST fact, and it precedes the revision
+    // check — a busy session's summary carries no `idleRevision` at all.
+    if (this.#activeExecutionIdFor(session) !== undefined) {
+      return { reason: 'CONFLICT', message: 'Session is busy' }
+    }
+    if (session.historyRevision !== params['expectedIdleRevision']) {
+      return { reason: 'CONFLICT', message: 'Session is not idle at the expected revision' }
+    }
+    return undefined
+  }
+
+  /**
+   * The execution the peer considers in flight for one session: the live run
+   * if one exists, otherwise the fixture's declared one — the same precedence
+   * `#sessionSummary` projects onto the wire.
+   */
+  #activeExecutionIdFor(session: FakeSessionRecord): string | undefined {
+    return this.#activeExecutionId ?? session.activeExecutionId
   }
 
   /** `agent.executions.cancel`, faithful to `abortAndDrain`'s precondition. */
