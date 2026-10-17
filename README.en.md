@@ -106,7 +106,7 @@ The manual profile line is equivalent to:
 | `cherry_agents` | List the agents available on a device (paginated). |
 | `cherry_workspaces` | List an agent's **registered** workspaces, and whether a system workspace exists. |
 | `cherry_sessions` | List an agent's sessions, optionally filtered by workspace. |
-| `cherry_read` | Read a session's message-history snapshot (two-level baseline: `agent.sessions.get` + `agent.messages.list`/`agent.parts.list`; parts are read under **each message's own** revision). Attachment parts come back as `name`/`mediaType`/`byteLength` with an **empty** `content` — the bytes are never fetched. |
+| `cherry_read` | Read a session's message-history snapshot (two-level baseline: `agent.sessions.get` + `agent.messages.list`/`agent.parts.list`; parts are read under **each message's own** revision). Attachment parts come back as `name`/`mediaType`/`byteLength` with an **empty** `content` — the bytes are never fetched. Messages come back **newest-first** (`messages[0]` is the latest), so `limit` drops the **oldest** messages; a truncated walk always says so (`truncated` with a `truncationReason`), and `messagesResumeCursor` continues toward **older** messages. |
 | `cherry_events` | Read the session's buffered events newer than `cursor`, acking them after delivery. |
 | `cherry_create` | Create a session in an agent workspace (workspace selection is **required**; identity is read back via `agent.sessions.get`). |
 | `cherry_send` | Send a message to a session, by default waiting for a terminal state and returning the assistant text; `wait: false` returns the command receipt immediately. |
@@ -117,9 +117,15 @@ The manual profile line is equivalent to:
 | `cherry_pair` | Pair with a desktop using "the pairing information shown by the scanned page". |
 | `cherry_unpair` | Unpair: tear the connection down and delete the device archive entry. |
 
-The device selector (the `device` argument) accepts an **exact `deviceId`** or
-a **unique display-name prefix**; a prefix matching several devices returns a
-structured ambiguity error — it never picks one arbitrarily.
+The device selector (the `device` argument) accepts an **exact `deviceId`**, or
+a **prefix of a `deviceId` or of a display name** (both are matched together and
+deduplicated by `deviceId`); a prefix matching several devices returns a
+structured ambiguity error (`ambiguous-device` + `candidates`) — it never picks
+one arbitrarily — and a selector matching nothing returns `not-found` + `known`
+(the paired `deviceId`s), not an ambiguity with no candidates. `cherry_devices`
+returns either verdict as its structured result; every other tool **throws**
+when no device matches instead of returning a verdict object. A quarantined
+archive (`archive-quarantined`) outranks all of this.
 
 `cherry_send(wait: true)` / `cherry_wait` results carry one of **8 `status`
 values**: the four protocol terminal states

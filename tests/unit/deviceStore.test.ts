@@ -208,17 +208,53 @@ describe('DeviceStore.resolve', () => {
     expect(store.resolve('Gamma')).toEqual(
       expect.objectContaining({ deviceId: 'dev-gamma' }),
     )
-    expect(store.resolve('Beta')).toEqual({ ambiguous: [] })
+    // Nothing matches → a MISS, not ambiguity with no candidates (issue #13).
+    expect(store.resolve('Beta')).toEqual({ notFound: true })
 
-    // Ambiguous prefix returns the candidate display names.
+    // An id prefix that exactly names a device is that device, even though it
+    // is also a display-name prefix of another one.
+    expect(store.resolve('dev-alp')).toEqual(
+      expect.objectContaining({ deviceId: 'dev-alp' }),
+    )
+
+    // Ambiguous prefix returns the candidate display names, in store order.
+    store.upsert(makeRecord({ deviceId: 'dev-alp2', displayName: 'Alpaca Box' }))
     expect(store.resolve('Alp')).toEqual({
-      ambiguous: ['Alpha Workstation', 'Alpine Box'],
+      ambiguous: ['Alpha Workstation', 'Alpine Box', 'Alpaca Box'],
     })
 
     // Exact display-name match is itself unique.
     expect(store.resolve('Alpine Box')).toEqual(
       expect.objectContaining({ deviceId: 'dev-alp' }),
     )
+  })
+
+  it('resolves an abbreviated deviceId (issue #13 field report)', async () => {
+    const store = new DeviceStore(await makeStoreFile())
+    // A realistic id: the first 8 characters are what a caller abbreviates to.
+    store.upsert(makeRecord({ deviceId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890', displayName: 'Desk Alpha' }))
+
+    expect(store.resolve('a1b2c3d4')).toEqual(
+      expect.objectContaining({ deviceId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' }),
+    )
+    // The exact id still wins outright.
+    expect(store.resolve('a1b2c3d4-e5f6-7890-abcd-ef1234567890')).toEqual(
+      expect.objectContaining({ deviceId: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890' }),
+    )
+  })
+
+  it('unions deviceId and display-name prefixes, deduplicated by deviceId', async () => {
+    const store = new DeviceStore(await makeStoreFile())
+    // The SAME device matches on both faces; it must be one candidate, not two.
+    store.upsert(makeRecord({ deviceId: 'dev-alpha', displayName: 'dev-alpha workstation' }))
+    expect(store.resolve('dev-al')).toEqual(
+      expect.objectContaining({ deviceId: 'dev-alpha' }),
+    )
+
+    // Two different devices, one matched by id and one by name.
+    store.upsert(makeRecord({ deviceId: 'dev-beta', displayName: 'Desk Beta' }))
+    expect(store.resolve('dev-')).toEqual({ ambiguous: ['dev-alpha workstation', 'Desk Beta'] })
+    expect(store.resolve('a1b2c3d4')).toEqual({ notFound: true })
   })
 })
 
@@ -599,7 +635,7 @@ describe('DeviceStore corruption handling', () => {
     const store = new DeviceStore(file)
 
     expect(store.list()).toEqual([])
-    expect(store.resolve('anything')).toEqual({ ambiguous: [] })
+    expect(store.resolve('anything')).toEqual({ notFound: true })
     expect(warn).toHaveBeenCalled()
     expect(warn.mock.calls[0]?.[0]).toContain(file)
   })
@@ -645,7 +681,7 @@ describe('DeviceStore corruption handling', () => {
 
     const store = new DeviceStore(file)
     expect(store.list()).toEqual([])
-    expect(store.resolve('dev-alpha')).toEqual({ ambiguous: [] })
+    expect(store.resolve('dev-alpha')).toEqual({ notFound: true })
     // The degradation is still ANNOUNCED — just at the level it deserves. A
     // missing archive is not a fault to act on, so warning about it trains the
     // operator to ignore warnings; saying nothing at all would hide a real

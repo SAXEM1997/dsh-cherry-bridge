@@ -1081,6 +1081,86 @@ describe('read-only cherry tools over a real loopback channel', () => {
     }
   })
 
+  it('⑥c device resolution: a deviceId prefix resolves on every face, read tools included (issue #13)', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Session One',
+            historyRevision: '1',
+          },
+        ],
+        messages: [],
+      },
+    })
+    // The field report: a caller abbreviated the id instead of the name.
+    const prefix = rig.store.list()[0]!.deviceId.slice(0, 3)
+    expect(prefix).toBe('dev')
+
+    const result = (await rig.call('cherry_devices', { device: prefix })) as {
+      devices?: Array<{ deviceId: string }>
+    }
+    expect(result.devices?.map((entry) => entry.deviceId)).toEqual(['dev-A'])
+
+    // The read face accepts the same abbreviation: it resolves to the live
+    // connection instead of failing to find a device.
+    const read = (await rig.call('cherry_read', { device: prefix, sessionId: 's-1' })) as Record<string, unknown>
+    expect(read['error']).toBeUndefined()
+    expect(read['messages']).toEqual([])
+  })
+
+  it('⑥f device resolution: two devices sharing a prefix still answer ambiguous-device', async () => {
+    const rig = await makeRig(
+      {},
+      { extraDevices: [{ deviceId: 'dev-A2', displayName: 'Desk Alpha Two' }] },
+    )
+
+    // An id prefix counting twice must not COLLAPSE into one candidate: two
+    // paired devices still match, so the answer keeps both names.
+    const result = (await rig.call('cherry_devices', { device: 'dev-' })) as {
+      error?: string
+      candidates?: string[]
+    }
+    expect(result.error).toBe('ambiguous-device')
+    expect(result.candidates).toEqual(['Desk Alpha', 'Desk Alpha Two'])
+  })
+
+  it('⑥d device resolution: a selector matching nothing answers not-found with the known ids', async () => {
+    const rig = await makeRig(
+      {},
+      { extraDevices: [{ deviceId: 'dev-B2', displayName: 'Desk Beta' }] },
+    )
+
+    const result = (await rig.call('cherry_devices', { device: 'no-such-device' })) as Record<string, unknown>
+    expect(result).toEqual({
+      error: 'not-found',
+      device: 'no-such-device',
+      known: ['dev-A', 'dev-B2'],
+    })
+    // NOT the pre-#13 shape: ambiguity with an empty candidate list.
+    expect(result['candidates']).toBeUndefined()
+    expect(rig.fake.readCalls).toHaveLength(0)
+  })
+
+  it('⑥e device resolution: a non-cherry_devices tool given an unmatched selector throws', async () => {
+    const rig = await makeRig()
+
+    // A tool that cannot proceed without a device does not answer with a
+    // verdict OBJECT — its result is consumed as data, and a not-found object
+    // would be mistaken for one. It throws, naming the selector and the ids.
+    const thrown = await rig
+      .call('cherry_agents', { device: 'no-such-device' })
+      .then(() => undefined, (error: unknown) => error)
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).toContain('no-such-device')
+    expect((thrown as Error).message).toContain('dev-A')
+    expect(rig.fake.readCalls).toHaveLength(0)
+  })
+
   it('⑥b an offline device answers the structured {device, state} error and never dials', async () => {
     const rig = await makeRig({}, { skipConnect: true })
     expect(rig.tool('cherry_agents')).toBeDefined()
