@@ -62,10 +62,12 @@ class FakeWebServer {
 
 /**
  * Which host generation the fake serves (issue #7):
- *  - `hybrid`: DSH 0.2.0 — `webRuntime` arrives BOTH on the injected ctx and via
- *    `ctx.get`, and `webStartup` does not exist yet.
+ *  - `hybrid`: DSH 0.2.0 — `webRuntime` arrives via `ctx.get`, and `webStartup`
+ *    does not exist yet.
  *  - `webserver-only`: DSH 0.2.1-rc.2 — `webRuntime` is GONE (the service was
- *    removed) and `trustedHosts` moved to the `webStartup` service config.
+ *    removed) and `trustedHosts` (plus the explicit listener bind as `host`)
+ *    moved to the `webStartup` service config. The injected ctx never carries
+ *    either one: real cordis would throw on the read (see {@link strictWctx}).
  *  - `bare`: neither generation — only `webServer`, so the fence falls back to
  *    loopback-only.
  */
@@ -74,6 +76,8 @@ type HostShape = 'hybrid' | 'webserver-only' | 'bare'
 interface FakeCtx {
   server: FakeWebServer
   trustedHosts: string[]
+  /** The 0.2.1 `webStartup.host` (the explicit `--host` bind), when any. */
+  host?: string
   injected: string[][]
   /** `false` makes dynamic injection throw (headless deploy). */
   injectable: boolean
@@ -86,13 +90,42 @@ interface FakeCtx {
   on(event: string, cb: () => void): void
 }
 
+/**
+ * Wraps the callback's ctx in the STRICT reflection proxy real cordis installs
+ * (`ReflectService.handler.get`, cordis 4.0.5): EVERY property read is checked
+ * against the injection list, and a name that is not injected THROWS
+ * synchronously — `cannot get property "<prop>" without inject`. `?.` does not
+ * save a caller, because the get trap itself throws.
+ *
+ * This is the DEFAULT here, not an opt-in: it is the precise mechanism that let
+ * issue #7's first fix pass review while being broken (reading `wctx.webRuntime`
+ * threw inside the callback, so `mountRoutes` never ran) and then broke 0.2.0
+ * again. Any regression back to reading a non-injected key turns these cases
+ * RED instead of silently mounting nothing.
+ *
+ * Keys carried on the wctx are exactly what the service provides (here only
+ * `webServer`, matching the injection list); symbols and other non-service
+ * intrinsics pass through untouched, as cordis' `isSpecialProperty` does.
+ */
+function strictWctx<T extends object>(services: T, deps: readonly string[]): T {
+  const injected = new Set(deps)
+  return new Proxy(services, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'symbol') return Reflect.get(target, prop, receiver)
+      if (!injected.has(prop)) throw new Error(`cannot get property "${prop}" without inject`)
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
+
 function makeCtx(
-  options: { trustedHosts?: string[]; injectable?: boolean; shape?: HostShape } = {},
+  options: { trustedHosts?: string[]; host?: string; injectable?: boolean; shape?: HostShape } = {},
 ): FakeCtx {
   const server = new FakeWebServer()
   const ctx: FakeCtx = {
     server,
     trustedHosts: options.trustedHosts ?? [],
+    host: options.host,
     injected: [],
     injectable: options.injectable ?? true,
     shape: options.shape ?? 'hybrid',
@@ -100,20 +133,23 @@ function makeCtx(
     inject(deps, cb) {
       ctx.injected.push([...deps])
       if (!ctx.injectable) throw new Error('service "webServer" is not available')
-      const wctx: Record<string, unknown> = { webServer: server }
-      // 0.2.0 only: the bind-dependent values ride on the injected ctx.
-      if (ctx.shape === 'hybrid') wctx['webRuntime'] = { trustedHosts: ctx.trustedHosts }
-      const disposer = cb(wctx)
+      // The REAL injected ctx: `webServer` alone, behind the strict proxy. No
+      // generation carries `webRuntime`/`webStartup` here — a real cordis proxy
+      // would throw on that read.
+      const disposer = cb(strictWctx({ webServer: server }, deps))
       if (typeof disposer === 'function') ctx.disposers.push(disposer)
     },
     get(name) {
-      // The injected service itself aside, 0.2.0 exposes `webRuntime` (the
-      // pre-migration `ctx.get` fallback) and 0.2.1 only `webStartup`.
+      // 0.2.0 exposes `webRuntime`; 0.2.1 exposes `webStartup` (`trustedHosts`
+      // plus, only with an explicit `--host`, the listener bind as `host`).
       if (name === 'webRuntime') {
         return ctx.shape === 'hybrid' ? { trustedHosts: ctx.trustedHosts } : undefined
       }
       if (name === 'webStartup') {
-        return ctx.shape === 'hybrid' ? undefined : { trustedHosts: ctx.trustedHosts }
+        if (ctx.shape === 'hybrid') return undefined
+        return ctx.host === undefined
+          ? { trustedHosts: ctx.trustedHosts }
+          : { trustedHosts: ctx.trustedHosts, host: ctx.host }
       }
       return undefined
     },
@@ -1212,8 +1248,14 @@ describe('⑥ lifecycle', () => {
   // -------------------------------------------------------------------------
   // Issue #7: the host-generation matrix for `trustedHosts`. 0.2.1-rc.2
   // removed the `webRuntime` service (its `trustedHosts` moved to the
-  // `webStartup` service config), so the fence's source list is a three-step
-  // optional chain and every step must be exercised against the REAL fence.
+  // `webStartup` service config), so the fence's source list is an optional
+  // `ctx.get` chain and every step must be exercised against the REAL fence.
+  //
+  // Every case runs over the STRICT injected ctx (`strictWctx`): reading a key
+  // the callback did not inject throws exactly as real cordis does. These cases
+  // going green is therefore also the strictness assertion — a callback that
+  // went back to reading `wctx.webRuntime` would throw here, the mount would be
+  // skipped, and the fence assertions below would fail (403/404 instead of 200).
   // -------------------------------------------------------------------------
 
   /** The deps `mount()` builds, for the host-shape cases that own their ctx. */
@@ -1231,7 +1273,7 @@ describe('⑥ lifecycle', () => {
   }
 
   /** Registers over an EXPLICIT fake ctx (the `mount()` fixture owns a hybrid one). */
-  function mountOn(options: { shape: HostShape; trustedHosts?: string[] }): FakeCtx {
+  function mountOn(options: { shape: HostShape; trustedHosts?: string[]; host?: string }): FakeCtx {
     const fake = makeCtx(options)
     dispose = registerHttpApi(fake as unknown as CherryHttpContext, shapeDeps())
     return fake
@@ -1244,40 +1286,56 @@ describe('⑥ lifecycle', () => {
     return res.status
   }
 
-  it('#7 0.2.1 shape: webServer alone is injected and webStartup supplies trustedHosts', async () => {
-    const fake = mountOn({ shape: 'webserver-only', trustedHosts: ['harness.internal:23023'] })
+  it('#7 0.2.1 shape: webServer alone is injected; webStartup trustedHosts AND its LAN bind are admitted', async () => {
+    // A LAN-bound deployment (`--host 10.6.0.4`) that never passed
+    // `--trusted-host`: `webStartup.host` is the listener bind the host's own
+    // /api fence admits implicitly, so the plugin's fence must admit the very
+    // same self-origin — otherwise the settings page 403s against itself.
+    const fake = mountOn({
+      shape: 'webserver-only',
+      trustedHosts: ['harness.internal:23023'],
+      host: '10.6.0.4',
+    })
 
+    // Strictness: the injected ctx carried a real strict proxy; the mount ran,
+    // so the callback read NOTHING outside its `['webServer']` list (a
+    // `wctx.webRuntime` regression would have thrown here, not mounted, and
+    // every fence assertion below would read 404).
     expect(fake.injected).toEqual([['webServer']])
     expect(fake.server.routes.has(PREFIX)).toBe(true)
-    // The fence reads the MIGRATED source: the declared LAN authority is
-    // admitted, and an undeclared one stays refused.
+    // The declared authority is admitted…
     expect(await statusFor(fake, 'harness.internal:23023')).toBe(200)
+    // …the LAN bind is admitted as a BARE entry: any port on that hostname.
+    expect(await statusFor(fake, '10.6.0.4:23023')).toBe(200)
+    expect(await statusFor(fake, '10.6.0.4:8080')).toBe(200)
+    // An unrelated LAN host stays refused.
+    expect(await statusFor(fake, '10.6.0.5:23023')).toBe(403)
     expect(await statusFor(fake, 'evil.example.com')).toBe(403)
     // Loopback is inherent, not configuration.
     expect(await statusFor(fake, HOST)).toBe(200)
   })
 
-  it('#7 0.2.0 fallback: webRuntime.trustedHosts wins over the get() lookup', async () => {
-    // Both generations present at once — the injected wctx value must win, or a
-    // host that carries its bind values on webRuntime would silently start
-    // trusting whatever the newer service happened to hold.
+  it('#7 0.2.0 wins: get("webRuntime") answers before get("webStartup") is ever consulted', async () => {
+    // Both generations offered at once behind `ctx.get`: the 0.2.0 service is
+    // the host's own bind-dependent value, so it must win — and the newer
+    // service must not even be consulted.
     const fake = makeCtx()
     const seenGets: string[] = []
     const shadowed = {
       ...fake,
-      // Same server/inject wiring, but `ctx.get('webStartup')` and
-      // `ctx.get('webRuntime')` advertise a DIFFERENT list.
       get(name: string): unknown {
         seenGets.push(name)
-        return { trustedHosts: ['shadowed.example.com:1'] }
+        if (name === 'webRuntime') return fake.get('webRuntime')
+        return { trustedHosts: ['shadowed.example.com:1'], host: 'shadowed-lan.example.com' }
       },
     }
     dispose = registerHttpApi(shadowed as unknown as CherryHttpContext, shapeDeps())
 
-    expect(await statusFor(fake, 'shadowed.example.com:1')).toBe(403)
     expect(await statusFor(fake, HOST)).toBe(200)
-    // The wctx source answered, so the lookup is never even consulted.
-    expect(seenGets).toEqual([])
+    expect(await statusFor(fake, 'shadowed.example.com:1')).toBe(403)
+    expect(await statusFor(fake, 'shadowed-lan.example.com:23023')).toBe(403)
+    // The `webRuntime` source answered, so `webStartup` was never asked for.
+    expect(seenGets).toEqual(['webRuntime'])
   })
 
   it('#7 neither service: mounts anyway and the fence stays loopback-only', async () => {
@@ -1287,6 +1345,7 @@ describe('⑥ lifecycle', () => {
     expect(fake.server.routes.has(PREFIX)).toBe(true)
     expect(await statusFor(fake, HOST)).toBe(200)
     expect(await statusFor(fake, 'harness.internal:23023')).toBe(403)
+    expect(await statusFor(fake, '10.6.0.4:23023')).toBe(403)
   })
 
   it('R9: dispose detaches the assembly listeners it registered', async () => {

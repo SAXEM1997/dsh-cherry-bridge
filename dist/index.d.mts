@@ -93,6 +93,12 @@ type WebRouteHandler = (req: HttpRequestLike, res: HttpResponseLike) => void | P
 interface WebRuntimeLike {
   /** LAN literals followed by explicit invocation authorities. */
   trustedHosts: readonly string[];
+  /**
+   * 0.2.1 only: the explicit `--host` listener bind, when one was given. A
+   * bare hostname (never an authority with a port) — the fence's
+   * `isTrustedAuthority` matches a bare entry on any port.
+   */
+  host?: string;
 }
 /** The context carrying the host's web services. */
 interface CherryHttpContext {

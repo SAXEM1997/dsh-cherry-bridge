@@ -81,6 +81,12 @@ export type WebRouteHandler = (req: HttpRequestLike, res: HttpResponseLike) => v
 export interface WebRuntimeLike {
   /** LAN literals followed by explicit invocation authorities. */
   trustedHosts: readonly string[]
+  /**
+   * 0.2.1 only: the explicit `--host` listener bind, when one was given. A
+   * bare hostname (never an authority with a port) — the fence's
+   * `isTrustedAuthority` matches a bare entry on any port.
+   */
+  host?: string
 }
 
 /** The context carrying the host's web services. */
@@ -762,38 +768,59 @@ function pairingVerdict(error: unknown): { status: number; error: string; messag
  * Resolves the deployment's `trustedHosts` across the host GENERATIONS this
  * plugin runs on, in preference order:
  *
- *  1. `wctx.webRuntime.trustedHosts` — the shape DSH 0.2.0 hands to the
- *     injected callback;
- *  2. `ctx.get('webRuntime').trustedHosts` — the same 0.2.0 value looked up
- *     optionally, for a host that does not put it on the injected ctx;
- *  3. `ctx.get('webStartup').trustedHosts` — DSH 0.2.1, where `dsh-web-app`
- *     stopped providing `webRuntime` and moved the bind-dependent values onto
- *     the `webStartup` service config;
- *  4. `[]` — neither service: the fence stays loopback-only.
+ *  1. `ctx.get('webRuntime').trustedHosts` — DSH 0.2.0's bind-dependent values
+ *     (the `webRuntime` service; removed again in 0.2.1, issue #7);
+ *  2. `ctx.get('webStartup')` — DSH 0.2.1. Its `trustedHosts` are the
+ *     `--trusted-host` CLI values, and its `host` is the explicit `--host`
+ *     bind. The `host` is appended as a BARE hostname entry, mirroring the
+ *     host's own `/api` fence, which admits its listener bind implicitly —
+ *     otherwise a LAN-bound deployment that never passed `--trusted-host`
+ *     would 403 its own origin. 0.2.0's list already carried the LAN bind
+ *     literal (see the module header), so this keeps the generations aligned;
+ *  3. `[]` — neither service: the fence stays loopback-only.
  *
- * The lookups are `ctx.get`, NOT more injection keys: `inject` is an AND gate
- * over its list, and that is precisely what issue #7 was — see
- * {@link registerHttpApi}. Each step is optional, so an old host (no
+ * **Why every step is `ctx.get` and NOT a property read on the injected ctx.**
+ * cordis hands the inject callback a strict reflection proxy
+ * (`ReflectService.handler.get`): reading a property that is not in the
+ * callback's `inject` list THROWS synchronously — `cannot get property
+ * "<name>" without inject` — and `?.` does not help, because the getter itself
+ * throws. That is exactly how issue #7 shipped broken and then regressed
+ * 0.2.0: the first cut read `wctx.webRuntime` from a `['webServer']` callback,
+ * so on a real host it threw, `mountRoutes` never ran and NOTHING was mounted.
+ * `ctx.get(name)` is the unGATED lookup: absent ⇒ `undefined`, never a throw.
+ * The callback may therefore only read the keys it injected
+ * ({@link registerHttpApi}); every other source is resolved here.
+ *
+ * `inject` is an AND gate over its list — the root cause of issue #7 — so no
+ * source here may become another injection key. Each step is optional and
+ * narrowed structurally ({@link asWebRuntime}), so an old host (no
  * `webStartup`), a new host (no `webRuntime`) and a bare fake all resolve to a
  * list rather than throwing.
  */
-export function resolveTrustedHosts(wctx: { webRuntime?: WebRuntimeLike }, ctx: CherryHttpContext): readonly string[] {
-  const fromCtx = wctx.webRuntime?.trustedHosts
-  if (fromCtx !== undefined) return fromCtx
+export function resolveTrustedHosts(ctx: CherryHttpContext): readonly string[] {
   const runtime = asWebRuntime(ctx.get?.('webRuntime'))
   if (runtime?.trustedHosts !== undefined) return runtime.trustedHosts
   const startup = asWebRuntime(ctx.get?.('webStartup'))
-  if (startup?.trustedHosts !== undefined) return startup.trustedHosts
+  if (startup?.trustedHosts !== undefined) {
+    // The listener bind rides along as a bare hostname (see above).
+    return startup.host === undefined ? [...startup.trustedHosts] : [...startup.trustedHosts, startup.host]
+  }
   return []
 }
 
-/** Narrows an untyped `ctx.get` answer; anything without a list yields undefined. */
+/**
+ * Narrows an untyped `ctx.get` answer; anything without a list yields
+ * undefined. A 0.2.1 `webStartup` also carries the listener bind as `host`
+ * (string, only when `--host` was given explicitly): it is kept for the
+ * caller to fold in, and a non-string or empty value is simply dropped.
+ */
 function asWebRuntime(service: unknown): WebRuntimeLike | undefined {
   if (typeof service !== 'object' || service === null) return undefined
-  const { trustedHosts } = service as { trustedHosts?: unknown }
+  const { trustedHosts, host } = service as { trustedHosts?: unknown; host?: unknown }
   if (!Array.isArray(trustedHosts)) return undefined
   if (!trustedHosts.every((entry): entry is string => typeof entry === 'string')) return undefined
-  return { trustedHosts }
+  const bound = typeof host === 'string' && host.length > 0 ? host : undefined
+  return bound === undefined ? { trustedHosts } : { trustedHosts, host: bound }
 }
 
 /**
@@ -822,6 +849,12 @@ function asWebRuntime(service: unknown): WebRuntimeLike | undefined {
  * very failure modes it would report. The `webServer === undefined` warning
  * inside the callback stays as the one honest signal available.
  *
+ * **The callback reads ONLY injected keys.** cordis' injected ctx is a strict
+ * reflection proxy whose get trap throws `cannot get property "<name>" without
+ * inject` for anything outside the list, so `wctx` here is typed with
+ * `webServer` alone and every `trustedHosts` source goes through
+ * {@link resolveTrustedHosts} (which uses the unGATED `ctx.get`).
+ *
  * The route handler is a SINGLE prefix registration that dispatches the five
  * endpoints internally: one disposer, one fence site, no route-table churn.
  */
@@ -833,18 +866,17 @@ export function registerHttpApi(ctx: CherryHttpContext, deps: CherryHttpDeps): (
 
   let disposeRoutes: (() => void) | undefined
   try {
-    ctx.inject<{ webServer?: WebServerLike; webRuntime?: WebRuntimeLike }>(
-      ['webServer'],
-      (wctx) => {
-        const webServer = wctx.webServer
-        if (webServer === undefined) {
-          console.warn('[cherry-remote] webServer unavailable; http api not mounted')
-          return
-        }
-        disposeRoutes = mountRoutes(webServer, resolveTrustedHosts(wctx, ctx), deps)
-        console.info(`[cherry-remote] http api mounted at ${HTTP_API_PREFIX}`)
-      },
-    )
+    // The payload type is the injection list itself: `webServer` and nothing
+    // else may be read off the strict proxy.
+    ctx.inject<{ webServer?: WebServerLike }>(['webServer'], (wctx) => {
+      const webServer = wctx.webServer
+      if (webServer === undefined) {
+        console.warn('[cherry-remote] webServer unavailable; http api not mounted')
+        return
+      }
+      disposeRoutes = mountRoutes(webServer, resolveTrustedHosts(ctx), deps)
+      console.info(`[cherry-remote] http api mounted at ${HTTP_API_PREFIX}`)
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     console.warn(`[cherry-remote] http api not mounted (webServer unavailable): ${message}`)

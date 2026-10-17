@@ -1102,15 +1102,19 @@ function mountHttpApi(overrides: Partial<CherryHttpDeps> = {}): {
   const dir = tempDir('cherry-diag-http-')
   const store = new DeviceStore(join(dir, 'devices.json'))
   const ctx = {
-    webServer: server,
-    webRuntime: { trustedHosts: ['harness.internal:23023'] },
+    // Issue #7: the callback payload is `webServer` ALONE. Real cordis installs
+    // a strict reflection proxy on the injected ctx whose get trap THROWS for
+    // any property outside the injection list ("cannot get property … without
+    // inject"), so a host CANNOT carry `webRuntime` there — `?.` does not help,
+    // the getter itself throws. `trustedHosts` is therefore looked up via the
+    // unGATED `ctx.get` below, which keeps the fence assertions' declared-host
+    // branch alive.
     inject<T>(_deps: string[], cb: (ctx: T) => void | (() => void)): void {
-      // The 0.2.0 payload shape. Issue #7 moved the injection key set to
-      // `['webServer']` alone, but a host that DOES carry `webRuntime` on the
-      // injected ctx still supplies `trustedHosts` from here (first source of
-      // `resolveTrustedHosts`), so the fence assertions below keep their
-      // declared-host branch.
-      cb({ webServer: server, webRuntime: { trustedHosts: ['harness.internal:23023'] } } as T)
+      cb({ webServer: server } as T)
+    },
+    // cordis' optional service lookup: no inject gate, absent ⇒ undefined.
+    get(name: string): unknown {
+      return name === 'webRuntime' ? { trustedHosts: ['harness.internal:23023'] } : undefined
     },
   }
   const dispose = registerHttpApi(ctx as unknown as Parameters<typeof registerHttpApi>[0], {
@@ -1426,7 +1430,7 @@ describe('③ release configuration', () => {
     // ignored when it is present), so this field is the gate's only input.
     //
     // The bounds are deliberate: 0.2.0-rc.2 is the oldest host the
-    // `resolveTrustedHosts` fallback chain still supports (the `webRuntime`
+    // `resolveTrustedHosts` `ctx.get` chain still supports (the `webRuntime`
     // world); `-0` on the upper bound excludes the whole 0.3.0 prerelease
     // family, because app-boot's ranges let prereleases participate and a
     // bare `<0.3.0` would wave 0.3.0-rc.1 through. Widening either end is a
@@ -1773,8 +1777,16 @@ function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unkn
         })
         return
       }
-      // Issue #7: `webServer` alone (the web-only inject key set).
+      // Issue #7: `webServer` alone (the web-only inject key set). Nothing else
+      // may be read off this payload — real cordis' injected ctx is a strict
+      // proxy that throws on non-injected keys.
       cb({ webServer: server })
+    },
+    // cordis' optional, unGATED lookup (`absent ⇒ undefined`): the surface the
+    // plugin resolves `trustedHosts` through. The fake host offers none here, so
+    // the fence stays loopback-only and these cases dial loopback hosts.
+    get(): unknown {
+      return undefined
     },
     effect(): void {},
     injectedEffects,
