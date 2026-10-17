@@ -36,6 +36,8 @@ flowchart TB
 
 ## Install
 
+> **DSH version requirement**: `>=0.2.0-rc.2 <0.3.0-0` — declared via `engines.dsh` in `package.json`; DSH's plugin compatibility gate checks it, and when it is unmet the install/enable is refused (the bundle is skipped and its row disabled). `dsh plugin allow-version` grants a precise, explicit exemption if you really need one. 0.3.0 support needs a fresh compatibility pass before the range widens.
+
 ```bash
 # From GitHub (recommended)
 npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge

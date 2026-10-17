@@ -34,6 +34,8 @@ flowchart TB
 
 ## 安装
 
+> **DSH 版本需求**：`>=0.2.0-rc.2 <0.3.0-0`（由 `package.json` 的 `engines.dsh` 声明，DSH 的插件兼容门会据此检查；不满足时安装/启用会被拒绝——bundle 被跳过、行被禁用；确需在区间外使用可用 `dsh plugin allow-version` 精确豁免。0.3.0 需重新评估兼容性后再放开）。
+
 ```bash
 # 从 GitHub 安装（推荐）
 npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge

@@ -167,7 +167,7 @@ describe('T4 host integration: tri-state, injection gate and co-lifecycle', () =
     // and the misrouted fixture would report the wrong diagnosis; the web-only
     // call is a positive match against its own literal instead.
     expect(() => asksForScopeKeys(['agent', 'workspaceRegistr'])).toThrow(/NEITHER tool-scope key/)
-    expect(asksForScopeKeys(['webServer', 'webRuntime'])).toBe(false)
+    expect(asksForScopeKeys(['webServer'])).toBe(false)
   })
 
   it('② unsupported: register / restrict / schemas are each a hard gate (static failure wins)', () => {
@@ -487,7 +487,8 @@ interface AssemblyFixture {
 
 /**
  * The same dependency-key split the three existing assembly fixtures get: the
- * web keys answer with `webServer`/`webRuntime`, the two scope keys answer with
+ * web key (`webServer` — issue #7) answers with the fake web server, the two scope
+ * keys answer with
  * `agents`/`workspaceRegistry` plus the injected ctx's own `effect`/`on`.
  */
 function assemblyCtx(options: { deferAgents?: boolean } = {}): AssemblyFixture {
@@ -519,7 +520,6 @@ function assemblyCtx(options: { deferAgents?: boolean } = {}): AssemblyFixture {
         return () => routes.delete(route.path)
       },
     },
-    webRuntime: { trustedHosts: [] },
     tools: {
       definitions,
       register(definition: { name: string; description: string }) {
@@ -546,7 +546,8 @@ function assemblyCtx(options: { deferAgents?: boolean } = {}): AssemblyFixture {
         if (options.deferAgents !== true) cb(inside)
         return
       }
-      cb({ webServer: ctx['webServer'], webRuntime: ctx['webRuntime'] })
+      // Issue #7: `webServer` alone; no `webRuntime` on the injected ctx.
+      cb({ webServer: ctx['webServer'] })
     },
     effect(cb: () => () => void) {
       effects.push(cb())
