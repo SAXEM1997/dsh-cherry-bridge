@@ -130,6 +130,28 @@ describe('R3-F2: a quarantined archive is surfaced on the tool face, never misre
     expect(result['error']).not.toBe('ambiguous-device')
   })
 
+  it('F2-4b2 a quarantined archive answers archive-quarantined, never not-found (issue #13)', async () => {
+    const rig = quarantinedRig()
+
+    // A quarantined archive serves an EMPTY view, so every selector misses.
+    // Answering `not-found` would call a store that still holds a valid token
+    // "no such device" — the quarantine must keep precedence.
+    const devices = (await rig.call('cherry_devices', { device: 'Desk Alpha' })) as Record<string, unknown>
+    expect(devices['error']).toBe('archive-quarantined')
+    expect(devices['error']).not.toBe('not-found')
+
+    // The same precedence on the throw route: a non-cherry_devices tool gets
+    // the quarantine verdict, however unmatched the selector looks.
+    const read = (await rig.call('cherry_read', { device: 'no-such-device', sessionId: 's-1' })) as Record<
+      string,
+      unknown
+    >
+    expect(read['error']).toBe('archive-quarantined')
+
+    const unpair = (await rig.call('cherry_unpair', { device: 'no-such-device' })) as Record<string, unknown>
+    expect(unpair['error']).toBe('archive-quarantined')
+  })
+
   it('F2-4c cherry_read answers the structured quarantine verdict rather than ambiguous-with-no-candidates', async () => {
     const rig = quarantinedRig()
 

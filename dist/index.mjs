@@ -320,12 +320,28 @@ var DeviceStore = class {
 	list() {
 		return this.#load().map((record) => structuredClone(record));
 	}
+	/**
+	* Resolves a selector to exactly one record, the ambiguous candidates, or a
+	* miss.
+	*
+	* Order of precedence: an exact `deviceId` wins outright, then a prefix of
+	* EITHER the `deviceId` or the display name — the two abbreviations every
+	* tool documents ("exact deviceId, or a unique display-name prefix"), so a
+	* truncated id resolves like a truncated name does. Candidates keep archive
+	* order, so the same selector always answers the same list.
+	*
+	* A miss is its own member ({@link UnresolvedDevice}): nothing matching is
+	* not several things matching, and folding the two together made
+	* `cherry_devices` answer `ambiguous-device` with `candidates: []` on a
+	* machine with a single paired device.
+	*/
 	resolve(device) {
 		const devices = this.list();
 		const exact = devices.find((record) => record.deviceId === device);
 		if (exact !== void 0) return exact;
-		const matches = devices.filter((record) => record.displayName.startsWith(device));
+		const matches = devices.filter((record) => record.deviceId.startsWith(device) || record.displayName.startsWith(device));
 		if (matches.length === 1) return matches[0];
+		if (matches.length === 0) return { notFound: true };
 		return { ambiguous: matches.map((record) => record.displayName) };
 	}
 	upsert(record) {
@@ -4198,7 +4214,9 @@ var CherryToolEngine = class {
 	/**
 	* Resolves `device` to a live connection, or returns the structured verdict
 	* the caller must report. Ambiguity is NOT an error throw (controller ruling
-	* ⑤): the candidate list is the answer.
+	* ⑤): the candidate list is the answer. A MISS is a verdict too — see
+	* {@link CherryDeviceNotFound} — and it carries the ids the caller could have
+	* meant so the answer stays actionable.
 	*/
 	#resolve(device) {
 		const resolution = this.#deps.store.resolve(device);
@@ -4207,6 +4225,7 @@ var CherryToolEngine = class {
 			device,
 			candidates: resolution.ambiguous
 		};
+		if ("notFound" in resolution) return this.#notFoundVerdict(device);
 		const connection = this.#deps.connect(resolution.deviceId);
 		if (connection.state !== "connected") return {
 			error: "device-unavailable",
@@ -4223,12 +4242,12 @@ var CherryToolEngine = class {
 	*
 	* Consulted BEFORE any resolution, because a quarantined store's empty view
 	* makes every downstream answer a lie: `resolve` cannot find a device that IS
-	* paired (the archive is unreadable), so it reports ambiguity with no
-	* candidates, and a caller reasonably concludes the device is not paired —
-	* about a store that still holds its access token on disk. The probe is a
-	* cheap readonly field read on the store, and it is deliberately checked on
-	* every device-dependent entry point rather than once at registration: the
-	* archive can go bad while the process is running.
+	* paired (the archive is unreadable), so it reports a miss — and a caller
+	* reasonably concludes the device is not paired, about a store that still
+	* holds its access token on disk. The probe is a cheap readonly field read on
+	* the store, and it is deliberately checked on every device-dependent entry
+	* point rather than once at registration: the archive can go bad while the
+	* process is running.
 	*/
 	#quarantineVerdict() {
 		const info = this.#deps.store.quarantineInfo();
@@ -4247,26 +4266,37 @@ var CherryToolEngine = class {
 	/**
 	* Resolve-or-verdict: every non-`cherry_devices` tool needs a live link.
 	*
-	* The two failure faces are deliberately DIFFERENT (controller ruling ⑤):
-	* an ambiguous selector is an ANSWER — the structured candidate list is
-	* returned in band, because the caller can act on it — while a non-connected
-	* device is the §6 `DeviceUnavailableError` the established error face
-	* already defines.
+	* The failure faces are deliberately DIFFERENT (controller ruling ⑤): an
+	* ambiguous selector and a MISS are ANSWERS — the candidate list, or the
+	* known ids, returned in band, because the caller can act on them — while a
+	* non-connected device is the §6 `DeviceUnavailableError` the established
+	* error face already defines.
+	*
+	* A miss cannot ride in band here: a non-`cherry_devices` tool has nothing to
+	* do without a device, and returning a not-found OBJECT from a tool whose
+	* result is consumed as data would be mistaken for one. It throws instead.
+	* `cherry_devices` does not come through this method — it goes through
+	* {@link #selectRecords}, which returns the verdict in band.
 	*/
 	#requireConnection(device) {
 		const resolved = this.#resolve(device);
 		if (!this.#isVerdict(resolved)) return resolved;
 		if (resolved.error === "ambiguous-device") return resolved;
+		if (resolved.error === "not-found") {
+			const known = resolved.known.length === 0 ? "none" : resolved.known.join(", ");
+			throw new Error(`no paired device matches "${device}"; known device ids: ${known}`);
+		}
 		throw new DeviceUnavailableError(resolved.device, resolved.state);
 	}
 	/**
-	* The connection-plus-record pair, or the ambiguous verdict to return
-	* verbatim. Lets each tool's body read as `resolved.link ?? resolved.verdict`
-	* without repeating the discriminant dance.
+	* The connection-plus-record pair, or the verdict to return verbatim. Lets
+	* each tool's body read as `resolved.link ?? resolved.verdict` without
+	* repeating the discriminant dance.
 	*
 	* The quarantine check comes FIRST: it is the strongest statement available
 	* (the device set itself is unknowable), and letting resolution run would
-	* replace it with a weaker, wrong one.
+	* replace it with a weaker, wrong one — a miss under a READ-ONLY archive
+	* would describe a store that still holds a valid token as "no such device".
 	*/
 	#linkOr(device) {
 		const quarantined = this.#quarantineVerdict();
@@ -4274,6 +4304,17 @@ var CherryToolEngine = class {
 		const resolved = this.#requireConnection(device);
 		if ("error" in resolved) return { verdict: resolved };
 		return { link: resolved };
+	}
+	/**
+	* The `{ notFound: true }` member of a store resolution as the tool-face
+	* verdict, with the ids the caller could have meant.
+	*/
+	#notFoundVerdict(device) {
+		return {
+			error: "not-found",
+			device,
+			known: this.#deps.store.list().map((record) => record.deviceId)
+		};
 	}
 	/**
 	* Walks pages until `limit` items are collected or the peer runs out,
@@ -4356,7 +4397,7 @@ var CherryToolEngine = class {
 				type: "object",
 				properties: { device: {
 					type: "string",
-					description: "Optional device selector: exact deviceId, or a unique display-name prefix."
+					description: "Optional device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 				} },
 				additionalProperties: false
 			},
@@ -4372,8 +4413,13 @@ var CherryToolEngine = class {
 		});
 	}
 	/**
-	* The `cherry_devices` selector: candidates beat a throw (ruling ⑤), and the
-	* quarantined archive outranks both.
+	* The `cherry_devices` selector: candidates and a miss beat a throw (ruling
+	* ⑤), and the quarantined archive outranks both.
+	*
+	* The QUARANTINE check comes first and is a real precedence rule, not a
+	* formality: a quarantined archive serves an empty view, so every selector
+	* misses, and answering "no such device" would describe a store that still
+	* holds a valid token on disk as one with nothing paired.
 	*
 	* `cherry_unpair` shares this, so the quarantine check here is what keeps its
 	* `store.remove` from ever being reached on a READ-ONLY archive — the write
@@ -4388,6 +4434,7 @@ var CherryToolEngine = class {
 			device: selector,
 			candidates: resolution.ambiguous
 		};
+		if ("notFound" in resolution) return this.#notFoundVerdict(selector);
 		return [resolution];
 	}
 	/**
@@ -4542,7 +4589,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -4612,7 +4659,8 @@ var CherryToolEngine = class {
 			session,
 			messages,
 			truncated: page.truncated,
-			...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason }
+			...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason },
+			...page.truncated && page.nextCursor !== void 0 ? { messagesResumeCursor: page.nextCursor } : {}
 		};
 	}
 	/** One message: list ALL its parts under the message's OWN revision, then aggregate. */

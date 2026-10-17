@@ -96,7 +96,7 @@ profile 手工加行等价于：
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。 |
-| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。 |
+| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。消息**从新到旧**排列（`messages[0]` 是最新的一条），因此 `limit` 丢掉的是**最旧**的消息；被截断的走查一定会说明（`truncated` 为 `true`，并带 `truncationReason`），`messagesResumeCursor` 用于续读**更旧**的消息。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后经 `agent.sessions.get` 回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。 |
@@ -107,8 +107,12 @@ profile 手工加行等价于：
 | `cherry_pair` | 用「扫码后页面显示的配对信息」建立与桌面端的配对。 |
 | `cherry_unpair` | 解除配对：断开连接并从设备档案删除。 |
 
-设备选择器（`device` 参数）接受**精确 `deviceId`** 或**唯一的显示名前缀**；前缀命中
-多项时返回结构化歧义错误，不会任选一个。
+设备选择器（`device` 参数）接受**精确 `deviceId`**，或 **`deviceId` 前缀 / 显示名前缀**
+（两者合并匹配、按 `deviceId` 去重）；前缀命中多项时返回结构化歧义错误（`ambiguous-device`
++ `candidates`），不会任选一个；一个都没命中时返回 `not-found` + `known`（已配对设备的
+`deviceId` 列表），而不是候选为空的歧义。`cherry_devices` 以结构化结果原样返回这两种判定；
+其余工具检索不到设备时 **抛错**而非返回判定对象。档案被隔离（`archive-quarantined`）优先于
+上述一切。
 
 `cherry_send(wait: true)` / `cherry_wait` 返回的 `status` 有 **8 个取值**：四个协议终态
 （`completed`/`failed`/`cancelled`/`interrupted`）之外，还有四个 waiter 自己的判定——

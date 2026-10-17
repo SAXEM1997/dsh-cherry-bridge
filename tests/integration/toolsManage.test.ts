@@ -429,7 +429,8 @@ describe('② cherry_unpair: forget the archive entry and tear the link down', (
       .find((definition) => definition.name === 'cherry_unpair')!
       .execute({ device: 'nope' })) as Record<string, unknown>
 
-    expect(result).toMatchObject({ error: 'ambiguous-device', device: 'nope', candidates: [] })
+    // A miss is its own verdict (issue #13): not ambiguity with no candidates.
+    expect(result).toEqual({ error: 'not-found', device: 'nope', known: ['dev-A', 'dev-B'] })
     expect(store.list()).toHaveLength(2)
     expect(evictions).toEqual([])
   })

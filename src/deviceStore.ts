@@ -56,12 +56,25 @@ export interface DeviceRecord {
   enabled: boolean
 }
 
-/** A `resolve` miss: every display name whose prefix matched is a candidate. */
+/**
+ * A selector that matched SEVERAL devices: the candidate display names, in
+ * archive order, and nothing chosen for the caller.
+ */
 export interface AmbiguousDevice {
   ambiguous: string[]
 }
 
-export type DeviceResolution = DeviceRecord | AmbiguousDevice
+/**
+ * A `resolve` MISS: nothing matched, which is not the same answer as
+ * ambiguity. A miss means the selector names no paired device at all, so there
+ * is no candidate to offer — reporting it as ambiguity with no candidates
+ * would tell the caller to choose from a list that does not exist.
+ */
+export interface UnresolvedDevice {
+  notFound: true
+}
+
+export type DeviceResolution = DeviceRecord | AmbiguousDevice | UnresolvedDevice
 
 /** The only `schemaVersion` this build reads and writes. */
 export const CURRENT_SCHEMA_VERSION = 2
@@ -506,14 +519,35 @@ export class DeviceStore {
     return this.#load().map((record) => structuredClone(record))
   }
 
+  /**
+   * Resolves a selector to exactly one record, the ambiguous candidates, or a
+   * miss.
+   *
+   * Order of precedence: an exact `deviceId` wins outright, then a prefix of
+   * EITHER the `deviceId` or the display name — the two abbreviations every
+   * tool documents ("exact deviceId, or a unique display-name prefix"), so a
+   * truncated id resolves like a truncated name does. Candidates keep archive
+   * order, so the same selector always answers the same list.
+   *
+   * A miss is its own member ({@link UnresolvedDevice}): nothing matching is
+   * not several things matching, and folding the two together made
+   * `cherry_devices` answer `ambiguous-device` with `candidates: []` on a
+   * machine with a single paired device.
+   */
   resolve(device: string): DeviceResolution {
     const devices = this.list()
 
     const exact = devices.find((record) => record.deviceId === device)
     if (exact !== undefined) return exact
 
-    const matches = devices.filter((record) => record.displayName.startsWith(device))
+    // One `filter` over the archive list yields the UNION of the two prefix
+    // spaces, already deduplicated by `deviceId` (the filter visits each record
+    // once) and already in store order.
+    const matches = devices.filter(
+      (record) => record.deviceId.startsWith(device) || record.displayName.startsWith(device),
+    )
     if (matches.length === 1) return matches[0]!
+    if (matches.length === 0) return { notFound: true }
     return { ambiguous: matches.map((record) => record.displayName) }
   }
 
