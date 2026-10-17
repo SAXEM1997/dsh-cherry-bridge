@@ -29,8 +29,9 @@ import type { RefreshSummary } from './toolScopeHost.js'
  *    `invalid-device` 400 — see {@link writeQuarantineRefusal}.
  *
  * Registration is lazy and headless-safe: `registerHttpApi` dynamically
- * injects `webServer`/`webRuntime` and degrades to a warning when the
- * deployment has no web half.
+ * injects `webServer` alone and degrades to a warning when the deployment has
+ * no web half. `trustedHosts` is resolved by optional lookup across host
+ * generations — 0.2.0's `webRuntime` or 0.2.1's `webStartup` (issue #7).
  */
 
 /** The plugin's route prefix: an absolute pathname with no trailing slash. */
@@ -44,10 +45,12 @@ const HEARTBEAT_MS = 30_000
 // ---------------------------------------------------------------------------
 //
 // Structural types, deliberately narrow: the host's `WebServer.register` and
-// `webRuntime` are not imported as types, so the plugin neither depends on a
-// host package at build time nor breaks when the host's declarations move.
-// @deepseek-ai/dsh-host-webserver's WebServer.register/WebRoute and
-// @deepseek-ai/dsh-web-app's WebRuntimeValues satisfy these shapes exactly.
+// the bind-dependent `trustedHosts` values are not imported as types, so the
+// plugin neither depends on a host package at build time nor breaks when the
+// host's declarations move. @deepseek-ai/dsh-host-webserver's
+// WebServer.register/WebRoute satisfies the first; the second is provided as
+// DSH 0.2.0's `webRuntime` (WebRuntimeValues) and, since 0.2.1, on the
+// `webStartup` service config (issue #7).
 
 /** One HTTP request, as the routes read it (Node's IncomingMessage fits). */
 export interface HttpRequestLike {
@@ -83,7 +86,13 @@ export interface WebRuntimeLike {
 /** The context carrying the host's web services. */
 export interface CherryHttpContext {
   webServer?: WebServerLike
+  /**
+   * DSH 0.2.0 shape only. 0.2.1-rc.2 removed the service (issue #7), so this is
+   * one OPTIONAL source for `trustedHosts` — never an injection key.
+   */
   webRuntime?: WebRuntimeLike
+  /** cordis' optional service lookup — no inject gate; absent ⇒ `undefined`. */
+  get?(name: string): unknown
   inject?<T>(deps: string[], callback: (ctx: T) => void | (() => void)): unknown
 }
 
@@ -750,13 +759,68 @@ function pairingVerdict(error: unknown): { status: number; error: string; messag
 }
 
 /**
+ * Resolves the deployment's `trustedHosts` across the host GENERATIONS this
+ * plugin runs on, in preference order:
+ *
+ *  1. `wctx.webRuntime.trustedHosts` — the shape DSH 0.2.0 hands to the
+ *     injected callback;
+ *  2. `ctx.get('webRuntime').trustedHosts` — the same 0.2.0 value looked up
+ *     optionally, for a host that does not put it on the injected ctx;
+ *  3. `ctx.get('webStartup').trustedHosts` — DSH 0.2.1, where `dsh-web-app`
+ *     stopped providing `webRuntime` and moved the bind-dependent values onto
+ *     the `webStartup` service config;
+ *  4. `[]` — neither service: the fence stays loopback-only.
+ *
+ * The lookups are `ctx.get`, NOT more injection keys: `inject` is an AND gate
+ * over its list, and that is precisely what issue #7 was — see
+ * {@link registerHttpApi}. Each step is optional, so an old host (no
+ * `webStartup`), a new host (no `webRuntime`) and a bare fake all resolve to a
+ * list rather than throwing.
+ */
+export function resolveTrustedHosts(wctx: { webRuntime?: WebRuntimeLike }, ctx: CherryHttpContext): readonly string[] {
+  const fromCtx = wctx.webRuntime?.trustedHosts
+  if (fromCtx !== undefined) return fromCtx
+  const runtime = asWebRuntime(ctx.get?.('webRuntime'))
+  if (runtime?.trustedHosts !== undefined) return runtime.trustedHosts
+  const startup = asWebRuntime(ctx.get?.('webStartup'))
+  if (startup?.trustedHosts !== undefined) return startup.trustedHosts
+  return []
+}
+
+/** Narrows an untyped `ctx.get` answer; anything without a list yields undefined. */
+function asWebRuntime(service: unknown): WebRuntimeLike | undefined {
+  if (typeof service !== 'object' || service === null) return undefined
+  const { trustedHosts } = service as { trustedHosts?: unknown }
+  if (!Array.isArray(trustedHosts)) return undefined
+  if (!trustedHosts.every((entry): entry is string => typeof entry === 'string')) return undefined
+  return { trustedHosts }
+}
+
+/**
  * Registers the plugin's same-origin HTTP face on the host's web server.
  *
- * The web services arrive by dynamic injection (the `dsh-mcp-connector`
+ * The web service arrives by dynamic injection (the `dsh-mcp-connector`
  * pattern): a headless deployment simply has no `webServer`, so the call warns
  * and skips registration instead of failing the plugin — the tool face stays
  * usable. The returned disposer unregisters the route seat (the host throws on
  * a duplicate `(kind, path)`, so a second `apply` would otherwise fail).
+ *
+ * **Injection shape (issue #7).** The list is `['webServer']` ALONE. It used to
+ * be `['webServer', 'webRuntime']`, which cordis reads as an AND: the callback
+ * waited for BOTH services. DSH 0.2.1-rc.2 REMOVED `webRuntime` (`trustedHosts`
+ * moved to the `webStartup` service config), so the callback never ran — the
+ * route was never mounted and the three degradation warnings inside it never
+ * printed, leaving a silent, zero-log outage. `webRuntime` is therefore read
+ * through the optional {@link resolveTrustedHosts} chain instead of being
+ * demanded.
+ *
+ * The remaining silent failure is `webServer` itself never arriving (a truly
+ * headless host, or a future host that renames it). That is NOT distinguishable
+ * here from a healthy apply — the callback may legitimately fire later than the
+ * call returns — so no "callback did not run" probe is installed: a log that
+ * needs a timer would race the host, and console output is suppressed by the
+ * very failure modes it would report. The `webServer === undefined` warning
+ * inside the callback stays as the one honest signal available.
  *
  * The route handler is a SINGLE prefix registration that dispatches the five
  * endpoints internally: one disposer, one fence site, no route-table churn.
@@ -770,14 +834,14 @@ export function registerHttpApi(ctx: CherryHttpContext, deps: CherryHttpDeps): (
   let disposeRoutes: (() => void) | undefined
   try {
     ctx.inject<{ webServer?: WebServerLike; webRuntime?: WebRuntimeLike }>(
-      ['webServer', 'webRuntime'],
+      ['webServer'],
       (wctx) => {
         const webServer = wctx.webServer
         if (webServer === undefined) {
           console.warn('[cherry-remote] webServer unavailable; http api not mounted')
           return
         }
-        disposeRoutes = mountRoutes(webServer, wctx.webRuntime?.trustedHosts ?? [], deps)
+        disposeRoutes = mountRoutes(webServer, resolveTrustedHosts(wctx, ctx), deps)
         console.info(`[cherry-remote] http api mounted at ${HTTP_API_PREFIX}`)
       },
     )

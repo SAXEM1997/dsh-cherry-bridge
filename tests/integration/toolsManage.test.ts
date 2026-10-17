@@ -691,7 +691,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
           cb(injected)
           return
         }
-        cb({ webServer: ctx.server, webRuntime: { trustedHosts: [] } })
+        // Issue #7: the web-only call asks for `webServer` ALONE — injecting
+        // `webRuntime` too made the callback wait on a service 0.2.1 removed.
+        cb({ webServer: ctx.server })
       },
       effect(cb) {
         ctx.effects.push(cb())

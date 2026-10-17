@@ -97,7 +97,13 @@ interface WebRuntimeLike {
 /** The context carrying the host's web services. */
 interface CherryHttpContext {
   webServer?: WebServerLike;
+  /**
+   * DSH 0.2.0 shape only. 0.2.1-rc.2 removed the service (issue #7), so this is
+   * one OPTIONAL source for `trustedHosts` — never an injection key.
+   */
   webRuntime?: WebRuntimeLike;
+  /** cordis' optional service lookup — no inject gate; absent ⇒ `undefined`. */
+  get?(name: string): unknown;
   inject?<T>(deps: string[], callback: (ctx: T) => void | (() => void)): unknown;
 }
 //#endregion

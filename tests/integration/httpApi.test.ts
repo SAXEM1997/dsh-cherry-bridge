@@ -60,34 +60,62 @@ class FakeWebServer {
   }
 }
 
+/**
+ * Which host generation the fake serves (issue #7):
+ *  - `hybrid`: DSH 0.2.0 — `webRuntime` arrives BOTH on the injected ctx and via
+ *    `ctx.get`, and `webStartup` does not exist yet.
+ *  - `webserver-only`: DSH 0.2.1-rc.2 — `webRuntime` is GONE (the service was
+ *    removed) and `trustedHosts` moved to the `webStartup` service config.
+ *  - `bare`: neither generation — only `webServer`, so the fence falls back to
+ *    loopback-only.
+ */
+type HostShape = 'hybrid' | 'webserver-only' | 'bare'
+
 interface FakeCtx {
   server: FakeWebServer
   trustedHosts: string[]
   injected: string[][]
   /** `false` makes dynamic injection throw (headless deploy). */
   injectable: boolean
+  /** The host generation the fake answers with. */
+  shape: HostShape
   disposers: Array<() => void>
   inject(deps: string[], cb: (wctx: unknown) => void | (() => void)): void
+  /** cordis' optional lookup — NOT gated by `inject`; absent ⇒ `undefined`. */
+  get(name: string): unknown
   on(event: string, cb: () => void): void
 }
 
-function makeCtx(options: { trustedHosts?: string[]; injectable?: boolean } = {}): FakeCtx {
+function makeCtx(
+  options: { trustedHosts?: string[]; injectable?: boolean; shape?: HostShape } = {},
+): FakeCtx {
   const server = new FakeWebServer()
   const ctx: FakeCtx = {
     server,
     trustedHosts: options.trustedHosts ?? [],
     injected: [],
     injectable: options.injectable ?? true,
+    shape: options.shape ?? 'hybrid',
     disposers: [],
     inject(deps, cb) {
       ctx.injected.push([...deps])
       if (!ctx.injectable) throw new Error('service "webServer" is not available')
-      const wctx = {
-        webServer: server,
-        webRuntime: { trustedHosts: ctx.trustedHosts },
-      }
+      const wctx: Record<string, unknown> = { webServer: server }
+      // 0.2.0 only: the bind-dependent values ride on the injected ctx.
+      if (ctx.shape === 'hybrid') wctx['webRuntime'] = { trustedHosts: ctx.trustedHosts }
       const disposer = cb(wctx)
       if (typeof disposer === 'function') ctx.disposers.push(disposer)
+    },
+    get(name) {
+      // The injected service itself aside, 0.2.0 exposes `webRuntime` (the
+      // pre-migration `ctx.get` fallback) and 0.2.1 only `webStartup`.
+      if (name === 'webRuntime') {
+        return ctx.shape === 'hybrid' ? { trustedHosts: ctx.trustedHosts } : undefined
+      }
+      if (name === 'webStartup') {
+        return ctx.shape === 'hybrid' ? undefined : { trustedHosts: ctx.trustedHosts }
+      }
+      return undefined
     },
     on() {},
   }
@@ -1169,7 +1197,10 @@ describe('⑥ lifecycle', () => {
 
   it('registers lazily through dynamic injection and returns a working disposer', async () => {
     mount()
-    expect(ctx.injected).toEqual([['webServer', 'webRuntime']])
+    // Issue #7: `webServer` ALONE. Asking for `webRuntime` as well was an AND
+    // gate — 0.2.1 removed that service, so the callback never ran, nothing was
+    // mounted and not even the degradation warnings below could print.
+    expect(ctx.injected).toEqual([['webServer']])
     expect(ctx.server.routes.has(PREFIX)).toBe(true)
     // The host's `register` disposer is what the returned teardown drives.
     expect(typeof dispose).toBe('function')
@@ -1177,6 +1208,87 @@ describe('⑥ lifecycle', () => {
     dispose = undefined
     expect(ctx.server.unregistered).toEqual([PREFIX])
   })
+
+  // -------------------------------------------------------------------------
+  // Issue #7: the host-generation matrix for `trustedHosts`. 0.2.1-rc.2
+  // removed the `webRuntime` service (its `trustedHosts` moved to the
+  // `webStartup` service config), so the fence's source list is a three-step
+  // optional chain and every step must be exercised against the REAL fence.
+  // -------------------------------------------------------------------------
+
+  /** The deps `mount()` builds, for the host-shape cases that own their ctx. */
+  function shapeDeps(): CherryHttpDeps {
+    return {
+      store: new DeviceStore(join(dataDir, 'devices.json')),
+      scope: new ToolScopeState({ file: join(dataDir, 'scope.json') }),
+      refreshScope: () => undefined,
+      pair: (opts) => pairImpl(opts),
+      identity: () => new Uint8Array([1]),
+      connect: () => fakeConnection() as never,
+      onDeviceState: () => {},
+      onPairingProgress: () => {},
+    }
+  }
+
+  /** Registers over an EXPLICIT fake ctx (the `mount()` fixture owns a hybrid one). */
+  function mountOn(options: { shape: HostShape; trustedHosts?: string[] }): FakeCtx {
+    const fake = makeCtx(options)
+    dispose = registerHttpApi(fake as unknown as CherryHttpContext, shapeDeps())
+    return fake
+  }
+
+  /** Dispatches one REST read through the fake host's prefix table. */
+  async function statusFor(fake: FakeCtx, host: string): Promise<number> {
+    const res = new FakeResponse()
+    await fake.server.dispatch(new FakeRequest(`${PREFIX}/devices`, { host }), res)
+    return res.status
+  }
+
+  it('#7 0.2.1 shape: webServer alone is injected and webStartup supplies trustedHosts', async () => {
+    const fake = mountOn({ shape: 'webserver-only', trustedHosts: ['harness.internal:23023'] })
+
+    expect(fake.injected).toEqual([['webServer']])
+    expect(fake.server.routes.has(PREFIX)).toBe(true)
+    // The fence reads the MIGRATED source: the declared LAN authority is
+    // admitted, and an undeclared one stays refused.
+    expect(await statusFor(fake, 'harness.internal:23023')).toBe(200)
+    expect(await statusFor(fake, 'evil.example.com')).toBe(403)
+    // Loopback is inherent, not configuration.
+    expect(await statusFor(fake, HOST)).toBe(200)
+  })
+
+  it('#7 0.2.0 fallback: webRuntime.trustedHosts wins over the get() lookup', async () => {
+    // Both generations present at once — the injected wctx value must win, or a
+    // host that carries its bind values on webRuntime would silently start
+    // trusting whatever the newer service happened to hold.
+    const fake = makeCtx()
+    const seenGets: string[] = []
+    const shadowed = {
+      ...fake,
+      // Same server/inject wiring, but `ctx.get('webStartup')` and
+      // `ctx.get('webRuntime')` advertise a DIFFERENT list.
+      get(name: string): unknown {
+        seenGets.push(name)
+        return { trustedHosts: ['shadowed.example.com:1'] }
+      },
+    }
+    dispose = registerHttpApi(shadowed as unknown as CherryHttpContext, shapeDeps())
+
+    expect(await statusFor(fake, 'shadowed.example.com:1')).toBe(403)
+    expect(await statusFor(fake, HOST)).toBe(200)
+    // The wctx source answered, so the lookup is never even consulted.
+    expect(seenGets).toEqual([])
+  })
+
+  it('#7 neither service: mounts anyway and the fence stays loopback-only', async () => {
+    const fake = mountOn({ shape: 'bare' })
+
+    expect(fake.injected).toEqual([['webServer']])
+    expect(fake.server.routes.has(PREFIX)).toBe(true)
+    expect(await statusFor(fake, HOST)).toBe(200)
+    expect(await statusFor(fake, 'harness.internal:23023')).toBe(403)
+  })
+
   it('R9: dispose detaches the assembly listeners it registered', async () => {
     // The assembly channels are sets that OUTLIVE one hub: they live on the
     // module-level state, so a hub that registers without ever detaching leaves

@@ -1105,6 +1105,11 @@ function mountHttpApi(overrides: Partial<CherryHttpDeps> = {}): {
     webServer: server,
     webRuntime: { trustedHosts: ['harness.internal:23023'] },
     inject<T>(_deps: string[], cb: (ctx: T) => void | (() => void)): void {
+      // The 0.2.0 payload shape. Issue #7 moved the injection key set to
+      // `['webServer']` alone, but a host that DOES carry `webRuntime` on the
+      // injected ctx still supplies `trustedHosts` from here (first source of
+      // `resolveTrustedHosts`), so the fence assertions below keep their
+      // declared-host branch.
       cb({ webServer: server, webRuntime: { trustedHosts: ['harness.internal:23023'] } } as T)
     },
   }
@@ -1753,7 +1758,8 @@ function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unkn
         })
         return
       }
-      cb({ webServer: server, webRuntime: { trustedHosts: [] } })
+      // Issue #7: `webServer` alone (the web-only inject key set).
+      cb({ webServer: server })
     },
     effect(): void {},
     injectedEffects,

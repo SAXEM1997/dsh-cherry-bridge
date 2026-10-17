@@ -14,8 +14,9 @@
  * two-key typo) — THROWS rather than routing to either ctx. Both throws can only
  * come from a typo in the plugin's own `INJECT_KEYS`
  * (`src/toolScopeHost.ts`): there are exactly two dynamic `inject` call sites in
- * `src/` and they request disjoint key sets — `['webServer','webRuntime']` (no
- * scope key) and the two below.
+ * `src/` and they request disjoint key sets — `['webServer']` (no scope key;
+ * issue #7 removed the co-injected `webRuntime`, whose AND semantics had made
+ * the callback unreachable on DSH 0.2.1) and the two below.
  *
  * "NEITHER scope key" is deliberately NOT the same test as "the web-only call":
  * classifying by the ABSENCE of the scope keys alone is what let a two-key typo
@@ -32,12 +33,14 @@
 export const SCOPE_INJECT_KEYS = ['agents', 'workspaceRegistry'] as const
 
 /**
- * The web-only dynamic `inject` call site's key set (`src/httpApi.ts:773`): the
- * ONLY production call that asks for no scope key. Named here as a literal for
- * the same reason as {@link SCOPE_INJECT_KEYS} — the gate must not agree with a
- * typo by construction.
+ * The web-only dynamic `inject` call site's key set (`registerHttpApi` in
+ * `src/httpApi.ts`): the ONLY production call that asks for no scope key. Named
+ * here as a literal for the same reason as {@link SCOPE_INJECT_KEYS} — the gate
+ * must not agree with a typo by construction. It is pinned to ONE key since
+ * issue #7: `webRuntime` was removed in DSH 0.2.1, and asking for it as well
+ * turned this injection into an AND gate that never fired.
  */
-export const WEB_INJECT_KEYS = ['webServer', 'webRuntime'] as const
+export const WEB_INJECT_KEYS = ['webServer'] as const
 
 /**
  * Classifies one `inject(deps, cb)` call: `true` ⇒ the scope-capable ctx,
