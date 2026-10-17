@@ -2849,7 +2849,12 @@ var DeviceConnection = class {
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
 			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs);
 			if (reconnected === void 0) throw lost;
-			return await reconnected.client.request(method, params, opts);
+			try {
+				return await reconnected.client.request(method, params, opts);
+			} catch (error) {
+				if (this.#isTransportLoss(error)) throw lost;
+				throw error;
+			}
 		}
 	}
 	/** Whether a rejection is the dead channel, as opposed to a peer's own answer. */
@@ -2884,9 +2889,13 @@ var DeviceConnection = class {
 				resolve(value);
 			};
 			const listener = (state) => {
-				if (state === "disabled" || state === "identity-mismatch") finish(void 0);
+				if (state === "disabled" || state === "identity-mismatch") {
+					finish(void 0);
+					return;
+				}
+				if (state !== "connected") return;
 				const link = this.#link;
-				if (state !== "connected" || link === void 0) return;
+				if (link === void 0) return;
 				finish({
 					client: link.client,
 					epoch: link.epoch
@@ -4943,7 +4952,7 @@ var CherryToolEngine = class {
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
 			const chunk = Buffer.from(data, "base64");
 			hash.update(chunk);
-			chunks.push(chunk.toString("utf8"));
+			chunks.push(chunk);
 			read += chunk.length;
 			if (read > MAX_EXTERNALIZED_BYTES) throw new Error(`agent.content.read for ${contentId} exceeded the ${MAX_EXTERNALIZED_BYTES}-byte limit for externalized content; not read`);
 			if (typeof slice["sha256"] === "string") sha = slice["sha256"];
@@ -4960,7 +4969,7 @@ var CherryToolEngine = class {
 		if (expected === void 0) throw new ContentIntegrityError(`agent.content.read for ${contentId} returned no sha256 to verify`);
 		const actual = hash.digest("hex");
 		if (actual !== expected) throw new ContentIntegrityError(`agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`);
-		return chunks.join("");
+		return Buffer.concat(chunks).toString("utf8");
 	}
 	#eventsTool() {
 		return defineCherryTool({

@@ -1062,6 +1062,39 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(fakeInfo.fake.authenticateCount).toBe(2)
   }, 20_000)
 
+  it('⑭e a replay that ALSO loses its link is still a classified TransportLostError', async () => {
+    // The replay is the last attempt. A link that dies again must not escape as
+    // the bare `JSON-RPC channel closed` text — that is the whole defect this
+    // issue is about, and it would resurface on the second failure if the replay
+    // were left unwrapped.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: { heartbeatMs: 60_000 },
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const kill = (): void => {
+      fakeInfo.fake.dropConnections()
+      // Re-arm: the SECOND arrival is the replay, and it must die too.
+      fakeInfo.fake.beforeNextCall('agent.agents.list', kill)
+    }
+    fakeInfo.fake.beforeNextCall('agent.agents.list', kill)
+    const record = recordFor(fakeInfo)
+    const connection = makeConnection({
+      identity,
+      record,
+      backoffInitialMs: 1,
+      transportRetryWaitMs: 5_000,
+    })
+    await connection.connect()
+
+    const error = await connection.rpc.request('agent.agents.list', {}).catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(TransportLostError)
+    expect((error as TransportLostError).retryable).toBe(true)
+    // Exactly two attempts on the wire: the original and the one replay.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(2)
+    await waitForState(connection, 'connected', 5_000)
+  })
+
   it('⑭b a read whose reconnect never happens surfaces a retryable TransportLostError naming device and method', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeLinkKillingFake('agent.agents.list', {

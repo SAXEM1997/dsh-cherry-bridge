@@ -1802,7 +1802,13 @@ class CherryToolEngine {
     let sha: string | undefined
     let complete = false
     let read = 0
-    const chunks: string[] = []
+    // BYTES, never text: a 24 KiB slice boundary lands inside a multi-byte
+    // character often enough to matter, and decoding each slice on its own turns
+    // the split character into U+FFFD in BOTH halves — while the digest, which
+    // covers the raw bytes, still matches. The bytes are decoded ONCE at the end
+    // (the official client does the same), so the walk cannot corrupt text it
+    // has certified.
+    const chunks: Buffer[] = []
     const hash = createHash('sha256')
     for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
       const slice = (await connection.rpc.request('agent.content.read', {
@@ -1813,12 +1819,9 @@ class CherryToolEngine {
         maxBytes: CONTENT_READ_MAX_BYTES,
       })) as Record<string, unknown>
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
-      // The TEXT and the digest are consumed as the walk goes: a slice is all
-      // this loop ever holds at once, so neither bound below depends on the
-      // content fitting in memory as a whole.
       const chunk = Buffer.from(data, 'base64')
       hash.update(chunk)
-      chunks.push(chunk.toString('utf8'))
+      chunks.push(chunk)
       read += chunk.length
       // The slice budget cannot hold the cap on its own: a ref with no usable
       // `byteLength` falls back to the slice bound, which the peer can fill with
@@ -1874,7 +1877,7 @@ class CherryToolEngine {
         `agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`,
       )
     }
-    return chunks.join('')
+    return Buffer.concat(chunks).toString('utf8')
   }
 
   // -------------------------------------------------------------------------

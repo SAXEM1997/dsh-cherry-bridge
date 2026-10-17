@@ -1149,7 +1149,15 @@ export class DeviceConnection {
       )
       const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs)
       if (reconnected === undefined) throw lost
-      return await reconnected.client.request<T>(method, params, opts)
+      try {
+        return await reconnected.client.request<T>(method, params, opts)
+      } catch (error) {
+        // The replay is the LAST attempt: a link that dies again is reported as
+        // the same classified loss, never as the bare channel-closed text the
+        // caller cannot act on.
+        if (this.#isTransportLoss(error)) throw lost
+        throw error
+      }
     }
   }
 
@@ -1188,9 +1196,13 @@ export class DeviceConnection {
         resolve(value)
       }
       const listener = (state: DeviceState): void => {
-        if (state === 'disabled' || state === 'identity-mismatch') finish(undefined)
+        if (state === 'disabled' || state === 'identity-mismatch') {
+          finish(undefined)
+          return
+        }
+        if (state !== 'connected') return
         const link = this.#link
-        if (state !== 'connected' || link === undefined) return
+        if (link === undefined) return
         finish({ client: link.client, epoch: link.epoch })
       }
       const timer = setTimeout(() => finish(undefined), waitMs)

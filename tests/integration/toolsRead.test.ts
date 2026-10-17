@@ -1419,3 +1419,40 @@ describe('read-only cherry tools: registration framework', () => {
     }
   })
 })
+
+describe('issue #17: a slice boundary inside a multi-byte character', () => {
+  it('④q decodes the reassembled BYTES, so a split character survives intact', async () => {
+    // `agent.content.read` slices at 24 KiB, which lands inside a multi-byte
+    // character whenever the content is not pure ASCII. Decoding each slice on
+    // its own yields U+FFFD in both halves — and the sha256, computed over the
+    // RAW BYTES, still matches, so the integrity check cannot catch it. The
+    // text below puts a CJK character exactly across the first boundary.
+    const boundary = 24_576
+    const text = `${'a'.repeat(boundary - 1)}中文内容测试${'b'.repeat(64)}`
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text }],
+          },
+        ],
+      },
+    })
+
+    const snapshot = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ content: string; unavailable?: string }> }>
+    }
+
+    const part = snapshot.messages[0]!.parts[0]!
+    expect(part.unavailable).toBeUndefined()
+    expect(part.content).toBe(text)
+    expect(part.content).not.toContain('\uFFFD')
+  })
+})
