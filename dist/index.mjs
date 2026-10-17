@@ -3816,6 +3816,57 @@ const TERMINAL_EXECUTION_STATUSES = [
 const PAGE_ITEMS_FALLBACK = 100;
 /** The largest MESSAGE aggregate a caller may ask for; the per-page clamp still applies. */
 const MAX_AGGREGATE_LIMIT = 1e3;
+/**
+* MESSAGE CEILING for the terminal/timeout/idle aggregate (issue #3).
+*
+* These three results are answers to a WAIT, not listings: the caller asked
+* "what did my run produce?" and the walk exists to find the run's own
+* messages. Reading the session's whole history to answer that was the field
+* defect — a 459-message session meant 29+ `agent.messages.list` pages plus
+* every part of every message, i.e. 118-124 s of round trips AFTER the
+* deadline had already elapsed.
+*
+* 20 is not a guess about how much history a caller might like: one run
+* persists a user message and an assistant message (a pair), and the peer's
+* `listSessionMessages` walks NEWEST-FIRST, so the walk reaches the run's own
+* messages FIRST. Ten runs' worth of slack is therefore already an order of
+* magnitude more than the walk needs to see the current one.
+*
+* Truncation is SURFACED (`messagesTruncated` + reason + resume cursor), never
+* silent: a caller that really wants the deeper history resumes from the
+* cursor or reads the session with `cherry_read`, whose own `limit` is the
+* caller's to raise.
+*/
+const TERMINAL_AGGREGATE_MESSAGES = 20;
+/**
+* BYTE BUDGET for the terminal/timeout/idle aggregate, applied to the
+* PROJECTED messages (each one after `#projectMessage`, measured with
+* `JSON.stringify`'s length as a cheap approximation of its wire cost).
+*
+* The message ceiling alone does not bound the RESULT: one message can carry
+* hundreds of parts, each an externalized `{ref}` resolved through a separate
+* `agent.content.read`. The field report's aggregate was 13 MB across 459
+* messages, and a result that size does not survive the MCP boundary at all
+* ("value is not lossless JSON") — the caller loses the verdict along with the
+* content. 256 KiB is a deliberate fraction of a tool result: enough for a
+* long reply plus its reasoning, small enough to stay well inside the limit.
+*
+* THE NEWEST MESSAGE IS ALWAYS WHOLE. The budget is checked only AFTER a
+* message's projection completes, and the first message is always taken before
+* any check runs — it is the run's own reply, so a budget that could truncate
+* it would defeat the purpose of reading the history in the first place.
+*/
+const TERMINAL_AGGREGATE_BYTES = 262144;
+/**
+* What a caller whose terminal aggregate could not be assembled should do.
+*
+* The assembly failure is a CONTENT problem (an unverifiable `{ref}`, a part
+* walk the peer would not terminate, a message list that moved under us), not
+* a verdict on the run: the run's status is already known and is still true.
+* Saying so — and naming the route that rebuilds the content without a wait —
+* is what keeps the caller from re-running a command whose outcome is settled.
+*/
+const AGGREGATE_FAILED_GUIDANCE = "content assembly failed; the run verdict stands — use cherry_read to fetch the messages";
 /** One `agent.content.read` slice is capped at the protocol's `remoteLimits.contentBytes`. */
 const CONTENT_READ_MAX_BYTES = 24576;
 /**
@@ -4917,7 +4968,7 @@ var CherryToolEngine = class {
 				const timeoutMs = waitTimeout(args["timeoutMs"]);
 				return this.#awaitRun(connection, subscriptions, sessionId, {
 					timeoutMs,
-					startedAt: Date.now(),
+					startedAt: performance.now(),
 					baselineSeq,
 					executionId: typeof receipt["executionId"] === "string" ? receipt["executionId"] : void 0,
 					commandId: typeof receipt["commandId"] === "string" ? receipt["commandId"] : void 0
@@ -5027,20 +5078,29 @@ var CherryToolEngine = class {
 				if (activeExecutionId === void 0) {
 					const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 					if (idle !== void 0) this.#revisionCache.set(this.#cacheKey(record.deviceId, sessionId), idle);
-					const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
+					const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
+						status: "idle",
+						sessionId,
+						cursor: this.#cursorOf(subscriptions, sessionId)
+					});
+					if (assembled.failed !== void 0) return {
+						...assembled.failed,
+						session,
+						executionId: null
+					};
 					return {
 						status: "idle",
 						sessionId,
 						session,
 						executionId: null,
-						messages,
+						messages: assembled.messages,
 						cursor: this.#cursorOf(subscriptions, sessionId),
-						...walk
+						...assembled.walk
 					};
 				}
 				return this.#awaitRun(connection, subscriptions, sessionId, {
 					timeoutMs: waitTimeout(args["timeoutMs"]),
-					startedAt: Date.now(),
+					startedAt: performance.now(),
 					executionId: activeExecutionId
 				});
 			}
@@ -5711,7 +5771,7 @@ var CherryToolEngine = class {
 				...options.commandId === void 0 ? {} : { commandId: options.commandId },
 				...observed.terminalMessageId === void 0 ? {} : { terminalMessageId: observed.terminalMessageId }
 			});
-			const now = Date.now();
+			const now = performance.now();
 			if (now >= deadline) return await this.#timeoutResult(connection, subscriptions, sessionId, {
 				timeoutMs: options.timeoutMs,
 				...latestExecutionId === void 0 ? {} : { executionId: latestExecutionId },
@@ -5939,26 +5999,43 @@ var CherryToolEngine = class {
 	* run's reply on the second send of a reused session — the primary workflow.
 	* The cut is the terminal's own `messageId` when the peer named one (the
 	* waiter carries it from `execution.updated`); without that name the text
-	* falls back to the LAST assistant message, which is the run's reply under
-	* the protocol's append-per-run ordering. Either way the FULL `messages`
-	* array stays on the result as context.
+	* falls back to the NEWEST assistant message (see
+	* {@link aggregateAssistantText}). Either way the `messages` array stays on
+	* the result as context, bounded by {@link TERMINAL_AGGREGATE_MESSAGES} and
+	* {@link TERMINAL_AGGREGATE_BYTES}.
+	*
+	* A CONTENT ASSEMBLY FAILURE DOES NOT UNDO THE VERDICT (issue #3). The run
+	* really did settle on `status`; only the history read behind `text` failed.
+	* Throwing would take the status and the run's identifiers down with it —
+	* the field report could not even recover the `commandId` of the command it
+	* had just issued. So the failure DEGRADES to a stub receipt: the verdict,
+	* the session, the execution/command ids and the event cursor, plus
+	* `aggregateError` and `guidance`, and NO `messages`/`text` (half an
+	* assembly must never be presented as the run's output).
 	*/
 	async #terminalResult(connection, subscriptions, sessionId, status, extra) {
 		const { terminalMessageId, ...rest } = extra;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
-		const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle !== void 0) this.#revisionCache.set(this.#cacheKey(connection.record.deviceId, sessionId), idle);
+		const cursor = this.#cursorOf(subscriptions, sessionId);
+		const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
+			status,
+			sessionId,
+			...rest,
+			cursor
+		});
+		if (assembled.failed !== void 0) return assembled.failed;
 		return {
 			status,
 			sessionId,
 			...rest,
 			session,
-			text: aggregateAssistantText(messages, typeof terminalMessageId === "string" ? terminalMessageId : void 0),
-			messages,
-			cursor: this.#cursorOf(subscriptions, sessionId),
-			...walk
+			text: aggregateAssistantText(assembled.messages, typeof terminalMessageId === "string" ? terminalMessageId : void 0),
+			messages: assembled.messages,
+			cursor,
+			...assembled.walk
 		};
 	}
 	/**
@@ -5969,32 +6046,167 @@ var CherryToolEngine = class {
 	* not settled, so there is no terminal message to cut at, and the whole point
 	* of the timeout answer is to hand back the PARTIAL content produced so far
 	* (spec §3.6: 超时非失败返回部分内容+游标).
+	*
+	* WHERE THE PARTIAL CONTENT ACTUALLY LIVES — and therefore how honest `text`
+	* is. A run that has not settled has usually not committed anything to the
+	* HISTORY face yet: on the real peer the assistant message exists as a
+	* pending row whose `parts` are still empty, and the tokens stream on the
+	* EVENT channel as `part.append` events. So a timeout's `text` is very often
+	* `''`, and that empty string is the truthful answer: the newest assistant
+	* message — this run's — has no parts in the history face. The content is in
+	* the event stream, which is where `part.append` carries it; it reaches the
+	* history face (and this aggregate) only when the run commits. The fallback
+	* anchor is the NEWEST assistant message for exactly this reason: an older
+	* message's text would say "this is your run's output" about a run that has
+	* produced none. See {@link aggregateAssistantText}.
+	*
+	* The result also carries `progress` — a zero-round-trip HEARTBEAT: the
+	* newest event already in this session's subscription buffer, with its kind.
+	* It costs no RPC (the waiter holds the buffer) and it is the one thing that
+	* lets a caller tell "the run is still moving" from "the stream went silent"
+	* without a second call. Its limits are stated where it is built
+	* ({@link CherryToolEngine.#timeoutProgress}).
 	*/
 	async #timeoutResult(connection, subscriptions, sessionId, extra) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
-		const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
+		const cursor = this.#cursorOf(subscriptions, sessionId);
+		const progress = this.#timeoutProgress(subscriptions, sessionId);
+		const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
+			status: "timeout",
+			sessionId,
+			...extra,
+			cursor,
+			...progress === void 0 ? {} : { progress }
+		});
+		if (assembled.failed !== void 0) return assembled.failed;
 		return {
 			status: "timeout",
 			sessionId,
 			...extra,
 			session,
-			text: aggregateAssistantText(messages),
-			messages,
-			cursor: this.#cursorOf(subscriptions, sessionId),
-			...walk
+			text: aggregateAssistantText(assembled.messages),
+			messages: assembled.messages,
+			cursor,
+			...progress === void 0 ? {} : { progress },
+			...assembled.walk
 		};
 	}
 	/**
-	* The session's assistant messages, read to completion with `{ref}` parts
-	* aggregated through `agent.content.read` — the SAME path `cherry_read` uses
+	* The timeout answer's HEARTBEAT: the newest event the session's own
+	* subscription buffer already holds, and its kind.
+	*
+	* ZERO ROUND TRIPS BY CONSTRUCTION. The waiter has been folding this buffer
+	* every poll pass, so the newest entry is already in hand; asking the peer
+	* (`agent.sessions.get`, a journal read) for the same fact would spend the
+	* caller's window on a second RPC at the exact moment the first one is
+	* already late — and would re-introduce the unbounded-ring-time defect this
+	* result is being fixed for. Both numbers are read from one scan of the
+	* buffer's tail, so they always describe the SAME event.
+	*
+	* ITS LIMITS, stated here rather than discovered by a caller:
+	*
+	*  - **Omitted when the buffer is empty.** An epoch rotation (a
+	*    `resetRequired`, a re-subscribe, an LRU eviction) drops the buffer
+	*    WHOLESALE, and a session with no event traffic at all starts empty. In
+	*    both cases there is no event to report, so the field is ABSENT — never a
+	*    zero or an invented seq, which a caller would read as "the stream is at
+	*    position 0" and conclude the opposite of what is true.
+	*  - **It is not a liveness PROOF, only a liveness HINT.** `seq` is this
+	*    session's stream position, so an unchanged `lastEventSeq` across two
+	*    timeouts means no event arrived in between — the stream is quiet, not
+	*    that the run is dead (a run can legitimately emit nothing for a while).
+	*    A CHANGED `lastEventSeq` is the strong signal: the run (or the session)
+	*    is producing events.
+	*  - **The buffer is bounded per session** (the subscriptions layer trims it
+	*    to a byte budget by dropping the OLDEST events). That only ever hides
+	*    old events, and the heartbeat reads the newest.
+	*/
+	#timeoutProgress(subscriptions, sessionId) {
+		let newest;
+		let newestSeq = Number.NEGATIVE_INFINITY;
+		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
+			const seq = Number(entry["seq"]);
+			if (!Number.isFinite(seq) || seq <= newestSeq) continue;
+			newest = entry;
+			newestSeq = seq;
+		}
+		if (newest === void 0) return void 0;
+		return {
+			lastEventSeq: newestSeq,
+			lastEventKind: String(newest["kind"] ?? "")
+		};
+	}
+	/**
+	* The bounded history read the three wait answers share, with its two
+	* possible outcomes folded into one type:
+	*
+	*  - the projection succeeded → `messages` + the walk verdict (which may
+	*    itself say the walk was bounded or byte-capped — surfaced, never
+	*    silent);
+	*  - the projection FAILED → `failed`, the STUB RECEIPT the caller returns
+	*    verbatim (issue #3): the verdict and the identifiers already collected
+	*    in `identity`, plus `aggregateError` and `guidance`, and no content.
+	*
+	* Failure does not distinguish an integrity error from a transport fault
+	* here, deliberately: `cherry_read`'s rule (an unverifiable `{ref}` fails the
+	* WHOLE read) is about not presenting unverified content as a snapshot, and
+	* that rule still holds — `cherry_read` still throws. A WAIT is a different
+	* question: the run's verdict is already known and must survive, so here the
+	* same failure degrades the CONTENT (`messages`/`text` absent) while the
+	* verdict stands. Nothing unverified is handed back either way.
+	*/
+	async #assembledTerminalMessages(connection, sessionId, session, identity) {
+		try {
+			const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
+			return {
+				messages,
+				walk
+			};
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.warn(`[cherry-remote] the ${String(identity["status"])} answer for session ${sessionId} could not assemble its content (${message}); returning the verdict with the assembly failure reported`);
+			return { failed: {
+				...identity,
+				aggregateError: message.slice(0, 200),
+				guidance: AGGREGATE_FAILED_GUIDANCE
+			} };
+		}
+	}
+	/**
+	* The session's recent messages, projected with `{ref}` parts aggregated
+	* through `agent.content.read` — the SAME projection `cherry_read` uses
 	* (spec §3.6: the terminal aggregate resolves externalized parts too).
 	*
-	* The MESSAGE-walk verdict comes back WITH the messages rather than being
-	* dropped: this walk is bounded by {@link MAX_AGGREGATE_LIMIT} messages, so a
-	* session past that ceiling stops with the peer still holding pages. The three
-	* callers (terminal, timeout, idle) each surface it — a walk never stops early
-	* and reports success.
+	* BOUNDED, in two dimensions (issue #3):
+	*
+	*  1. **Messages** — at most {@link TERMINAL_AGGREGATE_MESSAGES}, starting
+	*     from the NEWEST page. The peer's `listSessionMessages` walks
+	*     newest-first, so the walk reaches the current run's own messages first;
+	*     history past the ceiling is not what a wait is asking for.
+	*  2. **Bytes** — the projected messages are accumulated (their
+	*     `JSON.stringify` length as a wire-cost proxy) and the projection stops
+	*     once {@link TERMINAL_AGGREGATE_BYTES} is exceeded. The message COUNT
+	*     alone bounds nothing: one message may carry hundreds of parts, each a
+	*     separate `agent.content.read`.
+	*
+	* The FIRST message is always projected and always kept WHOLE — it is the
+	* newest, i.e. the run's own reply — so the byte budget is only ever checked
+	* AFTER a complete message has been taken. A walk that stopped for either
+	* reason comes back with the verdict filled in (`messageWalkVerdict`
+	* handles the ceiling; `'aggregate-bytes'` is attributed here), and the
+	* three callers (terminal, timeout, idle) each surface it.
+	*
+	* A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
+	* points past the entire page it came with, so a byte stop in the MIDDLE of a
+	* page would hand out a cursor whose interval still holds messages this walk
+	* trimmed — newer than the cursor, older than the last one returned. A caller
+	* chaining `cherry_read` from it would never see them, and only `cherry_read`
+	* (or this result's own `messages`) can still fetch them; offering a cursor
+	* that jumps over content is worse than offering none. The cursor is
+	* therefore attached only when the WHOLE page was returned (nothing lies
+	* between it and what this result carries) — see
+	* {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*/
 	async #readTerminalMessages(connection, sessionId, session) {
 		const historyRevision = optionalString(session["historyRevision"]);
@@ -6005,9 +6217,28 @@ var CherryToolEngine = class {
 		}, (result) => ({
 			items: arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), MAX_AGGREGATE_LIMIT);
+		}), TERMINAL_AGGREGATE_MESSAGES);
 		const messages = [];
-		for (const raw of page.items) messages.push(await this.#projectMessage(connection, sessionId, raw));
+		let projectedBytes = 0;
+		let outOfBudget = false;
+		for (const raw of page.items) {
+			const message = await this.#projectMessage(connection, sessionId, raw);
+			messages.push(message);
+			projectedBytes += JSON.stringify(message).length;
+			if (projectedBytes >= TERMINAL_AGGREGATE_BYTES) {
+				outOfBudget = true;
+				break;
+			}
+		}
+		if (outOfBudget && (messages.length < page.items.length || page.truncated)) {
+			const verdict = {
+				messages,
+				messagesTruncated: true,
+				messagesTruncationReason: "aggregate-bytes"
+			};
+			if (page.nextCursor !== void 0 && messages.length === page.items.length) verdict.messagesResumeCursor = page.nextCursor;
+			return verdict;
+		}
 		return {
 			messages,
 			...messageWalkVerdict(page)
@@ -6152,22 +6383,49 @@ function messageWalkVerdict(page) {
 * concatenate what the read produced.
 *
 * The scope is what makes this correct on a REUSED session: the peer appends a
-* fresh assistant message per run and `messages.list` serves the WHOLE
-* cumulative history, so summing every assistant message would re-deliver run
-* N-1's reply as run N's output. `terminalMessageId` — the message the awaited
-* execution's terminal named — is the exact cut. When the peer named none, the
-* LAST assistant message is the run's own reply under the protocol's
-* append-per-run ordering, which still beats summing the history.
+* fresh assistant message per run and `messages.list` serves the cumulative
+* history, so summing every assistant message would re-deliver run N-1's reply
+* as run N's output. `terminalMessageId` — the message the awaited execution's
+* terminal named — is the exact cut, and it is matched BY ID, so the array's
+* order is irrelevant to it.
 *
-* THE FALLBACK IS BEST-EFFORT, AND THAT IS WHY THE CALLER FLAGS IT. The
-* last-in-walk message is only the run's reply when the walk reached the
-* session's true end. On a session past the aggregate ceiling it is a message
-* from an EARLIER run, and `terminalMessageId` is present but outside the walk
-* in the same way — both cases leave the text partial or stale, so neither may
-* be presented as a complete answer (see {@link CherryMessageWalkVerdict}).
+* ## The fallback anchors the NEWEST assistant message
+*
+* The array is NEWEST-FIRST. The peer's `listSessionMessages` "walks
+* newest-first; an absent cursor returns the most recent page, each
+* `nextCursor` walks one page older", so `messages[0]` is the most recent
+* message in the session — which is why the fallback starts at index 0 and
+* takes the first assistant message it meets.
+*
+* It used to anchor the array's TAIL, on the assumption that the protocol
+* appended per run in read order. It does not: the tail is the OLDEST assistant
+* message in the whole history, and the field defect was a 2026-10 run whose
+* fallback text came from a July message. Anchoring the newest end is the exact
+* inverse mistake — the right one, because the run this answer is about is the
+* most recent thing the session produced.
+*
+* ## An empty string is a real answer
+*
+* On the TIMEOUT path the run is still in flight and has usually committed
+* nothing to the history face: its assistant message exists as a pending row
+* whose `parts` are empty, while the streamed tokens ride the EVENT channel as
+* `part.append`. So the newest assistant message is the run's own, and it can
+* legitimately have no text — `''` then says exactly that, where an older
+* message's text would say "this is your run's output" about a run that has
+* produced none. The partial content is in the event stream, not here.
+*
+* ## The scope is bounded, and that is flagged
+*
+* The walk this reads was bounded by the caller
+* (`TERMINAL_AGGREGATE_MESSAGES` / `TERMINAL_AGGREGATE_BYTES`), so on a long
+* session the text is assembled from the newest window only. When even that
+* window was cut, the result carries the walk verdict
+* ({@link CherryMessageWalkVerdict}) and `terminalMessageId` may fall outside
+* it — both leave the text partial or stale, and neither may be presented as a
+* complete answer.
 */
 function aggregateAssistantText(messages, terminalMessageId) {
-	const scoped = terminalMessageId === void 0 ? lastAssistantMessage(messages) : messages.filter((message) => message.messageId === terminalMessageId);
+	const scoped = terminalMessageId === void 0 ? newestAssistantMessage(messages) : messages.filter((message) => message.messageId === terminalMessageId);
 	const chunks = [];
 	for (const message of scoped) {
 		if (message.role !== "assistant") continue;
@@ -6179,9 +6437,16 @@ function aggregateAssistantText(messages, terminalMessageId) {
 	}
 	return chunks.join("");
 }
-/** The session's newest assistant message, as a one-element list (or empty). */
-function lastAssistantMessage(messages) {
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
+/**
+* The session's NEWEST assistant message, as a one-element list (or empty).
+*
+* Index 0 is the newest: the peer serves the history newest-first (see
+* {@link aggregateAssistantText}). Named for the direction it reads rather than
+* for its position, because conflating the two is exactly the defect this
+* replaced.
+*/
+function newestAssistantMessage(messages) {
+	for (let index = 0; index < messages.length; index += 1) {
 		const message = messages[index];
 		if (message !== void 0 && message.role === "assistant") return [message];
 	}

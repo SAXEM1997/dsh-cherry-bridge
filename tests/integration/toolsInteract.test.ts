@@ -1500,8 +1500,11 @@ describe('final review: run-scoped terminal aggregate', () => {
     // The headline text is THIS run's reply ONLY.
     expect(second.text).toBe('run-two-reply')
     expect(second.text).not.toContain('run-one-reply')
-    // The full history stays available as context, both messages present.
-    expect(second.messages.map((message) => message.messageId)).toEqual(['m-assistant', 'm-assistant-2'])
+    // The history stays available as context, both messages present — in the
+    // peer's own order, which is NEWEST-FIRST (issue #3; the fake serves its
+    // fixture order, and a settling run prepends its message exactly as the
+    // real `listSessionMessages` returns the most recent page first).
+    expect(second.messages.map((message) => message.messageId)).toEqual(['m-assistant-2', 'm-assistant'])
   })
 
   it('R1b: the two runs really do persist DISTINCT assistant messages', async () => {
@@ -1524,12 +1527,14 @@ describe('final review: run-scoped terminal aggregate', () => {
     })
     await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'two', timeoutMs: 5_000 })
 
-    // The divergence the fake used to hide: the real peer appends per run.
+    // The divergence the fake used to hide: the real peer persists a fresh
+    // message per run, and serves the history NEWEST-FIRST (issue #3) — run
+    // two's message comes back first.
     const page = (await rig.rawRequest('agent.messages.list', {
       sessionId: 's-1',
       historyRevision: '1',
     })) as { items: Array<{ messageId: string }> }
-    expect(page.items.map((item) => item.messageId)).toEqual(['m-assistant', 'm-assistant-2'])
+    expect(page.items.map((item) => item.messageId)).toEqual(['m-assistant-2', 'm-assistant'])
   })
 })
 
