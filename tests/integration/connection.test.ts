@@ -1095,6 +1095,44 @@ describe('DeviceConnection over a real loopback channel', () => {
     await waitForState(connection, 'connected', 5_000)
   })
 
+  it('⑮c a link dying while the replay waits for its pacing admission never leaks disposal text', async () => {
+    // The replay takes a fresh rate admission, and the pacing wait can outlast
+    // the link it resolved on — the primary path re-judges after its own
+    // acquire for exactly this reason. Without the re-judgement the replay
+    // fires into a client that teardown has since disposed, and the caller gets
+    // raw 'JSON-RPC client disposed' — a verdict nothing can act on.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeLinkKillingFake('agent.agents.list', {
+      hello: { heartbeatMs: 60_000 },
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const record = recordFor(fakeInfo)
+    const connection = makeConnection({
+      identity,
+      record,
+      backoffInitialMs: 1,
+      transportRetryWaitMs: 10_000,
+      // One admission per ~1.15s: the replay parks in the limiter queue, which
+      // is exactly the window the second kill has to land in.
+      rateBudgetPerSecond: 1,
+    })
+    await connection.connect()
+
+    const pending = connection.rpc.request('agent.agents.list', {}).catch((reason: unknown) => reason)
+    // Kill #1 fires as the frame arrives; the reconnect lands on the 1ms
+    // backoff; the replay resolves and queues for its admission (~1.15s out).
+    await sleep(400)
+    // Kill #2 lands while the replay is still waiting for pacing: teardown
+    // disposes the client the replay is holding.
+    fakeInfo.fake.dropConnections()
+    const error = (await pending) as TransportLostError
+    expect(error).toBeInstanceOf(TransportLostError)
+    // The classified loss, never the raw disposal text.
+    expect(error.message).toMatch(/transport lost/i)
+    expect(error.message).not.toMatch(/disposed/)
+    expect(error.retryable).toBe(true)
+  })
+
   it('⑮b close() during a parked replay wait settles it at once, not at the window bound', async () => {
     // close() tears down "timers, channel, client, retries" — a parked replay
     // wait is a retry. Before the drain it outlived the close and held the

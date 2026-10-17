@@ -160,6 +160,8 @@ const RATE_WINDOW_MS = 1_000
 const RATE_WINDOW_MARGIN_MS = 150
 /** Bare rejection the rpc layer uses once the channel can no longer answer. */
 const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/
+/** The deliberate local-shutdown face of a disposed client (see the replay path). */
+const DISPOSED_RE = /^JSON-RPC client disposed$/
 /**
  * The read methods whose transport loss may be replayed automatically (two
  * entries are not called today — kept so a future call site is covered the day
@@ -1166,13 +1168,23 @@ export class DeviceConnection {
       // original link. The admission this call paid above bought the attempt
       // that died; arrivals, not logical calls, are what the peer paces.
       await this.#limiter.acquire()
+      // The pacing wait can outlast the link it resolved on (the primary path
+      // re-judges after its own acquire for the same reason): a teardown during
+      // it disposes the target client, and firing into a disposed client would
+      // surface raw disposal text — a verdict the caller cannot act on.
+      if (!this.#running || this.#state !== 'connected') throw lost
       try {
         return await reconnected.client.request<T>(method, params, opts)
       } catch (error) {
         // The replay is the LAST attempt: a link that dies again is reported as
         // the same classified loss, never as the bare channel-closed text the
-        // caller cannot act on.
-        if (this.#isTransportLoss(error)) throw lost
+        // caller cannot act on. A DISPOSED target is the same class here — the
+        // replay's link was real a moment ago, so its disposal is the lifecycle
+        // moving on under the request, not the caller's own close() (which the
+        // re-check above already answered).
+        if (this.#isTransportLoss(error) || DISPOSED_RE.test(String((error as Error)?.message ?? ''))) {
+          throw lost
+        }
         throw error
       }
     }

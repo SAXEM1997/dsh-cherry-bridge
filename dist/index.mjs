@@ -2180,6 +2180,8 @@ const DEFAULT_PROTOCOL_VERSIONS = [1];
 const SILENCE_FACTOR = 2;
 /** Bare rejection the rpc layer uses once the channel can no longer answer. */
 const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/;
+/** The deliberate local-shutdown face of a disposed client (see the replay path). */
+const DISPOSED_RE = /^JSON-RPC client disposed$/;
 /**
 * The read methods whose transport loss may be replayed automatically (two
 * entries are not called today — kept so a future call site is covered the day
@@ -2861,10 +2863,11 @@ var DeviceConnection = class {
 			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
 			if (reconnected === void 0) throw lost;
 			await this.#limiter.acquire();
+			if (!this.#running || this.#state !== "connected") throw lost;
 			try {
 				return await reconnected.client.request(method, params, opts);
 			} catch (error) {
-				if (this.#isTransportLoss(error)) throw lost;
+				if (this.#isTransportLoss(error) || DISPOSED_RE.test(String(error?.message ?? ""))) throw lost;
 				throw error;
 			}
 		}
