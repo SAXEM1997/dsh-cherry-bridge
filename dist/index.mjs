@@ -2181,8 +2181,9 @@ const SILENCE_FACTOR = 2;
 /** Bare rejection the rpc layer uses once the channel can no longer answer. */
 const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/;
 /**
-* The READ methods this plugin calls, and the ONLY methods whose transport loss
-* may be replayed automatically.
+* The read methods whose transport loss may be replayed automatically (two
+* entries are not called today — kept so a future call site is covered the day
+* it appears rather than silently un-retried).
 *
 * Reads are safe to replay by construction: the peer answers from stored
 * revisions and the call has no side effect, so a second copy costs one round
@@ -2383,6 +2384,15 @@ var DeviceConnection = class {
 	#helloProtocolVersions;
 	#transportRetryWaitMs;
 	#stateListeners = /* @__PURE__ */ new Set();
+	/**
+	* Waits parked inside `#awaitReconnect`. close() drains them: a shutdown has
+	* no reconnect to wait for, and — the case that matters — a close() followed
+	* by a fresh connect() must not let an OLD lifecycle's replay ride the new
+	* one. close() may fire NO state transition at all (setting 'offline' when
+	* the state is already 'offline' is a no-op), so the listeners alone cannot
+	* be relied on to notice.
+	*/
+	#replayWaiters = /* @__PURE__ */ new Set();
 	/** Notification handlers, re-attached to every new client after a reconnect. */
 	#notificationHandlers = /* @__PURE__ */ new Set();
 	/**
@@ -2502,6 +2512,7 @@ var DeviceConnection = class {
 	async close() {
 		this.#running = false;
 		this.#epoch += 1;
+		for (const abort of [...this.#replayWaiters]) abort(void 0);
 		this.#clearAllTimers();
 		this.#teardownLink();
 		this.#setState("offline");
@@ -2847,8 +2858,9 @@ var DeviceConnection = class {
 			const lost = new TransportLostError(this.record.deviceId, "connected", method);
 			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
-			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs);
+			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
 			if (reconnected === void 0) throw lost;
+			await this.#limiter.acquire();
 			try {
 				return await reconnected.client.request(method, params, opts);
 			} catch (error) {
@@ -2870,11 +2882,12 @@ var DeviceConnection = class {
 	* commits `#link` before its hello/authenticate pair completes, and a replay
 	* into that window would ride an unauthenticated client.
 	*/
-	#awaitReconnect(waitMs) {
+	#awaitReconnect(waitMs, deadClient) {
 		if (!this.#running) return Promise.resolve(void 0);
 		const established = () => {
 			const link = this.#link;
 			if (this.#state !== "connected" || link === void 0) return void 0;
+			if (link.client === deadClient) return void 0;
 			return {
 				client: link.client,
 				epoch: link.epoch
@@ -2886,22 +2899,24 @@ var DeviceConnection = class {
 			const finish = (value) => {
 				clearTimeout(timer);
 				this.#stateListeners.delete(listener);
+				this.#replayWaiters.delete(finish);
 				resolve(value);
 			};
 			const listener = (state) => {
-				if (state === "disabled" || state === "identity-mismatch") {
+				if (!this.#running || state === "disabled" || state === "identity-mismatch") {
 					finish(void 0);
 					return;
 				}
 				if (state !== "connected") return;
 				const link = this.#link;
-				if (link === void 0) return;
+				if (link === void 0 || link.client === deadClient) return;
 				finish({
 					client: link.client,
 					epoch: link.epoch
 				});
 			};
 			const timer = setTimeout(() => finish(void 0), waitMs);
+			this.#replayWaiters.add(finish);
 			this.#stateListeners.add(listener);
 		});
 	}
@@ -4278,8 +4293,8 @@ var CherryToolEngine = class {
 	* rather than silently truncating.
 	*/
 	#partsSafetyBound;
-	/** Fallback content slice budget, injectable for the same reason as above. */
-	#contentSliceBound;
+	/** Externalized-content byte ceiling, injectable for the reason above. */
+	#externalizedByteCap;
 	/** Poll cadence for the interactive waiters (see `DEFAULT_WAIT_POLL_MS`). */
 	#waitPollMs;
 	/**
@@ -4321,7 +4336,7 @@ var CherryToolEngine = class {
 	constructor(deps, options = {}) {
 		this.#deps = deps;
 		this.#partsSafetyBound = Math.max(1, Math.floor(options.partsSafetyBound ?? DEFAULT_PARTS_SAFETY_BOUND));
-		this.#contentSliceBound = Math.max(1, Math.floor(options.contentSliceBound ?? DEFAULT_CONTENT_SLICE_BOUND));
+		this.#externalizedByteCap = Math.max(1, Math.floor(options.externalizedByteCap ?? MAX_EXTERNALIZED_BYTES));
 		this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS));
 	}
 	definitions() {
@@ -4933,8 +4948,8 @@ var CherryToolEngine = class {
 		const revision = String(ref["revision"] ?? "");
 		const declaredSha = typeof ref["sha256"] === "string" ? ref["sha256"] : void 0;
 		const declaredBytes = Number(ref["byteLength"]);
-		if (Number.isFinite(declaredBytes) && declaredBytes > MAX_EXTERNALIZED_BYTES) throw new Error(`{ref} ${contentId} declares ${declaredBytes} bytes, above the ${MAX_EXTERNALIZED_BYTES}-byte limit for externalized content; not read`);
-		const maxSlices = Number.isSafeInteger(declaredBytes) ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES)) : this.#contentSliceBound;
+		if (Number.isFinite(declaredBytes) && declaredBytes > this.#externalizedByteCap) throw new Error(`{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit for externalized content; not read`);
+		const maxSlices = Number.isSafeInteger(declaredBytes) ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES)) : DEFAULT_CONTENT_SLICE_BOUND;
 		let offset = "0";
 		let sha;
 		let complete = false;
@@ -4950,11 +4965,13 @@ var CherryToolEngine = class {
 				maxBytes: CONTENT_READ_MAX_BYTES
 			});
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
+			const cap = this.#externalizedByteCap;
+			if (read + Math.ceil(data.length / 4) * 3 > cap + 2) throw new Error(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for externalized content; not read`);
 			const chunk = Buffer.from(data, "base64");
 			hash.update(chunk);
 			chunks.push(chunk);
 			read += chunk.length;
-			if (read > MAX_EXTERNALIZED_BYTES) throw new Error(`agent.content.read for ${contentId} exceeded the ${MAX_EXTERNALIZED_BYTES}-byte limit for externalized content; not read`);
+			if (read > cap) throw new Error(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for externalized content; not read`);
 			if (typeof slice["sha256"] === "string") sha = slice["sha256"];
 			if (slice["eof"] === true) {
 				complete = true;

@@ -1095,6 +1095,71 @@ describe('DeviceConnection over a real loopback channel', () => {
     await waitForState(connection, 'connected', 5_000)
   })
 
+  it('⑮b close() during a parked replay wait settles it at once, not at the window bound', async () => {
+    // close() tears down "timers, channel, client, retries" — a parked replay
+    // wait is a retry. Before the drain it outlived the close and held the
+    // caller for the full transportRetryWaitMs (measured 2999ms of 3000ms).
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeLinkKillingFake('agent.agents.list', {
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const record = recordFor(fakeInfo)
+    const connection = makeConnection({
+      identity,
+      record,
+      // No reconnect can land inside the window; only close() may end the wait.
+      backoffInitialMs: 60_000,
+      transportRetryWaitMs: 3_000,
+    })
+    await connection.connect()
+
+    const pending = connection.rpc.request('agent.agents.list', {}).catch((reason: unknown) => reason)
+    // Park the wait: the kill fires as the frame arrives, well inside this beat.
+    await sleep(150)
+    const settled = Date.now()
+    await connection.close()
+    const error = (await pending) as TransportLostError
+    // The close itself settled it — not the 3s bound it was parked on.
+    expect(Date.now() - settled).toBeLessThan(1_000)
+    expect(error).toBeInstanceOf(TransportLostError)
+    expect(error.retryable).toBe(true)
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
+  })
+
+  it('⑮a a replay parked across close() then connect() never rides the NEW lifecycle', async () => {
+    // The worse half of the same defect: close() followed by a fresh connect()
+    // used to let the OLD lifecycle's replay fire on the new link and succeed —
+    // a request the caller had every reason to consider dead came back to life
+    // across a shutdown. The wait must die with the lifecycle that parked it.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeLinkKillingFake('agent.agents.list', {
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const record = recordFor(fakeInfo)
+    // A huge backoff so NO automatic reconnect can race the close: the new
+    // lifecycle below exists only because the test starts it, which makes
+    // "the replay fired on the new lifecycle" a deterministic claim.
+    const connection = makeConnection({
+      identity,
+      record,
+      backoffInitialMs: 60_000,
+      transportRetryWaitMs: 10_000,
+    })
+    await connection.connect()
+
+    const pending = connection.rpc.request('agent.agents.list', {}).catch((reason: unknown) => reason)
+    await sleep(150)
+    await connection.close()
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    // Give a wrongly-surviving replay every chance to land on the new link.
+    await sleep(300)
+    const error = (await pending) as TransportLostError
+    expect(error).toBeInstanceOf(TransportLostError)
+    // The original arrival only: the replay never fired on the new lifecycle.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
+  })
+
   it('⑭b a read whose reconnect never happens surfaces a retryable TransportLostError naming device and method', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeLinkKillingFake('agent.agents.list', {

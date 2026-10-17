@@ -782,17 +782,16 @@ export interface CherryToolEngineOptions {
    */
   partsSafetyBound?: number
   /**
-   * Fallback slice budget for one `{ref}` with no usable `byteLength`. Omitted
-   * uses {@link DEFAULT_CONTENT_SLICE_BOUND}.
+   * Byte ceiling for one `{ref}`'s externalized content. Omitted uses
+   * {@link MAX_EXTERNALIZED_BYTES}.
    *
-   * It exists because the two bounds answer DIFFERENT questions and only their
-   * INDEPENDENCE is testable: with the default budget a peer serving real 24 KiB
-   * slices reaches the 32 MiB ceiling (issue #17) solely through the slice count,
-   * so a case that shrinks this bound to a handful of slices makes the byte
-   * ceiling the only thing that can stop the walk — and only then is the byte
-   * check provably load-bearing rather than shadowed by the budget.
+   * Injectable so a test can prove the CUMULATIVE arm of the ceiling is
+   * load-bearing: with the real 32 MiB value, any ref that crosses it through
+   * honest 24 KiB slices exhausts the slice budget first, and only a small cap
+   * makes the byte check the arm that actually stops a peer that serves more
+   * than it declared.
    */
-  contentSliceBound?: number
+  externalizedByteCap?: number
   /**
    * How long a waiter may sit between two judgement passes when the session
    * buffer has not moved. Omitted uses {@link DEFAULT_WAIT_POLL_MS}. Lowering
@@ -894,8 +893,8 @@ class CherryToolEngine {
    * rather than silently truncating.
    */
   readonly #partsSafetyBound: number
-  /** Fallback content slice budget, injectable for the same reason as above. */
-  readonly #contentSliceBound: number
+  /** Externalized-content byte ceiling, injectable for the reason above. */
+  readonly #externalizedByteCap: number
   /** Poll cadence for the interactive waiters (see `DEFAULT_WAIT_POLL_MS`). */
   readonly #waitPollMs: number
   /**
@@ -944,9 +943,9 @@ class CherryToolEngine {
       1,
       Math.floor(options.partsSafetyBound ?? DEFAULT_PARTS_SAFETY_BOUND),
     )
-    this.#contentSliceBound = Math.max(
+    this.#externalizedByteCap = Math.max(
       1,
-      Math.floor(options.contentSliceBound ?? DEFAULT_CONTENT_SLICE_BOUND),
+      Math.floor(options.externalizedByteCap ?? MAX_EXTERNALIZED_BYTES),
     )
     this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS))
   }
@@ -1788,15 +1787,15 @@ class CherryToolEngine {
     // cap: past it the walk is refused BEFORE any round trip (see
     // MAX_EXTERNALIZED_BYTES). This is the degradable class — a plain Error, so
     // the part is marked unavailable instead of failing the read.
-    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_EXTERNALIZED_BYTES) {
+    if (Number.isFinite(declaredBytes) && declaredBytes > this.#externalizedByteCap) {
       throw new Error(
-        `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${MAX_EXTERNALIZED_BYTES}-byte limit ` +
+        `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit ` +
           'for externalized content; not read',
       )
     }
     const maxSlices = Number.isSafeInteger(declaredBytes)
       ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES))
-      : this.#contentSliceBound
+      : DEFAULT_CONTENT_SLICE_BOUND
 
     let offset = '0'
     let sha: string | undefined
@@ -1819,17 +1818,29 @@ class CherryToolEngine {
         maxBytes: CONTENT_READ_MAX_BYTES,
       })) as Record<string, unknown>
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
+      // The cap is checked on the base64 LENGTH first, before the decode: a
+      // slice may carry any size a hostile peer puts in one frame, and decoding
+      // it just to measure it is the memory exposure the cap exists to bound.
+      // ceil(len/4)*3 is the exact byte count for unpadded base64 and errs high
+      // by at most the padding — the safe direction for a ceiling.
+      const cap = this.#externalizedByteCap
+      if (read + Math.ceil(data.length / 4) * 3 > cap + 2) {
+        throw new Error(
+          `agent.content.read for ${contentId} exceeded the ${cap}-byte limit ` +
+            'for externalized content; not read',
+        )
+      }
       const chunk = Buffer.from(data, 'base64')
       hash.update(chunk)
       chunks.push(chunk)
       read += chunk.length
       // The slice budget cannot hold the cap on its own: a ref with no usable
       // `byteLength` falls back to the slice bound, which the peer can fill with
-      // more than 32 MiB, and a peer may simply serve more than it declared.
+      // more than the cap, and a peer may simply serve more than it declared.
       // Bytes actually read are the only honest measure here.
-      if (read > MAX_EXTERNALIZED_BYTES) {
+      if (read > cap) {
         throw new Error(
-          `agent.content.read for ${contentId} exceeded the ${MAX_EXTERNALIZED_BYTES}-byte limit ` +
+          `agent.content.read for ${contentId} exceeded the ${cap}-byte limit ` +
             'for externalized content; not read',
         )
       }

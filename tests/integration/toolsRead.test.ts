@@ -1456,3 +1456,50 @@ describe('issue #17: a slice boundary inside a multi-byte character', () => {
     expect(part.content).not.toContain('\uFFFD')
   })
 })
+
+describe('issue #17: the CUMULATIVE arm of the externalized-content ceiling', () => {
+  it('④r a peer serving MORE than it declared is stopped by bytes read, not slices', async () => {
+    // The declared arm refuses up front; the cumulative arm is what bounds a
+    // peer that UNDER-declares (declared <= cap) and then serves more. With the
+    // real 32 MiB cap every honest walk exhausts the slice budget first, so the
+    // cap is injected small here to make the byte check the arm that stops the
+    // walk — the configuration where removing it demonstrably returns more than
+    // the ceiling in one verified piece.
+    const text = 'Z'.repeat(2_048)
+    const rig = await makeRig(
+      {
+        agent: {
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'assistant',
+              status: 'success',
+              parts: [
+                { kind: 'text', text: 'inline survives' },
+                { kind: 'text', text, external: true },
+              ],
+            },
+          ],
+        },
+      },
+      { engine: { externalizedByteCap: 1_024 } },
+    )
+    // Declared == cap, so the declared arm's strict `>` does not fire; the real
+    // bytes are 2x the cap and the slice budget (ceil(1024/24576) = 1) still
+    // holds one whole slice. Only bytes-read can stop this walk.
+    rig.fake.understateContentLength('m-1:1', '1001', 1_024)
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ content: string; unavailable?: string }> }>
+    }
+
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline survives')
+    const overServed = result.messages[0]!.parts[1]!
+    expect(overServed.unavailable).toMatch(/exceeded the 1024-byte limit/)
+    expect(overServed.content).toBe('')
+  })
+})

@@ -710,8 +710,6 @@ export class FakeCherry {
   #contentDigests = new Map<string, string>()
   /** Deliberately FALSE `byteLength` declarations (see `understateContentLength`). */
   #contentByteOverrides = new Map<string, number>()
-  /** Refs served with `byteLength` absent altogether (see `omitContentLength`). */
-  #contentLengthOmitted = new Set<string>()
 
   // Interactive command face observation (Task 9).
   /**
@@ -1175,15 +1173,6 @@ export class FakeCherry {
    */
   understateContentLength(contentId: string, revision: string, declaredBytes: number): void {
     this.#contentByteOverrides.set(`${contentId}:${revision}`, declaredBytes)
-  }
-
-  /**
-   * Serve one `{ref}` with NO usable `byteLength` — the malformed-ref face,
-   * where the client has no declared length to derive its slice budget from.
-   * Callable BEFORE the part is projected (pins are created lazily).
-   */
-  omitContentLength(contentId: string, revision: string): void {
-    this.#contentLengthOmitted.add(`${contentId}:${revision}`)
   }
 
   /** The current journal watermark cursor for a session. */
@@ -2179,7 +2168,7 @@ export class FakeCherry {
           ref: {
             contentId: partId,
             revision,
-            ...(this.#contentLengthOmitted.has(key) ? {} : { byteLength: String(declaredBytes) }),
+            byteLength: String(declaredBytes),
             mediaType: 'text/plain',
             sha256: advertised,
           },

@@ -161,8 +161,9 @@ const RATE_WINDOW_MARGIN_MS = 150
 /** Bare rejection the rpc layer uses once the channel can no longer answer. */
 const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/
 /**
- * The READ methods this plugin calls, and the ONLY methods whose transport loss
- * may be replayed automatically.
+ * The read methods whose transport loss may be replayed automatically (two
+ * entries are not called today — kept so a future call site is covered the day
+ * it appears rather than silently un-retried).
  *
  * Reads are safe to replay by construction: the peer answers from stored
  * revisions and the call has no side effect, so a second copy costs one round
@@ -431,6 +432,15 @@ export class DeviceConnection {
   readonly #helloProtocolVersions: readonly number[]
   readonly #transportRetryWaitMs: number
   readonly #stateListeners = new Set<(state: DeviceState) => void>()
+  /**
+   * Waits parked inside `#awaitReconnect`. close() drains them: a shutdown has
+   * no reconnect to wait for, and — the case that matters — a close() followed
+   * by a fresh connect() must not let an OLD lifecycle's replay ride the new
+   * one. close() may fire NO state transition at all (setting 'offline' when
+   * the state is already 'offline' is a no-op), so the listeners alone cannot
+   * be relied on to notice.
+   */
+  readonly #replayWaiters = new Set<(value?: undefined) => void>()
   /** Notification handlers, re-attached to every new client after a reconnect. */
   readonly #notificationHandlers = new Set<(method: string, params: unknown) => void>()
   /**
@@ -579,6 +589,9 @@ export class DeviceConnection {
   async close(): Promise<void> {
     this.#running = false
     this.#epoch += 1
+    // Abort every parked replay wait first: this is the only reliable signal
+    // they get — see #replayWaiters.
+    for (const abort of [...this.#replayWaiters]) abort(undefined)
     this.#clearAllTimers()
     this.#teardownLink()
     this.#setState('offline')
@@ -1138,17 +1151,21 @@ export class DeviceConnection {
       // device was up and the link was what went away.
       const lost = new TransportLostError(this.record.deviceId, 'connected', method)
       // Only a read is replayed (see RETRYABLE_READ_METHODS); only a live
-      // lifecycle has a reconnect to wait for. The replay goes to the NEW
-      // link's client directly: the admission this call paid for above is the
-      // one it spends, and charging a second one for the same logical call
-      // would let a flapping link starve the rate window.
+      // lifecycle has a reconnect to wait for.
       if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost
       console.warn(
         `[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); ` +
           `waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`,
       )
-      const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs)
+      const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client)
       if (reconnected === undefined) throw lost
+      // The replay is a NEW ARRIVAL at the peer, so it takes a fresh pacing
+      // admission: a reconnect releases every parked replay at once, and an
+      // un-paced burst is exactly the spike the peer answers with a session
+      // close (the rate-limit terminator) — the same kill that took the
+      // original link. The admission this call paid above bought the attempt
+      // that died; arrivals, not logical calls, are what the peer paces.
+      await this.#limiter.acquire()
       try {
         return await reconnected.client.request<T>(method, params, opts)
       } catch (error) {
@@ -1178,11 +1195,18 @@ export class DeviceConnection {
    * commits `#link` before its hello/authenticate pair completes, and a replay
    * into that window would ride an unauthenticated client.
    */
-  #awaitReconnect(waitMs: number): Promise<{ client: JsonRpcClient; epoch: number } | undefined> {
+  #awaitReconnect(
+    waitMs: number,
+    deadClient: JsonRpcClient,
+  ): Promise<{ client: JsonRpcClient; epoch: number } | undefined> {
     if (!this.#running) return Promise.resolve(undefined)
+    // The link whose channel just died must not be handed back: the supervisor
+    // may not have observed the loss yet, and replaying into the SAME dead
+    // client burns the one retry on an immediate rejection.
     const established = (): { client: JsonRpcClient; epoch: number } | undefined => {
       const link = this.#link
       if (this.#state !== 'connected' || link === undefined) return undefined
+      if (link.client === deadClient) return undefined
       return { client: link.client, epoch: link.epoch }
     }
     const ready = established()
@@ -1193,19 +1217,21 @@ export class DeviceConnection {
       const finish = (value: { client: JsonRpcClient; epoch: number } | undefined): void => {
         clearTimeout(timer)
         this.#stateListeners.delete(listener)
+        this.#replayWaiters.delete(finish)
         resolve(value)
       }
       const listener = (state: DeviceState): void => {
-        if (state === 'disabled' || state === 'identity-mismatch') {
+        if (!this.#running || state === 'disabled' || state === 'identity-mismatch') {
           finish(undefined)
           return
         }
         if (state !== 'connected') return
         const link = this.#link
-        if (link === undefined) return
+        if (link === undefined || link.client === deadClient) return
         finish({ client: link.client, epoch: link.epoch })
       }
       const timer = setTimeout(() => finish(undefined), waitMs)
+      this.#replayWaiters.add(finish)
       this.#stateListeners.add(listener)
     })
   }
