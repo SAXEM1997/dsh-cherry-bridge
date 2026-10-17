@@ -20,6 +20,18 @@
  */
 export const DEFAULT_RATE_BUDGET_PER_SECOND = 32
 
+/**
+ * How long one READ may wait for a reconnected link before it reports the
+ * transport loss to its caller (`DeviceConnectionOptions.transportRetryWaitMs`).
+ *
+ * It lives here because it is the caller-facing half of issue #12: a read whose
+ * link dies in flight is replayed on the next connection, and this is how long
+ * the caller is made to wait for that to happen. A bound long enough to outlast
+ * the reconnect backoff turns a transient blip into a call that outlives its
+ * own patience — the very complaint the classified error exists to answer.
+ */
+export const DEFAULT_TRANSPORT_RETRY_WAIT_MS = 5_000
+
 /** 2 MiB of event text cached per session (spec §3.5). */
 export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 

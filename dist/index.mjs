@@ -2129,6 +2129,27 @@ var DeviceUnavailableError = class extends Error {
 	}
 };
 /**
+* The link died UNDER an in-flight request: the request reached the wire and
+* its answer was lost. Distinct from {@link DeviceUnavailableError}, which is a
+* fail-fast about a device that was already not connected — the difference a
+* caller acts on is that this one MAY be retried.
+*/
+var TransportLostError = class extends Error {
+	device;
+	state;
+	method;
+	/** Always true: the peer never gave this request a verdict. */
+	retryable = true;
+	constructor(device, state, method) {
+		super(`device ${device}: transport lost while "${method}" was in flight (request may be retried)`);
+		this.name = "TransportLostError";
+		this.device = device;
+		this.state = state;
+		this.method = method;
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+};
+/**
 * CEILING for the business-request window — not the window itself. The window
 * is owned by the rpc layer and is sized from the peer's hello-reported
 * `inFlightRequests` (spec §3.4「取回报一半」): see
@@ -2159,6 +2180,37 @@ const DEFAULT_PROTOCOL_VERSIONS = [1];
 const SILENCE_FACTOR = 2;
 /** Bare rejection the rpc layer uses once the channel can no longer answer. */
 const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/;
+/** The deliberate local-shutdown face of a disposed client (see the replay path). */
+const DISPOSED_RE = /^JSON-RPC client disposed$/;
+/**
+* The read methods whose transport loss may be replayed automatically (two
+* entries are not called today — kept so a future call site is covered the day
+* it appears rather than silently un-retried).
+*
+* Reads are safe to replay by construction: the peer answers from stored
+* revisions and the call has no side effect, so a second copy costs one round
+* trip and nothing else. A COMMAND is the opposite — `agent.messages.send`,
+* `agent.interactions.respond`, `agent.executions.cancel` — and replaying one
+* after a lost answer could double-apply a write whose outcome the peer already
+* committed. Admissibility is NOT a property this layer can infer from a method
+* name, so it is stated here once and everything absent is treated as a command.
+*
+* NEW READS MUST BE ADDED HERE: a read left out is simply not retried, which is
+* the safe failure, but it gives up the recovery this list exists for.
+*/
+const RETRYABLE_READ_METHODS = /* @__PURE__ */ new Set([
+	"connection.ping",
+	"agent.agents.list",
+	"agent.workspaces.list",
+	"agent.sessions.list",
+	"agent.sessions.get",
+	"agent.messages.list",
+	"agent.parts.list",
+	"agent.interactions.list",
+	"agent.interactions.get",
+	"agent.content.read",
+	"agent.checkpoints.read"
+]);
 /**
 * Second-level rate smoothing for business requests: admissions are paced at
 * least `(window+margin)/budget` ms apart, so any 1-second window — measured
@@ -2332,7 +2384,17 @@ var DeviceConnection = class {
 	#rpcTimeoutMs;
 	#protocolVersions;
 	#helloProtocolVersions;
+	#transportRetryWaitMs;
 	#stateListeners = /* @__PURE__ */ new Set();
+	/**
+	* Waits parked inside `#awaitReconnect`. close() drains them: a shutdown has
+	* no reconnect to wait for, and — the case that matters — a close() followed
+	* by a fresh connect() must not let an OLD lifecycle's replay ride the new
+	* one. close() may fire NO state transition at all (setting 'offline' when
+	* the state is already 'offline' is a no-op), so the listeners alone cannot
+	* be relied on to notice.
+	*/
+	#replayWaiters = /* @__PURE__ */ new Set();
 	/** Notification handlers, re-attached to every new client after a reconnect. */
 	#notificationHandlers = /* @__PURE__ */ new Set();
 	/**
@@ -2364,6 +2426,7 @@ var DeviceConnection = class {
 		this.#rpcTimeoutMs = opts.rpcTimeoutMs;
 		this.#protocolVersions = opts.protocolVersions ?? DEFAULT_PROTOCOL_VERSIONS;
 		this.#helloProtocolVersions = opts.helloProtocolVersions ?? this.#protocolVersions;
+		this.#transportRetryWaitMs = opts.transportRetryWaitMs ?? 5e3;
 	}
 	/**
 	* The business RPC surface: rate-smoothed and gated on `connected`. Typed
@@ -2451,6 +2514,7 @@ var DeviceConnection = class {
 	async close() {
 		this.#running = false;
 		this.#epoch += 1;
+		for (const abort of [...this.#replayWaiters]) abort(void 0);
 		this.#clearAllTimers();
 		this.#teardownLink();
 		this.#setState("offline");
@@ -2789,7 +2853,75 @@ var DeviceConnection = class {
 			console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`);
 			throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		}
-		return link.client.request(method, params, opts);
+		try {
+			return await link.client.request(method, params, opts);
+		} catch (error) {
+			if (!this.#isTransportLoss(error)) throw error;
+			const lost = new TransportLostError(this.record.deviceId, "connected", method);
+			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
+			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
+			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
+			if (reconnected === void 0) throw lost;
+			await this.#limiter.acquire();
+			if (!this.#running || this.#state !== "connected") throw lost;
+			try {
+				return await reconnected.client.request(method, params, opts);
+			} catch (error) {
+				if (this.#isTransportLoss(error) || DISPOSED_RE.test(String(error?.message ?? ""))) throw lost;
+				throw error;
+			}
+		}
+	}
+	/** Whether a rejection is the dead channel, as opposed to a peer's own answer. */
+	#isTransportLoss(error) {
+		return error instanceof Error && !(error instanceof JsonRpcRequestError) && CHANNEL_CLOSED_RE.test(error.message);
+	}
+	/**
+	* Resolves with the next AUTHENTICATED link (+epoch) within `waitMs`, or
+	* undefined once the bound, a shutdown, or a cycle the supervisor abandoned
+	* makes a replay pointless.
+	*
+	* `connected` is the right condition rather than "a link exists": `#establish`
+	* commits `#link` before its hello/authenticate pair completes, and a replay
+	* into that window would ride an unauthenticated client.
+	*/
+	#awaitReconnect(waitMs, deadClient) {
+		if (!this.#running) return Promise.resolve(void 0);
+		const established = () => {
+			const link = this.#link;
+			if (this.#state !== "connected" || link === void 0) return void 0;
+			if (link.client === deadClient) return void 0;
+			return {
+				client: link.client,
+				epoch: link.epoch
+			};
+		};
+		const ready = established();
+		if (ready !== void 0) return Promise.resolve(ready);
+		return new Promise((resolve) => {
+			const finish = (value) => {
+				clearTimeout(timer);
+				this.#stateListeners.delete(listener);
+				this.#replayWaiters.delete(finish);
+				resolve(value);
+			};
+			const listener = (state) => {
+				if (!this.#running || state === "disabled" || state === "identity-mismatch") {
+					finish(void 0);
+					return;
+				}
+				if (state !== "connected") return;
+				const link = this.#link;
+				if (link === void 0 || link.client === deadClient) return;
+				finish({
+					client: link.client,
+					epoch: link.epoch
+				});
+			};
+			const timer = setTimeout(() => finish(void 0), waitMs);
+			this.#replayWaiters.add(finish);
+			this.#stateListeners.add(listener);
+		});
 	}
 	#setState(next) {
 		if (this.#state === next) return;
@@ -3926,6 +4058,20 @@ const MAX_CONSECUTIVE_EMPTY_PAGES = 3;
 * FAILS the read rather than returning a partial (unverifiable) content.
 */
 const DEFAULT_CONTENT_SLICE_BOUND = 4096;
+/**
+* ABSOLUTE ceiling on one `{ref}`'s content, in bytes — the same 32 MiB the
+* official Cherry Studio client applies (`remoteContent.ts`).
+*
+* The walk's slice budget derives from the length the REF DECLARES, so without
+* an absolute ceiling a peer declaring 4 GiB makes this client issue ~170,000
+* `agent.content.read` round trips before it reaches `eof` — a read that cannot
+* finish in any caller's patience, and one the caller has no way to stop. The
+* cap is a refusal to attempt that walk, not a proof about the content: content
+* the desktop really does externalize never approaches it, and a part above it
+* degrades to `unavailable` exactly like any other part this client will not
+* read.
+*/
+const MAX_EXTERNALIZED_BYTES = 33554432;
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
 const TEXT_MAX_LENGTH = 32768;
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
@@ -4150,6 +4296,8 @@ var CherryToolEngine = class {
 	* rather than silently truncating.
 	*/
 	#partsSafetyBound;
+	/** Externalized-content byte ceiling, injectable for the reason above. */
+	#externalizedByteCap;
 	/** Poll cadence for the interactive waiters (see `DEFAULT_WAIT_POLL_MS`). */
 	#waitPollMs;
 	/**
@@ -4191,6 +4339,7 @@ var CherryToolEngine = class {
 	constructor(deps, options = {}) {
 		this.#deps = deps;
 		this.#partsSafetyBound = Math.max(1, Math.floor(options.partsSafetyBound ?? DEFAULT_PARTS_SAFETY_BOUND));
+		this.#externalizedByteCap = Math.max(1, Math.floor(options.externalizedByteCap ?? MAX_EXTERNALIZED_BYTES));
 		this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS));
 	}
 	definitions() {
@@ -4355,6 +4504,7 @@ var CherryToolEngine = class {
 		const items = [];
 		let cursor;
 		let emptyPages = 0;
+		const seen = /* @__PURE__ */ new Set();
 		for (let pages = 0;; pages += 1) {
 			if (items.length >= ceiling) return this.#truncated(items, bindsCallerLimit ? "limit" : "safety-bound", cursor);
 			if (pages >= MAX_AGGREGATE_PAGES) throw new Error(`${method} did not terminate within ${MAX_AGGREGATE_PAGES} page(s) for ${JSON.stringify(params)}`);
@@ -4375,6 +4525,8 @@ var CherryToolEngine = class {
 			};
 			const advanced = String(next);
 			if (advanced === cursor) throw new Error(`${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`);
+			if (seen.has(advanced)) throw new Error(`${method} cycled back to cursor ${advanced} it already served for ${JSON.stringify(params)}; refusing to spin on a peer whose pagination loops`);
+			seen.add(advanced);
 			emptyPages = extracted.items.length === 0 ? emptyPages + 1 : 0;
 			if (emptyPages >= MAX_CONSECUTIVE_EMPTY_PAGES) throw new Error(`${method} answered ${emptyPages} consecutive empty page(s) (last nextCursor ${advanced}) for ${JSON.stringify(params)}; refusing to spin on a peer that makes no progress`);
 			cursor = advanced;
@@ -4799,11 +4951,14 @@ var CherryToolEngine = class {
 		const revision = String(ref["revision"] ?? "");
 		const declaredSha = typeof ref["sha256"] === "string" ? ref["sha256"] : void 0;
 		const declaredBytes = Number(ref["byteLength"]);
+		if (Number.isFinite(declaredBytes) && declaredBytes > this.#externalizedByteCap) throw new Error(`{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit for externalized content; not read`);
 		const maxSlices = Number.isSafeInteger(declaredBytes) ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES)) : DEFAULT_CONTENT_SLICE_BOUND;
-		const chunks = [];
 		let offset = "0";
 		let sha;
 		let complete = false;
+		let read = 0;
+		const chunks = [];
+		const hash = createHash("sha256");
 		for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
 			const slice = await connection.rpc.request("agent.content.read", {
 				sessionId,
@@ -4813,7 +4968,13 @@ var CherryToolEngine = class {
 				maxBytes: CONTENT_READ_MAX_BYTES
 			});
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
-			chunks.push(new Uint8Array(Buffer.from(data, "base64")));
+			const cap = this.#externalizedByteCap;
+			if (read + Math.ceil(data.length / 4) * 3 > cap + 2) throw new Error(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for externalized content; not read`);
+			const chunk = Buffer.from(data, "base64");
+			hash.update(chunk);
+			chunks.push(chunk);
+			read += chunk.length;
+			if (read > cap) throw new Error(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for externalized content; not read`);
 			if (typeof slice["sha256"] === "string") sha = slice["sha256"];
 			if (slice["eof"] === true) {
 				complete = true;
@@ -4824,12 +4985,11 @@ var CherryToolEngine = class {
 			offset = next;
 		}
 		if (!complete) throw new ContentIntegrityError(`agent.content.read for ${contentId} did not reach eof within ${maxSlices} slice(s); refusing to aggregate a partial content`);
-		const bytes = Buffer.concat(chunks);
 		const expected = sha ?? declaredSha;
 		if (expected === void 0) throw new ContentIntegrityError(`agent.content.read for ${contentId} returned no sha256 to verify`);
-		const actual = createHash("sha256").update(bytes).digest("hex");
+		const actual = hash.digest("hex");
 		if (actual !== expected) throw new ContentIntegrityError(`agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`);
-		return bytes.toString("utf8");
+		return Buffer.concat(chunks).toString("utf8");
 	}
 	#eventsTool() {
 		return defineCherryTool({

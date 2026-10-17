@@ -8,7 +8,7 @@ import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { connectionMethods, connectionNotificationSchema, pairingMethods } from '@cherrystudio/remote-protocol'
 import { agentNotificationSchema, commandReceiptSchema, executionSchema } from '@cherrystudio/remote-protocol/agent'
 import { DeviceStore } from '../../src/deviceStore.js'
-import { DeviceConnection } from '../../src/connection.js'
+import { DeviceConnection, DeviceUnavailableError, TransportLostError } from '../../src/connection.js'
 import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
@@ -465,22 +465,36 @@ describe('① the six-entry contract difference list', () => {
     expect(entry.realPeer).toMatch(/1011/)
 
     // The fake's cap is injectable; the real desktop's is 64 req/s. Exceeding
-    // it closes the SESSION — every in-flight request dies with it, and the
-    // client routes the close through its offline→backoff path rather than
-    // seeing a structured per-request refusal.
+    // it closes the SESSION — every in-flight request dies with it — which the
+    // client now answers with a CLASSIFIED loss (and, for reads, one paced
+    // replay on the reconnected link) rather than a bare channel-closed text.
     const rig = await makeRig({ rateLimitPerSecond: 4 })
 
     // Fire well past the cap. The peer terminates the SESSION: the in-flight
-    // requests fail together, and the socket goes away with them.
+    // requests die together, and the socket goes away with them.
     const results = await Promise.allSettled(
       Array.from({ length: 24 }, () => rig.connection.rpc.request('agent.agents.list', { limit: 1 })),
     )
-    expect(results.some((result) => result.status === 'rejected')).toBe(true)
 
-    await waitForState(rig.connection, ['offline', 'connecting', 'connected'])
-    // The session really was terminated: nothing in flight survived, and the
-    // client is on its reconnect path rather than serving the old socket.
-    expect(rig.connection.state).not.toBe('connected')
+    // The session really was terminated: a second socket exists ONLY because
+    // the first one died — this is the proof of the 1011 close, not of a
+    // per-request refusal (which would have left one socket standing).
+    expect(rig.fake.socketCount).toBeGreaterThanOrEqual(2)
+
+    // Whatever the caller saw is CLASSIFIED: the reads that died in flight are
+    // a retryable transport loss (or resolved through their replay), and the
+    // ones that never left the queue were failed fast as unavailable. The bare
+    // `JSON-RPC channel closed` text — the verdict no caller can act on — is
+    // exactly what must never surface.
+    const rejections = results.flatMap((result) => (result.status === 'rejected' ? [result.reason as Error] : []))
+    for (const error of rejections) {
+      const classified = error instanceof TransportLostError || error instanceof DeviceUnavailableError
+      expect(classified).toBe(true)
+    }
+
+    // And the client recovers: the supervised reconnect lands and answers.
+    await waitForState(rig.connection, ['connected'])
+    await expect(rig.connection.rpc.request('agent.agents.list', { limit: 1 })).resolves.toBeTruthy()
   }, 20_000)
 
   // -------------------------------------------------------------------------
