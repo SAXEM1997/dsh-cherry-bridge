@@ -108,10 +108,28 @@ interface SessionState {
   buffer: CachedEvent[]
   bytes: number
   /**
-   * The oldest stream position this session can still serve: the baseline the
-   * subscription started from, advanced whenever old events are dropped.
+   * The oldest stream position this session still TRACKS: the baseline the
+   * subscription started from, advanced whenever old events are dropped. It is
+   * a rejection boundary, not a resume point — whether it can itself be served
+   * depends on {@link evicted}.
    */
   windowStart: number
+  /**
+   * Whether {@link windowStart} has been advanced by an EVENT DROP rather than
+   * standing at the subscription's baseline (`#trimToBudget` sets this).
+   *
+   * The two states are not equivalent, and `read` treats them differently: a
+   * baseline IS a position this layer itself issued as a resume point and never
+   * discarded anything at, so serving it loses nothing; a boundary reached by
+   * dropping events cannot be served, because the events that occupied it are
+   * gone (see {@link SessionSubscriptions.read} for the full rule). A boolean
+   * rather than a separate "baseline" field because the baseline is simply
+   * `windowStart` while this is false — one value, two meanings, one flag.
+   *
+   * Reset to false by every install, since a re-subscribe or a checkpoint
+   * recovery starts a FRESH window with nothing dropped from it (issue #2).
+   */
+  evicted: boolean
   /**
    * The resolver queue behind {@link SessionSubscriptions.waitFor}: one entry
    * per caller currently parked on this session, all settled together (and
@@ -238,13 +256,28 @@ export class SessionSubscriptions {
   }
 
   /**
-   * The session's cache WINDOW START — the oldest position this layer can still
-   * serve — or undefined when the session is untracked.
+   * The session's cache WINDOW START — the retention BOUNDARY of this layer's
+   * cache: the oldest position it still tracks — or undefined when the session
+   * is untracked.
    *
-   * The servable replay range is STRICTLY AFTER this position (see
-   * {@link read} for why the boundary itself is refused), so this is exactly the
-   * value a `cursor-out-of-window` verdict reports as "the earliest cursor you
-   * could possibly resume from".
+   * The boundary means two DIFFERENT things depending on whether the window has
+   * dropped events (issue #2; see {@link SessionState.evicted}), which is why it
+   * must not be described as "the earliest position you could resume from" in
+   * one breath:
+   *
+   *  - NOTHING DROPPED — the boundary is the subscription's baseline, a position
+   *    this layer itself issues as a resume point, and it IS the earliest
+   *    resumable position: {@link read} serves it (the replay is the boundary
+   *    INCLUSIVE here).
+   *  - EVENTS DROPPED — the boundary is where the discarded run ended, and the
+   *    event that occupied it is gone. The earliest resumable position is then
+   *    the first retained event STRICTLY after it; the boundary itself is
+   *    refused, and its value is what the refusal is judged against and what
+   *    points a caller at the rebuild (`cherry_read`).
+   *
+   * So the reported value is exact as a rejection threshold and as a rebuild
+   * anchor, and it must NOT be fed back to `read` in the dropped state — there
+   * the verdict refuses it.
    *
    * Exposed because the layer is the only thing that knows it. Callers were
    * previously expected to rediscover it by binary-searching `read`'s verdict
@@ -292,14 +325,29 @@ export class SessionSubscriptions {
   /**
    * Reads buffered events newer than `fromCursor`.
    *
-   * Returns `{ error: 'cursor-out-of-window' }` when the requested cursor is at
-   * or before the session's retention window start. The servable replay range
-   * is **strictly after** the window start (controller ruling; brief ②'s
-   * 「含窗口起点」): a caller parked exactly ON the window start is refused,
-   * because the window cannot prove what happened at that position — the layer
-   * only knows the position itself, not the event that produced it. Anything
-   * before the window start is refused for the same reason (spec §3.6), so the
-   * caller is told to rebuild a baseline rather than trust a partial window.
+   * Returns `{ error: 'cursor-out-of-window' }` when the requested cursor is
+   * strictly before the session's retention window start, or exactly AT it once
+   * that boundary was advanced by dropping events (see {@link SessionState.evicted}).
+   * Two positions reach the boundary, and they are NOT interchangeable:
+   *
+   *  - the subscription's BASELINE — where the window starts before anything was
+   *    dropped. It is not an unretained event: it is the position this very
+   *    layer hands out as the resume point (`#nextCursor` returns `state.cursor`
+   *    when the buffer is empty, which on a fresh window IS the baseline), so
+   *    serving it re-delivers exactly what the caller has not seen. Refusing it
+   *    made the layer contradict itself: the cursor `cherry_send`/`cherry_wait`
+   *    report and `cherry_events` must accept would have been rejected by this
+   *    very method, and on a fresh session the two tools deadlocked (issue #2).
+   *  - a boundary ADVANCED BY A DROP ({@link #trimToBudget}): the events that
+   *    occupied that position are gone, so continuity cannot be proven. Serving
+   *    it would return a correct-looking but possibly EMPTY replay whose
+   *    `nextCursor` is that same unservable boundary, handing the caller a
+   *    stale, empty read forever. Refusing routes them to `cherry_read`'s
+   *    baseline rebuild instead, which is the only honest recovery.
+   *
+   * Anything strictly BEFORE the boundary is refused in both states (spec §3.6):
+   * the layer never issued that position on this window, so it cannot vouch for
+   * what happened at it.
    */
   read(sessionId: string, fromCursor?: AgentCursor): ReadResult {
     const state = this.#sessions.get(sessionId)
@@ -310,31 +358,36 @@ export class SessionSubscriptions {
         return { error: 'cursor-out-of-window' }
       }
       const requested = Number(fromCursor.seq)
-      // The window start is the oldest provable position: the subscription's
-      // baseline while nothing has been dropped, advanced only when the cache
-      // evicts old events. It is NOT servable — the range is strictly after it.
+      // THE TWO-STATE RULE (issue #2), and the reason it is a flag rather than a
+      // comparison against the buffer:
       //
-      // DIVERGENCE FROM THE SPEC WORDING, deliberately (controller ruling in
-      // commit f2b852b): the spec says 「早于」 the window start is out of
-      // window, which reads as `requested < windowStart`. This implementation
-      // refuses AT the start too (`<=`), and the extra strictness is
-      // load-bearing rather than defensive:
+      //  - `requested === windowStart` is SERVABLE while the boundary is still
+      //    the subscription's baseline. Nothing was discarded below it, and it
+      //    is the position this layer itself issues as the resume point (see
+      //    `#nextCursor`), so the replay cannot lose anything.
+      //  - once `#trimToBudget` has dropped events, the boundary marks a
+      //    position whose event is GONE. The layer knows the position and
+      //    nothing about the event that occupied it, so it cannot certify what
+      //    the caller has seen. Accepting it would answer a possibly EMPTY
+      //    replay whose nextCursor is the unservable boundary itself — a stale
+      //    read that repeats forever, having lost whatever was dropped. That
+      //    refusal stands: it routes the caller to `cherry_read`'s baseline
+      //    rebuild, the only honest recovery.
       //
-      //  - `windowStart` is the position of an event this layer did NOT retain
-      //    (a dropped oldest event) or the subscription's baseline, which was
-      //    never delivered over this stream at all. The layer knows the
-      //    POSITION and nothing about the event that occupied it, so it cannot
-      //    certify that the caller has seen it.
-      //  - Accepting `requested === windowStart` would return the events
-      //    strictly after it — a correct-looking but possibly EMPTY replay read
-      //    whose nextCursor is the window start itself. A caller that then
-      //    resumed from that nextCursor would be handed a stale, empty read
-      //    forever, having lost whatever the peer had already discarded.
-      //
-      // Refusing routes that caller to `cherry_read`'s baseline rebuild
-      // instead, which is the only honest recovery. The semantics are pinned by
-      // tests ② (face 2) and ⑤b, which assert the verdict AT the start.
-      if (!Number.isFinite(requested) || requested <= state.windowStart) {
+      // DIVERGENCE FROM THE SPEC WORDING, deliberately: the spec says 「早于」 the
+      // window start is out of window. Below the boundary is refused in both
+      // states, as written; AT the boundary the verdict depends on whether
+      // anything was actually dropped, which the spec wording does not
+      // distinguish. The earliest RESUMABLE position therefore has TWO forms,
+      // and `windowStart()` reports one boundary that they share: in the
+      // nothing-dropped state the boundary itself is resumable, and in the
+      // dropped state it is NOT — the first retained event strictly after it
+      // is. The boundary is what the refusal is judged against and what the
+      // caller rebuilds from; it is not, in the dropped state, itself a cursor
+      // to resume on.
+      const belowWindow = !Number.isFinite(requested) || requested < state.windowStart
+      const atDroppedBoundary = requested === state.windowStart && state.evicted
+      if (belowWindow || atDroppedBoundary) {
         return { error: 'cursor-out-of-window' }
       }
       const threshold = requested
@@ -545,6 +598,9 @@ export class SessionSubscriptions {
       buffer: [],
       bytes: 0,
       windowStart: Number(descriptor.highWatermark.seq),
+      // A fresh window: nothing has been dropped from it, so the baseline is a
+      // position this layer may serve (issue #2).
+      evicted: false,
       waiters: [],
       projection: [],
     })
@@ -674,6 +730,9 @@ export class SessionSubscriptions {
       buffer: [],
       bytes: 0,
       windowStart: Number(descriptor.checkpoint.cursor.seq),
+      // A fresh window: nothing has been dropped from it, so the baseline is a
+      // position this layer may serve (issue #2).
+      evicted: false,
       waiters: [],
       projection: [...items],
     })
@@ -885,8 +944,11 @@ export class SessionSubscriptions {
       state.bytes -= removed.bytes
       dropped += 1
       // The window start advances past every dropped event: a caller parked at
-      // or before it can no longer be served and must rebuild a baseline.
+      // or before it can no longer be served and must rebuild a baseline. The
+      // flag is what distinguishes this boundary from the subscription's
+      // baseline, which stays servable (see `read`).
       state.windowStart = Math.max(state.windowStart, Number(removed.cursor.seq))
+      state.evicted = true
     }
     console.warn(
       `[cherry-remote] session ${sessionId} cache exceeded ${this.#perSessionCacheBytes} bytes; ` +

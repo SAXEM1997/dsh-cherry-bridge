@@ -3258,13 +3258,28 @@ var SessionSubscriptions = class {
 		return this.#sessions.get(sessionId)?.cursor;
 	}
 	/**
-	* The session's cache WINDOW START — the oldest position this layer can still
-	* serve — or undefined when the session is untracked.
+	* The session's cache WINDOW START — the retention BOUNDARY of this layer's
+	* cache: the oldest position it still tracks — or undefined when the session
+	* is untracked.
 	*
-	* The servable replay range is STRICTLY AFTER this position (see
-	* {@link read} for why the boundary itself is refused), so this is exactly the
-	* value a `cursor-out-of-window` verdict reports as "the earliest cursor you
-	* could possibly resume from".
+	* The boundary means two DIFFERENT things depending on whether the window has
+	* dropped events (issue #2; see {@link SessionState.evicted}), which is why it
+	* must not be described as "the earliest position you could resume from" in
+	* one breath:
+	*
+	*  - NOTHING DROPPED — the boundary is the subscription's baseline, a position
+	*    this layer itself issues as a resume point, and it IS the earliest
+	*    resumable position: {@link read} serves it (the replay is the boundary
+	*    INCLUSIVE here).
+	*  - EVENTS DROPPED — the boundary is where the discarded run ended, and the
+	*    event that occupied it is gone. The earliest resumable position is then
+	*    the first retained event STRICTLY after it; the boundary itself is
+	*    refused, and its value is what the refusal is judged against and what
+	*    points a caller at the rebuild (`cherry_read`).
+	*
+	* So the reported value is exact as a rejection threshold and as a rebuild
+	* anchor, and it must NOT be fed back to `read` in the dropped state — there
+	* the verdict refuses it.
 	*
 	* Exposed because the layer is the only thing that knows it. Callers were
 	* previously expected to rediscover it by binary-searching `read`'s verdict
@@ -3308,14 +3323,29 @@ var SessionSubscriptions = class {
 	/**
 	* Reads buffered events newer than `fromCursor`.
 	*
-	* Returns `{ error: 'cursor-out-of-window' }` when the requested cursor is at
-	* or before the session's retention window start. The servable replay range
-	* is **strictly after** the window start (controller ruling; brief ②'s
-	* 「含窗口起点」): a caller parked exactly ON the window start is refused,
-	* because the window cannot prove what happened at that position — the layer
-	* only knows the position itself, not the event that produced it. Anything
-	* before the window start is refused for the same reason (spec §3.6), so the
-	* caller is told to rebuild a baseline rather than trust a partial window.
+	* Returns `{ error: 'cursor-out-of-window' }` when the requested cursor is
+	* strictly before the session's retention window start, or exactly AT it once
+	* that boundary was advanced by dropping events (see {@link SessionState.evicted}).
+	* Two positions reach the boundary, and they are NOT interchangeable:
+	*
+	*  - the subscription's BASELINE — where the window starts before anything was
+	*    dropped. It is not an unretained event: it is the position this very
+	*    layer hands out as the resume point (`#nextCursor` returns `state.cursor`
+	*    when the buffer is empty, which on a fresh window IS the baseline), so
+	*    serving it re-delivers exactly what the caller has not seen. Refusing it
+	*    made the layer contradict itself: the cursor `cherry_send`/`cherry_wait`
+	*    report and `cherry_events` must accept would have been rejected by this
+	*    very method, and on a fresh session the two tools deadlocked (issue #2).
+	*  - a boundary ADVANCED BY A DROP ({@link #trimToBudget}): the events that
+	*    occupied that position are gone, so continuity cannot be proven. Serving
+	*    it would return a correct-looking but possibly EMPTY replay whose
+	*    `nextCursor` is that same unservable boundary, handing the caller a
+	*    stale, empty read forever. Refusing routes them to `cherry_read`'s
+	*    baseline rebuild instead, which is the only honest recovery.
+	*
+	* Anything strictly BEFORE the boundary is refused in both states (spec §3.6):
+	* the layer never issued that position on this window, so it cannot vouch for
+	* what happened at it.
 	*/
 	read(sessionId, fromCursor) {
 		const state = this.#sessions.get(sessionId);
@@ -3323,7 +3353,9 @@ var SessionSubscriptions = class {
 		if (fromCursor !== void 0) {
 			if (fromCursor.sessionId !== sessionId || fromCursor.streamEpoch !== state.cursor.streamEpoch) return { error: "cursor-out-of-window" };
 			const requested = Number(fromCursor.seq);
-			if (!Number.isFinite(requested) || requested <= state.windowStart) return { error: "cursor-out-of-window" };
+			const belowWindow = !Number.isFinite(requested) || requested < state.windowStart;
+			const atDroppedBoundary = requested === state.windowStart && state.evicted;
+			if (belowWindow || atDroppedBoundary) return { error: "cursor-out-of-window" };
 			const threshold = requested;
 			const events = state.buffer.filter((entry) => Number(entry.cursor.seq) > threshold).map((entry) => entry.event);
 			return {
@@ -3506,6 +3538,7 @@ var SessionSubscriptions = class {
 			buffer: [],
 			bytes: 0,
 			windowStart: Number(descriptor.highWatermark.seq),
+			evicted: false,
 			waiters: [],
 			projection: []
 		});
@@ -3591,6 +3624,7 @@ var SessionSubscriptions = class {
 			buffer: [],
 			bytes: 0,
 			windowStart: Number(descriptor.checkpoint.cursor.seq),
+			evicted: false,
 			waiters: [],
 			projection: [...items]
 		});
@@ -3752,6 +3786,7 @@ var SessionSubscriptions = class {
 			state.bytes -= removed.bytes;
 			dropped += 1;
 			state.windowStart = Math.max(state.windowStart, Number(removed.cursor.seq));
+			state.evicted = true;
 		}
 		console.warn(`[cherry-remote] session ${sessionId} cache exceeded ${this.#perSessionCacheBytes} bytes; dropped ${dropped} oldest event(s)`);
 	}
@@ -4677,7 +4712,7 @@ var CherryToolEngine = class {
 	#eventsTool() {
 		return defineCherryTool({
 			name: "cherry_events",
-			description: "Read the session's buffered events newer than `cursor`, delivering them and then acknowledging the advanced cursor to the peer. A cursor at or before the cache window start answers a structured `cursor-out-of-window` verdict; rebuild the baseline with `cherry_read` instead.",
+			description: "Read the session's buffered events newer than `cursor`, delivering them and then acknowledging the advanced cursor to the peer. While the window has dropped no events, every cursor this plugin handed out is servable, including the baseline `cherry_send`/`cherry_wait` report on an empty window. Once the window DISCARDS events, the boundary it reports is not: that boundary and everything below it answer a structured `cursor-out-of-window` verdict, and only positions strictly past it are served — rebuild the baseline with `cherry_read` and resume from that instead.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -4719,7 +4754,7 @@ var CherryToolEngine = class {
 				const result = subscriptions.read(sessionId, cursor);
 				if ("error" in result) return {
 					error: "cursor-out-of-window",
-					message: `the requested cursor is at or before the cache window start for session ${sessionId}; use cherry_read to rebuild the baseline`,
+					message: `the requested cursor is before the cache window start for session ${sessionId}, or at it after the cache discarded events; the window can no longer prove continuity from that position. Use cherry_read to rebuild the baseline, or cherry_events with no cursor to read the whole retained window`,
 					windowStart: this.#windowStart(subscriptions, sessionId)
 				};
 				try {

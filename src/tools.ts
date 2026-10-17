@@ -1650,9 +1650,12 @@ class CherryToolEngine {
       name: 'cherry_events',
       description:
         'Read the session\'s buffered events newer than `cursor`, delivering them and then ' +
-        'acknowledging the advanced cursor to the peer. A cursor at or before the cache ' +
-        'window start answers a structured `cursor-out-of-window` verdict; rebuild the ' +
-        'baseline with `cherry_read` instead.',
+        'acknowledging the advanced cursor to the peer. While the window has dropped no events, ' +
+        'every cursor this plugin handed out is servable, including the baseline ' +
+        '`cherry_send`/`cherry_wait` report on an empty window. Once the window DISCARDS events, ' +
+        'the boundary it reports is not: that boundary and everything below it answer a structured ' +
+        '`cursor-out-of-window` verdict, and only positions strictly past it are served — rebuild ' +
+        'the baseline with `cherry_read` and resume from that instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -1687,11 +1690,22 @@ class CherryToolEngine {
           return {
             error: 'cursor-out-of-window',
             message:
-              `the requested cursor is at or before the cache window start for session ${sessionId}; ` +
-              'use cherry_read to rebuild the baseline',
+              `the requested cursor is before the cache window start for session ${sessionId}, or at it ` +
+              'after the cache discarded events; the window can no longer prove continuity from that ' +
+              'position. Use cherry_read to rebuild the baseline, or cherry_events with no cursor to ' +
+              'read the whole retained window',
             // Reported even when the caller sent NO cursor: the verdict means
             // the session's cache cannot serve a replay from a provable
             // position, and the boundary is the actionable half of that answer.
+            // It reaches TWO states, which are not interchangeable: a cursor
+            // strictly BELOW the window start (refused whether or not anything
+            // was ever dropped), and a cursor exactly ON a boundary that a drop
+            // advanced (refused only because the event there is gone). In the
+            // dropped state the reported boundary is the position the verdict
+            // just refused, so a caller must resume from the FIRST retained
+            // event past it — or rebuild with `cherry_read`; in the
+            // nothing-dropped state no at-boundary cursor was refused at all,
+            // and the boundary IS the resumable baseline.
             windowStart: this.#windowStart(subscriptions, sessionId),
           } satisfies CherryCursorOutOfWindow
         }

@@ -189,9 +189,15 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     // Established at the checkpoint baseline (seq 0), before anything arrives.
     expect(rig.subs.windowStart('s1')).toEqual(cursor('s1', 0))
     expect(rig.subs.cursorOf('s1')).toEqual(cursor('s1', 0))
-    // Nothing is servable yet, so the boundary itself is refused — exactly what
-    // `windowStart` names.
-    expect(rig.subs.read('s1', rig.subs.windowStart('s1')!)).toEqual({ error: 'cursor-out-of-window' })
+    // Nothing has been dropped, so the boundary IS a servable resume point (it
+    // is the position this layer itself hands out while the buffer is empty).
+    // Issue #2: refusing it here made `windowStart` name a cursor the layer then
+    // rejected — the deadlock between `cherry_read`/`cherry_wait`'s cursor and
+    // `cherry_events`.
+    const empty = rig.subs.read('s1', rig.subs.windowStart('s1')!)
+    if (!('events' in empty)) throw new Error('expected events: the baseline is servable')
+    expect(empty.events).toEqual([])
+    expect(empty.nextCursor).toEqual(cursor('s1', 0))
 
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await waitFor(() => {
@@ -199,10 +205,14 @@ describe('SessionSubscriptions over a real loopback channel', () => {
       return 'events' in read && read.events.length === 1
     }, 3_000, 'the event cached')
 
-    // The cursor advanced; the window start did NOT (nothing was evicted).
+    // The cursor advanced; the window start did NOT (nothing was evicted), and
+    // it is still servable — it now yields the event that arrived above it.
     expect(rig.subs.cursorOf('s1')).toEqual(cursor('s1', 1))
     expect(rig.subs.windowStart('s1')).toEqual(cursor('s1', 0))
-    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+    const fromStart = rig.subs.read('s1', cursor('s1', 0))
+    if (!('events' in fromStart)) throw new Error('expected events: the baseline is servable')
+    expect(fromStart.events).toHaveLength(1)
+    expect(fromStart.nextCursor.seq).toBe('1')
     expect('events' in rig.subs.read('s1', cursor('s1', 1))).toBe(true)
 
     // An untracked session reports NEITHER, rather than a fabricated seq 0.
@@ -210,11 +220,11 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     expect(rig.subs.windowStart('never-subscribed')).toBeUndefined()
   })
 
-  it('② reports cursor-out-of-window BEFORE the window and AT the window start, but serves cursors strictly after it', async () => {
+  it('② reports cursor-out-of-window BEFORE the window, serves the BASELINE at its start, and serves cursors strictly after it', async () => {
     const rig = await makeRig()
     await rig.subs.ensure('s1')
     // The subscribe answer is a checkpoint descriptor at seq 0, so this
-    // session's window start is 0 and the servable range is strictly after it.
+    // session's window start is 0 and nothing has been dropped from it.
     expect(rig.fake.subscribeCalls[0]!.mode).toBe('checkpoint')
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e2' } })
@@ -226,9 +236,23 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     // Face 1 — strictly BEFORE the window start: out of window.
     expect(rig.subs.read('s1', cursor('s1', -1))).toEqual({ error: 'cursor-out-of-window' })
 
-    // Face 2 — AT the window start: ALSO out of window (brief 「含窗口起点」).
-    // The servable replay range is strictly AFTER windowStart.
-    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+    // Face 2 — AT the window start: SERVABLE, because that start is still the
+    // subscription's BASELINE and nothing below it was ever discarded. Issue #2
+    // reversed the brief's 「含窗口起点」 reading here: the boundary is the
+    // position this layer itself issues as the resume point, so refusing it
+    // deadlocked the tools that hand it out. It returns every retained event
+    // newer than it, which is all of them.
+    const atStart = rig.subs.read('s1', cursor('s1', 0))
+    if (!('events' in atStart)) throw new Error('expected events: the baseline is servable')
+    expect(atStart.events).toHaveLength(2)
+    expect(atStart.events.map((event) => (event.payload as unknown as { executionId: string }).executionId)).toEqual([
+      'e1',
+      'e2',
+    ])
+    expect(atStart.nextCursor.seq).toBe('2')
+
+    // Once an event DROP advances the boundary, the at-the-start reading flips
+    // to refused — pinned by N2 below, since this window never drops anything.
 
     // Face 3 — strictly AFTER the window start: servable, and returns exactly
     // the events newer than the requested cursor.
@@ -239,24 +263,49 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     expect(afterStart.nextCursor.seq).toBe('2')
   })
 
-  it('②b reports cursor-out-of-window when the layer holds no provable continuity', async () => {
+  it('②b re-baselines a re-subscribed session at the peer\'s position, so a pre-reset cursor is refused', async () => {
     const rig = await makeRig()
     await rig.subs.ensure('s1')
+    const first = rig.subs.cursorOf('s1')!
+    expect(first).toEqual(cursor('s1', 0))
+
     rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await waitFor(() => {
-      const read = rig.subs.read('s1', cursor('s1', 1))
-      return 'events' in read && read.events.length === 0
-    }, 3_000, 'first event cached')
+      const read = rig.subs.read('s1')
+      return 'events' in read && read.events.length === 1
+    }, 3_000, 'the event cached')
 
-    // A peer reset drops the subscription locally (and, per the peer's own
-    // `reset`, the whole replayable suffix with it). The re-subscribe lands in
-    // checkpoint mode at a NEW baseline, so a cursor from the PREVIOUS
-    // subscription can no longer be proven continuous and is out of window.
+    // A peer reset drops the subscription locally; the re-subscribe then lands in
+    // checkpoint mode at the NEW baseline the peer reports.
     rig.fake.pushResetRequired('s1')
     await waitFor(() => rig.fake.subscriptions.length === 0, 3_000, 'peer-side reset')
     await rig.subs.ensure('s1')
     await waitFor(() => rig.subs.activeSessions().includes('s1'), 3_000, 're-subscribed')
-    expect(rig.subs.read('s1', cursor('s1', 1))).toEqual({ error: 'cursor-out-of-window' })
+
+    // The peer's checkpoint cursor advances with the journal, so the recovered
+    // window starts AT that event: the layer has NOTHING retained, and it never
+    // saw whatever came before. The recovered baseline therefore refers to an
+    // event this subscription never delivered — it is servable (issue #2: it is
+    // still the position the layer hands out as the resume point, and serving it
+    // loses nothing), but it proves continuity with nothing older.
+    const recovered = rig.subs.cursorOf('s1')!
+    expect(recovered.seq).toBe('1')
+    expect(rig.subs.windowStart('s1')).toEqual(recovered)
+    const baseline = rig.subs.read('s1', recovered)
+    if (!('events' in baseline)) throw new Error('expected events: the recovered baseline is servable')
+    expect(baseline.events).toEqual([])
+
+    // A cursor from BEFORE the reset is strictly below the recovered baseline,
+    // and the layer cannot certify it: it is refused, exactly as it was before
+    // issue #2. This is the face the fix deliberately did NOT relax.
+    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+
+    // The same cursor against a DIFFERENT epoch is refused for its own reason
+    // (mismatch), independently of the window rule.
+    expect(rig.subs.read('s1', cursor('s1', 1, 'epoch-from-another-connection'))).toEqual({
+      error: 'cursor-out-of-window',
+    })
+    expect(rig.subs.read('s1', first)).toEqual({ error: 'cursor-out-of-window' })
   })
 
   it('③ evicts the oldest session on the 9th subscription, closes it, and warns', async () => {
@@ -624,8 +673,13 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     // The drop is logged, never silent (「丢最旧并记录」).
     const warnings = consoleWarn.mock.calls.flat().map(String)
     expect(warnings.some((message) => /dropped .* oldest/i.test(message))).toBe(true)
-    // And the dropped event's cursor is now out of window.
+    // And the dropped event's cursor is now out of window. KEPT AS IS after
+    // issue #2: this window really did discard events, so its baseline is no
+    // longer a position the layer may serve (the boundary, let alone below it).
     expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+    // The boundary the drop advanced to is refused too — the half of the rule
+    // the fix left untouched (N2 pins the full shape).
+    expect(rig.subs.read('s1', rig.subs.windowStart('s1')!)).toEqual({ error: 'cursor-out-of-window' })
   })
 
   it('⑬ acknowledges the delivered cursor to the peer', async () => {
@@ -752,6 +806,143 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     const newest = rig.subs.read('s1')
     if (!('events' in newest)) throw new Error('expected events')
     expect(newest.nextCursor.seq).toBe('3')
+  })
+
+  it('N1 (issue #2) serves the BASELINE position itself while nothing has been dropped', async () => {
+    // The regression issue #2 reports: a freshly established session has an
+    // EMPTY buffer whose window start IS the position this layer itself hands
+    // out as a resume point (`#nextCursor` returns `state.cursor` when nothing
+    // is returned — and `cursorOf`/`windowStart` are both that same baseline).
+    // Refusing it made the cursor `cherry_read`/`cherry_wait` issue unusable by
+    // `cherry_events`, i.e. the layer contradicted itself from the first call.
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+
+    // Nothing has arrived yet: the baseline is the whole (empty) window, and it
+    // must be SERVABLE rather than refused.
+    const baseline = rig.subs.cursorOf('s1')!
+    expect(rig.subs.windowStart('s1')).toEqual(baseline)
+    const read = rig.subs.read('s1', baseline)
+    if (!('events' in read)) throw new Error('expected events: the baseline is servable')
+    expect(read.events).toEqual([])
+    // The empty replay is not a dead end: its nextCursor is the baseline itself,
+    // which the NEXT read accepts too — the round trip a caller actually makes.
+    expect(read.nextCursor).toEqual(baseline)
+    const again = rig.subs.read('s1', read.nextCursor)
+    if (!('events' in again)) throw new Error('expected events: the baseline stays servable')
+    expect(again.events).toEqual([])
+
+    // The same verdict in the non-empty case: the baseline serves EVERYTHING
+    // retained, because nothing in that range was ever dropped.
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { executionId: 'e2' } })
+    await waitFor(() => {
+      const current = rig.subs.read('s1')
+      return 'events' in current && current.events.length === 2
+    }, 3_000, 'both events cached')
+    const whole = rig.subs.read('s1', baseline)
+    if (!('events' in whole)) throw new Error('expected events: the baseline is still servable')
+    expect(whole.events.map((event) => event.kind)).toEqual(['execution.updated', 'execution.updated'])
+    expect(whole.nextCursor.seq).toBe('2')
+
+    // Strictly BELOW the baseline has no provable continuity and stays refused.
+    expect(rig.subs.read('s1', cursor('s1', -1))).toEqual({ error: 'cursor-out-of-window' })
+  })
+
+  it('N2 (issue #2) refuses AT the window start once a byte-budget drop has advanced it, and still serves strictly after', async () => {
+    // The OTHER state the boundary can be in, and the reason the rule cannot be
+    // "always servable": `#trimToBudget` really did discard events, so the layer
+    // can no longer prove a caller resuming from the boundary has seen them.
+    // A tiny 2 KiB budget — the shape ⑫ uses — forces the drop deterministically:
+    // each event's JSON is ~1.0 KiB, so two fit and the third cannot, leaving the
+    // oldest dropped and the newest TWO retained.
+    //
+    // The pushes are PACED (push one, wait until it is cached, then the next).
+    // The layer trims once per FOLD, and a loopback channel may deliver several
+    // pushes inside one fold, so three in a row can land together and trim down
+    // to a SINGLE retained event. That would make the tail assertion below
+    // vacuous: with one retained event, "the suffix from the first retained
+    // event" looks exactly like "the replay was empty", which is what a layer
+    // returning nothing once every retained event sits at-or-above the cursor
+    // also produces. Pacing pins the one-fold-per-push shape, so the suffix is
+    // a real MULTI-event range.
+    const rig = await makeRig({}, { perSessionCacheBytes: 2_048 })
+    await rig.subs.ensure('s1')
+    expect(rig.subs.windowStart('s1')).toEqual(cursor('s1', 0))
+
+    const filler = 'x'.repeat(940)
+    for (const tag of ['first', 'second', 'third']) {
+      rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { tag, filler } })
+      await waitFor(
+        () => {
+          const held = rig.subs.read('s1')
+          return 'events' in held && held.events.length > 0
+        },
+        3_000,
+        `the ${tag} event cached`,
+      )
+    }
+    await waitFor(
+      () => {
+        const dropped = consoleWarn.mock.calls.flat().map(String).some((message) => /dropped .* oldest/i.test(message))
+        return dropped && rig.subs.cursorOf('s1')?.seq === '3'
+      },
+      3_000,
+      'the oldest-drop warning',
+    )
+
+    // The drop ADVANCED the boundary past the discarded position.
+    const start = rig.subs.windowStart('s1')!
+    expect(Number(start.seq)).toBeGreaterThan(0)
+
+    // AT the boundary: REFUSED — this is the rule that must survive the fix,
+    // because the event that occupied that position is gone.
+    expect(rig.subs.read('s1', start)).toEqual({ error: 'cursor-out-of-window' })
+    // And so is the position the window STARTED from, now strictly below it.
+    expect(rig.subs.read('s1', cursor('s1', 0))).toEqual({ error: 'cursor-out-of-window' })
+
+    // The un-cursored read still shows what the budget retained, and every
+    // retained event is STRICTLY newer than the boundary — which is what makes
+    // it servable through a cursor placed below it.
+    const retained = rig.subs.read('s1')
+    if (!('events' in retained)) throw new Error('expected events: the un-cursored read')
+    // MULTI-event on purpose, for the reason the pacing above records.
+    expect(retained.events.length).toBe(2)
+    const retainedSeqs = retained.events.map((event) => Number((event as unknown as { seq: string }).seq))
+    expect(Math.min(...retainedSeqs)).toBeGreaterThan(Number(start.seq))
+    const retainedTags = retained.events.map((event) => (event.payload as unknown as { tag: string }).tag)
+    expect(retainedTags).not.toContain('first')
+    expect(retainedTags).toContain('third')
+
+    // THE OTHER HALF OF THE RULE: strictly AFTER the boundary stays servable.
+    // `read` keeps the events strictly NEWER than the requested position
+    // (`Number(entry.cursor.seq) > requested`), and the boundary itself is
+    // refused, so the earliest position a caller can actually resume from is
+    // the FIRST RETAINED event — the suffix behind it is the whole retained
+    // window less that event. Without this assertion the case pinned the
+    // refusal twice (the boundary, and one position below it) and never the
+    // serving half, which is equally consistent with a layer that refuses
+    // EVERYTHING once it has dropped a single event.
+    const retainedFirst = retained.events[0]!
+    const retainedFirstSeq = Number((retainedFirst as unknown as { seq: string }).seq)
+    expect(retainedFirstSeq).toBe(Number(start.seq) + 1)
+    const afterBoundary = rig.subs.read('s1', cursor('s1', retainedFirstSeq))
+    if (!('events' in afterBoundary)) throw new Error('expected events: the first retained event is servable')
+    // Everything the un-cursored read showed, less that one event — nothing
+    // above it is missing and nothing below it leaks back in — and the SAME
+    // nextCursor, so the caller's round trip (resume, then resume from
+    // nextCursor) ends where the un-cursored read ends.
+    const expectedSuffix = retained.events.slice(1)
+    expect(afterBoundary.events).toHaveLength(expectedSuffix.length)
+    expect(afterBoundary.events).toEqual(expectedSuffix)
+    expect(afterBoundary.nextCursor).toEqual(retained.nextCursor)
+    // And with a one-event suffix (the smallest retained window the drop can
+    // leave), the round trip is empty-but-live rather than refused: the cursor
+    // the read answers with is still servable.
+    const atNewest = rig.subs.read('s1', cursor('s1', Number(retained.nextCursor.seq)))
+    if (!('events' in atNewest)) throw new Error('expected events: the newest retained position is servable')
+    expect(atNewest.events).toEqual([])
+    expect(atNewest.nextCursor).toEqual(retained.nextCursor)
   })
 
   it('F2-6d a non-string streamEpoch is refused with a warning, never treated as the current epoch', async () => {
