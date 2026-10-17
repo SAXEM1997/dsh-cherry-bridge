@@ -381,6 +381,67 @@ describe('cherry_send admission self-heals a stale expectedIdleRevision (issue #
     expect(seconds[0]!['expectedIdleRevision']).toBe(bumped)
   })
 
+  it('T5 the healed revision beats a LINGERING stale streamed event on the retry', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION }],
+        terminalMessage: terminalMessage('first reply', 'm-first'),
+      },
+    })
+
+    // A normal send establishes the subscription and the cache (revision 1000).
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'first' })
+    expect(sendsOf(rig, 'first')).toHaveLength(1)
+
+    // A LINGERING `session.updated` still sits in the event buffer carrying the
+    // OLD revision — the shape the desktop produces when it advances the
+    // revision locally and the announcement arrives late.
+    rig.fake.pushEvent('s-1', {
+      kind: 'session.updated',
+      payload: { idleRevision: '1000', historyRevision: '1000' },
+    })
+    // Block until it is IN the buffer: the stream is the buffer, not the wire.
+    await vi.waitFor(
+      async () => {
+        const result = (await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })) as {
+          events?: Array<{ kind: string }>
+        }
+        expect(result.events?.map((event) => event.kind)).toContain('session.updated')
+      },
+      5_000,
+    )
+
+    // The peer moves on with NO event traffic, so the streamed value above stays
+    // the only thing the buffer knows — and it is now stale.
+    const bumped = rig.fake.silentIdleBump('s-1')
+    expect(bumped).toBe('1001')
+
+    rig.fake.setTerminalMessage(terminalMessage('second reply', 'm-second'))
+    const result = (await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'second' })) as {
+      status?: string
+      text?: string
+    }
+
+    // Exactly two attempts, and the run completed.
+    const calls = sendsOf(rig, 'second')
+    expect(calls).toHaveLength(2)
+    expect(result.status).toBe('completed')
+    expect(result.text).toBe('second reply')
+
+    // The FIRST attempt quoted the lingering streamed value and was refused...
+    expect(calls[0]!['expectedIdleRevision']).toBe('1000')
+    expect(rig.fake.receiptFor(String(calls[0]!['commandId']))?.['status']).toBe('rejected')
+
+    // ...and the RETRY quotes what the healing `sessions.get` returned, NOT the
+    // stale streamed value it would have re-derived: the stream still outranks
+    // the cache inside `#idleRevision`, so a retry that asked it again would
+    // re-send 1000 and be refused a second time.
+    expect(calls[1]!['expectedIdleRevision']).toBe(bumped)
+    expect(rig.fake.receiptFor(String(calls[1]!['commandId']))?.['status']).not.toBe('rejected')
+    expect(calls[1]!['commandId']).not.toBe(calls[0]!['commandId'])
+  })
+
   it('T4 a fresh cache keeps the zero-read fast path on a cold send', async () => {
     const rig = await makeRig({ agent: { agents: [AGENT], sessions: [{ ...SESSION }] } })
 

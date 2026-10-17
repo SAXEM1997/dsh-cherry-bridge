@@ -1980,9 +1980,15 @@ class CherryToolEngine {
    *    the peer has a run in flight, so the revision is not even the question
    *    and a second attempt could only fail; the receipt is final.
    *  - The retry asks the peer (`agent.sessions.get`) rather than guessing a
-   *    revision, and only when that snapshot shows an IDLE session (the value
-   *    the send must quote is present). A busy session means the first
-   *    receipt stands.
+   *    revision, and only when that snapshot shows an IDLE session: it must
+   *    report NO `activeExecutionId` AND carry an `idleRevision`/
+   *    `historyRevision` to quote. A busy session means the first receipt
+   *    stands. (A busy summary DOES carry a mid-run `historyRevision`, so the
+   *    execution check — not the revision's absence — is what decides this.)
+   *  - The retry QUOTES the revision that read returned, rather than letting
+   *    `#idleRevision` re-derive one: that helper prefers the event stream, and
+   *    a stale buffered `session.updated` would hand back the revision the peer
+   *    has just refused.
    *  - The retry uses a FRESH `randomUUID()`, never the caller's id. The peer
    *    settled the refused command in its ledger as `rejected`, and the retry's
    *    body DIFFERS (a new `expectedIdleRevision`): replaying that id would
@@ -2005,8 +2011,10 @@ class CherryToolEngine {
     const { args, text } = request
     const attempt = async (
       commandId: string,
+      revisionOverride?: string,
     ): Promise<{ receipt: Record<string, unknown>; baselineSeq: number }> => {
-      const expectedIdleRevision = await this.#idleRevision(connection, subscriptions, deviceId, sessionId)
+      const expectedIdleRevision =
+        revisionOverride ?? (await this.#idleRevision(connection, subscriptions, deviceId, sessionId))
       // THE BASELINE IS TAKEN BEFORE THE COMMAND IS ISSUED, and that ordering
       // is what makes a fast run observable at all. The waiter's baseline is
       // the cut that decides which events belong to THIS run; taking it after
@@ -2036,12 +2044,37 @@ class CherryToolEngine {
     >
     const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
     const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
-    // A busy snapshot names no idle revision: the session really is running,
-    // so the refusal stands and nothing is retried.
+    // TWO conditions, and BOTH must hold before anything is retried — neither
+    // alone proves the session is idle:
+    //
+    //  - no `activeExecutionId`: the peer is reporting no run in flight, so the
+    //    refusal really did turn on a stale revision rather than on a busy
+    //    session (whose "Session is busy" answer this branch never reaches);
+    //  - a revision the send can quote: the snapshot actually carries
+    //    `idleRevision`/`historyRevision`.
+    //
+    // The `activeExecutionId` test is what carries the decision: a BUSY summary
+    // DOES carry a `historyRevision` (the mid-run one), so keying the guard on
+    // the revision alone would call a running session idle and retry into a
+    // guaranteed "Session is busy". Failing either condition leaves the first
+    // receipt standing.
     if (idle === undefined || optionalString(session['activeExecutionId']) !== undefined) return first
     this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle)
 
-    return attempt(randomUUID())
+    // THE HEALED VALUE IS PASSED THROUGH, not re-derived. `#idleRevision`
+    // prefers the EVENT STREAM, and that stream is exactly what went stale here:
+    // a buffered `session.updated` older than the peer's current `idleRevision`
+    // would be returned again, so the retry would re-send the very revision that
+    // was just refused — a second identical refusal, and the healing did
+    // nothing. The snapshot above is the peer's answer taken moments ago, so it
+    // wins this one retry.
+    //
+    // The trade-off, stated honestly: if the stream delivers a NEWER
+    // `session.updated` between that read and the retry (a value DIFFERENT from
+    // the one refused), this still quotes the healing read's value and can earn
+    // one more refusal. That is bounded by construction — exactly one retry, no
+    // loop — and the receipt is then returned as the peer gave it.
+    return attempt(randomUUID(), idle)
   }
 
   // -------------------------------------------------------------------------
@@ -2783,8 +2816,22 @@ class CherryToolEngine {
     // next `agent.messages.send` must quote, so folding it in here keeps the
     // send baseline fresh without another round trip — and, together with the
     // idle-snapshot write-back in `cherry_wait`, keeps a blind event buffer
-    // from pinning a stale revision forever (issue #1). A BUSY session's
-    // summary carries no `idleRevision` at all, so nothing is written then.
+    // from pinning a stale revision forever (issue #1).
+    //
+    // A BUSY session's summary is written too, and that is deliberate rather
+    // than an oversight: it carries no `idleRevision`, but it does carry the
+    // MID-RUN `historyRevision`, which is what lands here. Writing it is safe
+    // because every reader of this entry can live with it:
+    //
+    //  - a send issued while the session is still busy is refused with
+    //    "Session is busy" — a refusal `#admitSend` never retries, so a value
+    //    written mid-run cannot be quoted into a retry;
+    //  - once the run settles, the written revision is stale, and that is
+    //    exactly the case `#admitSend`'s self-heal exists to absorb (issue #1):
+    //    the refusal triggers one `sessions.get` and one retry on the fresh
+    //    value;
+    //  - the peer's revision is MONOTONIC, so a mid-run value is never newer
+    //    than the truth and can only ever be too old — the recoverable side.
     const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
     if (idle !== undefined) this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle)
     const active = optionalString(session['activeExecutionId'])

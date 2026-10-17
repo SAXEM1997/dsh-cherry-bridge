@@ -4910,9 +4910,15 @@ var CherryToolEngine = class {
 	*    the peer has a run in flight, so the revision is not even the question
 	*    and a second attempt could only fail; the receipt is final.
 	*  - The retry asks the peer (`agent.sessions.get`) rather than guessing a
-	*    revision, and only when that snapshot shows an IDLE session (the value
-	*    the send must quote is present). A busy session means the first
-	*    receipt stands.
+	*    revision, and only when that snapshot shows an IDLE session: it must
+	*    report NO `activeExecutionId` AND carry an `idleRevision`/
+	*    `historyRevision` to quote. A busy session means the first receipt
+	*    stands. (A busy summary DOES carry a mid-run `historyRevision`, so the
+	*    execution check — not the revision's absence — is what decides this.)
+	*  - The retry QUOTES the revision that read returned, rather than letting
+	*    `#idleRevision` re-derive one: that helper prefers the event stream, and
+	*    a stale buffered `session.updated` would hand back the revision the peer
+	*    has just refused.
 	*  - The retry uses a FRESH `randomUUID()`, never the caller's id. The peer
 	*    settled the refused command in its ledger as `rejected`, and the retry's
 	*    body DIFFERS (a new `expectedIdleRevision`): replaying that id would
@@ -4927,8 +4933,8 @@ var CherryToolEngine = class {
 	*/
 	async #admitSend(connection, subscriptions, deviceId, sessionId, request) {
 		const { args, text } = request;
-		const attempt = async (commandId) => {
-			const expectedIdleRevision = await this.#idleRevision(connection, subscriptions, deviceId, sessionId);
+		const attempt = async (commandId, revisionOverride) => {
+			const expectedIdleRevision = revisionOverride ?? await this.#idleRevision(connection, subscriptions, deviceId, sessionId);
 			const baselineSeq = this.#newestSeq(subscriptions, sessionId);
 			return {
 				receipt: await this.#command(connection, "agent.messages.send", {
@@ -4947,7 +4953,7 @@ var CherryToolEngine = class {
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle === void 0 || optionalString(session["activeExecutionId"]) !== void 0) return first;
 		this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle);
-		return attempt(randomUUID());
+		return attempt(randomUUID(), idle);
 	}
 	#waitTool() {
 		return defineCherryTool({
