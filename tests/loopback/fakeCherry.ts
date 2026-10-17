@@ -190,8 +190,11 @@ export interface FakeAgentOptions {
    */
   sessions?: FakeSessionRecord[]
   /**
-   * Messages every registered session serves; `parts` decide the two-level
-   * read. Task 9's `terminalMessage` is appended here by an accepted run.
+   * Messages every registered session serves, in the peer's own order:
+   * NEWEST-FIRST (`agent.messages.list` walks from the most recent page).
+   * `parts` decide the two-level read. Task 9's `terminalMessage` is PREPENDED
+   * here by an accepted run — the run's message is the newest one, as it is on
+   * the real peer.
    */
   messages?: FakeMessageRecord[]
   /**
@@ -206,6 +209,17 @@ export interface FakeAgentOptions {
    * three-pages-of-50 case without violating the protocol's 100-item cap.
    */
   maxPageSize?: number
+  /**
+   * The same ceiling, for `agent.messages.list` ONLY.
+   *
+   * A message-history page size is worth pinning on its own because the MESSAGE
+   * walk's limit is what terminal/timeout/idle answers are bounded by (issue
+   * #3): a test that narrows every read face at once cannot tell whether the
+   * client asked for 20 messages or for everything (the peer clamps a page
+   * before the client's own ceiling is ever visible on the wire). The two
+   * combine — the effective page is the smaller of the two.
+   */
+  maxMessagePageSize?: number
   /**
    * PEER FAULT injection: answer with an EMPTY `items` array plus this dangling
    * `nextCursor`, forever. Models a broken peer whose pagination never makes
@@ -1977,7 +1991,7 @@ export class FakeCherry {
       partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
       status: message.status,
     }))
-    return this.#page(messages, params)
+    return this.#page(messages, params, this.#agent().maxMessagePageSize)
   }
 
   /** The real `listParts`: a stale `messageRevision` is REVISION_EXPIRED. */
@@ -2113,8 +2127,19 @@ export class FakeCherry {
     }
   }
 
-  /** The real `pageOf`: a numeric-offset cursor, clamped to the protocol cap. */
-  #page<T>(items: readonly T[], params: Record<string, unknown>): { items: T[]; nextCursor: string | null } {
+  /**
+   * The real `pageOf`: a numeric-offset cursor, clamped to the protocol cap.
+   *
+   * `extraCeiling` is the per-FACE peer cap (`maxMessagePageSize`) — a peer that
+   * pages the message history smaller than every other face, so a test can
+   * observe the client's own message limit on the wire. It only ever LOWERS the
+   * effective page.
+   */
+  #page<T>(
+    items: readonly T[],
+    params: Record<string, unknown>,
+    extraCeiling?: number,
+  ): { items: T[]; nextCursor: string | null } {
     // Peer-fault face: an empty page that still claims more are coming.
     const dangling = this.#agent().emptyPagesWithDanglingCursor
     if (dangling !== undefined) return { items: [], nextCursor: dangling }
@@ -2132,7 +2157,11 @@ export class FakeCherry {
     const requested = (params['limit'] as number | undefined) ?? this.#agent().defaultPageSize ?? 20
     // Two independent ceilings: the protocol's own page cap, and a peer that
     // pages smaller than the cap. The effective page is the smaller of the two.
-    const ceiling = Math.min(remoteLimits.pageItems, this.#agent().maxPageSize ?? remoteLimits.pageItems)
+    const ceiling = Math.min(
+      remoteLimits.pageItems,
+      this.#agent().maxPageSize ?? remoteLimits.pageItems,
+      extraCeiling ?? remoteLimits.pageItems,
+    )
     const limit = Math.max(1, Math.min(requested, ceiling))
     const end = start + limit
     return { items: items.slice(start, end), nextCursor: end < items.length ? String(end) : null }
@@ -2661,12 +2690,23 @@ export class FakeCherry {
    * none: `?? []` would push into a throwaway and silently serve an empty
    * message list, which is precisely the bug this face would otherwise hide.
    *
-   * APPEND, never dedupe-by-id: the real peer persists a FRESH assistant
-   * message per run, and the session's `messages.list` serves the cumulative
-   * history. A fake that skipped the push when the id was already present made
-   * two consecutive runs on one session look like a single message — hiding the
-   * exact defect (a terminal aggregate summing the whole history and
-   * re-delivering run 1's reply as run 2's output) that a real session exposes.
+   * PREPEND, never dedupe-by-id and never append: the real peer persists a
+   * FRESH assistant message per run, and its `agent.messages.list` serves the
+   * history NEWEST-FIRST (`listSessionMessages`: an absent cursor returns the
+   * most recent page, each `nextCursor` walks one page OLDER). The fixture array
+   * is that same order — index 0 is the newest — so a run's message belongs at
+   * the FRONT.
+   *
+   * Two defects this face keeps visible:
+   *
+   *  - A fake that skipped the push when the id was already present made two
+   *    consecutive runs on one session look like a single message, hiding the
+   *    terminal aggregate that summed the whole history and re-delivered run
+   *    1's reply as run 2's output.
+   *  - A fake that APPENDED put the run's message at the OLDEST end, hiding
+   *    issue #3's anchor defect (a fallback that read the array's tail and so
+   *    reported the oldest assistant message in the session).
+   *
    * A fixture that wants a stable id across runs can still set `runMessageId`,
    * but then its text is genuinely the same message and re-reading it is right.
    */
@@ -2675,7 +2715,7 @@ export class FakeCherry {
     const message = agent?.terminalMessage
     if (agent === undefined || message === undefined) return
     agent.messages ??= []
-    agent.messages.push(message)
+    agent.messages.unshift(message)
   }
 
   /** Every interaction, in the wire view the real `interactionsOf` serves. */

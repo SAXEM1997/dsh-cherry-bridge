@@ -31,6 +31,15 @@ import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherr
  * These tests are the DISCRIMINATOR: the truncation is forced by making the
  * peer page smaller than the message count, so the aggregate ceiling is reached
  * with the peer still holding pages.
+ *
+ * ISSUE #3 LOWERED THAT CEILING — from the generic 1000-item aggregate bound to
+ * `TERMINAL_AGGREGATE_MESSAGES = 20`, with a `TERMINAL_AGGREGATE_BYTES` budget on
+ * top. The rule under test is unchanged (a walk that stopped early is SURFACED,
+ * never silent); what changed is the number and, therefore, WHICH bound trips:
+ * a caller-limit stop is `'limit'`, and here the caller is the tool itself. The
+ * assertions below read `'limit'` rather than `'safety-bound'` for that reason,
+ * and F2-1e was rewritten: the old fallback anchored the array's TAIL — the
+ * OLDEST assistant message — and is now anchored at the NEWEST.
  */
 
 /** One assistant message fixture, page-cheap (a single tiny text part). */
@@ -178,6 +187,15 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
   return rig
 }
 
+/** The message a settling run persists — the terminal names this id. */
+const RUN_MESSAGE: FakeMessageRecord = {
+  messageId: 'm-run',
+  revision: '1',
+  role: 'assistant',
+  status: 'success',
+  parts: [{ kind: 'text', text: 'the run reply' }],
+}
+
 /** The one session every scenario drives. */
 const SESSION = {
   sessionId: 's-1',
@@ -199,6 +217,22 @@ const AGENT = { agentId: 'agent-1', name: 'Agent One' }
 const MESSAGE_COUNT = 1001
 function longHistory(): FakeMessageRecord[] {
   return Array.from({ length: MESSAGE_COUNT }, (_unused, index) => assistantMessage(index))
+}
+
+/**
+ * `count` filler messages under their own id space, NEWEST-FIRST.
+ *
+ * Distinct ids from `longHistory()` so a scenario can assert WHICH window it
+ * got: `old-0` is the newest filler, `old-${count - 1}` the oldest.
+ */
+function fillerHistory(count: number): FakeMessageRecord[] {
+  return Array.from({ length: count }, (_unused, index) => ({
+    messageId: `old-${index}`,
+    revision: '1',
+    role: 'assistant' as const,
+    status: 'success' as const,
+    parts: [{ kind: 'text' as const, text: `old ${index}` }],
+  }))
 }
 
 describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message walk', () => {
@@ -262,12 +296,18 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     expect(idle.status).toBe('idle')
     // The walk stopped at the ceiling: the flag is the honest face.
     expect(idle.messagesTruncated).toBe(true)
-    expect(idle.messagesTruncationReason).toBe('safety-bound')
+    // The TOOL's own message ceiling binds here (`limit`), not the internal
+    // circuit-breaker: since issue #3 the caller-facing bound for these three
+    // answers is `TERMINAL_AGGREGATE_MESSAGES` (20), which is set independently
+    // of `MAX_AGGREGATE_LIMIT` and therefore reads as a caller limit.
+    expect(idle.messagesTruncationReason).toBe('limit')
     // Where to resume: the peer's cursor, as a decimal string.
     expect(typeof idle.messagesResumeCursor).toBe('string')
     expect(Number(idle.messagesResumeCursor)).toBeGreaterThan(0)
-    // The aggregate really is bounded, and the text is best-effort — not silent.
-    expect(idle.messages.length).toBeLessThanOrEqual(1000)
+    // The aggregate really is bounded (issue #3), and the text is best-effort —
+    // not silent.
+    expect(idle.messages.length).toBeLessThanOrEqual(20)
+    expect(idle.messages.length).toBeGreaterThan(0)
   })
 
   it('F2-1c a timeout result flags the truncation too, alongside its partial content', async () => {
@@ -297,28 +337,32 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
 
     expect(result.status).toBe('timeout')
     expect(result.messagesTruncated).toBe(true)
-    expect(result.messagesTruncationReason).toBe('safety-bound')
+    // The tool's message ceiling binds — see issue #3 and F2-1b above.
+    expect(result.messagesTruncationReason).toBe('limit')
     expect(typeof result.messagesResumeCursor).toBe('string')
     // The EVENT cursor is a different thing and must still be there.
     expect(result.cursor).toBeDefined()
   })
 
   it('F2-1d a terminal aggregate whose terminal message is OUT of reach flags instead of answering silently', async () => {
+    // The terminal NAMES a message that the bounded walk cannot reach. Issue #3
+    // bounds the walk to the NEWEST 20 messages (the peer walks newest-first),
+    // so a run whose message was persisted behind 41 newer messages is outside
+    // it — the exact shape a session with a deep history produces. The answer
+    // must SAY the aggregate is partial rather than present it as the run's
+    // output.
+    //
+    // `runMessageId` names the out-of-reach message for the terminal event
+    // WITHOUT persisting a copy of it at the newest end, so nothing in the
+    // window can accidentally satisfy the id.
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
         sessions: [SESSION],
-        // 1001 messages, and the run appends its own 1002nd — beyond the
-        // ceiling. A walk that stops at 1000 can therefore never see it.
-        messages: longHistory(),
-        maxPageSize: 100,
-        terminalMessage: {
-          messageId: 'm-run',
-          revision: '1',
-          role: 'assistant',
-          status: 'success',
-          parts: [{ kind: 'text', text: 'the run reply' }],
-        },
+        // NEWEST-FIRST, and the run's message sits 41 back.
+        messages: [...fillerHistory(41), RUN_MESSAGE],
+        maxMessagePageSize: 100,
+        runMessageId: 'm-run',
       },
     })
 
@@ -330,7 +374,7 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     })) as {
       status: string
       text?: string
-      messages: unknown[]
+      messages: Array<{ messageId: string }>
       messagesTruncated?: boolean
       messagesTruncationReason?: string
       messagesResumeCursor?: string
@@ -340,20 +384,44 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     // The run's own text is NOT in the aggregate, and the result SAYS SO
     // rather than presenting the partial aggregate as the run's output.
     expect(result.messagesTruncated).toBe(true)
-    expect(result.messagesTruncationReason).toBe('safety-bound')
+    // The tool's message ceiling binds — see issue #3 and F2-1b above.
+    expect(result.messagesTruncationReason).toBe('limit')
     expect(typeof result.messagesResumeCursor).toBe('string')
+    // The LIMIT IS ON THE WIRE: no page is asked for more than the tool-side
+    // ceiling (issue #3), so the walk cannot quietly grow back to the history.
+    for (const call of rig.fake.readCallsFor('agent.messages.list')) {
+      expect(call['limit'] as number).toBeLessThanOrEqual(20)
+    }
+    // The walk starts at the NEWEST message (issue #3) and takes 20 of them, so
+    // the run's message — 41 back — is outside the window it returns.
+    expect(result.messages.length).toBeLessThanOrEqual(20)
+    expect(result.messages.map((message) => message.messageId)).not.toContain('m-run')
+    // The run's text is therefore NOT the answer, and the flags above are why
+    // the caller knows that rather than reading an empty string as "no output".
+    expect(result.text).toBe('')
   })
 
-  it('F2-1e the no-anchor case (no terminalMessageId, last message out of reach) flags rather than passing stale text off as the run', async () => {
+  it('F2-1e the no-anchor case flags a bounded walk, and the fallback reads the NEWEST end (issue #3)', async () => {
     // `omitSendExecutionId` makes the wait ADOPT the run, so no terminal
-    // message id is carried; the text then falls back to the LAST assistant
-    // message in the walk. When the walk stopped early that fallback is a
-    // PREVIOUS run's message — staleness the flag must expose.
+    // message id is carried and the text falls back to an assistant message
+    // the walk happened to include.
+    //
+    // ISSUE #3 CHANGED WHICH ONE. The fallback used to anchor the array's TAIL
+    // on the assumption that the history read oldest-first; it does not (the
+    // peer walks newest-first), so the tail was the OLDEST assistant message in
+    // the session. It is now anchored at the NEWEST, and the fixture's newest
+    // message is the run's own reply. The flag still matters — the walk stopped
+    // at the tool's ceiling, so the array is a WINDOW, not the history — but
+    // the text it produces is the current run's, not a July message's.
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
         sessions: [SESSION],
-        messages: longHistory(),
+        // NEWEST-FIRST: at settlement the fake puts the run's message in front
+        // of whatever the fixture declared, so the run's message becomes the
+        // newest assistant message, with the 60 declared ones behind it — all
+        // OUTSIDE the bounded newest window (issue #3: 20 messages).
+        messages: fillerHistory(25),
         maxPageSize: 100,
         terminalMessage: {
           messageId: 'm-run',
@@ -377,11 +445,15 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
       messagesTruncationReason?: string
     }
 
-    // Best-effort stale text MAY remain — but never unflagged.
+    // The bound is NEVER silent.
     expect(result.messagesTruncated).toBe(true)
-    expect(result.messagesTruncationReason).toBe('safety-bound')
-    // And the stale text is NOT the run's reply, which is exactly why the flag
-    // has to be there.
-    expect(result.text).not.toContain('the run reply')
+    // The tool's message ceiling binds — see issue #3 and F2-1b above.
+    expect(result.messagesTruncationReason).toBe('limit')
+    // The fallback anchor is the NEWEST assistant message — here that is the
+    // run's own (the newest USER turn in front of it has the other role) — so
+    // the answer is the run's text, reached without the terminal naming it.
+    // The OLD anchor, which read the array's tail, would have reported the
+    // 60-messages-old `old-59` instead.
+    expect(result.text).toBe('the run reply')
   })
 })
