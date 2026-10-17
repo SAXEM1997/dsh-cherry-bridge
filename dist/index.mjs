@@ -3906,6 +3906,33 @@ function withIdempotencyHint(error) {
 function optionalString(value) {
 	return typeof value === "string" && value !== "" ? value : void 0;
 }
+/**
+* The peer's `agent.messages.send` refusal for a STALE `expectedIdleRevision`,
+* in the exact shape Cherry Studio answers it: a `rejected` receipt whose
+* `error` is `{reason: 'CONFLICT', message: 'Session is not idle at the
+* expected revision'}` (a throw inside the handler's `startRun` guard, folded
+* into a receipt by its `command()` wrapper).
+*
+* Deliberately NOT "any CONFLICT": two other CONFLICT refusals share the
+* reason and mean something entirely different —
+*
+*  - "Session is busy" says a run is in flight. The revision is moot, and a
+*    retry would change nothing; retrying it would spend a command per call
+*    on a session that is working normally.
+*  - "Execution is not active" belongs to the cancel verb, not to this one.
+*
+* The message match is what separates them, so this predicate keys on the
+* message the peer actually sends rather than on the reason alone.
+*/
+function isStaleRevisionRefusal(receipt) {
+	if (receipt["status"] !== "rejected") return false;
+	const error = isRecord(receipt["error"]) ? receipt["error"] : void 0;
+	if (error === void 0 || error["reason"] !== "CONFLICT") return false;
+	const message = error["message"];
+	return typeof message === "string" && message.includes(SEND_STALE_REVISION_MESSAGE);
+}
+/** The peer's exact wire文案 for a stale admission baseline (see above). */
+const SEND_STALE_REVISION_MESSAGE = "not idle at the expected revision";
 function requiredString(args, key) {
 	const value = args[key];
 	if (typeof value !== "string" || value === "") throw new Error(`cherry tools: "${key}" is required and must be a non-empty string`);
@@ -4846,13 +4873,9 @@ var CherryToolEngine = class {
 				};
 				await this.#ensureSubscription(record.deviceId, sessionId);
 				const subscriptions = this.#deps.subs(record.deviceId);
-				const expectedIdleRevision = await this.#idleRevision(connection, subscriptions, record.deviceId, sessionId);
-				const baselineSeq = this.#newestSeq(subscriptions, sessionId);
-				const receipt = await this.#command(connection, "agent.messages.send", {
-					commandId: this.#commandId(args),
-					sessionId,
-					text,
-					expectedIdleRevision
+				const { receipt, baselineSeq } = await this.#admitSend(connection, subscriptions, record.deviceId, sessionId, {
+					args,
+					text
 				});
 				if (args["wait"] === false) return receipt;
 				if (receipt["status"] === "rejected" || receipt["status"] === "interrupted") return receipt;
@@ -4866,6 +4889,71 @@ var CherryToolEngine = class {
 				});
 			}
 		});
+	}
+	/**
+	* Issues `agent.messages.send` and returns the receipt the caller should act
+	* on — self-healing ONCE a stale admission baseline.
+	*
+	* `expectedIdleRevision` comes from the CACHE's session snapshot. A cold cache
+	* is baselined first (`sessions.get`), so the value is always one the peer
+	* itself reported; a warm one is trusted without revalidation. That trust is
+	* what issue #1 breaks: the cache's freshest source is the event stream, and
+	* the stream's buffer is dropped WHOLESALE when its epoch rotates, a
+	* re-subscribe rebuilds it, or the LRU evicts it. With the buffer empty the
+	* cached value can be arbitrarily old, the peer refuses admission with
+	* CONFLICT "Session is not idle at the expected revision", and the same stale
+	* entry would be sent again on every later call: a PERMANENT conflict.
+	*
+	* So a refusal on exactly that ground earns ONE re-baseline and ONE retry:
+	*
+	*  - "Session is busy" is a DIFFERENT refusal and is never retried. It says
+	*    the peer has a run in flight, so the revision is not even the question
+	*    and a second attempt could only fail; the receipt is final.
+	*  - The retry asks the peer (`agent.sessions.get`) rather than guessing a
+	*    revision, and only when that snapshot shows an IDLE session: it must
+	*    report NO `activeExecutionId` AND carry an `idleRevision`/
+	*    `historyRevision` to quote. A busy session means the first receipt
+	*    stands. (A busy summary DOES carry a mid-run `historyRevision`, so the
+	*    execution check — not the revision's absence — is what decides this.)
+	*  - The retry QUOTES the revision that read returned, rather than letting
+	*    `#idleRevision` re-derive one: that helper prefers the event stream, and
+	*    a stale buffered `session.updated` would hand back the revision the peer
+	*    has just refused.
+	*  - The retry uses a FRESH `randomUUID()`, never the caller's id. The peer
+	*    settled the refused command in its ledger as `rejected`, and the retry's
+	*    body DIFFERS (a new `expectedIdleRevision`): replaying that id would
+	*    return the recorded refusal, and a differing body under a settled id is
+	*    the peer's IDEMPOTENCY_CONFLICT. A new id is a new command.
+	*  - Exactly one retry. A second refusal is returned as-is — the peer has
+	*    then answered this caller twice, and a third attempt would just loop.
+	*
+	* The returned `baselineSeq` belongs to the attempt whose receipt is
+	* returned: the caller's waiter must fold events that arrived after the
+	* command which actually started the run.
+	*/
+	async #admitSend(connection, subscriptions, deviceId, sessionId, request) {
+		const { args, text } = request;
+		const attempt = async (commandId, revisionOverride) => {
+			const expectedIdleRevision = revisionOverride ?? await this.#idleRevision(connection, subscriptions, deviceId, sessionId);
+			const baselineSeq = this.#newestSeq(subscriptions, sessionId);
+			return {
+				receipt: await this.#command(connection, "agent.messages.send", {
+					commandId,
+					sessionId,
+					text,
+					expectedIdleRevision
+				}),
+				baselineSeq
+			};
+		};
+		const first = await attempt(this.#commandId(args));
+		if (!isStaleRevisionRefusal(first.receipt)) return first;
+		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
+		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
+		if (idle === void 0 || optionalString(session["activeExecutionId"]) !== void 0) return first;
+		this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle);
+		return attempt(randomUUID(), idle);
 	}
 	#waitTool() {
 		return defineCherryTool({
@@ -4902,6 +4990,8 @@ var CherryToolEngine = class {
 				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
 				const activeExecutionId = optionalString(session["activeExecutionId"]);
 				if (activeExecutionId === void 0) {
+					const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
+					if (idle !== void 0) this.#revisionCache.set(this.#cacheKey(record.deviceId, sessionId), idle);
 					const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
 					return {
 						status: "idle",
@@ -5379,7 +5469,10 @@ var CherryToolEngine = class {
 			return streamed;
 		}
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const active = optionalString((isRecord(sessionResult["session"]) ? sessionResult["session"] : {})["activeExecutionId"]);
+		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
+		if (idle !== void 0) this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle);
+		const active = optionalString(session["activeExecutionId"]);
 		if (active !== void 0) {
 			this.#executionCache.set(this.#cacheKey(deviceId, sessionId), active);
 			return active;
