@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -1248,6 +1249,139 @@ describe('read-only cherry tools over a real loopback channel', () => {
     const messageCalls = rig.fake.readCallsFor('agent.messages.list')
     expect(messageCalls).toHaveLength(2)
   })
+
+  it('④n a cursor CYCLE (A → B → A) is refused on the second visit, not after the page backstop', async () => {
+    // The advance guard only sees a cursor that repeats IMMEDIATELY. A TWO-step
+    // cycle advances on every step, so without cycle detection this walk spins
+    // to MAX_AGGREGATE_PAGES — ~10,000 RPCs against a peer that will never
+    // terminate. A ↔ B is also the case the one-item-per-page shape is for: the
+    // item ceiling never engages (well, not before the backstop would).
+    const rig = await makeRig({
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts: [] }],
+        maxPageSize: 1,
+      },
+    })
+    rig.fake.scriptListPages('agent.parts.list', [
+      { items: [{ partId: 'p-0', revision: 'r', kind: 'text', content: { text: 'a' } }], nextCursor: 'A' },
+      { items: [{ partId: 'p-1', revision: 'r', kind: 'text', content: { text: 'b' } }], nextCursor: 'B' },
+      { items: [{ partId: 'p-2', revision: 'r', kind: 'text', content: { text: 'c' } }], nextCursor: 'A' },
+    ])
+
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /cycled back to cursor A/i,
+    )
+    // Three requests: first page, A, B, and the repeat of A is refused off the
+    // page that advertised it. A walk without the set runs to the backstop.
+    expect(rig.fake.readCallsFor('agent.parts.list')).toHaveLength(3)
+  }, 30_000)
+
+  it('④o a {ref} declaring more than 32 MiB is unavailable on THAT part while the rest of the read succeeds', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'text', text: 'inline survives' },
+              { kind: 'text', text: 'Z'.repeat(30 * 1024), external: true },
+            ],
+          },
+          {
+            messageId: 'm-2',
+            revision: '1002',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'later message survives' }],
+          },
+        ],
+      },
+    })
+    // The peer's ref claims 4 GiB. Deriving the slice budget from it would mean
+    // ~170,000 content round trips for a part this client will never hold.
+    rig.fake.understateContentLength('m-1:1', '1001', 4 * 1024 ** 3)
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        messageId: string
+        parts: Array<{ partId: string; content: string; unavailable?: string; byteLength?: string }>
+      }>
+    }
+
+    expect(result.messages.map((message) => message.messageId)).toEqual(['m-1', 'm-2'])
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline survives')
+    expect(result.messages[1]!.parts[0]!.content).toBe('later message survives')
+    const oversized = result.messages[0]!.parts[1]!
+    expect(oversized.partId).toBe('m-1:1')
+    expect(oversized.content).toBe('')
+    expect(oversized.unavailable).toMatch(/33554432|32 ?MiB/i)
+    // Not one byte was fetched for it: the cap is a refusal to start, not a
+    // budget that runs out mid-walk.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  }, 30_000)
+
+  it('④p a {ref} declaring MORE than the 32 MiB ceiling is refused before its walk even starts', async () => {
+    // The first of the ceiling's two arms, isolated from the second: with a
+    // HEAP of parts the slice budget is what ends every walk just shy of 32 MiB,
+    // and without the declaration check a part declaring 4 GiB would mean ~170,000
+    // content round trips before anything could stop it. Nothing is read here at
+    // all — the refusal is a decision, not a budget that runs out.
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'text', text: 'inline survives' },
+              { kind: 'text', text: 'Y'.repeat(30 * 1024), external: true },
+            ],
+          },
+          {
+            messageId: 'm-2',
+            revision: '1002',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'later message survives' }],
+          },
+        ],
+      },
+    })
+    rig.fake.understateContentLength('m-1:1', '1001', 4 * 1024 ** 3)
+    // A walk that ignored the declaration would be served real slices, which
+    // would fail on their own terms rather than on the ceiling's.
+    const sliceBytes = Buffer.alloc(4 * 1024, 0x61).toString('base64')
+    rig.fake.scriptContentPieces('m-1:1', '1001', 1, () => sliceBytes, '0'.repeat(64))
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ messageId: string; parts: Array<{ partId: string; content: string; unavailable?: string }> }>
+    }
+
+    expect(result.messages[1]!.parts[0]!.content).toBe('later message survives')
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline survives')
+    const oversized = result.messages[0]!.parts[1]!
+    expect(oversized.partId).toBe('m-1:1')
+    expect(oversized.content).toBe('')
+    expect(oversized.unavailable).toMatch(/33554432|32 ?MiB/i)
+    // The refusal cost ZERO round trips: the declaration was enough.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  }, 30_000)
 })
 
 describe('read-only cherry tools: registration framework', () => {

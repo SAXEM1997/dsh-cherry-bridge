@@ -448,6 +448,20 @@ const MAX_CONSECUTIVE_EMPTY_PAGES = 3
  * FAILS the read rather than returning a partial (unverifiable) content.
  */
 const DEFAULT_CONTENT_SLICE_BOUND = 4_096
+/**
+ * ABSOLUTE ceiling on one `{ref}`'s content, in bytes — the same 32 MiB the
+ * official Cherry Studio client applies (`remoteContent.ts`).
+ *
+ * The walk's slice budget derives from the length the REF DECLARES, so without
+ * an absolute ceiling a peer declaring 4 GiB makes this client issue ~170,000
+ * `agent.content.read` round trips before it reaches `eof` — a read that cannot
+ * finish in any caller's patience, and one the caller has no way to stop. The
+ * cap is a refusal to attempt that walk, not a proof about the content: content
+ * the desktop really does externalize never approaches it, and a part above it
+ * degrades to `unavailable` exactly like any other part this client will not
+ * read.
+ */
+const MAX_EXTERNALIZED_BYTES = 32 * 1024 * 1024
 
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
 const TEXT_MAX_LENGTH = 32_768
@@ -768,6 +782,18 @@ export interface CherryToolEngineOptions {
    */
   partsSafetyBound?: number
   /**
+   * Fallback slice budget for one `{ref}` with no usable `byteLength`. Omitted
+   * uses {@link DEFAULT_CONTENT_SLICE_BOUND}.
+   *
+   * It exists because the two bounds answer DIFFERENT questions and only their
+   * INDEPENDENCE is testable: with the default budget a peer serving real 24 KiB
+   * slices reaches the 32 MiB ceiling (issue #17) solely through the slice count,
+   * so a case that shrinks this bound to a handful of slices makes the byte
+   * ceiling the only thing that can stop the walk — and only then is the byte
+   * check provably load-bearing rather than shadowed by the budget.
+   */
+  contentSliceBound?: number
+  /**
    * How long a waiter may sit between two judgement passes when the session
    * buffer has not moved. Omitted uses {@link DEFAULT_WAIT_POLL_MS}. Lowering
    * it makes a wait react sooner at the cost of more wakeups; raising it makes
@@ -868,6 +894,8 @@ class CherryToolEngine {
    * rather than silently truncating.
    */
   readonly #partsSafetyBound: number
+  /** Fallback content slice budget, injectable for the same reason as above. */
+  readonly #contentSliceBound: number
   /** Poll cadence for the interactive waiters (see `DEFAULT_WAIT_POLL_MS`). */
   readonly #waitPollMs: number
   /**
@@ -915,6 +943,10 @@ class CherryToolEngine {
     this.#partsSafetyBound = Math.max(
       1,
       Math.floor(options.partsSafetyBound ?? DEFAULT_PARTS_SAFETY_BOUND),
+    )
+    this.#contentSliceBound = Math.max(
+      1,
+      Math.floor(options.contentSliceBound ?? DEFAULT_CONTENT_SLICE_BOUND),
     )
     this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS))
   }
@@ -1125,6 +1157,12 @@ class CherryToolEngine {
     const items: T[] = []
     let cursor: string | undefined
     let emptyPages = 0
+    // Every cursor this walk has been HANDED back, so a loop of any length is
+    // caught: the advance check below can only see a cursor that repeats
+    // IMMEDIATELY, and a longer cycle (A → B → A) would otherwise spin to the
+    // page backstop — thousands of RPCs spent to learn what one Set lookup
+    // answers on the second visit. Bounded by the backstop for the same reason.
+    const seen = new Set<string>()
 
     for (let pages = 0; ; pages += 1) {
       if (items.length >= ceiling) {
@@ -1168,6 +1206,13 @@ class CherryToolEngine {
           `${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`,
         )
       }
+      if (seen.has(advanced)) {
+        throw new Error(
+          `${method} cycled back to cursor ${advanced} it already served for ${JSON.stringify(params)}; ` +
+            'refusing to spin on a peer whose pagination loops',
+        )
+      }
+      seen.add(advanced)
       // An empty page that advances the cursor is PROGRESS: the desktop's
       // pinned-list walk answers `{items: [], nextCursor: 'entity:'}` when a pin
       // anchor vanished between requests. Only a RUN of them is a peer fault —
@@ -1739,14 +1784,26 @@ class CherryToolEngine {
     // on the ref, so a read that needs more slices than the content can hold is
     // a peer fault, not a reason to return a partial (and unverifiable) value.
     const declaredBytes = Number(ref['byteLength'])
+    // The declared length bounds the walk honestly, but only up to the absolute
+    // cap: past it the walk is refused BEFORE any round trip (see
+    // MAX_EXTERNALIZED_BYTES). This is the degradable class — a plain Error, so
+    // the part is marked unavailable instead of failing the read.
+    if (Number.isFinite(declaredBytes) && declaredBytes > MAX_EXTERNALIZED_BYTES) {
+      throw new Error(
+        `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${MAX_EXTERNALIZED_BYTES}-byte limit ` +
+          'for externalized content; not read',
+      )
+    }
     const maxSlices = Number.isSafeInteger(declaredBytes)
       ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES))
-      : DEFAULT_CONTENT_SLICE_BOUND
+      : this.#contentSliceBound
 
-    const chunks: Uint8Array[] = []
     let offset = '0'
     let sha: string | undefined
     let complete = false
+    let read = 0
+    const chunks: string[] = []
+    const hash = createHash('sha256')
     for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
       const slice = (await connection.rpc.request('agent.content.read', {
         sessionId,
@@ -1756,7 +1813,23 @@ class CherryToolEngine {
         maxBytes: CONTENT_READ_MAX_BYTES,
       })) as Record<string, unknown>
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
-      chunks.push(new Uint8Array(Buffer.from(data, 'base64')))
+      // The TEXT and the digest are consumed as the walk goes: a slice is all
+      // this loop ever holds at once, so neither bound below depends on the
+      // content fitting in memory as a whole.
+      const chunk = Buffer.from(data, 'base64')
+      hash.update(chunk)
+      chunks.push(chunk.toString('utf8'))
+      read += chunk.length
+      // The slice budget cannot hold the cap on its own: a ref with no usable
+      // `byteLength` falls back to the slice bound, which the peer can fill with
+      // more than 32 MiB, and a peer may simply serve more than it declared.
+      // Bytes actually read are the only honest measure here.
+      if (read > MAX_EXTERNALIZED_BYTES) {
+        throw new Error(
+          `agent.content.read for ${contentId} exceeded the ${MAX_EXTERNALIZED_BYTES}-byte limit ` +
+            'for externalized content; not read',
+        )
+      }
       if (typeof slice['sha256'] === 'string') sha = slice['sha256']
       if (slice['eof'] === true) {
         complete = true
@@ -1786,14 +1859,13 @@ class CherryToolEngine {
       )
     }
 
-    const bytes = Buffer.concat(chunks)
     const expected = sha ?? declaredSha
     if (expected === undefined) {
       // Not degradable either: nothing can verify these bytes, so reporting
       // them as a partial part would be certifying the unverifiable.
       throw new ContentIntegrityError(`agent.content.read for ${contentId} returned no sha256 to verify`)
     }
-    const actual = createHash('sha256').update(bytes).digest('hex')
+    const actual = hash.digest('hex')
     if (actual !== expected) {
       // A DIGEST MISMATCH, marked as its own class: the caller must be able to
       // tell "the peer would not serve this" (degradable, per-part) from "the
@@ -1802,7 +1874,7 @@ class CherryToolEngine {
         `agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`,
       )
     }
-    return bytes.toString('utf8')
+    return chunks.join('')
   }
 
   // -------------------------------------------------------------------------
