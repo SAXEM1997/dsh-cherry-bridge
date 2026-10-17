@@ -549,6 +549,8 @@ const INVITATION_MS = 120_000
 const CLAIM_ID = 'claim-1'
 /** The real peer's `INLINE_TEXT_LIMIT`: above it, part text travels as a `{ref}`. */
 const INLINE_TEXT_LIMIT = 4096
+/** The protocol's per-slice ceiling for `agent.content.read` (`contentBytes`). */
+const CONTENT_READ_MAX_BYTES = 24 * 1024
 
 /** The real peer's content digest: lowercase hex sha256 over the whole content. */
 function sha256Hex(bytes: Uint8Array): string {
@@ -693,6 +695,8 @@ export class FakeCherry {
   #readFailNext: Map<string, FakeFailure>
   /** One-shot hooks that fire AFTER the next successful read of a method. */
   #afterReadOnce = new Map<string, () => void>()
+  /** One-shot hooks that fire AS a method's next frame arrives (see `beforeNextCall`). */
+  #beforeNextCall = new Map<string, () => void>()
   /** Scripted pages per read-face method, served INSTEAD of the normal page. */
   #scriptedPages = new Map<string, Array<(params: Record<string, unknown>) => Record<string, unknown>>>()
   /** Externalized content bytes, keyed `<contentId>:<revision>` (the peer's pins). */
@@ -706,6 +710,8 @@ export class FakeCherry {
   #contentDigests = new Map<string, string>()
   /** Deliberately FALSE `byteLength` declarations (see `understateContentLength`). */
   #contentByteOverrides = new Map<string, number>()
+  /** Refs served with `byteLength` absent altogether (see `omitContentLength`). */
+  #contentLengthOmitted = new Set<string>()
 
   // Interactive command face observation (Task 9).
   /**
@@ -1139,6 +1145,16 @@ export class FakeCherry {
   }
 
   /**
+   * Run `hook` as the NEXT frame of `method` arrives and answer nothing —
+   * the only way to model a link lost UNDER a request on a method with no
+   * read-face failure knob (a command, say). Any face works, unlike
+   * `setReadFailure`, which the read handlers alone consult.
+   */
+  beforeNextCall(method: string, hook: () => void): void {
+    this.#beforeNextCall.set(method, hook)
+  }
+
+  /**
    * Corrupt one `{ref}` content: the stored bytes are replaced while the
    * digest the pin ADVERTISED stays as it was. A caller that trusts the bytes
    * without verifying sha256 therefore accepts corrupted text; a caller that
@@ -1159,6 +1175,15 @@ export class FakeCherry {
    */
   understateContentLength(contentId: string, revision: string, declaredBytes: number): void {
     this.#contentByteOverrides.set(`${contentId}:${revision}`, declaredBytes)
+  }
+
+  /**
+   * Serve one `{ref}` with NO usable `byteLength` — the malformed-ref face,
+   * where the client has no declared length to derive its slice budget from.
+   * Callable BEFORE the part is projected (pins are created lazily).
+   */
+  omitContentLength(contentId: string, revision: string): void {
+    this.#contentLengthOmitted.add(`${contentId}:${revision}`)
   }
 
   /** The current journal watermark cursor for a session. */
@@ -1306,6 +1331,43 @@ export class FakeCherry {
     for (const { socket } of this.#live) socket.close(code, reason)
   }
 
+  /**
+   * Serve ONE `agent.content.read` reply verbatim, instead of the pinned
+   * slices. The content walk has no other injection knob, and its hardest case
+   * is a peer that serves MORE than the ref declared — which the pin's own
+   * bytes cannot model.
+   */
+  scriptContentSlice(slice: Record<string, unknown>): void {
+    this.#scriptedPages.set('agent.content.read', [...(this.#scriptedPages.get('agent.content.read') ?? []), () => slice])
+  }
+
+  /**
+   * Serve `count` slices of ONE content, each `piece()` repeated, with an
+   * always-advancing offset and no `eof` — a walk that ends only when the
+   * CLIENT stops it. The digest reported is the caller's, so a walk that runs
+   * out of scripted pieces falls back to the pin and fails on its own terms.
+   */
+  scriptContentPieces(
+    contentId: string,
+    revision: string,
+    count: number,
+    piece: () => string,
+    sha256: string,
+  ): void {
+    const step = CONTENT_READ_MAX_BYTES
+    for (let index = 0; index < count; index += 1) {
+      this.scriptContentSlice({
+        contentId,
+        revision,
+        offset: String(index * step),
+        dataBase64: piece(),
+        nextOffset: String((index + 1) * step),
+        eof: false,
+        sha256,
+      })
+    }
+  }
+
   setRefreshFailure(failure: FakeFailure | undefined): void {
     this.#refreshFailure = failure
   }
@@ -1436,6 +1498,14 @@ export class FakeCherry {
     this.#inFlight += 1
     if (this.#inFlight > this.#maxInFlight) this.#maxInFlight = this.#inFlight
     try {
+      // Runs BEFORE the handler answers, so a hook that drops the link leaves
+      // the request genuinely IN FLIGHT: arrived, counted, never answered.
+      const before = this.#beforeNextCall.get(method)
+      if (before !== undefined) {
+        this.#beforeNextCall.delete(method)
+        before()
+        return
+      }
       if (this.#rateLimited(live)) return // session terminated; nothing further to say
 
       if (method === 'connection.ping' && this.#dropPings) {
@@ -1978,6 +2048,12 @@ export class FakeCherry {
       this.#readFailNext.delete(method)
       throw new FakeRpcError(once)
     }
+    // `agent.content.read` is a walk over slices, not a list page, so its
+    // scripted entries are never wrapped in an `items` envelope.
+    if (method === 'agent.content.read') {
+      const entry = this.#nextScriptedPage(method)
+      if (entry !== undefined) return entry(params)
+    }
     switch (method) {
       case 'agent.agents.list':
         return this.#page(
@@ -2103,7 +2179,7 @@ export class FakeCherry {
           ref: {
             contentId: partId,
             revision,
-            byteLength: String(declaredBytes),
+            ...(this.#contentLengthOmitted.has(key) ? {} : { byteLength: String(declaredBytes) }),
             mediaType: 'text/plain',
             sha256: advertised,
           },

@@ -6,7 +6,7 @@ import { remoteConnectPath } from '@cherrystudio/remote-protocol'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { digestIdentity } from './diagnostics.js'
-import { DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
+import { DEFAULT_RATE_BUDGET_PER_SECOND, DEFAULT_TRANSPORT_RETRY_WAIT_MS } from './defaults.js'
 import { urlHost } from './urlHost.js'
 import type { DeviceRecord } from './deviceStore.js'
 
@@ -62,6 +62,18 @@ export interface DeviceConnectionOptions {
    * face can be exercised. Never set in production wiring.
    */
   helloProtocolVersions?: readonly number[]
+  /**
+   * How long one READ may wait for the reconnected link before it gives up and
+   * surfaces the transport loss (default 5s).
+   *
+   * The field report's reads (large `cherry_read`s) die because a page response
+   * outgrew the wire and the peer terminated the session; the reconnect lands
+   * seconds later and the retry succeeds. The wait is bounded because the
+   * caller is holding a tool call: past this window the honest answer is "the
+   * link was lost, retry" rather than a call that waits for the backoff loop
+   * (up to 60s per attempt) to find the desktop again.
+   */
+  transportRetryWaitMs?: number
 }
 
 /**
@@ -77,6 +89,31 @@ export class DeviceUnavailableError extends Error {
     this.name = 'DeviceUnavailableError'
     this.device = device
     this.state = state
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+/**
+ * The link died UNDER an in-flight request: the request reached the wire and
+ * its answer was lost. Distinct from {@link DeviceUnavailableError}, which is a
+ * fail-fast about a device that was already not connected — the difference a
+ * caller acts on is that this one MAY be retried.
+ */
+export class TransportLostError extends Error {
+  readonly device: string
+  readonly state: DeviceState
+  readonly method: string
+  /** Always true: the peer never gave this request a verdict. */
+  readonly retryable = true
+
+  constructor(device: string, state: DeviceState, method: string) {
+    super(
+      `device ${device}: transport lost while "${method}" was in flight (request may be retried)`,
+    )
+    this.name = 'TransportLostError'
+    this.device = device
+    this.state = state
+    this.method = method
     Object.setPrototypeOf(this, new.target.prototype)
   }
 }
@@ -123,6 +160,34 @@ const RATE_WINDOW_MS = 1_000
 const RATE_WINDOW_MARGIN_MS = 150
 /** Bare rejection the rpc layer uses once the channel can no longer answer. */
 const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/
+/**
+ * The READ methods this plugin calls, and the ONLY methods whose transport loss
+ * may be replayed automatically.
+ *
+ * Reads are safe to replay by construction: the peer answers from stored
+ * revisions and the call has no side effect, so a second copy costs one round
+ * trip and nothing else. A COMMAND is the opposite — `agent.messages.send`,
+ * `agent.interactions.respond`, `agent.executions.cancel` — and replaying one
+ * after a lost answer could double-apply a write whose outcome the peer already
+ * committed. Admissibility is NOT a property this layer can infer from a method
+ * name, so it is stated here once and everything absent is treated as a command.
+ *
+ * NEW READS MUST BE ADDED HERE: a read left out is simply not retried, which is
+ * the safe failure, but it gives up the recovery this list exists for.
+ */
+const RETRYABLE_READ_METHODS: ReadonlySet<string> = new Set([
+  'connection.ping',
+  'agent.agents.list',
+  'agent.workspaces.list',
+  'agent.sessions.list',
+  'agent.sessions.get',
+  'agent.messages.list',
+  'agent.parts.list',
+  'agent.interactions.list',
+  'agent.interactions.get',
+  'agent.content.read',
+  'agent.checkpoints.read',
+])
 
 /**
  * Second-level rate smoothing for business requests: admissions are paced at
@@ -364,6 +429,7 @@ export class DeviceConnection {
   readonly #rpcTimeoutMs: number | undefined
   readonly #protocolVersions: readonly number[]
   readonly #helloProtocolVersions: readonly number[]
+  readonly #transportRetryWaitMs: number
   readonly #stateListeners = new Set<(state: DeviceState) => void>()
   /** Notification handlers, re-attached to every new client after a reconnect. */
   readonly #notificationHandlers = new Set<(method: string, params: unknown) => void>()
@@ -398,6 +464,7 @@ export class DeviceConnection {
     this.#rpcTimeoutMs = opts.rpcTimeoutMs
     this.#protocolVersions = opts.protocolVersions ?? DEFAULT_PROTOCOL_VERSIONS
     this.#helloProtocolVersions = opts.helloProtocolVersions ?? this.#protocolVersions
+    this.#transportRetryWaitMs = opts.transportRetryWaitMs ?? DEFAULT_TRANSPORT_RETRY_WAIT_MS
   }
 
   /**
@@ -1061,7 +1128,74 @@ export class DeviceConnection {
       console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
       throw new DeviceUnavailableError(this.record.deviceId, this.#state)
     }
-    return link.client.request<T>(method, params, opts)
+    try {
+      return await link.client.request<T>(method, params, opts)
+    } catch (error) {
+      if (!this.#isTransportLoss(error)) throw error
+      // Reported with the state the request DIED in ('connected'): the
+      // supervisor has not necessarily observed the loss yet, and naming the
+      // stale state would send a caller looking for an offline device when the
+      // device was up and the link was what went away.
+      const lost = new TransportLostError(this.record.deviceId, 'connected', method)
+      // Only a read is replayed (see RETRYABLE_READ_METHODS); only a live
+      // lifecycle has a reconnect to wait for. The replay goes to the NEW
+      // link's client directly: the admission this call paid for above is the
+      // one it spends, and charging a second one for the same logical call
+      // would let a flapping link starve the rate window.
+      if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost
+      console.warn(
+        `[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); ` +
+          `waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`,
+      )
+      const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs)
+      if (reconnected === undefined) throw lost
+      return await reconnected.client.request<T>(method, params, opts)
+    }
+  }
+
+  /** Whether a rejection is the dead channel, as opposed to a peer's own answer. */
+  #isTransportLoss(error: unknown): boolean {
+    // A peer refusal is a verdict (JsonRpcRequestError) and a deliberate local
+    // shutdown reads `JSON-RPC client disposed`; only the channel-closed face
+    // means "the request went out and no answer will ever arrive".
+    return error instanceof Error && !(error instanceof JsonRpcRequestError) && CHANNEL_CLOSED_RE.test(error.message)
+  }
+
+  /**
+   * Resolves with the next AUTHENTICATED link (+epoch) within `waitMs`, or
+   * undefined once the bound, a shutdown, or a cycle the supervisor abandoned
+   * makes a replay pointless.
+   *
+   * `connected` is the right condition rather than "a link exists": `#establish`
+   * commits `#link` before its hello/authenticate pair completes, and a replay
+   * into that window would ride an unauthenticated client.
+   */
+  #awaitReconnect(waitMs: number): Promise<{ client: JsonRpcClient; epoch: number } | undefined> {
+    if (!this.#running) return Promise.resolve(undefined)
+    const established = (): { client: JsonRpcClient; epoch: number } | undefined => {
+      const link = this.#link
+      if (this.#state !== 'connected' || link === undefined) return undefined
+      return { client: link.client, epoch: link.epoch }
+    }
+    const ready = established()
+    if (ready !== undefined) return Promise.resolve(ready)
+    // Rides the state listeners rather than a polling loop, so every wait costs
+    // one timer (its own bound) that is cleared whichever way it settles.
+    return new Promise((resolve) => {
+      const finish = (value: { client: JsonRpcClient; epoch: number } | undefined): void => {
+        clearTimeout(timer)
+        this.#stateListeners.delete(listener)
+        resolve(value)
+      }
+      const listener = (state: DeviceState): void => {
+        if (state === 'disabled' || state === 'identity-mismatch') finish(undefined)
+        const link = this.#link
+        if (state !== 'connected' || link === undefined) return
+        finish({ client: link.client, epoch: link.epoch })
+      }
+      const timer = setTimeout(() => finish(undefined), waitMs)
+      this.#stateListeners.add(listener)
+    })
   }
 
   #setState(next: DeviceState): void {
