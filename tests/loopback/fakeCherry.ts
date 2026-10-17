@@ -210,6 +210,19 @@ export interface FakeAgentOptions {
    */
   maxPageSize?: number
   /**
+   * Page plan for ONE method: served INSTEAD of its normal computed page, one
+   * plan entry per call, in order, then normal serving resumes. An entry may
+   * be a literal page or a function of the request params.
+   *
+   * Models a peer whose pagination is more than a numeric offset — the desktop
+   * session list walks a PINNED section before the entity section. Failure
+   * injections still win: `failNext`/`failAlways` throw first.
+   */
+  scriptedPages?: Record<
+    string,
+    Array<Record<string, unknown> | ((params: Record<string, unknown>) => Record<string, unknown>)>
+  >
+  /**
    * The same ceiling, for `agent.messages.list` ONLY.
    *
    * A message-history page size is worth pinning on its own because the MESSAGE
@@ -673,6 +686,8 @@ export class FakeCherry {
   #readFailNext: Map<string, FakeFailure>
   /** One-shot hooks that fire AFTER the next successful read of a method. */
   #afterReadOnce = new Map<string, () => void>()
+  /** Scripted pages per read-face method, served INSTEAD of the normal page. */
+  #scriptedPages = new Map<string, Array<(params: Record<string, unknown>) => Record<string, unknown>>>()
   /** Externalized content bytes, keyed `<contentId>:<revision>` (the peer's pins). */
   #contentBytes = new Map<string, Uint8Array>()
   /**
@@ -722,6 +737,9 @@ export class FakeCherry {
     this.#watermark = options.agent?.watermark ?? 0
     this.#failNextCheckpointCall = options.agent?.failNextCheckpointCall
     this.#readFailNext = new Map(Object.entries(options.agent?.failNext ?? {}))
+    for (const [method, pages] of Object.entries(options.agent?.scriptedPages ?? {})) {
+      this.scriptListPages(method, [...pages])
+    }
     this.#interactions = [...(options.agent?.interactions ?? [])]
     this.#activeExecutionId = options.agent?.activeExecutionId
     for (const interaction of this.#interactions) {
@@ -1085,6 +1103,26 @@ export class FakeCherry {
    */
   afterNextRead(method: string, hook: () => void): void {
     this.#afterReadOnce.set(method, hook)
+  }
+
+  /**
+   * Queues exact page replies for one read-face method. Each served call of
+   * that method consumes one entry INSTEAD of its computed page (a function
+   * entry is called with the request params); the queue empties and normal
+   * serving resumes. Failure injections still win: a `failNext`/`failAlways`
+   * entry throws before any scripted page is consulted.
+   */
+  scriptListPages(
+    method: string,
+    pages: Array<Record<string, unknown> | ((params: Record<string, unknown>) => Record<string, unknown>)>,
+  ): void {
+    const queued = pages.map((page) => (typeof page === 'function' ? page : () => page))
+    this.#scriptedPages.set(method, [...(this.#scriptedPages.get(method) ?? []), ...queued])
+  }
+
+  /** The next scripted page for `method`, consumed; undefined once drained. */
+  #nextScriptedPage(method: string): ((params: Record<string, unknown>) => Record<string, unknown>) | undefined {
+    return this.#scriptedPages.get(method)?.shift()
   }
 
   /** Install a one-shot read-face failure (consumed by the first match). */
@@ -1928,6 +1966,7 @@ export class FakeCherry {
     switch (method) {
       case 'agent.agents.list':
         return this.#page(
+          method,
           (this.#agent().agents ?? []).map((agent) => ({
             agentId: agent.agentId,
             name: agent.name,
@@ -1941,7 +1980,7 @@ export class FakeCherry {
         if (!(this.#agent().agents ?? []).some((agent) => agent.agentId === agentId)) {
           throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Agent not found' })
         }
-        return { ...this.#page(this.#agent().workspaces ?? [], params), systemWorkspace: true }
+        return { ...this.#page(method, this.#agent().workspaces ?? [], params), systemWorkspace: true }
       }
       case 'agent.sessions.list': {
         const agentId = params['agentId'] as string | undefined
@@ -1951,16 +1990,16 @@ export class FakeCherry {
             (agentId === undefined || session.agentId === agentId) &&
             (workspaceId === undefined || session.workspaceId === workspaceId),
         )
-        return this.#page(items.map((session) => this.#sessionSummary(session)), params)
+        return this.#page(method, items.map((session) => this.#sessionSummary(session)), params)
       }
       case 'agent.sessions.get': {
         const session = this.#requireSession(params['sessionId'] as string)
         return { session: this.#sessionSummary(session) }
       }
       case 'agent.messages.list':
-        return this.#handleMessagesList(params)
+        return this.#handleMessagesList(method, params)
       case 'agent.parts.list':
-        return this.#handlePartsList(params)
+        return this.#handlePartsList(method, params)
       default:
         return this.#handleContentRead(params)
     }
@@ -1997,7 +2036,7 @@ export class FakeCherry {
    * session's current one is REVISION_EXPIRED, which is exactly what makes the
    * caller re-pull the baseline.
    */
-  #handleMessagesList(params: Record<string, unknown>): Record<string, unknown> {
+  #handleMessagesList(method: string, params: Record<string, unknown>): Record<string, unknown> {
     const session = this.#requireSession(params['sessionId'] as string)
     if (session.historyRevision !== params['historyRevision']) {
       throw new FakeRpcError({ reason: 'REVISION_EXPIRED', message: 'History revision expired' })
@@ -2009,11 +2048,11 @@ export class FakeCherry {
       partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
       status: message.status,
     }))
-    return this.#page(messages, params, this.#agent().maxMessagePageSize)
+    return this.#page(method, messages, params, this.#agent().maxMessagePageSize)
   }
 
   /** The real `listParts`: a stale `messageRevision` is REVISION_EXPIRED. */
-  #handlePartsList(params: Record<string, unknown>): Record<string, unknown> {
+  #handlePartsList(method: string, params: Record<string, unknown>): Record<string, unknown> {
     this.#requireSession(params['sessionId'] as string)
     const messages = this.#agent().messages ?? []
     const message = messages.find((entry) => entry.messageId === params['messageId'])
@@ -2022,7 +2061,7 @@ export class FakeCherry {
       throw new FakeRpcError({ reason: 'REVISION_EXPIRED', message: 'Message revision expired' })
     }
     const parts = message.parts.map((part, index) => this.#part(message.messageId, index, part))
-    return this.#page(parts, params)
+    return this.#page(method, parts, params)
   }
 
   /**
@@ -2154,6 +2193,7 @@ export class FakeCherry {
    * effective page.
    */
   #page<T>(
+    method: string,
     items: readonly T[],
     params: Record<string, unknown>,
     extraCeiling?: number,
@@ -2161,6 +2201,10 @@ export class FakeCherry {
     // Peer-fault face: an empty page that still claims more are coming.
     const dangling = this.#agent().emptyPagesWithDanglingCursor
     if (dangling !== undefined) return { items: [], nextCursor: dangling }
+    // A scripted page replaces the computed one (the fault knobs above and the
+    // failure injections in `#serveRead` still take precedence).
+    const scripted = this.#nextScriptedPage(method)
+    if (scripted !== undefined) return scripted(params) as { items: T[]; nextCursor: string | null }
     const start = params['cursor'] === undefined ? 0 : Number(params['cursor'])
     if (!Number.isSafeInteger(start) || start < 0) {
       throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Invalid page cursor' })
@@ -2206,7 +2250,7 @@ export class FakeCherry {
 
     // The two query/read verbs of this face are NOT commands: they carry no
     // commandId and never enter the ledger.
-    if (method === 'agent.interactions.list') return this.#page(this.#interactionViews(), params)
+    if (method === 'agent.interactions.list') return this.#page(method, this.#interactionViews(), params)
     if (method === 'agent.interactions.get') {
       const view = this.#interactionViews().find(
         (entry) => entry['interactionId'] === params['interactionId'],

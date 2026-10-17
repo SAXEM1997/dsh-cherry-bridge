@@ -403,11 +403,24 @@ const DEFAULT_PARTS_SAFETY_BOUND = 10_000
  *
  * The item ceiling alone cannot stop a peer that answers `items: []` with a
  * non-null `nextCursor`: the item count never grows, so a bound expressed only
- * in items is never reached. This is a peer fault, and a walk that hits it
- * FAILS — an empty page that claims more are coming is never a reason to return
- * a partial (or empty) result as though it were complete.
+ * in items is never reached. Runs of empty pages are a peer fault handled
+ * directly ({@link MAX_CONSECUTIVE_EMPTY_PAGES}); this is the backstop against
+ * every other non-terminating shape, and a walk that hits it FAILS rather than
+ * returning a partial (or empty) result as though it were complete.
  */
 const MAX_AGGREGATE_PAGES = 10_000
+/**
+ * EMPTY-PAGE RUN limit for every aggregate walk. The desktop's pinned-list walk
+ * legally answers ONE empty page with an advancing cursor (the pin→entity
+ * section transition, `{items: [], nextCursor: 'entity:'}`), so a single empty
+ * page is not a fault; a run of them is, and fails the walk.
+ *
+ * THREE, not one: the transition happens at most once per walk upstream, and
+ * the margin keeps the walk working if a future peer chains section transitions
+ * — while any bounded number still ends a peer that answers empty pages forever
+ * (the `MAX_AGGREGATE_PAGES` backstop remains the last resort).
+ */
+const MAX_CONSECUTIVE_EMPTY_PAGES = 3
 /**
  * CIRCUIT-BREAKER for one `{ref}`'s content walk, used only when the ref
  * carries no usable `byteLength`. The ref's declared length normally derives
@@ -1010,10 +1023,11 @@ class CherryToolEngine {
    * peer-negotiated COUNT cap (the protocol's single-page hard limit, whatever
    * the caller asks for), and `maxPerPage` is the plugin's own WIRE-SAFETY
    * clamp: one JSON-RPC record may not exceed `remoteLimits.recordBytes`
-   * (64 KiB), the desktop's `pageOf` budgets pages by count alone, and a page
-   * of fat inline items is a record the transport answers by killing the
-   * connection. The clamps live in `defaults.ts` with their derivation; the
-   * effective page size is whichever of the two is smaller.
+   * (64 KiB), the desktop's `pageOf` budgets pages by count alone (deployed
+   * 2.1.6 and earlier; byte-budgeted upstream main as of #21854, unreleased),
+   * and a page of fat inline items is a record the transport answers by
+   * killing the connection. The clamps live in `defaults.ts` with their
+   * derivation; the effective page size is whichever of the two is smaller.
    *
    * `limit` is a CALLER contract, and reaching it is reported as
    * `truncationReason: 'limit'`. `safetyBound` is different in kind: it is an
@@ -1021,9 +1035,14 @@ class CherryToolEngine {
    * it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the resume
    * cursor) — a walk never stops early and reports success.
    *
-   * A peer that answers empty pages with a non-null `nextCursor` is a FAULT,
-   * not a slow walk: no item ceiling can ever be reached, so it is detected
-   * directly and thrown (see {@link MAX_AGGREGATE_PAGES} for the backstop).
+   * An EMPTY page with a non-null `nextCursor` is legal progress while the
+   * cursor advances: the desktop's pinned-list walk answers exactly
+   * `{items: [], nextCursor: 'entity:'}` when a pin anchor is unpinned or
+   * deleted between two requests (the pin→entity section transition). What is
+   * a FAULT is a walk that makes no progress: the same cursor again (stuck),
+   * three CONSECUTIVE empty pages (a peer that answers empty pages forever), or
+   * {@link MAX_AGGREGATE_PAGES} (the backstop). Each is thrown, never reported
+   * as a completed walk.
    */
   async #aggregate<T>(
     connection: DeviceConnection,
@@ -1055,6 +1074,7 @@ class CherryToolEngine {
     const bindsCallerLimit = aggregate < bound
     const items: T[] = []
     let cursor: string | undefined
+    let emptyPages = 0
 
     for (let pages = 0; ; pages += 1) {
       if (items.length >= ceiling) {
@@ -1089,14 +1109,16 @@ class CherryToolEngine {
       const next = extracted.nextCursor
       if (next === null || next === undefined) return { items, truncated: false }
       const advanced = String(next)
-      // An empty page that promises more is not progress: without this the walk
-      // spins forever, because the item ceiling is never reached. Treating it as
-      // a peer fault is the honest verdict — the alternative (returning the
-      // partial items as if complete) would hide real content loss.
-      if (extracted.items.length === 0) {
+      // An empty page that advances the cursor is PROGRESS: the desktop's
+      // pinned-list walk answers `{items: [], nextCursor: 'entity:'}` when a pin
+      // anchor vanished between requests. Only a RUN of them is a peer fault —
+      // no item ceiling can ever be reached, so it is thrown instead of spun
+      // on. Any non-empty page resets the run.
+      emptyPages = extracted.items.length === 0 ? emptyPages + 1 : 0
+      if (emptyPages >= MAX_CONSECUTIVE_EMPTY_PAGES) {
         throw new Error(
-          `${method} answered an empty page with nextCursor ${advanced} for ${JSON.stringify(params)}; ` +
-            'refusing to spin on a peer that makes no progress',
+          `${method} answered ${emptyPages} consecutive empty page(s) (last nextCursor ${advanced}) ` +
+            `for ${JSON.stringify(params)}; refusing to spin on a peer that makes no progress`,
         )
       }
       if (advanced === cursor) {
