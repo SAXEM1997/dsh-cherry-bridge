@@ -1011,7 +1011,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(rig.fake.ackCalls[0]!.subscriptionId).toBe(rig.fake.subscribeCalls[0]!.subscriptionId)
   })
 
-  it('⑤b cherry_events returns the structured cursor-out-of-window verdict with the window start', async () => {
+  it('⑤b cherry_events serves the BASELINE and still answers the structured verdict below it', async () => {
     const rig = await makeRig({
       agent: {
         sessions: [
@@ -1025,15 +1025,29 @@ describe('read-only cherry tools over a real loopback channel', () => {
     rig.fake.pushEvent('s-1', { kind: 'execution.updated', payload: { executionId: 'e1' } })
     await sleep(20)
 
-    // The window start is the checkpoint cursor (seq 0); its own position is NOT
-    // servable, so it is exactly the boundary the structured error reports.
-    const result = (await rig.call('cherry_events', {
+    // The window start is the checkpoint cursor (seq 0). Issue #2 reversed the
+    // verdict AT it: nothing was dropped, and it is the cursor the other tools
+    // hand out, so it is SERVABLE and delivers the event newer than it. Before
+    // the fix this call answered `cursor-out-of-window`, which is what made a
+    // caller unable to follow the cursor it had just been given.
+    const atBaseline = (await rig.call('cherry_events', {
       device: 'dev-A',
       sessionId: 's-1',
       cursor: { sessionId: 's-1', streamEpoch: 'epoch-1', seq: '0' },
+    })) as { events?: Array<{ kind: string }>; nextCursor?: { seq: string }; error?: string }
+    expect(atBaseline.error).toBeUndefined()
+    expect(atBaseline.events?.map((event) => event.kind)).toEqual(['execution.updated'])
+    expect(atBaseline.nextCursor?.seq).toBe('1')
+
+    // STRICTLY BELOW the window start the structured verdict still stands, and
+    // it still reports the boundary as the earliest resumable position.
+    const below = (await rig.call('cherry_events', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      cursor: { sessionId: 's-1', streamEpoch: 'epoch-1', seq: '-1' },
     })) as { error: string; windowStart?: { seq: string } }
-    expect(result.error).toBe('cursor-out-of-window')
-    expect(result.windowStart?.seq).toBe('0')
+    expect(below.error).toBe('cursor-out-of-window')
+    expect(below.windowStart?.seq).toBe('0')
   })
 
   it('⑥ device resolution: an ambiguous display name returns structured candidates, not an error', async () => {
