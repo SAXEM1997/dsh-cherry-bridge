@@ -681,7 +681,11 @@ describe('read-only cherry tools over a real loopback channel', () => {
   it('④g an empty page with a dangling nextCursor is a peer fault, refused instead of spun on', async () => {
     // A walk bounded only by item count can never finish here: the item count
     // never grows. The read must FAIL rather than spin or return an empty
-    // snapshot as though it were complete.
+    // snapshot as though it were complete. The knob answers the SAME cursor
+    // ('0') every time, so the refusal now comes from the cursor-advance guard:
+    // the FIRST empty page is tolerated (issue #11 — the desktop's legal
+    // pin→entity transition), and the empty-RUN bound is pinned separately in
+    // `toolsListWalkCompat.test.ts`.
     const rig = await makeRig({
       agent: {
         sessions: [

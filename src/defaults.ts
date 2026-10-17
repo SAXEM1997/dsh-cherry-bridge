@@ -49,8 +49,10 @@ export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
  * LIST_PAGE_CLAMP is pragmatic, not provable: message/session/agent records
  * carry large schema-bounded fields (`partIds` up to 4,096 entries, titles up
  * to 4,096 characters), so no count is provably sub-budget. 16 covers every
- * observed record with headroom; the complete fix is byte-budgeted paging on
- * the server (tracked upstream).
+ * observed record with headroom. The server-side fix has landed upstream
+ * (byte-budgeted pages: CherryHQ/cherry-studio#21852 closed by #21854), but
+ * the clamps stay: deployed peers (2.1.6 and earlier) still page by count
+ * alone.
  */
 
 /** Usable bytes of one wire record after page/margin overhead. */
