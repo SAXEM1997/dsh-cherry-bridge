@@ -1650,11 +1650,12 @@ class CherryToolEngine {
       name: 'cherry_events',
       description:
         'Read the session\'s buffered events newer than `cursor`, delivering them and then ' +
-        'acknowledging the advanced cursor to the peer. Any cursor this plugin handed out ' +
-        '(including the baseline `cherry_send`/`cherry_wait` report on an empty window) is ' +
-        'servable. A cursor BEFORE the cache window start answers a structured ' +
-        '`cursor-out-of-window` verdict; so does one AT it once the window has DISCARDED ' +
-        'events — rebuild the baseline with `cherry_read` in either case.',
+        'acknowledging the advanced cursor to the peer. While the window has dropped no events, ' +
+        'every cursor this plugin handed out is servable, including the baseline ' +
+        '`cherry_send`/`cherry_wait` report on an empty window. Once the window DISCARDS events, ' +
+        'the boundary it reports is not: that boundary and everything below it answer a structured ' +
+        '`cursor-out-of-window` verdict, and only positions strictly past it are served — rebuild ' +
+        'the baseline with `cherry_read` and resume from that instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -1696,10 +1697,15 @@ class CherryToolEngine {
             // Reported even when the caller sent NO cursor: the verdict means
             // the session's cache cannot serve a replay from a provable
             // position, and the boundary is the actionable half of that answer.
-            // After issue #2 that boundary is the EARLIEST RESUMABLE position,
-            // which in the state this verdict fires in (the window discarded
-            // events) is the position the verdict itself just refused — a
-            // caller should resume from the FIRST retained event past it.
+            // It reaches TWO states, which are not interchangeable: a cursor
+            // strictly BELOW the window start (refused whether or not anything
+            // was ever dropped), and a cursor exactly ON a boundary that a drop
+            // advanced (refused only because the event there is gone). In the
+            // dropped state the reported boundary is the position the verdict
+            // just refused, so a caller must resume from the FIRST retained
+            // event past it — or rebuild with `cherry_read`; in the
+            // nothing-dropped state no at-boundary cursor was refused at all,
+            // and the boundary IS the resumable baseline.
             windowStart: this.#windowStart(subscriptions, sessionId),
           } satisfies CherryCursorOutOfWindow
         }

@@ -853,16 +853,35 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     // The OTHER state the boundary can be in, and the reason the rule cannot be
     // "always servable": `#trimToBudget` really did discard events, so the layer
     // can no longer prove a caller resuming from the boundary has seen them.
-    // A tiny 2 KiB budget — the shape ⑫ uses — forces the drop deterministically
-    // (each event's JSON is just over 1 KiB, so three of them cannot all fit).
+    // A tiny 2 KiB budget — the shape ⑫ uses — forces the drop deterministically:
+    // each event's JSON is ~1.0 KiB, so two fit and the third cannot, leaving the
+    // oldest dropped and the newest TWO retained.
+    //
+    // The pushes are PACED (push one, wait until it is cached, then the next).
+    // The layer trims once per FOLD, and a loopback channel may deliver several
+    // pushes inside one fold, so three in a row can land together and trim down
+    // to a SINGLE retained event. That would make the tail assertion below
+    // vacuous: with one retained event, "the suffix from the first retained
+    // event" looks exactly like "the replay was empty", which is what a layer
+    // returning nothing once every retained event sits at-or-above the cursor
+    // also produces. Pacing pins the one-fold-per-push shape, so the suffix is
+    // a real MULTI-event range.
     const rig = await makeRig({}, { perSessionCacheBytes: 2_048 })
     await rig.subs.ensure('s1')
     expect(rig.subs.windowStart('s1')).toEqual(cursor('s1', 0))
 
-    const filler = 'x'.repeat(1_000)
-    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { tag: 'first', filler } })
-    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { tag: 'second', filler } })
-    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { tag: 'third', filler } })
+    const filler = 'x'.repeat(940)
+    for (const tag of ['first', 'second', 'third']) {
+      rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { tag, filler } })
+      await waitFor(
+        () => {
+          const held = rig.subs.read('s1')
+          return 'events' in held && held.events.length > 0
+        },
+        3_000,
+        `the ${tag} event cached`,
+      )
+    }
     await waitFor(
       () => {
         const dropped = consoleWarn.mock.calls.flat().map(String).some((message) => /dropped .* oldest/i.test(message))
@@ -887,20 +906,43 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     // it servable through a cursor placed below it.
     const retained = rig.subs.read('s1')
     if (!('events' in retained)) throw new Error('expected events: the un-cursored read')
-    expect(retained.events.length).toBeGreaterThan(0)
+    // MULTI-event on purpose, for the reason the pacing above records.
+    expect(retained.events.length).toBe(2)
     const retainedSeqs = retained.events.map((event) => Number((event as unknown as { seq: string }).seq))
     expect(Math.min(...retainedSeqs)).toBeGreaterThan(Number(start.seq))
     const retainedTags = retained.events.map((event) => (event.payload as unknown as { tag: string }).tag)
     expect(retainedTags).not.toContain('first')
     expect(retainedTags).toContain('third')
 
-    // STRICTLY AFTER the boundary stays servable, and every retained event is
-    // in that range — so a caller resuming just past the boundary (or at it,
-    // once the boundary IS servable again) reaches exactly the retained events.
-    expect(rig.subs.read('s1', start)).toEqual({ error: 'cursor-out-of-window' })
-    const afterBoundary = { sessionId: 's1', streamEpoch: 'epoch-1', seq: String(Number(start.seq) - 1) }
-    // (Below the boundary is refused too; the assertions above pin that.)
-    expect(rig.subs.read('s1', afterBoundary)).toEqual({ error: 'cursor-out-of-window' })
+    // THE OTHER HALF OF THE RULE: strictly AFTER the boundary stays servable.
+    // `read` keeps the events strictly NEWER than the requested position
+    // (`Number(entry.cursor.seq) > requested`), and the boundary itself is
+    // refused, so the earliest position a caller can actually resume from is
+    // the FIRST RETAINED event — the suffix behind it is the whole retained
+    // window less that event. Without this assertion the case pinned the
+    // refusal twice (the boundary, and one position below it) and never the
+    // serving half, which is equally consistent with a layer that refuses
+    // EVERYTHING once it has dropped a single event.
+    const retainedFirst = retained.events[0]!
+    const retainedFirstSeq = Number((retainedFirst as unknown as { seq: string }).seq)
+    expect(retainedFirstSeq).toBe(Number(start.seq) + 1)
+    const afterBoundary = rig.subs.read('s1', cursor('s1', retainedFirstSeq))
+    if (!('events' in afterBoundary)) throw new Error('expected events: the first retained event is servable')
+    // Everything the un-cursored read showed, less that one event — nothing
+    // above it is missing and nothing below it leaks back in — and the SAME
+    // nextCursor, so the caller's round trip (resume, then resume from
+    // nextCursor) ends where the un-cursored read ends.
+    const expectedSuffix = retained.events.slice(1)
+    expect(afterBoundary.events).toHaveLength(expectedSuffix.length)
+    expect(afterBoundary.events).toEqual(expectedSuffix)
+    expect(afterBoundary.nextCursor).toEqual(retained.nextCursor)
+    // And with a one-event suffix (the smallest retained window the drop can
+    // leave), the round trip is empty-but-live rather than refused: the cursor
+    // the read answers with is still servable.
+    const atNewest = rig.subs.read('s1', cursor('s1', Number(retained.nextCursor.seq)))
+    if (!('events' in atNewest)) throw new Error('expected events: the newest retained position is servable')
+    expect(atNewest.events).toEqual([])
+    expect(atNewest.nextCursor).toEqual(retained.nextCursor)
   })
 
   it('F2-6d a non-string streamEpoch is refused with a warning, never treated as the current epoch', async () => {

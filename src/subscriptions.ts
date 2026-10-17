@@ -108,8 +108,10 @@ interface SessionState {
   buffer: CachedEvent[]
   bytes: number
   /**
-   * The oldest stream position this session can still serve: the baseline the
-   * subscription started from, advanced whenever old events are dropped.
+   * The oldest stream position this session still TRACKS: the baseline the
+   * subscription started from, advanced whenever old events are dropped. It is
+   * a rejection boundary, not a resume point — whether it can itself be served
+   * depends on {@link evicted}.
    */
   windowStart: number
   /**
@@ -254,17 +256,28 @@ export class SessionSubscriptions {
   }
 
   /**
-   * The session's cache WINDOW START — the earliest position this layer can
-   * still serve — or undefined when the session is untracked.
+   * The session's cache WINDOW START — the retention BOUNDARY of this layer's
+   * cache: the oldest position it still tracks — or undefined when the session
+   * is untracked.
    *
-   * Read that literally, and it is what {@link read} enforces: the servable
-   * replay range is the boundary INCLUSIVE while it still stands at the
-   * subscription's baseline (a position this layer itself issues as a resume
-   * point), and STRICTLY AFTER it once the byte budget advanced it by dropping
-   * events (issue #2; see {@link SessionState.evicted}). Either way this is the
-   * value a `cursor-out-of-window` verdict reports as "the earliest position you
-   * could resume from", and — in the state the verdict fires in — the value the
-   * verdict actually refuses.
+   * The boundary means two DIFFERENT things depending on whether the window has
+   * dropped events (issue #2; see {@link SessionState.evicted}), which is why it
+   * must not be described as "the earliest position you could resume from" in
+   * one breath:
+   *
+   *  - NOTHING DROPPED — the boundary is the subscription's baseline, a position
+   *    this layer itself issues as a resume point, and it IS the earliest
+   *    resumable position: {@link read} serves it (the replay is the boundary
+   *    INCLUSIVE here).
+   *  - EVENTS DROPPED — the boundary is where the discarded run ended, and the
+   *    event that occupied it is gone. The earliest resumable position is then
+   *    the first retained event STRICTLY after it; the boundary itself is
+   *    refused, and its value is what the refusal is judged against and what
+   *    points a caller at the rebuild (`cherry_read`).
+   *
+   * So the reported value is exact as a rejection threshold and as a rebuild
+   * anchor, and it must NOT be fed back to `read` in the dropped state — there
+   * the verdict refuses it.
    *
    * Exposed because the layer is the only thing that knows it. Callers were
    * previously expected to rediscover it by binary-searching `read`'s verdict
@@ -365,8 +378,13 @@ export class SessionSubscriptions {
       // window start is out of window. Below the boundary is refused in both
       // states, as written; AT the boundary the verdict depends on whether
       // anything was actually dropped, which the spec wording does not
-      // distinguish — `windowStart()` reports the earliest RESUMABLE position,
-      // and under this rule that name is finally accurate.
+      // distinguish. The earliest RESUMABLE position therefore has TWO forms,
+      // and `windowStart()` reports one boundary that they share: in the
+      // nothing-dropped state the boundary itself is resumable, and in the
+      // dropped state it is NOT — the first retained event strictly after it
+      // is. The boundary is what the refusal is judged against and what the
+      // caller rebuilds from; it is not, in the dropped state, itself a cursor
+      // to resume on.
       const belowWindow = !Number.isFinite(requested) || requested < state.windowStart
       const atDroppedBoundary = requested === state.windowStart && state.evicted
       if (belowWindow || atDroppedBoundary) {
