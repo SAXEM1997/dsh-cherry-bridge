@@ -2099,8 +2099,56 @@ function buildDiagnostics(sources, identity = DEFAULT_IDENTITY) {
 /**
 * The second-level smoothed request budget: admissions per second for business
 * RPCs (spec §3.4). Injectable through plugin config; this is the fallback.
+*
+* This is the SHARED tier: it covers every business RPC EXCEPT the content-read
+* tier below (see {@link DEFAULT_CONTENT_READ_BUDGET_PER_SECOND}).
+*
+* WHY 32: the desktop's own allowance for "other" RPCs is 64/s
+* (`RemoteAccessService.ts:223-225`; the official client paces them at 40/s,
+* `DesktopSession.ts:242-244`), and exceeding the allowance is not a refusal
+* but a whole-session close (1011). Half the peer's line leaves room for the
+* housekeeping traffic that shares the socket (hello/authenticate/ping/refresh
+* bypass pacing by design) and for arrival compression between our admission
+* times and the peer's arrival times.
+*
+* SOURCES (neither is in this repository): the desktop lines are
+* `_research/cherry-studio` @ v2.1.6 (90b234e); the official-client lines are
+* CherryHQ/cherry-studio-app @ main 18329fe (app 0.3.0), read on 2026-10-18 —
+* recorded in `.superpowers/review-v013-r1/context.md`.
 */
 const DEFAULT_RATE_BUDGET_PER_SECOND = 32;
+/**
+* The second-level smoothed request budget for the CONTENT-READ tier, which
+* carries exactly one method: `agent.content.read` (see `classifyRateTier` in
+* `connection.ts` — the classification is exact-match, not a prefix).
+*
+* WHY A SEPARATE TIER: an externalized part is read as a walk of
+* `agent.content.read` slices, so this one method carries the whole throughput
+* of every large reply. Cherry Studio >= 2.1.6 externalizes every part over
+* 4,096 characters, which makes long replies the common case, while the desktop
+* paces content reads against a 512/s allowance of their own
+* (`RemoteAccessService.ts:223-225`) and the official client issues them at
+* 480/s (`DesktopSession.ts:33-37`). Pacing them with the 32/s shared tier
+* bound a multi-slice walk to ~670 KiB/s and queued it behind unrelated RPCs;
+* 256 is half the peer's own kill line — the same 2× margin the shared tier
+* keeps on 64/s — and lifts the bound to the multi-MiB/s range of the official
+* client while leaving the desktop a session-sized headroom.
+*
+* NOT a plugin-config key: the two tiers derive from ONE injected shared budget
+* at the ratio below, so an operator who lowers `rateBudgetPerSecond` lowers
+* both. A second config key is deliberately deferred until there is a field
+* report that needs one.
+*
+* THE MARGINS ARE A DEFAULT-INJECTION CLAIM: the 2× headroom above holds at
+* the default injection (32/s), where this tier is exactly 256/s. An injected
+* budget consumes BOTH tiers' headroom in proportion — at 64/s the shared tier
+* is at the peer's 64/s line and this tier derives to 512/s, i.e. nominal
+* saturation of both allowances. The limiter's integer gap means the ACHIEVED
+* rate stays below the nominal one in that case (≤ 334/s on this tier, 55.6/s
+* on the shared one; see `SecondWindowRateLimiter` in `connection.ts`), which
+* is margin by accident rather than by design.
+*/
+const DEFAULT_CONTENT_READ_BUDGET_PER_SECOND = 256;
 /** 2 MiB of event text cached per session (spec §3.5). */
 const DEFAULT_PER_SESSION_CACHE_BYTES = 2097152;
 /**
@@ -2268,6 +2316,9 @@ const RETRYABLE_READ_METHODS = /* @__PURE__ */ new Set([
 * on the client's admission times OR the peer's (compressed) arrival times —
 * observes at most floor(window/minGap)+1 ≤ budget requests. This is rate
 * shaping ONLY — the in-flight concurrency cap belongs to JsonRpcClient.
+*
+* One instance is one TIER (see {@link RateTier}); a connection holds one per
+* tier, so a burst on one tier neither spends nor delays another's admissions.
 */
 var SecondWindowRateLimiter = class {
 	budgetPerSecond;
@@ -2278,16 +2329,55 @@ var SecondWindowRateLimiter = class {
 		this.#minGapMs = Math.ceil(1150 / Math.max(budgetPerSecond, 1));
 	}
 	async acquire() {
-		for (;;) {
-			const now = Date.now();
-			while (this.#admitted.length > 0 && now - this.#admitted[0] >= 1150) this.#admitted.shift();
-			const last = this.#admitted[this.#admitted.length - 1];
-			if (last === void 0 || now - last >= this.#minGapMs) {
-				this.#admitted.push(now);
-				return;
+		let release;
+		const ahead = this.#queue;
+		this.#queue = ahead.then(() => new Promise((resolve) => release = resolve));
+		await ahead;
+		try {
+			for (;;) {
+				const now = Date.now();
+				while (this.#admitted.length > 0 && now - this.#admitted[0] >= 1150) this.#admitted.shift();
+				const last = this.#admitted[this.#admitted.length - 1];
+				if (last === void 0 || now - last >= this.#minGapMs) {
+					this.#admitted.push(now);
+					return;
+				}
+				await new Promise((resolve) => setTimeout(resolve, this.#minGapMs - (now - last) + 1));
 			}
-			await new Promise((resolve) => setTimeout(resolve, this.#minGapMs - (now - last) + 1));
+		} finally {
+			release();
 		}
+	}
+	/** This tier's wait queue (see `acquire`). */
+	#queue = Promise.resolve();
+};
+/**
+* Which tier paces `method`. The rule is EXACT-MATCH: `agent.content.read` is
+* the only method on the content tier, and every other method — a command, a
+* list read, a different `agent.*.read` — keeps the shared tier. A prefix or
+* suffix match would silently widen the 256/s tier to methods whose peer-side
+* allowance is the 64/s one, which is a session-killing mistake (close 1011),
+* so a new content-plane method must be named here deliberately.
+*/
+function classifyRateTier(method) {
+	return method === "agent.content.read" ? "content" : "shared";
+}
+/**
+* The connection's two pacing tiers: an admission is taken from the tier its
+* `method` classifies to (see {@link classifyRateTier}), never from a shared
+* pool, so neither tier's burst spends or delays the other's.
+*/
+var TieredRateLimiter = class {
+	#tiers;
+	constructor(sharedBudgetPerSecond, contentBudgetPerSecond) {
+		this.#tiers = {
+			shared: new SecondWindowRateLimiter(sharedBudgetPerSecond),
+			content: new SecondWindowRateLimiter(contentBudgetPerSecond)
+		};
+	}
+	/** Waits for one admission on the tier `method` classifies to. */
+	acquire(method) {
+		return this.#tiers[classifyRateTier(method)].acquire();
 	}
 };
 const noop$1 = () => {};
@@ -2398,6 +2488,18 @@ function positive$2(value) {
 function businessWindowFor(reportedInFlightRequests) {
 	return Math.max(1, Math.min(BUSINESS_MAX_IN_FLIGHT, Math.floor(reportedInFlightRequests / 2)));
 }
+/**
+* The content-read tier's budget for a given SHARED budget.
+*
+* ONE injected knob, two tiers: an operator who lowers `rateBudgetPerSecond`
+* lowers both, and the content tier keeps the production proportion between
+* them rather than staying pinned at 256 while the shared tier shrinks. An
+* absent injection is the production default (which yields exactly
+* `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND`).
+*/
+function contentBudgetFor(sharedBudgetPerSecond) {
+	return Math.ceil((sharedBudgetPerSecond ?? 32) * 8);
+}
 function defer() {
 	let resolve;
 	let reject;
@@ -2480,7 +2582,7 @@ var DeviceConnection = class {
 	constructor(opts) {
 		this.record = opts.record;
 		this.#identity = opts.identity;
-		this.#limiter = new SecondWindowRateLimiter(opts.rateBudgetPerSecond ?? 32);
+		this.#limiter = new TieredRateLimiter(opts.rateBudgetPerSecond ?? 32, contentBudgetFor(opts.rateBudgetPerSecond));
 		this.#backoffInitialMs = opts.backoffInitialMs ?? DEFAULT_BACKOFF_INITIAL_MS;
 		this.#backoffMaxMs = opts.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS;
 		this.#refreshGraceMs = opts.refreshGraceMs ?? DEFAULT_REFRESH_GRACE_MS;
@@ -2909,7 +3011,7 @@ var DeviceConnection = class {
 			console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`);
 			throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		}
-		await this.#limiter.acquire();
+		await this.#limiter.acquire(method);
 		const link = this.#link;
 		if (this.#state !== "connected" || link === void 0) {
 			console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`);
@@ -2924,7 +3026,7 @@ var DeviceConnection = class {
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
 			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
 			if (reconnected === void 0) throw lost;
-			await this.#limiter.acquire();
+			await this.#limiter.acquire(method);
 			if (!this.#running || this.#state !== "connected") throw lost;
 			try {
 				return await reconnected.client.request(method, params, opts);
@@ -8955,4 +9057,4 @@ function apply(ctx, config = {}) {
 	});
 }
 //#endregion
-export { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND, apply, inject, name, noteError, resolveBridgeConfig, resolveDataDir };
+export { DEFAULT_CONTENT_READ_BUDGET_PER_SECOND, DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND, apply, inject, name, noteError, resolveBridgeConfig, resolveDataDir };

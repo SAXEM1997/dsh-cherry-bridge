@@ -76,8 +76,16 @@ export interface CherryBridgeConfig {
    */
   dataDir?: string
   /**
-   * Second-level smoothed request budget per device, handed to
-   * {@link DeviceConnection}. Omitted uses {@link DEFAULT_RATE_BUDGET_PER_SECOND}.
+   * Second-level smoothed request budget per device for the business RPCs on
+   * the SHARED tier, handed to {@link DeviceConnection}. Omitted uses
+   * {@link DEFAULT_RATE_BUDGET_PER_SECOND}.
+   *
+   * The CONTENT tier is not configurable on its own: it DERIVES from this value
+   * at the 8 : 1 production ratio (`DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` /
+   * `DEFAULT_RATE_BUDGET_PER_SECOND`), so the default 32 yields the 256/s
+   * content tier and any other value scales both tiers together. Raising this
+   * toward the peer's own lines therefore spends BOTH tiers' safety margin —
+   * see `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the numbers.
    */
   rateBudgetPerSecond?: number
   /**
@@ -101,15 +109,22 @@ export interface ResolvedBridgeConfig {
 }
 
 /**
- * The second-level smoothed request budget and the per-session cache budget.
+ * The second-level smoothed request budgets (both pacing tiers) and the
+ * per-session cache budget.
  *
  * Declared in `defaults.ts` and re-exported here: the connection and
  * subscription layers apply these SAME constants, so a single source is what
  * keeps the assembly's documented default from drifting away from the value
  * those layers actually fall back to. The names stay exported from this module
- * (the plugin's public entry) for callers and the contract test.
+ * (the plugin's public entry) for callers and the contract test — including
+ * the CONTENT tier, which is not a config key but is the other half of the
+ * same pacing policy and must be readable from the package's own entry.
  */
-export { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
+export {
+  DEFAULT_CONTENT_READ_BUDGET_PER_SECOND,
+  DEFAULT_PER_SESSION_CACHE_BYTES,
+  DEFAULT_RATE_BUDGET_PER_SECOND,
+} from './defaults.js'
 
 /** Applies the documented fallbacks to the plugin config's numeric keys. */
 export function resolveBridgeConfig(config: CherryBridgeConfig = {}): ResolvedBridgeConfig {

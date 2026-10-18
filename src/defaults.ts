@@ -17,8 +17,57 @@
 /**
  * The second-level smoothed request budget: admissions per second for business
  * RPCs (spec §3.4). Injectable through plugin config; this is the fallback.
+ *
+ * This is the SHARED tier: it covers every business RPC EXCEPT the content-read
+ * tier below (see {@link DEFAULT_CONTENT_READ_BUDGET_PER_SECOND}).
+ *
+ * WHY 32: the desktop's own allowance for "other" RPCs is 64/s
+ * (`RemoteAccessService.ts:223-225`; the official client paces them at 40/s,
+ * `DesktopSession.ts:242-244`), and exceeding the allowance is not a refusal
+ * but a whole-session close (1011). Half the peer's line leaves room for the
+ * housekeeping traffic that shares the socket (hello/authenticate/ping/refresh
+ * bypass pacing by design) and for arrival compression between our admission
+ * times and the peer's arrival times.
+ *
+ * SOURCES (neither is in this repository): the desktop lines are
+ * `_research/cherry-studio` @ v2.1.6 (90b234e); the official-client lines are
+ * CherryHQ/cherry-studio-app @ main 18329fe (app 0.3.0), read on 2026-10-18 —
+ * recorded in `.superpowers/review-v013-r1/context.md`.
  */
 export const DEFAULT_RATE_BUDGET_PER_SECOND = 32
+
+/**
+ * The second-level smoothed request budget for the CONTENT-READ tier, which
+ * carries exactly one method: `agent.content.read` (see `classifyRateTier` in
+ * `connection.ts` — the classification is exact-match, not a prefix).
+ *
+ * WHY A SEPARATE TIER: an externalized part is read as a walk of
+ * `agent.content.read` slices, so this one method carries the whole throughput
+ * of every large reply. Cherry Studio >= 2.1.6 externalizes every part over
+ * 4,096 characters, which makes long replies the common case, while the desktop
+ * paces content reads against a 512/s allowance of their own
+ * (`RemoteAccessService.ts:223-225`) and the official client issues them at
+ * 480/s (`DesktopSession.ts:33-37`). Pacing them with the 32/s shared tier
+ * bound a multi-slice walk to ~670 KiB/s and queued it behind unrelated RPCs;
+ * 256 is half the peer's own kill line — the same 2× margin the shared tier
+ * keeps on 64/s — and lifts the bound to the multi-MiB/s range of the official
+ * client while leaving the desktop a session-sized headroom.
+ *
+ * NOT a plugin-config key: the two tiers derive from ONE injected shared budget
+ * at the ratio below, so an operator who lowers `rateBudgetPerSecond` lowers
+ * both. A second config key is deliberately deferred until there is a field
+ * report that needs one.
+ *
+ * THE MARGINS ARE A DEFAULT-INJECTION CLAIM: the 2× headroom above holds at
+ * the default injection (32/s), where this tier is exactly 256/s. An injected
+ * budget consumes BOTH tiers' headroom in proportion — at 64/s the shared tier
+ * is at the peer's 64/s line and this tier derives to 512/s, i.e. nominal
+ * saturation of both allowances. The limiter's integer gap means the ACHIEVED
+ * rate stays below the nominal one in that case (≤ 334/s on this tier, 55.6/s
+ * on the shared one; see `SecondWindowRateLimiter` in `connection.ts`), which
+ * is margin by accident rather than by design.
+ */
+export const DEFAULT_CONTENT_READ_BUDGET_PER_SECOND = 256
 
 /**
  * How long one READ may wait for a reconnected link before it reports the
