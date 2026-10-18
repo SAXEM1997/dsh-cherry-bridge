@@ -96,10 +96,10 @@ profile 手工加行等价于：
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。 |
-| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。消息**从新到旧**排列（`messages[0]` 是最新的一条），因此 `limit` 丢掉的是**最旧**的消息；被截断的走查一定会说明（`truncated` 为 `true`，并带 `truncationReason`），`messagesResumeCursor` 用于续读**更旧**的消息。 |
+| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。消息**从新到旧**排列（`messages[0]` 是最新的一条），因此 `limit` 丢掉的是**最旧**的消息；被截断的走查一定会说明（`truncated` 为 `true`，并带 `truncationReason`），`messagesResumeCursor` 用于续读**更旧**的消息；消息走查的截断只丢**更旧**的消息，绝不切开已返回消息内部的 parts（parts 走查熔断是另一层：`partsTruncated` 丢的是该消息**较后**的 parts）。某条消息自身的 parts 没能读全（有 part 带 `unavailable`，或 parts 走查熔断而带 `partsTruncated`）时，该消息带 `incomplete: true`，若有不可读的 part 还带 `unavailableParts` 计数——这是消息的内容判定，与走查是否截断无关。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后经 `agent.sessions.get` 回读身份）。 |
-| `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。 |
+| `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的消息），返回的消息内部不会被切开；返回的消息自身 parts 没读全则带 `incomplete`。 |
 | `cherry_wait` | 只等待该会话在途执行收敛（不发送新消息）。 |
 | `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。 |
 | `cherry_respond` | 应答交互卡：提问必须全量作答，审批走 `decision`。 |

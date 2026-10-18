@@ -157,7 +157,24 @@ export interface CherryArchiveQuarantined {
   preservedAs?: string
 }
 
-/** Why an aggregate stopped before the peer said it was done. */
+/**
+ * Why an aggregate stopped before the peer said it was done.
+ *
+ * TWO scopes carry these reasons, and the scope — not the reason — decides
+ * which end is dropped:
+ *
+ * The MESSAGE-walk verdicts (`CherryReadSnapshot.truncationReason`,
+ * `CherryMessageWalkVerdict.messagesTruncationReason`) are about the message
+ * LIST: that walk runs newest-first, so every reason there drops the OLDER end
+ * of the history, and the messages returned are taken whole (see
+ * {@link CherryReadMessage.incomplete} for the one way a retained message can
+ * still be missing its own content).
+ *
+ * `CherryReadMessage.partsTruncated` reuses the type for a DIFFERENT scope —
+ * one message's own part list — where the walk runs OLDEST-part-first, so a
+ * stop (always `'safety-bound'`; parts have no byte budget) drops that
+ * message's LATER parts and flags the message incomplete.
+ */
 export type CherryTruncationReason =
   /** The caller's `limit` was reached with more items available. */
   | 'limit'
@@ -174,6 +191,10 @@ export type CherryTruncationReason =
    * different sentence from both ("you asked for this many" / "the peer still
    * had pages"). A caller told `'limit'` here would look for a `limit` it never
    * passed.
+   *
+   * The budget is only checked BETWEEN messages, so this drops the OLDER
+   * messages like every other reason and never cuts inside one: the newest
+   * message is always returned whole.
    */
   | 'aggregate-bytes'
 
@@ -239,11 +260,33 @@ export interface CherryReadMessage {
   parts: CherryReadPart[]
   /**
    * Present only when this message's parts could NOT all be read: the safety
-   * circuit-breaker stopped the walk. Absent means the part list is complete.
+   * circuit-breaker stopped the walk (always `'safety-bound'` here — parts
+   * have no byte budget). The walk runs OLDEST-part-first, so what it drops is
+   * this message's LATER parts, resumable from `partsResumeCursor`. Absent
+   * means the part list is complete.
    */
   partsTruncated?: CherryTruncationReason
   /** The `parts.list` cursor to resume this message's part walk from. */
   partsResumeCursor?: string
+  /**
+   * Present (`true`) when any part of this message could not be fully read.
+   *
+   * Two triggers, because a caller asking "is this message whole?" does not
+   * care WHICH layer lost the content: any part carrying `unavailable` (its
+   * text was refused or could not be completed — see
+   * {@link CherryReadPart.unavailable}), or `partsTruncated` being present (the
+   * parts walk circuit-broke, so the part list ITSELF is short). Without this
+   * flag a damaged message is indistinguishable from a complete one at the
+   * message level: the healthy parts render, `content` is just empty on the one
+   * that failed, and only a caller who walks every part learns otherwise.
+   *
+   * The message walk plays no part in this: a message truncated OUT of the walk
+   * is absent entirely, never marked. Cross-reference
+   * {@link CherryTruncationReason} for which end the walk drops.
+   */
+  incomplete?: true
+  /** How many of this message's parts carry an `unavailable` reason. */
+  unavailableParts?: number
 }
 
 /** The two-level `cherry_read` snapshot. */
@@ -252,12 +295,21 @@ export interface CherryReadSnapshot {
   /** NEWEST-first: `messages[0]` is the most recent message in the session. */
   messages: CherryReadMessage[]
   truncated: boolean
-  /** The MESSAGE-walk truncation reason, when `truncated` is true. */
+  /**
+   * The MESSAGE-walk truncation reason, when `truncated` is true.
+   *
+   * Every reason means the OLDER messages were dropped: the walk is
+   * newest-first and each message is projected whole before the walk decides
+   * whether to go on. A returned message is never cut inside its parts — if its
+   * own content could not be fully read, IT says so
+   * ({@link CherryReadMessage.incomplete}), not this field.
+   */
   truncationReason?: CherryTruncationReason
   /**
    * The `agent.messages.list` cursor to continue the walk with, present only
    * when `truncated` is true and the peer named one. Because the walk runs
-   * newest-first, resuming from it continues toward OLDER messages.
+   * newest-first, resuming from it continues toward OLDER messages — the only
+   * direction a truncation ever leaves unread.
    */
   messagesResumeCursor?: string
 }
@@ -278,7 +330,16 @@ export interface CherryReadSnapshot {
  * be partial and where to resume, and decides what to do about it.
  */
 export interface CherryMessageWalkVerdict {
-  /** Present and true exactly when the message walk stopped before the peer's end. */
+  /**
+   * Present and true exactly when the message walk stopped before the peer's end.
+   *
+   * The stop is always at the OLD end: the walk is newest-first, so what is
+   * missing is history BEHIND the returned messages, never content taken from
+   * one of them. A returned message whose own parts could not be fully read is
+   * content-incomplete and says so itself
+   * ({@link CherryReadMessage.incomplete}) — that is a different verdict, and
+   * `messagesTruncated` does not stand in for it.
+   */
   messagesTruncated?: boolean
   /** Why it stopped, present exactly when `messagesTruncated` is true. */
   messagesTruncationReason?: CherryTruncationReason
@@ -1474,7 +1535,9 @@ class CherryToolEngine {
         'sha256-verified through `agent.content.read`. A binary attachment is reported as ' +
         '`kind: "file"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes ' +
         'are deliberately not fetched into a text channel. Messages come NEWEST-first, so the ' +
-        'first entry is the latest and `limit` drops the OLDEST messages.',
+        'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
+        'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
+        'carries `incomplete` (with `unavailableParts`).',
       parameters: {
         type: 'object',
         properties: {
@@ -1601,6 +1664,16 @@ class CherryToolEngine {
     for (const part of page.items) {
       parts.push(await this.#projectPart(connection, sessionId, part))
     }
+    const partsTruncated = page.truncated ? (page.truncationReason ?? 'safety-bound') : undefined
+    // The message-level completeness verdict is set HERE, the one projection
+    // every face shares (`cherry_read` and the three terminal aggregates), so
+    // no caller can be told a different story by a different tool about the
+    // same message. Two ways to be incomplete, counted separately: parts that
+    // failed keep `unavailable` (the count says how many), a circuit-broken
+    // walk has no failing part at all — its list is merely short — so the count
+    // stays absent rather than claiming a zero.
+    const unavailableParts = parts.filter((part) => part.unavailable !== undefined).length
+    const incomplete = unavailableParts > 0 || partsTruncated !== undefined
     return {
       messageId,
       revision,
@@ -1610,12 +1683,14 @@ class CherryToolEngine {
       // A circuit-broken part list advertises itself, with the cursor to resume
       // from: the caller can see that this message is incomplete and where to
       // continue, so content is never dropped silently.
-      ...(page.truncated
-        ? {
-            partsTruncated: page.truncationReason ?? 'safety-bound',
+      ...(partsTruncated === undefined
+        ? {}
+        : {
+            partsTruncated,
             ...(page.nextCursor === undefined ? {} : { partsResumeCursor: page.nextCursor }),
-          }
-        : {}),
+          }),
+      ...(incomplete ? { incomplete: true as const } : {}),
+      ...(unavailableParts > 0 ? { unavailableParts } : {}),
     }
   }
 
@@ -2111,7 +2186,9 @@ class CherryToolEngine {
         'interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with ' +
         'cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns ' +
         'the command receipt immediately. A timeout is NOT a failure — it returns the partial content ' +
-        'and the cursor to resume from.',
+        'and the cursor to resume from. When content is cut, `messagesTruncated`/`messagesTruncationReason` ' +
+        'report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a ' +
+        'returned message missing its own parts carries `incomplete`.',
       parameters: {
         type: 'object',
         properties: {
@@ -2353,7 +2430,9 @@ class CherryToolEngine {
         'Wait for a session\'s in-flight execution to reach a terminal state, without sending ' +
         'anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight ' +
         'execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, ' +
-        'never a park. Use it to resume after answering an interaction.',
+        'never a park. Use it to resume after answering an interaction. Its message walk is bounded ' +
+        'like `cherry_send`\'s, with the same verdict wording: a cut drops the OLDER messages, and a ' +
+        'returned message missing its own parts carries `incomplete`.',
       parameters: {
         type: 'object',
         properties: {
@@ -4071,10 +4150,16 @@ class CherryToolEngine {
    *
    * The FIRST message is always projected and always kept WHOLE — it is the
    * newest, i.e. the run's own reply — so the byte budget is only ever checked
-   * AFTER a complete message has been taken. A walk that stopped for either
-   * reason comes back with the verdict filled in (`messageWalkVerdict`
-   * handles the ceiling; `'aggregate-bytes'` is attributed here), and the
-   * three callers (terminal, timeout, idle) each surface it.
+   * AFTER a complete message has been taken. That places the budget on the
+   * same side as every other bound: the walk runs newest-first and stops
+   * BETWEEN messages, so what it leaves out is the OLDER end of the history,
+   * never the tail of a message it returned. A returned message missing part
+   * of its OWN content is flagged by its own projection
+   * ({@link CherryReadMessage.incomplete}) — a content verdict, not this
+   * walk's. A walk that stopped for either reason comes back with the verdict
+   * filled in (`messageWalkVerdict` handles the ceiling;
+   * `'aggregate-bytes'` is attributed here), and the three callers (terminal,
+   * timeout, idle) each surface it.
    *
    * A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
    * points past the entire page it came with, so a byte stop in the MIDDLE of a
