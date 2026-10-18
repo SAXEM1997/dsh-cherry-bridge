@@ -622,6 +622,51 @@ describe('read-only cherry tools over a real loopback channel', () => {
     }
   })
 
+  it('④d3 BOTH triggers on one message: the circuit-broken walk and an unreadable part coexist', async () => {
+    // The two incompleteness triggers are independent, and one message can
+    // carry both: its parts walk circuit-breaks (short list) AND one of the
+    // retained parts failed its content read. An implementation that suppresses
+    // `unavailableParts` (or `incomplete`) when `partsTruncated` is present
+    // would leave every existing case green — this is the combination that
+    // distinguishes it.
+    const big = 'G'.repeat(30 * 1024)
+    const parts = Array.from({ length: 30 }, (_unused, index) =>
+      index === 3 ? { kind: 'text' as const, text: big, external: true } : { kind: 'text' as const, text: `part-${index}` },
+    )
+    const rig = await makeRig(
+      {
+        agent: {
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+          ],
+          messages: [{ messageId: 'm-1', revision: '1001', role: 'user', status: 'success', parts }],
+          maxPageSize: 20,
+        },
+      },
+      { engine: { partsSafetyBound: 25 } },
+    )
+    // The ref part (index 3, inside the retained 25) fails its content read.
+    rig.fake.setReadFailure('agent.content.read', { reason: 'NOT_FOUND', message: 'Content not found' })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        parts: Array<{ content: string; unavailable?: string }>
+        partsTruncated?: string
+        incomplete?: true
+        unavailableParts?: number
+      }>
+    }
+
+    const message = result.messages[0]!
+    expect(message.partsTruncated).toBe('safety-bound')
+    expect(message.parts).toHaveLength(25)
+    expect(message.parts[3]!.unavailable).toBe('NOT_FOUND')
+    // BOTH verdicts stand together: the walk's short list and the content's
+    // unreadable part are different losses, and neither absorbs the other.
+    expect(message.incomplete).toBe(true)
+    expect(message.unavailableParts).toBe(1)
+  })
+
   it('④e a {ref} whose content walk cannot reach eof fails rather than returning a partial value', async () => {
     // A ref that under-declares its byteLength derives too small a slice budget,
     // so the walk cannot reach `eof`. A partial (unverifiable) content must be a

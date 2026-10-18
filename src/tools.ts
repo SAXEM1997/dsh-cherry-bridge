@@ -160,11 +160,20 @@ export interface CherryArchiveQuarantined {
 /**
  * Why an aggregate stopped before the peer said it was done.
  *
- * Whatever the reason, a truncation is ABOUT THE MESSAGE LIST, never about a
- * retained message's insides: both walks run newest-first, so every truncation
- * drops the OLDER end of the history, and the messages that ARE returned are
- * taken whole (see {@link CherryReadMessage.incomplete} for the one way a
- * retained message can still be missing its own content).
+ * TWO scopes carry these reasons, and the scope — not the reason — decides
+ * which end is dropped:
+ *
+ * The MESSAGE-walk verdicts (`CherryReadSnapshot.truncationReason`,
+ * `CherryMessageWalkVerdict.messagesTruncationReason`) are about the message
+ * LIST: that walk runs newest-first, so every reason there drops the OLDER end
+ * of the history, and the messages returned are taken whole (see
+ * {@link CherryReadMessage.incomplete} for the one way a retained message can
+ * still be missing its own content).
+ *
+ * `CherryReadMessage.partsTruncated` reuses the type for a DIFFERENT scope —
+ * one message's own part list — where the walk runs OLDEST-part-first, so a
+ * stop (always `'safety-bound'`; parts have no byte budget) drops that
+ * message's LATER parts and flags the message incomplete.
  */
 export type CherryTruncationReason =
   /** The caller's `limit` was reached with more items available. */
@@ -251,7 +260,10 @@ export interface CherryReadMessage {
   parts: CherryReadPart[]
   /**
    * Present only when this message's parts could NOT all be read: the safety
-   * circuit-breaker stopped the walk. Absent means the part list is complete.
+   * circuit-breaker stopped the walk (always `'safety-bound'` here — parts
+   * have no byte budget). The walk runs OLDEST-part-first, so what it drops is
+   * this message's LATER parts, resumable from `partsResumeCursor`. Absent
+   * means the part list is complete.
    */
   partsTruncated?: CherryTruncationReason
   /** The `parts.list` cursor to resume this message's part walk from. */
