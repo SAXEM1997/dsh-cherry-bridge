@@ -624,16 +624,16 @@ describe('read-only cherry tools over a real loopback channel', () => {
   })
 
   it('④s cherry_read pins the message STOP POINT: a truncated walk carries messagesResumeCursor, a complete one does not', async () => {
-    // ISSUE #36: `messagesResumeCursor` is a STOP-POINT MARKER, not an input —
-    // `cherry_read` accepts `device`/`sessionId`/`limit` only
-    // (`additionalProperties: false`), so the only honest reading of the field
-    // is "older messages are still unread", and nothing pinned that this face
-    // emits it at all. Both edges are asserted here so neither can move
-    // silently: DROPPING the projection (`#readOnce`, the `messagesResumeCursor`
-    // spread) goes red on (a); a walk that stopped complete must carry no field
-    // at all — (b) is red on any projection that leaks the stop point into a
-    // complete result, and it is the pin that would catch a wider `truncated`
-    // verdict on the read face.
+    // ISSUE #36: `messagesResumeCursor` is a STOP-POINT MARKER, and nothing
+    // pinned that this face emits it at all. (ISSUE #26 made it an INPUT too —
+    // `cherry_read` now also takes `messagesResumeCursor`, and the value is the
+    // prefixed token form asserted below — but this test's subject is the two
+    // EDGES: a truncated walk carries one, a complete walk carries none. Both
+    // are asserted here so neither can move silently: DROPPING the projection
+    // (`#readOnce`, the `messagesResumeCursor` spread) goes red on (a); a walk
+    // that stopped complete must carry no field at all — (b) is red on any
+    // projection that leaks the stop point into a complete result, and it is
+    // the pin that would catch a wider `truncated` verdict on the read face.
     //
     // PEER SHAPE MATTERS. Two things were verified empirically before settling
     // on this fixture: (1) with the default 100-item peer cap the walk always
@@ -685,7 +685,11 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(messageCalls[0]!['cursor']).toBeUndefined()
     expect(messageCalls[1]!['cursor']).toBe(String(LIST_PAGE_CLAMP))
     expect(messageCalls[1]!['limit']).toBe(4)
-    expect(truncated.messagesResumeCursor).toBe('20')
+    // ISSUE #26 changed the SHAPE of the stop point: it is a resume INPUT now,
+    // so it is self-describing — `cursor:<peer position>`, never the peer's raw
+    // position (which no tool accepts, and which the desktop would silently
+    // treat as "the newest page" if forwarded).
+    expect(truncated.messagesResumeCursor).toBe('cursor:20')
     // The 20 returned are m-0..m-19: it is a stop point, and everything older
     // is simply not here — which is what "raise `limit`" answers.
     expect(truncated.messages[19]!.messageId).toBe('m-19')

@@ -306,10 +306,12 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     // answers is `TERMINAL_AGGREGATE_MESSAGES` (20), which is set independently
     // of `MAX_AGGREGATE_LIMIT` and therefore reads as a caller limit.
     expect(idle.messagesTruncationReason).toBe('limit')
-    // The stop point: the peer's cursor, as a decimal string. It marks where
-    // the unread history begins; it is not an input to any tool.
-    expect(typeof idle.messagesResumeCursor).toBe('string')
-    expect(Number(idle.messagesResumeCursor)).toBeGreaterThan(0)
+    // The stop point: a self-describing resume token (issue #26). This walk
+    // consumed its whole 20-message window and stopped on the ceiling, so the
+    // form is `cursor:<peer position>`; the position is the peer's own opaque
+    // value, so only the PREFIX and a non-empty remainder are asserted — the
+    // bridge never parses that value, and neither does this test.
+    expect(idle.messagesResumeCursor).toMatch(/^cursor:.+$/)
     // The aggregate really is bounded (issue #3), and the text is best-effort —
     // not silent.
     expect(idle.messages.length).toBeLessThanOrEqual(20)

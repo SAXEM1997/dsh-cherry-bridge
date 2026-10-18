@@ -106,7 +106,7 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | `cherry_agents` | List the agents available on a device (paginated). |
 | `cherry_workspaces` | List an agent's **registered** workspaces, and whether a system workspace exists. |
 | `cherry_sessions` | List an agent's sessions, optionally filtered by workspace. |
-| `cherry_read` | Read a session's message history snapshot, **newest-first** (`limit` drops the **oldest** messages). Attachment parts come back as `name`/`mediaType`/`byteLength` with an empty `content` — the bytes are never fetched. A truncated walk always says so (`truncated` + `truncationReason`): `limit` means your own ceiling was reached and raising `limit` helps; `aggregate-bytes` means the answer hit its **output size limit** — independent of `limit` (a larger `limit` only costs more round trips and stops at the same budget), and the older messages it leaves out are **unreachable through this tool by any argument** (the walk always starts at the newest message and takes no cursor) — view them on the desktop. `messagesResumeCursor` is a **stop-point marker only**, not an input. |
+| `cherry_read` | Read a session's message history snapshot, **newest-first** (`limit` drops the **oldest** messages). Attachment parts come back as `name`/`mediaType`/`byteLength` with an empty `content` — the bytes are never fetched. A truncated walk always says so (`truncated` + `truncationReason`): `limit` means your own ceiling was reached and raising `limit` helps; `aggregate-bytes` means the answer hit its **output size limit** — independent of `limit` (a larger `limit` only costs more round trips and stops at the same budget). **The older messages are reached by the resume token**: pass the `messagesResumeCursor` a truncated answer returned as this tool's own `messagesResumeCursor` argument to continue from that stop point (`limit` then bounds how many messages come back **from there**), walking a long history in successive answers. Two token forms: `cursor:<peer position>` (the peer page position after a whole window was consumed) and `after:<messageId>` (the walk stopped inside its window; the resume scans from the newest end to that message and returns the older ones). A token this tool did not emit is **refused locally** (never forwarded — the desktop silently falls back to the newest page for one), and an `after:` anchor that is no longer in the history is an **error**, not an empty result. |
 | `cherry_events` | Read the session's buffered events newer than `cursor`, acking them after delivery. |
 | `cherry_create` | Create a session in an agent workspace (workspace selection is **required**; identity is read back). |
 | `cherry_send` | Send a message, by default waiting for a terminal state and returning the assistant text; `wait: false` returns the command receipt immediately. `messagesTruncated`/`messagesTruncationReason` report a **message**-level cut (older messages dropped). |
@@ -139,8 +139,10 @@ with it).
 - One externalized content is capped at 32 MiB; a larger part is marked
   `unavailable` rather than returning unverifiable partial content.
 - A truncated history walk always says so (`truncationReason`; `limit` and
-  `aggregate-bytes` mean different things, see above); a message whose own parts
-  could not be fully read carries `incomplete: true`.
+  `aggregate-bytes` mean different things, see above) and, whenever a stop point
+  can be named honestly, carries a `messagesResumeCursor` resume token (absent
+  when the walk reached the peer's last page); a message whose own parts could
+  not be fully read carries `incomplete: true`.
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is

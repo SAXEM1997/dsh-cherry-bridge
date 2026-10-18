@@ -414,9 +414,10 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
     expect(whole.messages[19]!.messageId).toBe('w-fat')
     // Nothing lies between the cursor and what was returned: it honestly marks
     // where the unread history begins, at the first message this walk did NOT
-    // take (`t-0`).
-    expect(typeof whole.messagesResumeCursor).toBe('string')
-    expect(Number(whole.messagesResumeCursor)).toBe(20)
+    // take (`t-0`) — the peer position 20, in the self-describing form issue
+    // #26 made the one vocabulary both message faces emit (`cursor:<pos>`),
+    // which `cherry_read` also accepts as `messagesResumeCursor`.
+    expect(whole.messagesResumeCursor).toBe('cursor:20')
 
     const midWindowStop = await makeRig({
       agent: {
@@ -445,10 +446,13 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
     // The walk stopped BEFORE the end of its window: items 2..20 were
     // collected but are not on the result.
     expect(mid.messages.map((message) => message.messageId)).toEqual(['m-0'])
-    // So no stop point is offered: the peer's `nextCursor` would be past item
-    // 20, naming a position that skips items 2..20. (The parent commit
-    // attached it here — this assertion is the red line for that behaviour.)
-    expect(mid.messagesResumeCursor).toBeUndefined()
+    // So the peer position is NOT the stop point (it would be past item 20,
+    // naming a position that skips items 2..20 — the parent commit attached it
+    // here, and this is the red line for that behaviour). Issue #26 replaced it
+    // with the ANCHOR form: the last message actually returned, i.e. "strictly
+    // older than `m-0`", which `cherry_read` accepts and re-walks. Before #26
+    // this stop emitted NOTHING and the trimmed items were unreachable.
+    expect(mid.messagesResumeCursor).toBe('after:m-0')
   })
 })
 
@@ -832,11 +836,13 @@ describe('issue #29: `cherry_read` is bounded by BYTES at message boundaries too
     expect(carried).toBeLessThan(AGGREGATE_BYTES + 60 * 1024)
     // (5) The stop point is reported, and it names where the unread OLDER
     // history begins. This walk's page cursor is `undefined` (it ended on the
-    // peer's last page), so the value comes ONLY from the byte-stop derivation:
-    // the boundary the result itself establishes, one past the last message
-    // returned. A copied page cursor would have been `undefined` here, so this
+    // peer's last page) AND the stop is inside the collected window, so the
+    // value comes ONLY from the anchor derivation: an `after:<messageId>` token
+    // naming the last message returned — never a fabricated peer offset (the
+    // pre-#26 `String(messages.length)` boundary was a position the peer never
+    // had). A copied page cursor would have been `undefined` here, so this
     // assertion is what pins the derivation rather than the page position.
-    expect(result.messagesResumeCursor).toBe(String(result.messages.length))
+    expect(result.messagesResumeCursor).toBe(`after:${result.messages[result.messages.length - 1]?.messageId}`)
     // Every retained message carries its text: the budget never cuts inside one.
     for (const message of result.messages) {
       expect(message.parts[0]?.content).toHaveLength(60 * 1024)
@@ -869,7 +875,7 @@ describe('issue #29: `cherry_read` is bounded by BYTES at message boundaries too
     expect(result.truncated).toBe(true)
     expect(result.truncationReason).toBe('limit')
     expect(result.messages).toHaveLength(20)
-    expect(result.messagesResumeCursor).toBe('20')
+    expect(result.messagesResumeCursor).toBe('cursor:20')
     // All 20 were projected: the byte budget never fired on a walk this small.
     expect(rig.fake.readCallsFor('agent.parts.list')).toHaveLength(20)
   })
