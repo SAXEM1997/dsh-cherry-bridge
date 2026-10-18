@@ -11,7 +11,7 @@ import {
 import { JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 import type { DeviceRecord } from '../../src/deviceStore.js'
-import { DeviceConnection, TransportLostError } from '../../src/connection.js'
+import { CHANNEL_SEAM, DeviceConnection, TransportLostError } from '../../src/connection.js'
 import type { DeviceState, EffectiveLimits } from '../../src/connection.js'
 import { FakeCherry, maxRequestsInAnyOneSecondWindow } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
@@ -1266,6 +1266,100 @@ describe('DeviceConnection over a real loopback channel', () => {
     await waitForState(connection, 'connected')
     await sleep(100)
     expect(fakeInfo.fake.methodCount('agent.messages.send')).toBe(1)
+  }, 20_000)
+
+  it('⑭f (issue #28) a READ whose channel WRITE fails is classified as transport loss and replayed once on the reconnect', async () => {
+    // The upstream transport rejects `channel.write` with its own text
+    // ("Remote record budget exceeded" / "Remote socket unavailable or
+    // congested") and aborts the connection: the frame never reached the peer,
+    // so the request has no verdict — the TransportLostError definition. Before
+    // #28 the connection layer only recognised its own channel-closed literal,
+    // let that text through unclassified (no device/method context, no replay),
+    // while every OTHER in-flight request on the same dead link got a
+    // classified channel-closed from the read loop.
+    //
+    // A loopback fake cannot reach a CLIENT-side write failure — the peer never
+    // sees the frame, so no `beforeNextCall` hook can fire. The write is
+    // therefore failed at the channel seam itself: `:channel.connectSecureChannel`
+    // is wrapped for this one connection, and every channel it hands out keeps
+    // its real read loop while its `write` refuses ONE chosen frame. The frame is
+    // chosen by METHOD, not by order: the heartbeat's own `connection.ping`
+    // shares the link and its timing is not the test's to predict.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: { heartbeatMs: 60_000 },
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 1,
+      transportRetryWaitMs: 5_000,
+    })
+
+    /** The JSON-RPC method of an outbound envelope (the channel carries objects). */
+    const methodOf = (value: unknown): unknown =>
+      typeof value === 'object' && value !== null ? (value as { method?: unknown }).method : undefined
+
+    let failMethod: string | null = null
+    let failedWrites = 0
+    // `#`-named members are invisible to reflection, so the write can only be
+    // intercepted where the dial HANDS the channel out: the transport's connect
+    // function, reached through the connection's exported seam symbol and
+    // stubbed for this one connection. Every channel it returns keeps its real
+    // read loop; only `write` can refuse a frame.
+    const channel = connection[CHANNEL_SEAM]
+    channel.connectSecureChannel = async (...args: Parameters<typeof connectSecureChannel>) => {
+      const secured = await connectSecureChannel(...args)
+      const realWrite = secured.write.bind(secured)
+      secured.write = (value: unknown, signal?: AbortSignal): Promise<void> => {
+        if (failMethod !== null && methodOf(value) === failMethod) {
+          failMethod = null
+          failedWrites += 1
+          // The upstream aborts the connection when the write is refused;
+          // closing the peer socket makes the loss observable here.
+          fakeInfo.fake.dropConnections()
+          return Promise.reject(new Error('Remote record budget exceeded'))
+        }
+        return realWrite(value, signal)
+      }
+      return secured
+    }
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    expect(failedWrites).toBe(0)
+
+    failMethod = 'agent.agents.list'
+    // Absorbed, not surfaced: the READ is replayed on the reconnected link.
+    // Before the fix this rejects with the bare upstream text.
+    const value = (await connection.rpc.request('agent.agents.list', {})) as { items: unknown[] }
+    expect(value.items).toHaveLength(1)
+    expect(failedWrites).toBe(1)
+    // The peer saw exactly ONE arrival — the replay. The original never got to
+    // the wire: it died in the write, not in a per-request refusal.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
+    await waitForState(connection, 'connected', 5_000)
+
+    // A COMMAND on the same failed-write face is classified too, but never
+    // replayed: the caller retries it with its own commandId.
+    failMethod = 'agent.messages.send'
+    const command = await connection.rpc
+      .request('agent.messages.send', { commandId: 'c-1', sessionId: 's-1', text: 'hi', expectedIdleRevision: '1000' })
+      .catch((reason: unknown) => reason)
+    expect(command).toBeInstanceOf(TransportLostError)
+    expect((command as TransportLostError).retryable).toBe(true)
+    // The upstream diagnosis survives to the operator-facing error: the cause
+    // chain still says WHICH weight class killed the write (record budget or
+    // congestion), even though the classified message is one stable face.
+    const causes: string[] = []
+    for (let cause: unknown = command; cause instanceof Error; cause = cause.cause) {
+      causes.push(`${cause.name}: ${cause.message}`)
+    }
+    expect(causes.join(' <- ')).toMatch(/Remote (record budget exceeded|socket unavailable)/)
+    expect(failedWrites).toBe(2)
+    await waitForState(connection, 'connected', 5_000)
+    expect(fakeInfo.fake.methodCount('agent.messages.send')).toBe(0)
   }, 20_000)
 
   it('⑭d a peer REFUSAL under a live link is neither reclassified nor retried', async () => {

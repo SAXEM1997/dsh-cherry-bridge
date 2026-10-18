@@ -481,6 +481,40 @@ const ISSUE_LIMIT = 3;
 */
 const FRAME_FIELD_LIMIT = 120;
 /**
+* Whether a rejection is this client's "the channel can no longer answer" face.
+*
+* Exported so the connection layer classifies a dead channel WITHOUT keeping a
+* second copy of {@link CHANNEL_CLOSED_MESSAGE}: the literal lives here, in the
+* module that produces it, and every consumer asks this predicate instead. Two
+* copies of the text are two places to change and one place to forget, and the
+* failure mode before this predicate existed was exactly that — see
+* {@link writeLossError}.
+*/
+function isChannelClosedError(error) {
+	return error instanceof Error && error.message === CHANNEL_CLOSED_MESSAGE;
+}
+/**
+* The classified error for a FAILED WRITE, with the transport's own diagnosis
+* preserved as `cause`.
+*
+* A write failure means the frame never reached the peer: nothing can adjudicate
+* a request that was never sent, which is the transport-loss condition, not a
+* peer refusal. The upstream transport raises two such failures on this path —
+* "Remote record budget exceeded" (also aborting the connection) and "Remote
+* socket unavailable or congested" — and both used to be passed through
+* verbatim, so the connection layer (which classifies losses by the channel
+* message) neither recognised them nor replayed the read.
+*
+* The message is therefore the SAME classified face every in-flight request on
+* a dead link gets, and the upstream text rides along as `cause` instead of in
+* the message: operators keep the diagnosis (a record-budget kill reads
+* differently from congestion) while consumers key on one stable signal.
+*/
+function writeLossError(error) {
+	const detail = error instanceof Error ? error : /* @__PURE__ */ new Error(`JSON-RPC write failed (${String(error)})`);
+	return new Error(CHANNEL_CLOSED_MESSAGE, { cause: detail });
+}
+/**
 * The structured error a peer returns for a request. `code` is the literal
 * 1000 the transport reserves for protocol failures; `data.reason` is the
 * discriminator consumers switch on.
@@ -608,6 +642,11 @@ var JsonRpcClient = class {
 					reject(abortError ?? /* @__PURE__ */ new Error("JSON-RPC client disposed"));
 					return;
 				}
+				if (this.closed) {
+					reject(/* @__PURE__ */ new Error(CHANNEL_CLOSED_MESSAGE));
+					for (const send of this.queue.splice(0, this.queue.length)) send();
+					return;
+				}
 				const timer = setTimeout(() => {
 					this.finish(id, `JSON-RPC request "${method}" timed out after ${timeoutMs}ms`);
 				}, timeoutMs);
@@ -618,7 +657,11 @@ var JsonRpcClient = class {
 				});
 				this.inFlight += 1;
 				this.channel.write(encodeFrame(parsed.data)).catch((error) => {
-					this.finish(id, error instanceof Error ? error.message : "JSON-RPC write failed");
+					this.closed = true;
+					const pending = this.pending.get(id);
+					if (pending === void 0) return;
+					this.release(id);
+					pending.reject(writeLossError(error));
 				});
 			};
 			if (this.inFlight < this.maxInFlight) send();
@@ -2115,6 +2158,15 @@ function urlHost(host) {
 //#endregion
 //#region src/connection.ts
 /**
+* The transport call the dial hands a socket to (see
+* {@link DeviceConnection}'s channel accessor). An exported SYMBOL rather than a
+* `#`-name: `#` members are invisible to reflection by design, and issue #28's
+* client-side write failure can be injected nowhere the dial can be observed —
+* the transport captures its own write sink at construction, so a test needs
+* this one seam, and a symbol is the narrowest one that can be found.
+*/
+const CHANNEL_SEAM = Symbol("dsh-cherry-bridge.channel");
+/**
 * The structured §6 "设备离线" error: tool calls against a non-connected
 * device fail fast with `{device, state}` and never implicitly reconnect.
 */
@@ -2141,8 +2193,8 @@ var TransportLostError = class extends Error {
 	method;
 	/** Always true: the peer never gave this request a verdict. */
 	retryable = true;
-	constructor(device, state, method) {
-		super(`device ${device}: transport lost while "${method}" was in flight (request may be retried)`);
+	constructor(device, state, method, options) {
+		super(`device ${device}: transport lost while "${method}" was in flight (request may be retried)`, options);
 		this.name = "TransportLostError";
 		this.device = device;
 		this.state = state;
@@ -2179,8 +2231,6 @@ const DEFAULT_CONNECT_TIMEOUT_MS$1 = 1e4;
 const DEFAULT_PROTOCOL_VERSIONS = [1];
 /** Ping-silence multiplier: 2×heartbeatMs without a pong judges the line dead. */
 const SILENCE_FACTOR = 2;
-/** Bare rejection the rpc layer uses once the channel can no longer answer. */
-const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/;
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
 const DISPOSED_RE = /^JSON-RPC client disposed$/;
 /**
@@ -2405,6 +2455,17 @@ var DeviceConnection = class {
 	*/
 	#attachedHandlers = /* @__PURE__ */ new Set();
 	#timers = /* @__PURE__ */ new Map();
+	/**
+	* The transport call the dial hands a socket to.
+	*
+	* A named accessor, not a bare module import, for the same reason
+	* `#houseCall` exists: the connect function is the ONE place the connection
+	* decides how a link is turned into a channel, and naming it makes that
+	* decision observable from a test (issue #28's client-side write failure can
+	* be injected nowhere else, since the `#`-private dial is not addressable and
+	* the transport captures its own write sink at construction).
+	*/
+	[CHANNEL_SEAM] = { connectSecureChannel };
 	#state = "offline";
 	#limits = { ...FALLBACK_LIMITS };
 	#running = false;
@@ -2638,7 +2699,7 @@ var DeviceConnection = class {
 		const stream = new RemoteSocketStream(toRemoteSocket(ws), silentComponentLogger$1.forComponent("device"), "outbound");
 		let channel;
 		try {
-			channel = await connectSecureChannel(stream, {
+			channel = await this[CHANNEL_SEAM].connectSecureChannel(stream, {
 				identity: this.#identity,
 				logger: silentComponentLogger$1,
 				protocolVersions: [...this.#protocolVersions],
@@ -2750,7 +2811,7 @@ var DeviceConnection = class {
 		};
 		this.#pendingPings.add(ping);
 		this.#houseCall(this.#link, "connection.ping", { nonce: ping.nonce }, windowMs).then(() => this.#pendingPings.delete(ping), (error) => {
-			if (error instanceof Error && CHANNEL_CLOSED_RE.test(error.message)) {
+			if (isChannelClosedError(error)) {
 				this.#pendingPings.delete(ping);
 				this.#onLinkLost(epoch, "channel closed");
 			}
@@ -2777,7 +2838,7 @@ var DeviceConnection = class {
 			this.#refreshFirstFailureAt = void 0;
 			this.#scheduleRefresh(epoch);
 		} catch (error) {
-			if (error instanceof Error && CHANNEL_CLOSED_RE.test(error.message)) return;
+			if (isChannelClosedError(error)) return;
 			const first = this.#refreshFirstFailureAt ??= Date.now();
 			if (Date.now() - first >= this.#refreshGraceMs) {
 				console.error(`[cherry-remote] device ${this.record.deviceId}: token refresh kept failing beyond the ${this.#refreshGraceMs}ms grace window; going offline — check whether the desktop removed this device`);
@@ -2858,7 +2919,7 @@ var DeviceConnection = class {
 			return await link.client.request(method, params, opts);
 		} catch (error) {
 			if (!this.#isTransportLoss(error)) throw error;
-			const lost = new TransportLostError(this.record.deviceId, "connected", method);
+			const lost = new TransportLostError(this.record.deviceId, "connected", method, { cause: error });
 			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
 			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
@@ -2875,7 +2936,7 @@ var DeviceConnection = class {
 	}
 	/** Whether a rejection is the dead channel, as opposed to a peer's own answer. */
 	#isTransportLoss(error) {
-		return error instanceof Error && !(error instanceof JsonRpcRequestError) && CHANNEL_CLOSED_RE.test(error.message);
+		return error instanceof Error && !(error instanceof JsonRpcRequestError) && isChannelClosedError(error);
 	}
 	/**
 	* Resolves with the next AUTHENTICATED link (+epoch) within `waitMs`, or

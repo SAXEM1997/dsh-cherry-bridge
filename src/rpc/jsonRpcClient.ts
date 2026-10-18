@@ -31,6 +31,45 @@ export interface JsonRpcClientOptions {
 }
 
 /**
+ * Whether a rejection is this client's "the channel can no longer answer" face.
+ *
+ * Exported so the connection layer classifies a dead channel WITHOUT keeping a
+ * second copy of {@link CHANNEL_CLOSED_MESSAGE}: the literal lives here, in the
+ * module that produces it, and every consumer asks this predicate instead. Two
+ * copies of the text are two places to change and one place to forget, and the
+ * failure mode before this predicate existed was exactly that — see
+ * {@link writeLossError}.
+ */
+export function isChannelClosedError(error: unknown): boolean {
+  return error instanceof Error && error.message === CHANNEL_CLOSED_MESSAGE
+}
+
+/**
+ * The classified error for a FAILED WRITE, with the transport's own diagnosis
+ * preserved as `cause`.
+ *
+ * A write failure means the frame never reached the peer: nothing can adjudicate
+ * a request that was never sent, which is the transport-loss condition, not a
+ * peer refusal. The upstream transport raises two such failures on this path —
+ * "Remote record budget exceeded" (also aborting the connection) and "Remote
+ * socket unavailable or congested" — and both used to be passed through
+ * verbatim, so the connection layer (which classifies losses by the channel
+ * message) neither recognised them nor replayed the read.
+ *
+ * The message is therefore the SAME classified face every in-flight request on
+ * a dead link gets, and the upstream text rides along as `cause` instead of in
+ * the message: operators keep the diagnosis (a record-budget kill reads
+ * differently from congestion) while consumers key on one stable signal.
+ */
+function writeLossError(error: unknown): Error {
+  const detail =
+    error instanceof Error ? error : new Error(`JSON-RPC write failed (${String(error)})`)
+  // The classified message is the FIRST argument and never derived from `detail`,
+  // so it is byte-exact regardless of what the transport rejected with.
+  return new Error(CHANNEL_CLOSED_MESSAGE, { cause: detail })
+}
+
+/**
  * The structured error a peer returns for a request. `code` is the literal
  * 1000 the transport reserves for protocol failures; `data.reason` is the
  * discriminator consumers switch on.
@@ -190,6 +229,21 @@ export class JsonRpcClient {
           reject(abortError ?? new Error('JSON-RPC client disposed'))
           return
         }
+        // `closed` is re-checked HERE, not only in `request`: a queued send is
+        // admitted by `drainQueue` whenever the window frees, and a write
+        // failure (which sets `closed`) is exactly what frees it. Draining into
+        // a known-dead channel would write again to a socket the transport has
+        // already abandoned — the same doomed write, one queue slot later.
+        if (this.closed) {
+          // Drain the whole queue here, not just this one entry: the window this
+          // admission would have consumed is not consumed, so `drainQueue`'s
+          // loop stops (nothing was admitted) and anything left behind would be
+          // settled only by their own timeouts. Every queued request is dead
+          // for the same reason, so they all take the classified face now.
+          reject(new Error(CHANNEL_CLOSED_MESSAGE))
+          for (const send of this.queue.splice(0, this.queue.length)) send()
+          return
+        }
         // Register before writing: the response can land as soon as the write
         // is queued, and an unregistered id would be dropped as unknown.
         const timer = setTimeout(() => {
@@ -202,7 +256,17 @@ export class JsonRpcClient {
         })
         this.inFlight += 1
         void this.channel.write(encodeFrame(parsed.data)).catch((error: unknown) => {
-          this.finish(id, error instanceof Error ? error.message : 'JSON-RPC write failed')
+          // The write failed, so the frame never reached the peer and this
+          // request has no adjudicator: the channel is dead for it. Report the
+          // CLASSIFIED loss (same face the read loop gives every other in-flight
+          // request on the dead link) with the transport's own message kept as
+          // `cause`, and mark the client closed so requests admitted after this
+          // point fail fast instead of writing into an aborted connection.
+          this.closed = true
+          const pending = this.pending.get(id)
+          if (pending === undefined) return
+          this.release(id)
+          pending.reject(writeLossError(error))
         })
       }
 
