@@ -541,6 +541,18 @@ interface LiveConnection {
   arrivals: number[]
 }
 
+/**
+ * A socket the peer has ACCEPTED but whose Noise handshake has not completed —
+ * the window `handshakeDelayMs` holds open. It is not a {@link LiveConnection}
+ * (there is no channel yet), so unless it is tracked separately a
+ * `dropConnections()` cannot reach it, and the held handshake would complete
+ * against a socket the test already walked away from.
+ */
+interface PendingHandshake {
+  socket: WebSocket
+  controller: AbortController
+}
+
 const noop = (): void => {}
 const DEFAULT_PROTOCOL_VERSIONS = [1]
 const JSON_RPC_ERROR_CODE = 1000
@@ -631,6 +643,11 @@ export class FakeCherry {
   readonly #identity: Promise<Uint8Array>
   #server: WebSocketServer | undefined
   #live: LiveConnection[] = []
+  /**
+   * Accepted sockets still inside their handshake, where `dropConnections()`
+   * and `stop()` can find them (see {@link PendingHandshake}).
+   */
+  #pending: PendingHandshake[] = []
 
   // Runtime-mutable injection state (tests flip these mid-flight).
   #refreshFailure: FakeFailure | undefined
@@ -1147,6 +1164,19 @@ export class FakeCherry {
    * the only way to model a link lost UNDER a request on a method with no
    * read-face failure knob (a command, say). Any face works, unlike
    * `setReadFailure`, which the read handlers alone consult.
+   *
+   * ORDERING — the hook runs after the frame is counted and BEFORE every other
+   * per-frame judgement: it precedes the rate-limit check (`#rateLimited`) and
+   * the ping-drop branch (`dropPings`), and it bypasses the handler entirely.
+   * So a request consumed by a hook is never rate-limited and never reaches a
+   * ping-drop; a hook installed on `connection.ping` fires even when pings are
+   * being dropped.
+   *
+   * ONE-SHOT — the entry is consumed as it fires. Re-arming is the CALLER's
+   * job, and it must be done from inside the hook's own closure (see the ⑭e
+   * hook in `tests/integration/connection.test.ts`): a second `beforeNextCall`
+   * from ordinary test code races the second arrival, while a re-arm inside the
+   * closure is already registered before that arrival can be read.
    */
   beforeNextCall(method: string, hook: () => void): void {
     this.#beforeNextCall.set(method, hook)
@@ -1433,14 +1463,24 @@ export class FakeCherry {
    *
    * Returns the sockets it dropped, so a test can count a PEER-SIDE dial that
    * arrived after the drop.
+   *
+   * Sockets still inside their handshake are dropped too: they have no channel
+   * to server-close and are not in `#live`, so aborting their controller is the
+   * only way to stop the held handshake from completing after the drop.
    */
   dropConnections(): number {
+    this.#healPending()
     const dropped = this.#live.length
     for (const { socket, controller } of this.#live) {
       controller.abort()
       socket.terminate()
     }
     this.#live = []
+    for (const { socket, controller } of this.#pending) {
+      controller.abort()
+      socket.terminate()
+    }
+    this.#pending = []
     return dropped
   }
 
@@ -1450,6 +1490,11 @@ export class FakeCherry {
       socket.terminate()
     }
     this.#live = []
+    for (const { socket, controller } of this.#pending) {
+      controller.abort()
+      socket.terminate()
+    }
+    this.#pending = []
     const server = this.#server
     this.#server = undefined
     if (server !== undefined) {
@@ -1471,15 +1516,41 @@ export class FakeCherry {
     }
   }
 
+  /** Drop pending entries whose socket is already gone (a client-side hangup). */
+  #healPending(): void {
+    this.#pending = this.#pending.filter(({ socket }) => socket.readyState === WebSocket.OPEN)
+  }
+
   #handleSocket(socket: WebSocket, identity: Uint8Array): void {
     const controller = new AbortController()
     const stream = new RemoteSocketStream(toRemoteSocket(socket), componentLogger.forComponent('fake'), 'inbound')
+    // Registered until the handshake completes, so a drop DURING the handshake
+    // can abort this controller and terminate this socket. Stale entries from
+    // earlier dials are pruned first.
+    this.#healPending()
+    const pending: PendingHandshake = { socket, controller }
+    this.#pending.push(pending)
+    const unpending = (): void => {
+      this.#pending = this.#pending.filter((entry) => entry !== pending)
+    }
+    // The client may hang up before the hold elapses; stop keeping the entry.
+    socket.on('close', unpending)
     // The socket is already counted as accepted; `handshakeDelayMs` holds the
     // handshake itself back so a test can close a connection at a point that is
     // genuinely mid-handshake on any machine speed.
     const begin = async (): Promise<Awaited<ReturnType<typeof acceptSecureChannel>>> => {
       const delay = this.#options.handshakeDelayMs
-      if (delay !== undefined && delay > 0) await new Promise((resolve) => setTimeout(resolve, delay))
+      if (delay !== undefined && delay > 0) {
+        // `dropConnections()` and `stop()` reach a held socket through
+        // `#pending` and abort THIS controller. The hold itself just waits out
+        // its deadline — an aborted hold is caught by the check below, so a
+        // dropped socket is never served even if the timer runs long.
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+      // Aborted during (or before) the hold: abandon the handshake instead of
+      // starting one the caller has already walked away from. Without this the
+      // held socket would complete its handshake after the drop and be counted.
+      if (controller.signal.aborted) throw new Error('handshake abandoned before accept')
       return acceptSecureChannel(stream, {
         identity,
         logger: componentLogger,
@@ -1489,6 +1560,8 @@ export class FakeCherry {
     }
     void begin()
       .then((channel) => {
+        socket.off('close', unpending)
+        unpending()
         this.#connectionCount += 1
         const live: LiveConnection = { socket, channel, controller, hello: false, arrivals: [] }
         this.#live.push(live)
@@ -1497,6 +1570,8 @@ export class FakeCherry {
       .catch(() => {
         // Handshake failed (pin mismatch, bad prelude, abort): the transport
         // already tore the socket down; nothing to record beyond socketCount.
+        socket.off('close', unpending)
+        unpending()
       })
   }
 
@@ -1517,6 +1592,25 @@ export class FakeCherry {
   }
 
   async #dispatch(live: LiveConnection, frame: Record<string, unknown>): Promise<void> {
+    // `#serve` does NOT await this (a slow handler must not stall the read
+    // loop), so any rejection here would escape as an unhandled one and fail
+    // the suite. A hook or handler that throws has answered nothing: the frame
+    // still counts as "arrived, counted, never answered", which is the peer-side
+    // face the request already had. The in-flight slot is released by the
+    // finally below in every case.
+    try {
+      await this.#dispatchFrame(live, frame)
+    } catch (error) {
+      // Diagnostics ONLY: method name + error constructor name — never the
+      // message (it can carry frame text, and the contract suite asserts
+      // nothing of the sort leaks into console output).
+      console.warn(
+        `fakeCherry: dispatch of ${String(frame.method)} rejected with ${error instanceof Error ? error.constructor.name : typeof error}; answered nothing`,
+      )
+    }
+  }
+
+  async #dispatchFrame(live: LiveConnection, frame: Record<string, unknown>): Promise<void> {
     if (typeof frame.method !== 'string' || frame.id === undefined) return
     const method = frame.method
     const params = parseParams(method, frame.params)
@@ -1529,6 +1623,10 @@ export class FakeCherry {
 
     this.#inFlight += 1
     if (this.#inFlight > this.#maxInFlight) this.#maxInFlight = this.#inFlight
+    // A hook that THROWS must still release the slot, so the hook sits INSIDE
+    // the try: the frame arrived and was counted, and the finally below owns
+    // the decrement for every exit path, hooks included. (The throw itself is
+    // absorbed by `#dispatch`, leaving the request unanswered.)
     try {
       // Runs BEFORE the handler answers, so a hook that drops the link leaves
       // the request genuinely IN FLIGHT: arrived, counted, never answered.
@@ -2324,8 +2422,18 @@ export class FakeCherry {
     // Peer-fault face: an empty page that still claims more are coming.
     const dangling = this.#agent().emptyPagesWithDanglingCursor
     if (dangling !== undefined) return { items: [], nextCursor: dangling }
-    // A scripted page replaces the computed one (the fault knobs above and the
-    // failure injections in `#serveRead` still take precedence).
+    // A scripted page replaces the computed one. It sits HERE, ahead of
+    // everything below, so it overrides, in order of precedence:
+    //   1. the failure injections in `#serveRead` (always/once) — those run
+    //      BEFORE `#page` is reached at all,
+    //   2. the dangling-cursor empty page just above,
+    //   3. the cursor-validity check below (`Invalid page cursor`),
+    //   4. the stuck-cursor injection below,
+    //   5. the computed page itself (paging, ceilings, `nextCursor`).
+    // A scripted entry is therefore served VERBATIM, even for a request whose
+    // cursor the real peer would refuse, and it can advertise a stuck cursor of
+    // its own without the `stuckCursor` knob. Only 1 outranks it; 2-5 are all
+    // unreachable for that call.
     const scripted = this.#nextScriptedPage(method)
     if (scripted !== undefined) return scripted(params) as { items: T[]; nextCursor: string | null }
     const start = params['cursor'] === undefined ? 0 : Number(params['cursor'])
