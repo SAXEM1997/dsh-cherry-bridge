@@ -4189,11 +4189,10 @@ const MAX_AGGREGATE_LIMIT = 1e3;
 * messages FIRST. Ten runs' worth of slack is therefore already an order of
 * magnitude more than the walk needs to see the current one.
 *
-* Truncation is SURFACED (`messagesTruncated` + reason + stop-point cursor),
-* never silent: a caller that really wants the deeper history re-waits or
-* reads the session with `cherry_read`, whose own `limit` is the caller's to
-* raise. (The stop-point field names a position, not an input — no tool takes
-* a history-walk cursor.)
+* Truncation is SURFACED (`messagesTruncated` + reason + stop-point token),
+* never silent: a caller that really wants the deeper history re-waits, or
+* hands the stop-point token to `cherry_read` as `messagesResumeCursor` and
+* keeps walking the older history with that tool's own `limit`.
 */
 const TERMINAL_AGGREGATE_MESSAGES = 20;
 /**
@@ -4219,8 +4218,8 @@ const TERMINAL_AGGREGATE_MESSAGES = 20;
 * answers to "how big may one aggregate be?", drifting apart silently, on two
 * faces that already share the reason vocabulary. What differs between them is
 * the MESSAGE CEILING, not the byte cost of one message. The read face's own
-* way to ask for more is progressive: each stop is surfaced, and the older
-* history is re-read at a larger `limit` (the budget still bounds each answer).
+* way to ask for more is the RESUME TOKEN: each stop is surfaced with one, and
+* handing it back walks the older history from there at the same budget.
 *
 * THE NEWEST MESSAGE IS ALWAYS WHOLE. The budget is checked only AFTER a
 * message's projection completes, and the first message is always taken before
@@ -4260,6 +4259,31 @@ const DEFAULT_PARTS_SAFETY_BOUND = 1e4;
 * returning a partial (or empty) result as though it were complete.
 */
 const MAX_AGGREGATE_PAGES = 1e4;
+/** Token prefix for a peer page position; the one `#aggregate` can send back. */
+const RESUME_CURSOR_PREFIX = "cursor:";
+/** Token prefix for "strictly older than this message id". */
+const RESUME_ANCHOR_PREFIX = "after:";
+/**
+* PAGE-COUNT BOUND on the scan an `after:` token performs (issue #26).
+*
+* Derivation. An anchor is only ever emitted for a message this bridge
+* RETURNED, and the largest message walk here collects at most
+* {@link MAX_AGGREGATE_LIMIT} messages: an anchor can therefore be emitted at
+* most 1000 messages deep, whatever the caller asked for. A peer that pages at
+* the protocol's 100 items needs 10 pages to reach that depth; a peer that pages
+* smaller needs more, so the bound must be expressed against the smallest page
+* this walk can ask for. {@link LIST_PAGE_CLAMP} is that floor for every peer
+* whose negotiated `pageItems` is above it (1000 / 16 = 63 pages), and a peer
+* negotiating BELOW the clamp keeps its own smaller size — a 1-item page would
+* need 1000. 500 pages covers any page size the desktop offers in practice,
+* with room for the empty pages a pinned-list walk legally serves and for a
+* session that grew between the two calls (appends at the NEW end do not push
+* an anchor further away; appends at the old end never matter). A scan that
+* has not met its anchor after 500 pages is a session this tool should not
+* chase, and it fails LOUDLY rather than truncating a walk that never really
+* started.
+*/
+const MAX_ANCHOR_SCAN_PAGES = 500;
 /** The device id separator inside every engine cache key (neither id may hold NUL). */
 const CACHE_KEY_SEPARATOR = "\0";
 /**
@@ -4795,8 +4819,24 @@ var CherryToolEngine = class {
 	* three CONSECUTIVE empty pages (a peer that answers empty pages forever), or
 	* {@link MAX_AGGREGATE_PAGES} (the backstop). Each is thrown, never reported
 	* as a completed walk.
+	*
+	* `resume` (issue #26) is where the walk BEGINS, and it is the one optional
+	* trailing parameter: `cursor` seeds the first request with a peer page
+	* position, `anchor` makes the walk start cursorless and DISCARD items until
+	* `idOf` reports the anchor id — the anchor itself is not collected, and
+	* collection starts at the item after it. An `anchor` scan cannot be told to
+	* the peer (no protocol cursor means "after message X"), which is why it is a
+	* local scan. EVERY guard above stays in force during it: a page that does
+	* not hold the anchor is discarded WHOLE and the walk goes on, `emptyPages`
+	* keeps counting the RAW page (a discarded non-empty page is progress, not an
+	* empty-page run), and the stuck/cycle/backstop checks are untouched. Two
+	* failures are specific to a scan, and both are LOUD rather than a short
+	* result that reads complete: the peer's terminal page arriving with the
+	* anchor still unfound (it is gone), and {@link MAX_ANCHOR_SCAN_PAGES} pages
+	* spent without finding it. The ceiling counts COLLECTED items, so a scan's
+	* discarded pages do not spend the caller's `limit`.
 	*/
-	async #aggregate(connection, method, params, extract, limit, safetyBound = MAX_AGGREGATE_LIMIT, maxPerPage = 16) {
+	async #aggregate(connection, method, params, extract, limit, safetyBound = MAX_AGGREGATE_LIMIT, maxPerPage = 16, resume) {
 		const negotiated = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK));
 		const pageItems = Math.min(negotiated, Math.max(1, Math.floor(maxPerPage)));
 		const aggregate = Math.max(1, Math.floor(limit));
@@ -4804,13 +4844,16 @@ var CherryToolEngine = class {
 		const ceiling = Math.min(aggregate, bound);
 		const bindsCallerLimit = aggregate < bound;
 		const items = [];
-		let cursor;
+		let cursor = resume?.kind === "cursor" ? resume.cursor : void 0;
+		let pendingAnchor = resume?.kind === "anchor" ? resume.messageId : void 0;
+		let scannedPages = 0;
 		let emptyPages = 0;
 		let droppedTotal = 0;
 		const seen = /* @__PURE__ */ new Set();
 		for (let pages = 0;; pages += 1) {
 			if (items.length >= ceiling) return this.#truncated(items, bindsCallerLimit ? "limit" : "safety-bound", cursor);
 			if (pages >= MAX_AGGREGATE_PAGES) throw new Error(`${method} did not terminate within ${MAX_AGGREGATE_PAGES} page(s) for ${JSON.stringify(params)}`);
+			if (pendingAnchor !== void 0 && scannedPages >= MAX_ANCHOR_SCAN_PAGES) throw new Error(`${method}: could not find resume anchor message ${JSON.stringify(pendingAnchor)} within ${MAX_ANCHOR_SCAN_PAGES} page(s) for ${JSON.stringify(params)}`);
 			const request = {
 				...params,
 				limit: Math.min(ceiling - items.length, pageItems)
@@ -4820,13 +4863,22 @@ var CherryToolEngine = class {
 			const dropped = extracted.dropped ?? 0;
 			if (dropped > 0 && droppedTotal === 0) console.warn(`[cherry-remote] ${method} dropped ${dropped} non-record items from a page for ${JSON.stringify(params)}; they cannot be projected as entries`);
 			droppedTotal += dropped;
-			for (const item of extracted.items) {
+			let start = 0;
+			if (pendingAnchor !== void 0) {
+				const found = extracted.items.findIndex((item) => resume?.kind === "anchor" && resume.idOf(item) === pendingAnchor);
+				if (found >= 0) {
+					pendingAnchor = void 0;
+					start = found + 1;
+				} else start = extracted.items.length;
+			}
+			for (let index = start; index < extracted.items.length; index += 1) {
 				if (items.length >= ceiling) break;
-				items.push(item);
+				items.push(extracted.items[index]);
 			}
 			const next = extracted.nextCursor;
 			if (next === null || next === void 0) {
 				if (dropped > 0 && extracted.items.length === 0) throw new Error(`${method}: peer returned ${dropped} non-record items that were dropped from its terminal page (nextCursor null) for ${JSON.stringify(params)}; refusing a silently short result`);
+				if (pendingAnchor !== void 0) throw new Error(`${method}: resume anchor message ${JSON.stringify(pendingAnchor)} was not found before the peer's last page for ${JSON.stringify(params)}; the message is probably gone — re-read from the newest message (omit \`messagesResumeCursor\`) instead of resuming from it`);
 				return {
 					items,
 					truncated: false
@@ -4836,6 +4888,7 @@ var CherryToolEngine = class {
 			if (advanced === cursor) throw new Error(`${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`);
 			if (seen.has(advanced)) throw new Error(`${method} cycled back to cursor ${advanced} it already served for ${JSON.stringify(params)}; refusing to spin on a peer whose pagination loops`);
 			seen.add(advanced);
+			if (pendingAnchor !== void 0) scannedPages += 1;
 			emptyPages = extracted.items.length === 0 ? emptyPages + 1 : 0;
 			if (emptyPages >= MAX_CONSECUTIVE_EMPTY_PAGES) throw new Error(`${method} answered ${emptyPages} consecutive empty page(s) (last nextCursor ${advanced}) for ${JSON.stringify(params)}; refusing to spin on a peer that makes no progress`);
 			cursor = advanced;
@@ -5050,7 +5103,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the older messages left out (it only costs more round trips and stops at the same budget), and this tool offers no other way to reach them: it always starts at the newest message and takes no cursor, so they are viewable only on the desktop (or through a history-cursor read parameter, which is tracked as #26 and not provided today). A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: every truncated answer carries `messagesResumeCursor`, and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5066,20 +5119,25 @@ var CherryToolEngine = class {
 						type: "integer",
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of messages to return in total across pages (default 100). Distinct from the output budget: the answer may stop earlier with `truncationReason: \"aggregate-bytes\"`, which a larger `limit` does not extend."
+						description: "Maximum number of messages to return in total across pages (default 100). Distinct from the output budget: the answer may stop earlier with `truncationReason: \"aggregate-bytes\"`, which a larger `limit` does not extend — the resume token is how older messages are reached."
+					},
+					messagesResumeCursor: {
+						type: "string",
+						description: "A `messagesResumeCursor` a previous truncated read (this tool, or cherry_send/cherry_wait) returned: `\"cursor:<peer position>\"` or `\"after:<messageId>\"`. Continues the walk at that stop point instead of at the newest message; `limit` bounds what comes back from there. Omit it to read from the newest message."
 					}
 				},
 				required: ["device", "sessionId"],
 				additionalProperties: false
 			},
 			execute: async (args) => {
+				const resume = parseMessageResume(args["messagesResumeCursor"]);
 				const resolved = this.#linkOr(requiredString(args, "device"));
 				if (resolved.link === void 0) return resolved.verdict;
 				const { connection, record } = resolved.link;
 				const sessionId = requiredString(args, "sessionId");
 				const limit = aggregateLimit(args["limit"]);
 				await this.#ensureSubscription(record.deviceId, sessionId);
-				return this.#readRound(connection, sessionId, limit, true);
+				return this.#readRound(connection, sessionId, limit, true, resume);
 			}
 		});
 	}
@@ -5089,15 +5147,18 @@ var CherryToolEngine = class {
 	* `retryOnExpiry` implements the §6 REVISION_EXPIRED rule — a stale revision
 	* re-pulls the baseline (`sessions.get` → `messages.list`) and retries the
 	* WHOLE round ONCE. A second expiry is surfaced unchanged, so a peer whose
-	* revisions never settle cannot loop the caller.
+	* revisions never settle cannot loop the caller. `resume` travels with the
+	* retry: the retry re-pulls the baseline because the history MOVED under the
+	* walk, and the caller asked for the history after a position, not for one
+	* particular attempt at it.
 	*/
-	async #readRound(connection, sessionId, limit, retryOnExpiry) {
+	async #readRound(connection, sessionId, limit, retryOnExpiry, resume) {
 		try {
-			return await this.#readOnce(connection, sessionId, limit);
+			return await this.#readOnce(connection, sessionId, limit, resume);
 		} catch (error) {
 			if (retryOnExpiry && failureReason(error) === "REVISION_EXPIRED") {
 				console.warn(`[cherry-remote] session ${sessionId} history revision expired; re-pulling the baseline and retrying once`);
-				return this.#readRound(connection, sessionId, limit, false);
+				return this.#readRound(connection, sessionId, limit, false, resume);
 			}
 			throw error;
 		}
@@ -5127,8 +5188,14 @@ var CherryToolEngine = class {
 	* aggregate's own verdict is only inherited when the byte arm did not fire —
 	* a walk the budget cut is not the page aggregate's `'limit'`/`'safety-bound'`
 	* stop, even when the page aggregate also ran out.
+	*
+	* `resume` is where this walk starts (issue #26; absent = the newest
+	* message). It is handed to `#aggregate` as the walk's own starting point, so
+	* `limit` bounds what comes back FROM there, and the stop point is derived
+	* from where THIS walk ended — never from the caller's token. That is what
+	* makes repeated resumes a chain rather than a loop.
 	*/
-	async #readOnce(connection, sessionId, limit) {
+	async #readOnce(connection, sessionId, limit, resume) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
 		const historyRevision = session["historyRevision"];
@@ -5139,7 +5206,14 @@ var CherryToolEngine = class {
 		}, (result) => ({
 			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), limit);
+		}), limit, MAX_AGGREGATE_LIMIT, 16, resume === void 0 ? void 0 : resume.kind === "cursor" ? {
+			kind: "cursor",
+			cursor: resume.cursor
+		} : {
+			kind: "anchor",
+			messageId: resume.messageId,
+			idOf: (raw) => optionalString(raw["messageId"])
+		});
 		const messages = [];
 		let projectedBytes = 0;
 		let outOfBudget = false;
@@ -5155,13 +5229,13 @@ var CherryToolEngine = class {
 		const exhausted = outOfBudget && (messages.length < page.items.length || page.truncated);
 		const truncated = exhausted || page.truncated;
 		const truncationReason = exhausted ? "aggregate-bytes" : page.truncationReason;
-		const resumeCursor = exhausted && page.items.length > messages.length ? String(messages.length) : page.nextCursor;
+		const resumeToken = messageResumeToken(page, messages.length, messages[messages.length - 1]?.messageId);
 		return {
 			session,
 			messages,
 			truncated,
 			...truncationReason === void 0 ? {} : { truncationReason },
-			...truncated && resumeCursor !== void 0 ? { messagesResumeCursor: resumeCursor } : {}
+			...truncated && resumeToken !== void 0 ? { messagesResumeCursor: resumeToken } : {}
 		};
 	}
 	/** One message: list ALL its parts under the message's OWN revision, then aggregate. */
@@ -5514,7 +5588,7 @@ var CherryToolEngine = class {
 	#sendTool() {
 		return defineCherryTool({
 			name: "cherry_send",
-			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and a stop-point cursor marking where the unread history begins (re-wait or use cherry_read to see more; the field is not an input). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`.",
+			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and a `messagesResumeCursor` token marking where the unread history begins: hand it to `cherry_read` as `messagesResumeCursor` to read the older messages (re-waiting re-reads the newest window). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6755,13 +6829,15 @@ var CherryToolEngine = class {
 	}
 	/**
 	* The timeout result: NOT a failure. Partial content read so far + a
-	* stop-point cursor marking where the unread history begins.
+	* `messagesResumeCursor` token marking where the unread history begins.
 	*
 	* The spec's own sentence (§3.6, 2026-10-09 design: 「超时不是失败：返回已收到
-	* 的部分内容 + 当前游标，agent 可续查」) is a HISTORICAL statement of that
-	* contract in cursor terms: the "游标" it names is the event cursor (`cursor`,
-	* still returned) plus this stop point, and no tool accepts a history-walk
-	* cursor to "续查" through — "see more" means re-waiting or `cherry_read`.
+	* 的部分内容 + 当前游标，agent 可续查」) is a statement of that contract in
+	* cursor terms, and BOTH halves are now answerable: the event cursor
+	* (`cursor`, still returned) resumes the run's EVENT stream through
+	* `cherry_events`, and `messagesResumeCursor` resumes the HISTORY through
+	* `cherry_read`'s `messagesResumeCursor` argument (issue #26) — so "续查"
+	* reaches the older messages instead of re-reading the newest window.
 	*
 	* Unlike the terminal aggregate the text here is NOT run-scoped: the run has
 	* not settled, so there is no terminal message to cut at, and the whole point
@@ -6924,17 +7000,23 @@ var CherryToolEngine = class {
 	* `'aggregate-bytes'` is attributed here), and the three callers (terminal,
 	* timeout, idle) each surface it.
 	*
-	* The STOP-POINT CURSOR IS OMITTED WHEN IT WOULD MISDESCRIBE THE STOP. The
-	* peer's `nextCursor` points past the entire page it came with, so a byte
-	* stop in the MIDDLE of a page would report a position that still holds
-	* messages this walk trimmed — newer than the cursor, older than the last one
-	* returned. No tool takes a history-walk cursor, so it can never be
-	* "chained": the field only marks where the unread history begins, and
-	* naming a position the result itself contradicts is worse than naming none.
-	* Those trimmed messages are reachable by RE-READING (another wait, or
-	* `cherry_read`). The cursor is therefore attached only when the WHOLE page
-	* was returned (nothing lies between it and what this result carries) — see
-	* {@link CherryMessageWalkVerdict.messagesResumeCursor}.
+	* THE STOP POINT IS THE SAME TOKEN `cherry_read` EMITS AND ACCEPTS (issue
+	* #26), from the same helper ({@link messageResumeToken}), so the two message
+	* faces can never word a stop differently:
+	*
+	*  - the WHOLE collected window was returned → `cursor:<peer position>`, the
+	*    position the walk was handed when it stopped;
+	*  - the stop happened INSIDE the window (a byte stop that trimmed collected
+	*    messages) → `after:<last returned id>`. The peer's position sits past
+	*    those trimmed messages and would skip them, and no peer cursor can be
+	*    synthesised for the boundary (`AgentMessage` has no `createdAt`), so the
+	*    anchor is the honest stop. It is feedable to `cherry_read` as
+	*    `messagesResumeCursor`: the read scans from the newest end to the anchor
+	*    and continues strictly after it.
+	*
+	* The token is absent only when there is nothing older to point at (the walk
+	* reached the peer's last page having returned everything it collected).
+	* See {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*/
 	async #readTerminalMessages(connection, sessionId, session) {
 		const historyRevision = optionalString(session["historyRevision"]);
@@ -6959,17 +7041,17 @@ var CherryToolEngine = class {
 			}
 		}
 		if (outOfBudget && (messages.length < page.items.length || page.truncated)) {
-			const verdict = {
+			const resumeToken = messageResumeToken(page, messages.length, messages[messages.length - 1]?.messageId);
+			return {
 				messages,
 				messagesTruncated: true,
-				messagesTruncationReason: "aggregate-bytes"
+				messagesTruncationReason: "aggregate-bytes",
+				...resumeToken === void 0 ? {} : { messagesResumeCursor: resumeToken }
 			};
-			if (page.nextCursor !== void 0 && messages.length === page.items.length) verdict.messagesResumeCursor = page.nextCursor;
-			return verdict;
 		}
 		return {
 			messages,
-			...messageWalkVerdict(page)
+			...messageWalkVerdict(page, messages.length, messages[messages.length - 1]?.messageId)
 		};
 	}
 	async #ensureSubscription(deviceId, sessionId) {
@@ -7128,22 +7210,92 @@ function parseQuestionInput(input) {
 	return body["questions"].map((question) => isRecord(question) ? optionalString(question["question"]) : void 0).filter((question) => question !== void 0);
 }
 /**
+* The full stop-point TOKEN a message walk hands out (issue #26), or
+* `undefined` when the walk has no older history left to name.
+*
+* ONE helper, shared by BOTH message-walk faces (`#readOnce` and
+* `#readTerminalMessages` via {@link messageWalkVerdict}), because the marker
+* is now also the resume INPUT: two independently derived tokens would give the
+* two faces two dialects, and a caller that fed one into `cherry_read` would be
+* refused by a token the bridge itself had just printed.
+*
+* `returned < page.items.length` says the walk stopped INSIDE the window it
+* collected: messages it already holds were trimmed, so the page's own
+* `nextCursor` — which sits past ALL of them — would skip them on the way back.
+* The token is then `after:<lastReturnedId>`, "strictly older than this one".
+* With no id to anchor (a peer item that carried none) NO token is invented:
+* a wrong anchor is worse than no anchor, and `truncated` still says the walk
+* was cut. Otherwise the whole collected window was consumed, and the peer's
+* page position is exactly where the unread history begins (`cursor:<pos>`).
+*/
+function messageResumeToken(page, returned, lastReturnedId) {
+	if (returned < page.items.length) return optionalString(lastReturnedId) === void 0 ? void 0 : `${RESUME_ANCHOR_PREFIX}${lastReturnedId}`;
+	return page.nextCursor === void 0 ? void 0 : `${RESUME_CURSOR_PREFIX}${page.nextCursor}`;
+}
+/**
 * The message-walk verdict, projected off an aggregate page.
 *
 * Extracted so the three non-`cherry_read` walkers ({@link
 * CherryToolEngine.#readTerminalMessages}) report truncation in EXACTLY the
 * shape `cherry_read` already does, from one place: a second, independently
 * worded projection is how the terminal face and the read face drift apart
-* again. Absent fields (rather than `false`/`undefined` keys) keep a complete
-* walk's result shape unchanged for existing callers.
+* again. `returned`/`lastReturnedId` describe how much of this page the caller
+* actually took, because the stop point depends on it
+* ({@link messageResumeToken}). Absent fields (rather than `false`/`undefined`
+* keys) keep a complete walk's result shape unchanged for existing callers.
 */
-function messageWalkVerdict(page) {
+function messageWalkVerdict(page, returned, lastReturnedId) {
 	if (!page.truncated) return {};
+	const resumeToken = messageResumeToken(page, returned, lastReturnedId);
 	return {
 		messagesTruncated: true,
 		...page.truncationReason === void 0 ? {} : { messagesTruncationReason: page.truncationReason },
-		...page.nextCursor === void 0 ? {} : { messagesResumeCursor: page.nextCursor }
+		...resumeToken === void 0 ? {} : { messagesResumeCursor: resumeToken }
 	};
+}
+/**
+* Parse a caller's `messagesResumeCursor` into a {@link MessageResume}, or
+* refuse it HERE (issue #26).
+*
+* The peer's cursor format is NEVER parsed or validated: the real desktop's is
+* an opaque keyset token (`<createdAt-ms>:<messageId>`), the loopback peer's is
+* a numeric offset, and a future desktop may change it. Every token this bridge
+* EMITS is therefore self-describing — it carries one of OUR two prefixes — and
+* every token it ACCEPTS must carry one of them too. That is the only property
+* that can be checked without knowing the peer's format, and it is the property
+* that matters: the real desktop SILENTLY falls back to the newest page for a
+* malformed cursor, so a foreign string forwarded to it would come back as the
+* newest page presented as "continued history". A refusal here costs no dial
+* and no page, and it names both accepted forms.
+*
+* `undefined`/`null` means "from the newest message", which is the ordinary
+* read. An empty remainder (`'cursor:'`, `'after:'`) is refused like any other
+* foreign token: an empty anchor could never match a message.
+*/
+function parseMessageResume(value) {
+	if (value === void 0 || value === null) return void 0;
+	const refuse = () => {
+		throw new Error(`cherry_read: messagesResumeCursor must be a token this tool emitted ("cursor:<peer position>" or "after:<messageId>"), got ${JSON.stringify(value)}; omit the argument to read from the newest message.`);
+	};
+	if (typeof value !== "string") refuse();
+	const token = value;
+	if (token.startsWith(RESUME_CURSOR_PREFIX)) {
+		const cursor = token.slice(7);
+		if (cursor === "") refuse();
+		return {
+			kind: "cursor",
+			cursor
+		};
+	}
+	if (token.startsWith(RESUME_ANCHOR_PREFIX)) {
+		const messageId = token.slice(6);
+		if (messageId === "") refuse();
+		return {
+			kind: "anchor",
+			messageId
+		};
+	}
+	return refuse();
 }
 /**
 * The assistant text a terminal aggregate reports: the awaited RUN's assistant

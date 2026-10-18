@@ -230,27 +230,73 @@ These are load-bearing; the code comments are the long version.
 - **Ordering of guards.** The stuck-cursor check runs **before** the empty-page
   tolerance: tolerating empty pages must not blunt the no-progress guard.
 - A truncated walk is **always surfaced** (a `truncationReason` plus a
-  stop-point), never a silent short result. Hitting a safety bound fails or
-  reports; it never returns a partial as if it were complete.
+  stop-point token), never a silent short result. Hitting a safety bound fails
+  or reports; it never returns a partial as if it were complete.
+- A **resume** (an `after:` anchor scan) obeys every guard above unchanged.
+  Its two failures are its own: an anchor that is not on any page up to the
+  peer's last one, and a scan longer than `MAX_ANCHOR_SCAN_PAGES`. Both throw.
 
 ### Stop-point cursors (the teaching case)
 
-`messagesResumeCursor` marks a **position**, not an input. No tool takes a
-history-walk cursor; the walk always starts at the newest message. There are two
-`truncationReason` values and they mean different things:
+`messagesResumeCursor` is a stop point **and** an input: `cherry_read` takes it
+back as its own `messagesResumeCursor` argument (#26). The marker a walk emits
+is the token a walk accepts — **round-trip symmetry** is the invariant, and both
+message-walk faces (the read face and the terminal/timeout/idle aggregate)
+derive it from the SAME helper, `messageResumeToken`, so they cannot drift into
+two dialects.
+
+Two `truncationReason` values mean different things:
 
 - **`limit`** — the caller's own ceiling was reached with more available. Fix:
-  raise `limit`.
+  raise `limit`, or resume with the token and keep walking in another answer.
 - **`aggregate-bytes`** — the answer reached its **output budget** with the walk
   still having messages. This is **independent of `limit`**: raising `limit` only
-  costs more round trips and stops at the same budget. And because the walk has
-  no cursor input, **no argument of the tool reaches the older messages left
-  out** — they are viewable on the desktop, or through the history-cursor read
-  parameter that a future release may add (tracked as #26; not provided today).
+  costs more round trips and stops at the same budget. The **resume token** is
+  how the older messages are reached; from a resume point `limit` bounds how
+  many messages one answer carries, so a long history is walked in successive
+  answers, each carrying the next stop point.
 
 Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
 `limit`" was a field defect: a caller raised `limit` repeatedly, paid for every
-round trip, and still never saw the cut-off history.
+round trip, and still never saw the cut-off history. Leaving the marker with no
+consumer at all was the second half of that defect: the loss was stated and
+nothing could act on it.
+
+**Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
+
+- `cursor:<peerPosition>` — the walk consumed its whole collected window, so the
+  peer's page position is exactly where the unread history begins. The resume
+  read sends it as the **first** request's `cursor`.
+- `after:<messageId>` — the walk stopped **inside** its collected window (a byte
+  stop), so the peer's position sits past messages the walk already collected
+  and would skip them. `AgentMessage` carries no `createdAt`, so no peer cursor
+  can be synthesised for that boundary either. The anchor is the **last returned
+  message**; the resume read starts cursorless, scans from the newest end until
+  it has met the anchor (discarding pages whole), and returns what follows it.
+
+**The peer's cursor format is never parsed or validated.** The real desktop's is
+an opaque keyset token (`<createdAt-ms>:<messageId>`), the loopback peer's is a
+numeric offset, and a future desktop may change it. Every token we emit is
+therefore self-describing, and every token we accept must carry one of our two
+prefixes; anything else is refused **before any device work**. This is not
+pedantry: a malformed cursor handed to the real desktop is **silently swallowed**
+(it falls back to the newest page), so a forwarded foreign string would come
+back as the newest page presented as "continued history". A refusal that costs
+no dial and names both accepted forms is the only honest answer.
+
+**An anchor the walk cannot find is loud.** If the peer's terminal page arrives
+with the anchor still unfound, the read throws naming the message id (it is
+probably gone: deleted, or the session replaced), rather than returning an empty
+page that reads as "no older history" — the opposite of what happened. A scan
+past `MAX_ANCHOR_SCAN_PAGES` (500 pages) throws for the same reason: a session
+that deep is not one this tool should chase.
+
+**Every existing guard stays in force during a scan** — the stuck-cursor check,
+the cursor-cycle `seen` set, the consecutive-empty-page run and
+`MAX_AGGREGATE_PAGES`. The empty-page run counts the **raw** page the peer
+served, never what the scan kept: a non-empty page nobody wanted is still
+progress. The collected-item ceiling counts **returned** items, so a scan's
+discarded pages do not spend the caller's `limit`.
 
 ### `AGGREGATE_BYTES`: one budget, two faces
 

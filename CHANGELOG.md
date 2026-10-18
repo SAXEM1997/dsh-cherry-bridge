@@ -5,6 +5,37 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## [Unreleased]
+
+### Added
+
+- `feat(tools)`: `cherry_read` takes an optional `messagesResumeCursor`, the stop
+  point a truncated read returned — the older messages cut by an
+  `aggregate-bytes` (or `limit`) stop are now reachable through the tool instead
+  of only on the desktop (#26). From a resume point, `limit` bounds how many
+  messages one answer carries, so a long history is walked in successive answers.
+  The token from the terminal/timeout/idle aggregate (`cherry_send(wait: true)` /
+  `cherry_wait`) is accepted by `cherry_read` too.
+- Resume tokens whose anchor message is no longer in the history fail with an
+  error naming the message id, and an anchor scan is bounded by
+  `MAX_ANCHOR_SCAN_PAGES` (500 pages) — both loud, never an empty page presented
+  as "no older history".
+
+### Changed
+
+- The `messagesResumeCursor` token SHAPE is now self-describing:
+  `cursor:<peer position>` (the whole collected window was consumed) or
+  `after:<messageId>` (the walk stopped inside that window, where the peer's
+  page position would skip trimmed messages). The previous raw peer position
+  (`"20"`) is no longer emitted, and a token not carrying one of these two
+  prefixes — including a raw peer position — is refused locally before any
+  device work. The peer's cursor format is never parsed or validated, because a
+  malformed cursor is silently swallowed by the real desktop (it falls back to
+  the newest page).
+- The terminal/timeout/idle aggregate's mid-window byte stop now carries
+  `messagesResumeCursor: "after:<lastReturnedId>"` instead of nothing, from the
+  same helper the read face uses.
+
 ## v0.1.4 (2026-10-18)
 
 The 2026-10-18 UltraReview batch: eleven fixes and hardening merged after the

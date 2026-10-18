@@ -97,7 +97,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。 |
-| `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算，而本工具**没有任何参数**能取到被它挡下的更旧消息（走查恒从最新端起步、无游标入参）：只能在桌面端查看。`messagesResumeCursor` 只是**停点指示**，不是入参。 |
+| `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算。**被挡下的更旧消息用 `messagesResumeCursor` 续读**：把本次返回的 `messagesResumeCursor` 原样传给下一次调用的 `messagesResumeCursor` 参数即可从停点继续（`limit` 此时约束的是**从停点起**本次最多返回多少条），长历史分几次回答读完。两种令牌：`cursor:<peer position>`（整窗读完后的 peer 分页位置）与 `after:<messageId>`（停在窗内，续读从最新端扫到该消息、返回它更旧的那些）。不是本工具发出的令牌会被**本地拒绝**（不转发给桌面端——桌面端会静默回退到最新页）；`after:` 锚点在历史里找不到则**报错**，不会返回空结果。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的）。 |
@@ -122,8 +122,8 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 - 读方法在重连后**单次**重放；**命令永不重放**——写操作丢失应答时，携**原 `commandId`**
   重试即可，桌面端的命令账本会回放原回执。
 - 单个外置内容上限 32 MiB，超过的 part 标 `unavailable`，不回无法校验的部分内容。
-- 历史走查被截断时一定说明（`truncationReason`，`limit` 与 `aggregate-bytes` 两种含义不同，见上）；
-  某条消息自身 parts 没读全时带 `incomplete: true`。
+- 历史走查被截断时一定说明（`truncationReason`，`limit` 与 `aggregate-bytes` 两种含义不同，见上），
+  并给出 `messagesResumeCursor` 续读令牌；某条消息自身 parts 没读全时带 `incomplete: true`。
 - **已知限制**：`cherry_respond` 让 DSH agent 可代替用户批准 Cherry 端审批卡（MVP 不加拦截层，
   信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；仅 `ws://`（Noise 加密），不做 TLS 直连。
 
