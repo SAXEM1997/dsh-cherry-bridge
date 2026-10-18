@@ -16,6 +16,7 @@ import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '
 import { ToolScopeState } from '../../src/toolScope.js'
 import { pairWithPayload } from '../../src/pairing.js'
 import {
+  DEFAULT_CONTENT_READ_BUDGET_PER_SECOND,
   DEFAULT_PER_SESSION_CACHE_BYTES,
   DEFAULT_RATE_BUDGET_PER_SECOND,
   resolveBridgeConfig,
@@ -1661,6 +1662,15 @@ describe('③ release configuration', () => {
     // a profile omits a key.
     expect(DEFAULT_PER_SESSION_CACHE_BYTES).toBe(2097152)
     expect(DEFAULT_RATE_BUDGET_PER_SECOND).toBe(32)
+    // The CONTENT-READ tier (PR-F) is NOT a patch key — it has no row above and
+    // no config surface — but it is exported from this same public entry
+    // because it is the other half of the pacing policy: the connection derives
+    // it from `rateBudgetPerSecond` at the 8 : 1 ratio, and the pin makes a
+    // change to either number a deliberate contract edit rather than drift.
+    // 256 is half the desktop's 512/s content-read line
+    // (`RemoteAccessService.ts:223-225`).
+    expect(DEFAULT_CONTENT_READ_BUDGET_PER_SECOND).toBe(256)
+    expect(DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND).toBe(8)
     expect(resolveBridgeConfig({})).toEqual({
       perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
       rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,

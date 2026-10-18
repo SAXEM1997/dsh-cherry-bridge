@@ -6,7 +6,11 @@ import { remoteConnectPath } from '@cherrystudio/remote-protocol'
 import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { digestIdentity } from './diagnostics.js'
-import { DEFAULT_RATE_BUDGET_PER_SECOND, DEFAULT_TRANSPORT_RETRY_WAIT_MS } from './defaults.js'
+import {
+  DEFAULT_CONTENT_READ_BUDGET_PER_SECOND,
+  DEFAULT_RATE_BUDGET_PER_SECOND,
+  DEFAULT_TRANSPORT_RETRY_WAIT_MS,
+} from './defaults.js'
 import { urlHost } from './urlHost.js'
 import type { DeviceRecord } from './deviceStore.js'
 
@@ -38,10 +42,17 @@ export interface DeviceConnectionOptions {
   /** The paired device record; `hosts`/`port` are re-read on every attempt. */
   record: DeviceRecord
   /**
-   * Second-level smoothed request budget for business RPCs. Default 32,
-   * injected by the assembly from plugin config (Task 10 wires the cordis
-   * default key). Per-connection only: the peer's rate window is per-socket,
-   * so a per-device budget satisfies it with no cross-device scheduling.
+   * Second-level smoothed request budget for business RPCs on the SHARED tier
+   * — every business RPC except `agent.content.read`, which has its own tier
+   * (`DEFAULT_CONTENT_READ_BUDGET_PER_SECOND`). Default 32, injected by the
+   * assembly from plugin config (Task 10 wires the cordis default key).
+   * Per-connection only: the peer's rate window is per-socket, so a per-device
+   * budget satisfies it with no cross-device scheduling.
+   *
+   * The content tier DERIVES from this value at the production ratio
+   * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND),
+   * so one injected budget scales both tiers and the two stay in the same
+   * proportion the peer's allowances have.
    */
   rateBudgetPerSecond?: number
   /** First reconnect backoff (default 1s); doubles per attempt. */
@@ -207,32 +218,107 @@ const RETRYABLE_READ_METHODS: ReadonlySet<string> = new Set([
  * on the client's admission times OR the peer's (compressed) arrival times —
  * observes at most floor(window/minGap)+1 ≤ budget requests. This is rate
  * shaping ONLY — the in-flight concurrency cap belongs to JsonRpcClient.
+ *
+ * One instance is one TIER (see {@link RateTier}); a connection holds one per
+ * tier, so a burst on one tier neither spends nor delays another's admissions.
  */
 class SecondWindowRateLimiter {
   readonly #admitted: number[] = []
   readonly #minGapMs: number
 
   constructor(readonly budgetPerSecond: number) {
+    // The quotient is CEILED, the conservative direction: the gap is at least
+    // the exact window/budget spacing, so the window can never see MORE than
+    // `budgetPerSecond` admissions. The cost is that the ACHIEVED rate sits
+    // below the nominal one whenever the gap does not divide 1,150ms evenly —
+    // which is both configured tiers: 32/s → 36ms → ≈27.8/s, and 256/s → 5ms
+    // → exactly 200/s (the nominal 4.49ms would need a sub-millisecond timer).
+    // So the content tier trades ~22% of its NOMINAL rate for a gap the timer
+    // can honour; the direction is conservative and never exceeds the budget.
     this.#minGapMs = Math.ceil((RATE_WINDOW_MS + RATE_WINDOW_MARGIN_MS) / Math.max(budgetPerSecond, 1))
   }
 
   async acquire(): Promise<void> {
-    for (;;) {
-      const now = Date.now()
-      // Evict entries too old to matter for pacing state.
-      while (
-        this.#admitted.length > 0 &&
-        now - this.#admitted[0]! >= RATE_WINDOW_MS + RATE_WINDOW_MARGIN_MS
-      ) {
-        this.#admitted.shift()
+    // Paced through this tier's own FIFO, so two callers that wake together
+    // cannot both claim the one admission that just became due: every waiter is
+    // released strictly after the one before it reached the head.
+    let release!: () => void
+    const ahead = this.#queue
+    this.#queue = ahead.then(() => new Promise<void>((resolve) => (release = resolve)))
+    await ahead
+    try {
+      for (;;) {
+        const now = Date.now()
+        // Evict entries too old to matter for pacing state.
+        while (
+          this.#admitted.length > 0 &&
+          now - this.#admitted[0]! >= RATE_WINDOW_MS + RATE_WINDOW_MARGIN_MS
+        ) {
+          this.#admitted.shift()
+        }
+        const last = this.#admitted[this.#admitted.length - 1]
+        if (last === undefined || now - last >= this.#minGapMs) {
+          this.#admitted.push(now)
+          return
+        }
+        await new Promise((resolve) => setTimeout(resolve, this.#minGapMs - (now - last) + 1))
       }
-      const last = this.#admitted[this.#admitted.length - 1]
-      if (last === undefined || now - last >= this.#minGapMs) {
-        this.#admitted.push(now)
-        return
-      }
-      await new Promise((resolve) => setTimeout(resolve, this.#minGapMs - (now - last) + 1))
+    } finally {
+      release()
     }
+  }
+
+  /** This tier's wait queue (see `acquire`). */
+  #queue: Promise<void> = Promise.resolve()
+}
+
+/**
+ * The two independent admission tiers every business RPC is paced against.
+ *
+ *  - `shared` — every business RPC that is not a content read
+ *    ({@link DEFAULT_RATE_BUDGET_PER_SECOND}, injected through plugin config).
+ *  - `content` — `agent.content.read` alone
+ *    ({@link DEFAULT_CONTENT_READ_BUDGET_PER_SECOND}).
+ *
+ * WHY TWO TIERS: the desktop paces the two against different allowances (512/s
+ * for content reads, 64/s for everything else) and the official client follows
+ * suit (480/s and 40/s). Sharing one 32/s tier spent content-read throughput on
+ * unrelated RPCs and vice versa: a multi-slice walk of an externalized part —
+ * every part over 4,096 characters on Cherry >= 2.1.6 — queued behind list
+ * calls at ~36ms per slice.
+ */
+type RateTier = 'shared' | 'content'
+
+/**
+ * Which tier paces `method`. The rule is EXACT-MATCH: `agent.content.read` is
+ * the only method on the content tier, and every other method — a command, a
+ * list read, a different `agent.*.read` — keeps the shared tier. A prefix or
+ * suffix match would silently widen the 256/s tier to methods whose peer-side
+ * allowance is the 64/s one, which is a session-killing mistake (close 1011),
+ * so a new content-plane method must be named here deliberately.
+ */
+function classifyRateTier(method: string): RateTier {
+  return method === 'agent.content.read' ? 'content' : 'shared'
+}
+
+/**
+ * The connection's two pacing tiers: an admission is taken from the tier its
+ * `method` classifies to (see {@link classifyRateTier}), never from a shared
+ * pool, so neither tier's burst spends or delays the other's.
+ */
+class TieredRateLimiter {
+  readonly #tiers: Readonly<Record<RateTier, SecondWindowRateLimiter>>
+
+  constructor(sharedBudgetPerSecond: number, contentBudgetPerSecond: number) {
+    this.#tiers = {
+      shared: new SecondWindowRateLimiter(sharedBudgetPerSecond),
+      content: new SecondWindowRateLimiter(contentBudgetPerSecond),
+    }
+  }
+
+  /** Waits for one admission on the tier `method` classifies to. */
+  acquire(method: string): Promise<void> {
+    return this.#tiers[classifyRateTier(method)].acquire()
   }
 }
 
@@ -388,6 +474,20 @@ function businessWindowFor(reportedInFlightRequests: number): number {
   return Math.max(1, Math.min(BUSINESS_MAX_IN_FLIGHT, Math.floor(reportedInFlightRequests / 2)))
 }
 
+/**
+ * The content-read tier's budget for a given SHARED budget.
+ *
+ * ONE injected knob, two tiers: an operator who lowers `rateBudgetPerSecond`
+ * lowers both, and the content tier keeps the production proportion between
+ * them rather than staying pinned at 256 while the shared tier shrinks. An
+ * absent injection is the production default (which yields exactly
+ * `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND`).
+ */
+function contentBudgetFor(sharedBudgetPerSecond: number | undefined): number {
+  const ratio = DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND
+  return Math.ceil((sharedBudgetPerSecond ?? DEFAULT_RATE_BUDGET_PER_SECOND) * ratio)
+}
+
 function defer<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
   let resolve!: (value: T) => void
   let reject!: (error: Error) => void
@@ -433,7 +533,7 @@ type Timer = ReturnType<typeof setTimeout>
 export class DeviceConnection {
   readonly record: DeviceRecord
   readonly #identity: Uint8Array
-  readonly #limiter: SecondWindowRateLimiter
+  readonly #limiter: TieredRateLimiter
   readonly #backoffInitialMs: number
   readonly #backoffMaxMs: number
   readonly #refreshGraceMs: number
@@ -488,7 +588,10 @@ export class DeviceConnection {
   constructor(opts: DeviceConnectionOptions) {
     this.record = opts.record
     this.#identity = opts.identity
-    this.#limiter = new SecondWindowRateLimiter(opts.rateBudgetPerSecond ?? DEFAULT_RATE_BUDGET_PER_SECOND)
+    this.#limiter = new TieredRateLimiter(
+      opts.rateBudgetPerSecond ?? DEFAULT_RATE_BUDGET_PER_SECOND,
+      contentBudgetFor(opts.rateBudgetPerSecond),
+    )
     this.#backoffInitialMs = opts.backoffInitialMs ?? DEFAULT_BACKOFF_INITIAL_MS
     this.#backoffMaxMs = opts.backoffMaxMs ?? DEFAULT_BACKOFF_MAX_MS
     this.#refreshGraceMs = opts.refreshGraceMs ?? DEFAULT_REFRESH_GRACE_MS
@@ -1157,7 +1260,7 @@ export class DeviceConnection {
     // surfaces a raw `JSON-RPC client disposed` instead of the §6
     // `{device, state}` face this method promises. Re-judge the state AFTER the
     // wait; the checks below are ordered so the structured error always wins.
-    await this.#limiter.acquire()
+    await this.#limiter.acquire(method)
     const link = this.#link
     if (this.#state !== 'connected' || link === undefined) {
       console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
@@ -1190,7 +1293,7 @@ export class DeviceConnection {
       // close (the rate-limit terminator) — the same kill that took the
       // original link. The admission this call paid above bought the attempt
       // that died; arrivals, not logical calls, are what the peer paces.
-      await this.#limiter.acquire()
+      await this.#limiter.acquire(method)
       // The pacing wait can outlast the link it resolved on (the primary path
       // re-judges after its own acquire for the same reason): a teardown during
       // it disposes the target client, and firing into a disposed client would

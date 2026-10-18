@@ -730,6 +730,262 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(connection.state).toBe('connected')
   }, 15_000)
 
+  // -------------------------------------------------------------------------
+  // PR-F: TIERED rate budget (issue #30)
+  //
+  // The desktop paces `agent.content.read` against its own 512/s allowance and
+  // every other business RPC against 64/s, but this client paced them together
+  // at 32/s — which made a multi-slice externalized part walk at ~1/32 of the
+  // rate the peer would have allowed, and turned long replies (the common case
+  // on Cherry >= 2.1.6, where every part over 4,096 characters is a `{ref}`)
+  // into minutes of pacing. The two tiers are now INDEPENDENT counters.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The CONTENT tier's share of the injected budget.
+   *
+   * The connection's constructor takes ONE budget (the shared tier's), and the
+   * two tiers derive from it at the production ratio — `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND`
+   * over `DEFAULT_RATE_BUDGET_PER_SECOND` = 256/32 = 8. A test that injects a
+   * small SHARED budget therefore gets a content tier `8 ×` it, which scales the
+   * tier's own saturation down to something a fast suite can observe.
+   */
+  const CONTENT_TIER_MULTIPLE = 8
+
+  /** A well-formed `agent.content.read` slice reply (the fake's own shape). */
+  const sliceReply = (contentId: string, revision: string, eof = false): Record<string, unknown> => ({
+    contentId,
+    revision,
+    offset: '0',
+    dataBase64: Buffer.from('x').toString('base64'),
+    nextOffset: '1',
+    eof,
+    sha256: '0'.repeat(64),
+  })
+
+  it('(F1) a burst of agent.content.read is NOT paced by the shared tier: 40 of them land at once, while the 33rd OTHER business RPC still waits for its 1.15s gap', async () => {
+    const identity = await createDeviceIdentity()
+    // Heartbeat pushed out so housekeeping pings stay out of both measurements.
+    //
+    // The SHARED budget is the DEFAULT 32: "the other tier is the production
+    // 32/s" is asserted directly, not derived from an injection. 40 reads that
+    // land inside 600ms are impossible on 32/s (40 gaps ≈ 1.4s), and mechanical
+    // on the content tier, whose bursts are chunked by the in-flight window
+    // (8 concurrent reads at ~1ms each, measured at ~250ms, waiting on a 36ms
+    // timer only if the shared tier were leaking back in).
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+    await connection.connect()
+    fakeInfo.fake.scriptListPages(
+      'agent.content.read',
+      Array.from({ length: 40 }, (_, i) => () => sliceReply('content-f1', `${String(i)}`)),
+    )
+    const readOnce = (i: number): Promise<{ contentId: string }> =>
+      connection.rpc.request('agent.content.read', {
+        sessionId: 's-1',
+        contentId: 'content-f1',
+        revision: `${String(i)}`,
+        offset: '0',
+        maxBytes: 4_096,
+      })
+
+    const started = Date.now()
+    const burst = await Promise.all(Array.from({ length: 40 }, (_, i) => readOnce(i)))
+    expect(burst).toHaveLength(40)
+    // The content tier admits this burst without the shared tier's pacing.
+    expect(Date.now() - started).toBeLessThan(600)
+    // Every arrival reached the peer: nothing was refused or dropped.
+    expect(fakeInfo.fake.methodCount('agent.content.read')).toBe(40)
+
+    // The OTHER tier is independent of that burst: its window still admits 32,
+    // so the 33rd other RPC waits out a real admission gap (~1.15s), not a
+    // fixed sleep — the content burst did not consume any of it.
+    const otherStarted = Date.now()
+    const others = await Promise.all(
+      Array.from({ length: 33 }, (_, i) =>
+        connection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `o${String(i)}` }),
+      ),
+    )
+    expect(others).toHaveLength(33)
+    expect(Date.now() - otherStarted).toBeGreaterThanOrEqual(1_000)
+    expect(connection.state).toBe('connected')
+  }, 20_000)
+
+  it('(F2) paces agent.content.read on its OWN tier: it scales with the injected shared budget, and its own exhausted tier inserts a wait', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    // Injected SHARED budget 2/s ⇒ the content tier is 2 × 8 = 16/s with a
+    // (1,150 / 16 = 71.875 → ceil) 72ms gap. The tier's OWN saturation is
+    // observable here, at a fast scale.
+    const shared = 2
+    const content = shared * CONTENT_TIER_MULTIPLE
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), rateBudgetPerSecond: shared })
+    await connection.connect()
+    // One admission for the first read, then one per fill read.
+    fakeInfo.fake.scriptListPages(
+      'agent.content.read',
+      Array.from({ length: content + 1 }, () => () => sliceReply('content-f2', '1')),
+    )
+    const readOnce = (): Promise<{ contentId: string }> =>
+      connection.rpc.request('agent.content.read', {
+        sessionId: 's-1',
+        contentId: 'content-f2',
+        revision: '1',
+        offset: '0',
+        maxBytes: 4_096,
+      })
+
+    // The limiter CEILS its gap: 1,150 / 16 = 71.875ms → 72ms.
+    const gapMs = Math.ceil((1_000 + 150) / content)
+    expect(gapMs).toBe(72)
+    // The tier derives from the injection, not from the shared tier's own
+    // admission interval (1,150 / 2 = 575ms): the first content read is
+    // admitted at once, and the fill below is paced at 16/s rather than 2/s.
+    const firstStarted = Date.now()
+    await readOnce()
+    expect(Date.now() - firstStarted).toBeLessThan(gapMs)
+
+    // The fill is paced at the CONTENT gap, not the shared one: 16 reads take
+    // at least 15 content gaps (15 × 72ms = 1.08s) and would take 15 SHARED
+    // gaps (15 × 575ms ≈ 8.6s).
+    const fillStarted = Date.now()
+    const filled = await Promise.all(Array.from({ length: content }, () => readOnce()))
+    expect(filled).toHaveLength(content)
+    const fillElapsed = Date.now() - fillStarted
+    expect(fillElapsed).toBeGreaterThanOrEqual(gapMs)
+    expect(fillElapsed).toBeGreaterThanOrEqual(500)
+    expect(fillElapsed).toBeLessThan(6_000)
+    expect(connection.state).toBe('connected')
+  }, 30_000)
+
+  it('(F4) the content tier is EXACT-MATCH: other agent reads and look-alike method names are paced by the shared tier', async () => {
+    // The tiering rule widens a 256/s budget only for the ONE method whose
+    // peer-side allowance is 512/s. A prefix/suffix match on "read", on
+    // "agent.*" or on "agent.content.*" would put methods with the 64/s
+    // allowance on the fast tier, which is how a client gets its session closed
+    // (1011).
+    //
+    // The observable face of the rule without waiting on a real pace: the fake
+    // ANSWERS (`NOT_FOUND` for an unknown method, `NOT_FOUND` for an unexplored
+    // checkpoint) only after the admission was granted. So the WAIT is the
+    // measurement — a probed method that waits out the shared tier's gap is on
+    // the shared tier, and one admitted at once is on the content tier.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    const shared = 2
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), rateBudgetPerSecond: shared })
+    await connection.connect()
+
+    // Saturate the SHARED tier exactly.
+    await Promise.all(
+      Array.from({ length: shared }, (_, i) =>
+        connection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `q${String(i)}` }),
+      ),
+    )
+
+    // checkpoints.read is served by the fake and answers its own answer; it
+    // must wait out the shared tier's 575ms gap.
+    const checkpointStarted = Date.now()
+    await connection.rpc
+      .request('agent.checkpoints.read', { subscriptionId: 'sub-x', checkpointId: 'cp-x' })
+      .catch(() => undefined)
+    const checkpointWait = Date.now() - checkpointStarted
+    expect(checkpointWait).toBeGreaterThanOrEqual(400)
+
+    // content.read takes the CONTENT tier, which is still empty.
+    const contentStarted = Date.now()
+    await connection.rpc
+      .request('agent.content.read', { sessionId: 's-1', contentId: 'c-x', revision: '1', offset: '0', maxBytes: 4_096 })
+      .catch(() => undefined)
+    expect(Date.now() - contentStarted).toBeLessThan(200)
+    expect(connection.state).toBe('connected')
+  }, 20_000)
+
+  it('(F5) a LOOK-ALIKE method name (agent.content.write) is paced by the shared tier, not the content tier', async () => {
+    // The exact-match rule is one character away from a family rule: a
+    // `startsWith('agent.content.')` would send this name to the 256/s tier.
+    // The fake has no handler for it, but it still COUNTS the arrival and
+    // answers `NOT_FOUND` — after the admission, which is what is measured.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    const shared = 2
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo), rateBudgetPerSecond: shared })
+    await connection.connect()
+
+    // Saturate the SHARED tier exactly (2 admissions), so the next shared
+    // admission is ~575ms away.
+    await Promise.all(
+      Array.from({ length: shared }, (_, i) =>
+        connection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `w${String(i)}` }),
+      ),
+    )
+
+    const lookalikeStarted = Date.now()
+    await connection.rpc.request('agent.content.write', { sessionId: 's-1', contentId: 'c-x' }).catch(() => undefined)
+    // The look-alike waited on the SHARED tier...
+    expect(Date.now() - lookalikeStarted).toBeGreaterThanOrEqual(400)
+    // ...and it really reached the peer (the wait was an admission, not a
+    // local rejection that happened to be slow).
+    expect(fakeInfo.fake.methodCount('agent.content.write')).toBe(1)
+
+    // The genuine content read still takes the (now empty) CONTENT tier at
+    // once: the look-alike did not spend a content admission.
+    fakeInfo.fake.scriptListPages('agent.content.read', [() => sliceReply('content-f5', '1', true)])
+    const contentStarted = Date.now()
+    await connection.rpc.request('agent.content.read', {
+      sessionId: 's-1',
+      contentId: 'content-f5',
+      revision: '1',
+      offset: '0',
+      maxBytes: 4_096,
+    })
+    expect(Date.now() - contentStarted).toBeLessThan(200)
+    expect(connection.state).toBe('connected')
+  }, 20_000)
+
+  it('(F3) a replayed agent.content.read takes its FRESH admission from the CONTENT tier, not the shared one', async () => {
+    const identity = await createDeviceIdentity()
+    // The FIRST content.read arrival kills the link; the replay lands on the
+    // reconnect. The content tier stays EMPTY (one arrival before the kill),
+    // while the shared tier is already exhausted — see the fills below.
+    const fakeInfo = await makeLinkKillingFake('agent.content.read', { hello: { heartbeatMs: 60_000 } })
+    // Injected SHARED budget 2/s ⇒ shared gap 575ms, content tier 16/s with a
+    // 72ms gap. Small on purpose: the saturation below must stay cheap.
+    const shared = 2
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 1,
+      transportRetryWaitMs: 5_000,
+      rateBudgetPerSecond: shared,
+    })
+    await connection.connect()
+    fakeInfo.fake.scriptListPages('agent.content.read', [() => sliceReply('content-f3', '1', true)])
+
+    // Saturate the SHARED tier (2 admissions) with two pings.
+    await Promise.all(
+      Array.from({ length: shared }, (_, i) =>
+        connection.rpc.request<{ nonce: string }>('connection.ping', { nonce: `p${String(i)}` }),
+      ),
+    )
+
+    const started = Date.now()
+    const value = (await connection.rpc.request('agent.content.read', {
+      sessionId: 's-1',
+      contentId: 'content-f3',
+      revision: '1',
+      offset: '0',
+      maxBytes: 4_096,
+    })) as { eof: boolean }
+    expect(value.eof).toBe(true)
+    expect(fakeInfo.fake.methodCount('agent.content.read')).toBe(2)
+    // Original + replay both took their admission from the CONTENT tier: one
+    // content gap (72ms) at worst, against the shared tier's 575ms wait that a
+    // replay admitted there would have to serve.
+    expect(Date.now() - started).toBeLessThan(300)
+    expect(connection.state).toBe('connected')
+  }, 20_000)
+
   it('⑨ retries a failing refresh inside the grace window, then goes offline and hints the peer may have removed the device', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake({
