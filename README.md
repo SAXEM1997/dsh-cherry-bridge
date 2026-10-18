@@ -39,7 +39,7 @@ flowchart TB
 npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge
 
 # 钉住版本标签（生产推荐）
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.3
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.4
 
 # 或从 npm registry 安装
 dsh plugin --profile <name> add dsh-cherry-bridge

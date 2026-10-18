@@ -5,10 +5,10 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
-## Unreleased
+## v0.1.4 (2026-10-18)
 
-Batches merged after the v0.1.3 tag. They are not part of any published
-version yet; the install pins in both READMEs still name v0.1.3.
+The 2026-10-18 UltraReview batch: eleven fixes and hardening merged after the
+v0.1.3 tag, closing all 37 adjudicated findings of the v0.1.3 review round.
 
 - `fix(connection, rpc)`: a write that fails on a dying socket is classified as transport loss instead of an opaque RPC error; reads replay once, commands never (#37).
 - `fix(tools)`: `cherry_read` is bounded by an output budget (`AGGREGATE_BYTES`, 256 KiB) at message boundaries, with `truncationReason: "aggregate-bytes"` — raising `limit` no longer buys round trips that end at the same ceiling (#38).
