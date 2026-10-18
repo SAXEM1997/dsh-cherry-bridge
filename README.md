@@ -121,6 +121,23 @@ profile 手工加行等价于：
 的会话，立即返回当前快照）、`subscription-lost`（等待途中事件订阅丢失且重建失败，运行
 结局从此处**不可知**：与 `timeout` 不同，随附修复订阅／按 id 回读运行的指引）。
 
+### 错误与恢复语义
+
+- **传输丢失分读写两面。** 读方法在重连后**单次**配速重放（新的一次到达、重新过一遍
+  配速）；二次丢失或连接生命周期结束（teardown）则返回结构化的 lost 错误，不会无限重试。
+  **命令永不重放**：`cherry_send`/`cherry_create`/`cherry_respond`/`cherry_cancel` 这类
+  写操作丢失应答时，调用方携**原 `commandId`** 重试即可——桌面端的命令账本会回放原回执，
+  同一 id 配不同正文才报幂等冲突。
+- **单 ref 外置内容上限 32 MiB。** 超过上限的 part 直接标 `unavailable`，该消息带
+  `incomplete: true`，并在有不可读 part 时带 `unavailableParts` 计数；不返回无法校验的
+  部分内容。
+- **list 走查容忍「游标前进的连续空过渡页」至多 2 页，第 3 页即拒绝**（桌面端分区切换
+  时的正常过渡，任何非空页都会重置计数）；游标不前进或循环回已出现过的游标则直接拒绝，
+  不空转。
+- **发布门分工：** `prepublishOnly` 跑整条链（typecheck + 全量测试 + 两侧构建）；
+  `tests/unit/artifactFreshness.test.ts` 另做逐字节比对——从当前源码重建到临时目录，与
+  **已提交**的 `dist/index.mjs`/`dist/index.d.mts`/`lib/client.js` 完全相同才通过。
+
 ## 设置页（web client）
 
 插件同时是一个 **web client bundle**（`package.json` 的 `dsh.client` 声明

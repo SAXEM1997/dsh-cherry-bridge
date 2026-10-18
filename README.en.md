@@ -139,6 +139,33 @@ was lost mid-wait and could not be rebuilt, so the outcome is **unknowable**
 from here: unlike `timeout`, it ships guidance to repair the subscription or
 re-read the run by id).
 
+### Errors and recovery
+
+- **Transport loss is handled differently for reads and for commands.** A read
+  method is replayed **once**, at a fresh rate-limit admission, after a
+  reconnect; a second loss or a torn-down connection lifecycle yields a
+  structured lost error instead of an endless retry. A **command is never
+  replayed**: when `cherry_send`/`cherry_create`/`cherry_respond`/
+  `cherry_cancel` loses its answer, the caller retries with the **original
+  `commandId`** — the desktop's command ledger replays the original receipt,
+  and only the same id with a *different* body is reported as an idempotency
+  conflict.
+- **One ref's externalized content is capped at 32 MiB.** A part above the cap
+  is marked `unavailable`, its message carries `incomplete: true`, and also an
+  `unavailableParts` count when parts were unreadable; unverifiable partial
+  content is never returned.
+- **A list walk tolerates at most two consecutive empty transitional pages
+  whose cursor advances, and refuses on the third** (the desktop's
+  section-transition behaviour; any non-empty page resets the run). A cursor
+  that does not advance, or one that loops back to a cursor already served, is
+  refused outright rather than spun on.
+- **Release gates divide the work:** `prepublishOnly` runs the whole chain
+  (typecheck + full suite + both builds), while
+  `tests/unit/artifactFreshness.test.ts` does the byte-for-byte comparison —
+  rebuilding from the current source into a temp dir and passing only when the
+  result is identical to the **committed** `dist/index.mjs`,
+  `dist/index.d.mts` and `lib/client.js`.
+
 ## Settings page (web client)
 
 The plugin is also a **web client bundle** (`package.json`'s `dsh.client`

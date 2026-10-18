@@ -1400,7 +1400,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           limit: {
             type: 'integer',
             minimum: 1,
@@ -1436,7 +1436,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           agentId: { type: 'string', description: 'The agent whose workspaces to list.' },
           limit: {
             type: 'integer',
@@ -1486,7 +1486,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           agentId: { type: 'string', description: 'Only sessions of this agent.' },
           workspaceId: { type: 'string', description: 'Only sessions in this registered workspace.' },
           limit: {
@@ -1537,11 +1537,11 @@ class CherryToolEngine {
         'are deliberately not fetched into a text channel. Messages come NEWEST-first, so the ' +
         'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
         'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
-        'carries `incomplete` (with `unavailableParts`).',
+        'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable.',
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session to read.' },
           limit: {
             type: 'integer',
@@ -1984,7 +1984,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session whose events to read.' },
           cursor: {
             type: 'object',
@@ -2081,7 +2081,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           agentId: { type: 'string', description: 'The agent that owns the new session.' },
           workspaceId: {
             type: 'string',
@@ -2192,7 +2192,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session to send into.' },
           text: {
             type: 'string',
@@ -2436,7 +2436,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session to wait on.' },
           timeoutMs: {
             type: 'integer',
@@ -2533,7 +2533,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session whose interactions to list.' },
           includeAnswered: {
             type: 'boolean',
@@ -2629,7 +2629,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session holding the interaction.' },
           interactionId: { type: 'string', description: 'The interaction to answer.' },
           decision: {
@@ -2749,7 +2749,7 @@ class CherryToolEngine {
       parameters: {
         type: 'object',
         properties: {
-          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique display-name prefix.' },
+          device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           sessionId: { type: 'string', description: 'The session whose execution to cancel.' },
           expectedExecutionId: {
             type: 'string',
@@ -2927,14 +2927,14 @@ class CherryToolEngine {
       description:
         'Forget a paired desktop: tear its connection down and delete it from the device ' +
         'archive, so this harness no longer holds its access token. The `device` selector is ' +
-        'REQUIRED (an exact deviceId, or a unique display-name prefix); unpairing is permanent ' +
-        'and the device must be paired again from a fresh QR code.',
+        'REQUIRED (an exact deviceId, or a unique prefix of a deviceId or display name); ' +
+        'unpairing is permanent and the device must be paired again from a fresh QR code.',
       parameters: {
         type: 'object',
         properties: {
           device: {
             type: 'string',
-            description: 'Device selector: exact deviceId, or a unique display-name prefix.',
+            description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.',
           },
         },
         required: ['device'],
