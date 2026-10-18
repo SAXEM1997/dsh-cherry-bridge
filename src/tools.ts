@@ -2780,9 +2780,10 @@ class CherryToolEngine {
         'interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with ' +
         'cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns ' +
         'the command receipt immediately. A timeout is NOT a failure — it returns the partial content ' +
-        'and a `messagesResumeCursor` token marking where the unread history begins: hand it to ' +
-        '`cherry_read` as `messagesResumeCursor` to read the older messages (re-waiting re-reads the ' +
-        'newest window). When content is cut, `messagesTruncated`/`messagesTruncationReason` ' +
+        'and, whenever a stop point can be named honestly, a `messagesResumeCursor` token marking ' +
+        'where the unread history begins: hand it to `cherry_read` as `messagesResumeCursor` to read ' +
+        'the older messages (re-waiting re-reads the newest window). When content is cut, ' +
+        '`messagesTruncated`/`messagesTruncationReason` ' +
         'report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a ' +
         'returned message missing its own parts carries `incomplete`.',
       parameters: {
@@ -4699,8 +4700,10 @@ class CherryToolEngine {
   }
 
   /**
-   * The timeout result: NOT a failure. Partial content read so far + a
-   * `messagesResumeCursor` token marking where the unread history begins.
+   * The timeout result: NOT a failure. Partial content read so far +, whenever a
+   * stop point can be named honestly, a `messagesResumeCursor` token marking where
+   * the unread history begins — absent when the walk reached the peer's last page
+   * or its last returned message carried no id.
    *
    * The spec's own sentence (§3.6, 2026-10-09 design: 「超时不是失败：返回已收到
    * 的部分内容 + 当前游标，agent 可续查」) is a statement of that contract in

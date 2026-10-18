@@ -416,9 +416,9 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
 
     // `'20'` is the RAW page position the old face emitted, `'garbage'` is what
     // a caller invents, `'after:'` / `'cursor:'` are the prefixes with an empty
-    // remainder, and the last four are tokens that carry OUR prefix but a
-    // remainder no emission can produce (a stray space, a trailing space, a
-    // newline, and a whole token glued on). The real desktop SILENTLY falls back
+    // remainder, and the last three are tokens that carry OUR prefix but a
+    // remainder no emission can produce (a stray leading space, a trailing
+    // space, and a newline). The real desktop SILENTLY falls back
     // to the newest page for a malformed cursor, so forwarding any of these
     // would present the newest page again as "continued history" — and the
     // `after:` variants would instead report a phantom message id as "probably
