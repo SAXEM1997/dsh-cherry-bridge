@@ -515,6 +515,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
     )
     // The message is complete, so nothing claims otherwise.
     expect(result.messages[0]!.partsTruncated).toBeUndefined()
+    expect(result.messages[0]).not.toHaveProperty('incomplete')
 
     const calls = rig.fake.readCallsFor('agent.parts.list')
     expect(calls).toHaveLength(20)
@@ -547,13 +548,25 @@ describe('read-only cherry tools over a real loopback channel', () => {
     )
 
     const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
-      messages: Array<{ parts: Array<{ content: string }>; partsTruncated?: string; partsResumeCursor?: string }>
+      messages: Array<{
+        parts: Array<{ content: string }>
+        partsTruncated?: string
+        partsResumeCursor?: string
+        incomplete?: true
+        unavailableParts?: number
+      }>
     }
 
     // The partial read is ADMITTED: the reason and the resume point are both
     // present, so content is never dropped without the caller knowing.
     expect(result.messages[0]!.parts).toHaveLength(25)
     expect(result.messages[0]!.partsTruncated).toBe('safety-bound')
+    // A short part list is content-incomplete too, and `incomplete` is the
+    // message-level answer to that question — but NO part failed here, so the
+    // count must be ABSENT rather than a misleading zero (issue #14: the two
+    // triggers are distinct, and only one of them is countable).
+    expect(result.messages[0]!.incomplete).toBe(true)
+    expect(result.messages[0]).not.toHaveProperty('unavailableParts')
     // The resume cursor is the peer's next-page offset, i.e. the 26th part —
     // exactly where the walk stopped, not where its last page began.
     expect(result.messages[0]!.partsResumeCursor).toBe('25')
@@ -811,6 +824,8 @@ describe('read-only cherry tools over a real loopback channel', () => {
       messages: Array<{
         messageId: string
         parts: Array<{ partId: string; content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
       }>
     }
 
@@ -828,6 +843,77 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // ...and the message is COMPLETE as a part list: the failure was the
     // CONTENT, not a truncated walk, so it must not claim truncation.
     expect(result.messages[0]).not.toHaveProperty('partsTruncated')
+    // But its CONTENT is incomplete, and the message has to say so: the failed
+    // part alone is not enough, because a caller reading the message (or a
+    // terminal aggregate's top-level verdict) sees a message that otherwise
+    // looks whole, with an empty `content` it could read as "there was no
+    // text". Issue #14: a field caller concluded a run was interrupted because
+    // of exactly that shape.
+    expect(result.messages[0]!.incomplete).toBe(true)
+    expect(result.messages[0]!.unavailableParts).toBe(1)
+    // The OTHER message lost nothing, so it must carry NEITHER field — the
+    // flag is per message, not a page-level weather report.
+    expect(result.messages[1]).not.toHaveProperty('incomplete')
+    expect(result.messages[1]).not.toHaveProperty('unavailableParts')
+  })
+
+  it('④i-2 the SAME message-level flag rides the terminal aggregate: `cherry_send` marks the unreadable-ref message', async () => {
+    // The terminal/timeout/idle aggregates share `#projectMessage` with
+    // `cherry_read`, so a message that is content-incomplete must be flagged on
+    // THAT face too — the field report that produced issue #14 came from a
+    // `cherry_send` answer, where the only content signal was an empty part.
+    const big = 'G'.repeat(30 * 1024)
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'the conclusion is in the ref' }, { kind: 'text', text: big, external: true }],
+          },
+          {
+            messageId: 'm-2',
+            revision: '1002',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'a healthy older message' }],
+          },
+        ],
+      },
+    })
+
+    // One-shot: the FIRST content.read fails, which is `m-1`'s ref part.
+    rig.fake.setReadFailure('agent.content.read', { reason: 'NOT_FOUND', message: 'Content not found' })
+
+    const idle = (await rig.call('cherry_wait', { device: 'dev-A', sessionId: 's-1' })) as {
+      status: string
+      messages: Array<{
+        messageId: string
+        parts: Array<{ content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
+      }>
+      messagesTruncated?: boolean
+    }
+
+    expect(idle.status).toBe('idle')
+    expect(idle.messages.map((message) => message.messageId)).toEqual(['m-1', 'm-2'])
+    // The damaged message names its damage at the MESSAGE level...
+    expect(idle.messages[0]!.incomplete).toBe(true)
+    expect(idle.messages[0]!.unavailableParts).toBe(1)
+    // ...while the part-level reason is still where it always was.
+    expect(idle.messages[0]!.parts[1]!.unavailable).toMatch(/NOT_FOUND|Content not found/i)
+    // The walk itself was complete: this is a CONTENT verdict, not a walk one.
+    expect(idle.messagesTruncated).toBeUndefined()
+    // The healthy message carries neither field.
+    expect(idle.messages[1]).not.toHaveProperty('incomplete')
+    expect(idle.messages[1]).not.toHaveProperty('unavailableParts')
   })
 
   it('④j an INTEGRITY failure still fails the whole read: unverifiable bytes are never handed back', async () => {

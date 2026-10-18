@@ -4741,7 +4741,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete` (with `unavailableParts`).",
 			parameters: {
 				type: "object",
 				properties: {
@@ -4829,16 +4829,21 @@ var CherryToolEngine = class {
 		}), Number.POSITIVE_INFINITY, this.#partsSafetyBound, PARTS_LIST_PAGE_CLAMP);
 		const parts = [];
 		for (const part of page.items) parts.push(await this.#projectPart(connection, sessionId, part));
+		const partsTruncated = page.truncated ? page.truncationReason ?? "safety-bound" : void 0;
+		const unavailableParts = parts.filter((part) => part.unavailable !== void 0).length;
+		const incomplete = unavailableParts > 0 || partsTruncated !== void 0;
 		return {
 			messageId,
 			revision,
 			role: String(raw["role"] ?? ""),
 			status: String(raw["status"] ?? ""),
 			parts,
-			...page.truncated ? {
-				partsTruncated: page.truncationReason ?? "safety-bound",
+			...partsTruncated === void 0 ? {} : {
+				partsTruncated,
 				...page.nextCursor === void 0 ? {} : { partsResumeCursor: page.nextCursor }
-			} : {}
+			},
+			...incomplete ? { incomplete: true } : {},
+			...unavailableParts > 0 ? { unavailableParts } : {}
 		};
 	}
 	/**
@@ -5134,7 +5139,7 @@ var CherryToolEngine = class {
 	#sendTool() {
 		return defineCherryTool({
 			name: "cherry_send",
-			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and the cursor to resume from.",
+			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and the cursor to resume from. When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5275,7 +5280,7 @@ var CherryToolEngine = class {
 	#waitTool() {
 		return defineCherryTool({
 			name: "cherry_wait",
-			description: "Wait for a session's in-flight execution to reach a terminal state, without sending anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, never a park. Use it to resume after answering an interaction.",
+			description: "Wait for a session's in-flight execution to reach a terminal state, without sending anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, never a park. Use it to resume after answering an interaction. Its message walk is bounded like `cherry_send`'s, with the same verdict wording: a cut drops the OLDER messages, and a returned message missing its own parts carries `incomplete`.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6423,10 +6428,16 @@ var CherryToolEngine = class {
 	*
 	* The FIRST message is always projected and always kept WHOLE — it is the
 	* newest, i.e. the run's own reply — so the byte budget is only ever checked
-	* AFTER a complete message has been taken. A walk that stopped for either
-	* reason comes back with the verdict filled in (`messageWalkVerdict`
-	* handles the ceiling; `'aggregate-bytes'` is attributed here), and the
-	* three callers (terminal, timeout, idle) each surface it.
+	* AFTER a complete message has been taken. That places the budget on the
+	* same side as every other bound: the walk runs newest-first and stops
+	* BETWEEN messages, so what it leaves out is the OLDER end of the history,
+	* never the tail of a message it returned. A returned message missing part
+	* of its OWN content is flagged by its own projection
+	* ({@link CherryReadMessage.incomplete}) — a content verdict, not this
+	* walk's. A walk that stopped for either reason comes back with the verdict
+	* filled in (`messageWalkVerdict` handles the ceiling;
+	* `'aggregate-bytes'` is attributed here), and the three callers (terminal,
+	* timeout, idle) each surface it.
 	*
 	* A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
 	* points past the entire page it came with, so a byte stop in the MIDDLE of a

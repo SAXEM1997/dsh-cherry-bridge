@@ -449,6 +449,60 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
   })
 })
 
+describe('issue #14: a byte-budget cut drops WHOLE messages, and says which end', () => {
+  it('T5d `aggregate-bytes` retains complete messages with no `incomplete` field — the budget cuts BETWEEN messages', async () => {
+    // The acceptance the field misdiagnosis missed. A taker of this result read
+    // `messagesTruncated: true, messagesTruncationReason: 'aggregate-bytes'` as
+    // "content was cut mid-message, so the run was interrupted". The budget is
+    // only ever checked AFTER a message is fully projected, so what a byte stop
+    // removes is the OLDER messages, and every retained message arrives whole —
+    // no `incomplete`, no `unavailableParts`, every part carrying its text.
+    const fat = (messageId: string, kib: number): FakeMessageRecord => ({
+      messageId,
+      revision: '1',
+      role: 'assistant',
+      status: 'success',
+      parts: [{ kind: 'text', text: 'F'.repeat(kib * 1024) }],
+    })
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        // 260 KiB alone exceeds the 256 KiB budget: the walk takes the newest
+        // message, trips, and stops — the two older ones are what gets dropped.
+        messages: [fat('b-0', 260), fat('b-1', 1), fat('b-2', 1)],
+      },
+    })
+
+    const idle = (await rig.call('cherry_wait', { device: 'dev-A', sessionId: 's-1' })) as {
+      status: string
+      messages: Array<{
+        messageId: string
+        parts: Array<{ content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
+      }>
+      messagesTruncated?: boolean
+      messagesTruncationReason?: string
+      messagesResumeCursor?: string
+    }
+
+    expect(idle.status).toBe('idle')
+    expect(idle.messagesTruncated).toBe(true)
+    expect(idle.messagesTruncationReason).toBe('aggregate-bytes')
+    // The budget cut between messages: the newest survived COMPLETE, and the
+    // dropped ones are the OLDER ones.
+    expect(idle.messages.map((message) => message.messageId)).toEqual(['b-0'])
+    expect(idle.messages[0]!.parts[0]!.content).toHaveLength(260 * 1024)
+    // NOTHING in the retained message claims damage: the truncation verdict is
+    // the walk's, and the message itself is whole. This is the line the field
+    // report crossed.
+    expect(idle.messages[0]).not.toHaveProperty('incomplete')
+    expect(idle.messages[0]).not.toHaveProperty('unavailableParts')
+    expect(idle.messages[0]!.parts[0]!.unavailable).toBeUndefined()
+  })
+})
+
 describe('issue #3 T2: the text anchor is the NEWEST assistant message, never the oldest', () => {
   it('T2a a timeout over a history whose newest assistant is an empty pending run reports text "" — not the July message', async () => {
     // The exact field shape: the run's assistant message is PENDING with an
