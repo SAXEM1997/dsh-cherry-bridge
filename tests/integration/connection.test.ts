@@ -1218,6 +1218,65 @@ describe('DeviceConnection over a real loopback channel', () => {
   }, 15_000)
 
   // -------------------------------------------------------------------------
+  // Fake lifecycle seams (v0.1.3 UltraReview, build/code P3 ①②)
+  // -------------------------------------------------------------------------
+
+  it('(L1) a dropConnections() during the fake\'s HANDSHAKE HOLD cancels the pending handshake: no accept, no serve loop', async () => {
+    // `dropConnections()` only walks `#live`, which holds CHANNEL-ESTABLISHED
+    // sockets. A socket still inside `handshakeDelayMs` is in neither list, so
+    // before the fix the hold elapses and `acceptSecureChannel` runs against a
+    // socket that is already gone; `connectionCount` is never rolled back, and
+    // the peer reports a handshake that could not have happened.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ handshakeDelayMs: 300, hello: { heartbeatMs: 60_000 } })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    void connection.connect().catch(() => {})
+    await waitForSockets(fakeInfo.fake, 1)
+    // Still mid-hold: the peer has accepted the socket but not finished Noise.
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    fakeInfo.fake.dropConnections()
+
+    // Let the hold elapse, then give the (would-be) accept every chance to run.
+    await sleep(500)
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    // No hello ever reached a channel: the aborted socket never got served.
+    expect(fakeInfo.fake.helloCount).toBe(0)
+    // And the held socket itself is gone, not merely un-served.
+    expect(fakeInfo.fake.connectedClients).toBe(0)
+  }, 15_000)
+
+  it('(L2) a beforeNextCall() hook that THROWS still releases its in-flight slot', async () => {
+    // The hook ran between `#inFlight += 1` and the try block, so a throw
+    // escaped the decrement: the slot was never released, and every later
+    // request stacked behind a phantom in-flight request.
+    //
+    // The handler runs without being awaited from `#serve` (concurrently by
+    // design), so a hook that throws makes that promise reject; `#dispatch`
+    // converts a throwing hook into "counted, never answered", the same
+    // peer-side face as a hook that drops the link, instead of letting the
+    // rejection escape as an unhandled one. The CALLER therefore never settles
+    // — it is deliberately not awaited here, and the test closes the connection
+    // to release it. The subject is the FAKE's bookkeeping, observed on the
+    // peer: `inFlight` must be back to zero.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+    await connection.connect()
+
+    fakeInfo.fake.beforeNextCall('connection.ping', () => {
+      throw new Error('hook exploded')
+    })
+    void connection.rpc.request('connection.ping', { nonce: 'boom' }).catch(() => {})
+    // The frame arrived and was counted: the hook ran (so did the throw), and
+    // the slot it took is released on the way out of the finally.
+    await waitFor(() => fakeInfo.fake.methodCount('connection.ping') >= 1)
+    // Give a leaked slot every chance to show up before asserting zero.
+    await sleep(50)
+    expect(fakeInfo.fake.inFlight).toBe(0)
+  }, 15_000)
+
+  // -------------------------------------------------------------------------
   // R3-F2: close() cancels the CANDIDATE ITERATION
   // -------------------------------------------------------------------------
 
@@ -1266,8 +1325,11 @@ describe('DeviceConnection over a real loopback channel', () => {
     // The abandoned iteration's handshake only BEGINS once the peer's hold
     // elapses, so the assertions have to come after that window: checking
     // earlier would pass without the stale attempt ever having run, which is
-    // exactly the failure this case exists to catch.
-    await sleep(400)
+    // exactly the failure this case exists to catch. Gate on the peer observing
+    // the abandoned socket CLOSE (the new cycle's socket is still open, so a
+    // drop to a single live client is exactly "the stale one is finished")
+    // rather than on a fixed 400ms guess at the hold.
+    await waitFor(() => fakeInfo.fake.connectedClients === 1, 5_000)
     expect(connection.state).toBe('connected')
     await expect(connection.rpc.request('connection.ping', { nonce: 'alive' })).resolves.toMatchObject({
       nonce: 'alive',
@@ -1408,8 +1470,11 @@ describe('DeviceConnection over a real loopback channel', () => {
     await connection.connect()
 
     const pending = connection.rpc.request('agent.agents.list', {}).catch((reason: unknown) => reason)
-    // Park the wait: the kill fires as the frame arrives, well inside this beat.
-    await sleep(150)
+    // Park the wait: the kill fires as the frame arrives. Gate on the peer
+    // having SEEN that arrival rather than on a fixed 150ms beat — once the
+    // arrival is counted the killing hook has run, so the client is on its way
+    // into the replay wait this test is about to close.
+    await waitFor(() => fakeInfo.fake.methodCount('agent.agents.list') >= 1)
     const settled = Date.now()
     await connection.close()
     const error = (await pending) as TransportLostError
@@ -1442,11 +1507,15 @@ describe('DeviceConnection over a real loopback channel', () => {
     await connection.connect()
 
     const pending = connection.rpc.request('agent.agents.list', {}).catch((reason: unknown) => reason)
-    await sleep(150)
+    // Gate on the peer having SEEN the arrival (the killing hook has fired by
+    // then), not on a fixed beat.
+    await waitFor(() => fakeInfo.fake.methodCount('agent.agents.list') >= 1)
     await connection.close()
     await connection.connect()
     expect(connection.state).toBe('connected')
-    // Give a wrongly-surviving replay every chance to land on the new link.
+    // Give a wrongly-surviving replay every chance to land on the new link: the
+    // arrival count is what would move, so a bounded quiet window on the peer's
+    // side is the honest form of this check.
     await sleep(300)
     const error = (await pending) as TransportLostError
     expect(error).toBeInstanceOf(TransportLostError)
