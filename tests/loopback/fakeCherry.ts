@@ -1175,6 +1175,49 @@ export class FakeCherry {
     this.#contentByteOverrides.set(`${contentId}:${revision}`, declaredBytes)
   }
 
+  /**
+   * Replace one `{ref}` content's stored BYTES — the fixture-side way to hold
+   * content that is not legal UTF-8 (a fixture `text` can only ever encode to
+   * legal UTF-8, so the injection has to happen at the byte level).
+   *
+   * Unlike {@link tamperContent}, the digest moves WITH the bytes: the pin and
+   * every slice report the digest of `bytes`, so the peer is fully
+   * self-consistent and only the DECODE can judge the content. That is what
+   * isolates the decode from the digest check. Callable BEFORE the part is
+   * projected (which is when the real peer pins the bytes and advertises the
+   * digest on the ref); once pinned, use {@link setContentDigest} to move the
+   * advertised digest with it.
+   */
+  setContentBytes(contentId: string, revision: string, bytes: Uint8Array): void {
+    const key = `${contentId}:${revision}`
+    // A copy: the pin is the peer's own record, never the caller's buffer.
+    this.#contentBytes.set(key, Uint8Array.from(bytes))
+    this.#contentDigests.set(key, sha256Hex(bytes))
+    this.#contentByteOverrides.set(key, bytes.length)
+  }
+
+  /**
+   * Override the digest a pin ADVERTISES (the ref's `sha256`) and that every
+   * slice of that content reports. The bytes are left exactly as they are, so
+   * this is the instrument for the peer whose two digest sources agree with
+   * each other but not with its bytes, or for moving them apart.
+   *
+   * Set it BEFORE the part is projected: a call made pre-projection survives
+   * only the FIRST `agent.parts.list`, because the lazy pin then records the
+   * digest of the fixture bytes and OVERWRITES this override. A test that
+   * re-lists the parts (a second read of the same message) must therefore not
+   * rely on a persistent mismatch of this shape — use `setContentBytes` (which
+   * moves bytes and digest together) or script per-slice replies instead.
+   */
+  setContentDigest(contentId: string, revision: string, sha256: string): void {
+    this.#contentDigests.set(`${contentId}:${revision}`, sha256)
+  }
+
+  /** The digest the peer currently advertises for one pinned content. */
+  contentDigestFor(contentId: string, revision: string): string | undefined {
+    return this.#contentDigests.get(`${contentId}:${revision}`)
+  }
+
   /** The current journal watermark cursor for a session. */
   cursorFor(sessionId: string): AgentCursor {
     return { sessionId, streamEpoch: this.#journalEpoch, seq: String(this.#watermark) }

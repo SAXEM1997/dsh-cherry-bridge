@@ -4952,7 +4952,14 @@ var CherryToolEngine = class {
 	#degradableReadFailure(error) {
 		return !(error instanceof ContentIntegrityError);
 	}
-	/** Paginate `agent.content.read` over one `{ref}` and verify its sha256. */
+	/**
+	* Paginate `agent.content.read` over one `{ref}` and verify its sha256.
+	*
+	* The digest is checked against BOTH its sources (the ref's declaration and
+	* the slices' own reports), which must agree when both are present, and the
+	* certified bytes must then decode as legal UTF-8 — a digest certifies bytes,
+	* not text.
+	*/
 	async #readExternalized(connection, sessionId, ref) {
 		const contentId = String(ref["contentId"] ?? "");
 		const revision = String(ref["revision"] ?? "");
@@ -4978,6 +4985,8 @@ var CherryToolEngine = class {
 			const cap = this.#externalizedByteCap;
 			if (read + Math.ceil(data.length / 4) * 3 > cap + 2) throw new Error(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for externalized content; not read`);
 			const chunk = Buffer.from(data, "base64");
+			const sliceSha = typeof slice["sha256"] === "string" ? slice["sha256"] : void 0;
+			if (sliceSha !== void 0 && declaredSha !== void 0 && sliceSha !== declaredSha) throw new Error(`agent.content.read for ${contentId} returned a sha256 at slice ${sliceIndex + 1} (offset ${offset}) that disagrees with the ref (slice ${sliceSha}, ref ${declaredSha}); refusing to certify either`);
 			hash.update(chunk);
 			chunks.push(chunk);
 			read += chunk.length;
@@ -4992,11 +5001,16 @@ var CherryToolEngine = class {
 			offset = next;
 		}
 		if (!complete) throw new ContentIntegrityError(`agent.content.read for ${contentId} did not reach eof within ${maxSlices} slice(s); refusing to aggregate a partial content`);
+		if (sha !== void 0 && declaredSha !== void 0 && sha !== declaredSha) throw new Error(`agent.content.read for ${contentId} returned a sha256 that disagrees with the ref (slice ${sha}, ref ${declaredSha}); refusing to certify either`);
 		const expected = sha ?? declaredSha;
 		if (expected === void 0) throw new ContentIntegrityError(`agent.content.read for ${contentId} returned no sha256 to verify`);
 		const actual = hash.digest("hex");
 		if (actual !== expected) throw new ContentIntegrityError(`agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`);
-		return Buffer.concat(chunks).toString("utf8");
+		try {
+			return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+		} catch {
+			throw new Error(`agent.content.read for ${contentId} returned bytes that are not valid UTF-8; not decoded`);
+		}
 	}
 	#eventsTool() {
 		return defineCherryTool({
