@@ -489,4 +489,47 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
     expect(ids(resumed)).toEqual(messages.slice(1).map((message) => message.messageId))
     expect(ids(resumed)).not.toContain('w-0')
   })
+
+  it('⑦ a REVISION_EXPIRED retry keeps the resume point instead of silently re-reading the newest page', async () => {
+    // The §6 rule retries a WHOLE round once when the baseline revision moved,
+    // and it re-pulls `sessions.get` because the history changed UNDER the walk.
+    // The caller asked for the history AFTER a position, not for one particular
+    // attempt at it, so the resume has to travel with the retry.
+    //
+    // Dropping it here would not fail loudly: the retry would start at the
+    // newest message and hand back m-0..m-19 as though they were the
+    // continuation — the same silent-wrong-answer class the token prefixes
+    // exist to prevent, arriving through the one path a caller cannot see.
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: history(47) },
+    })
+
+    const first = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 20 })) as ReadResult
+    expect(first.messagesResumeCursor).toBe('cursor:20')
+
+    // The FIRST request of the resumed round expires. The retry must re-send
+    // the same peer position, not fall back to the newest page.
+    rig.fake.setReadFailure('agent.messages.list', {
+      reason: 'REVISION_EXPIRED',
+      message: 'History revision expired',
+    })
+    const before = rig.fake.readCallsFor('agent.messages.list').length
+    const resumed = (await rig.call('cherry_read', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      limit: 20,
+      messagesResumeCursor: first.messagesResumeCursor,
+    })) as ReadResult
+
+    // BOTH attempts of the resumed round carried the peer position: the one
+    // that expired and the retry that replaced it. A dropped resume shows up
+    // as `undefined` on the second entry. (The third call is the retried
+    // round's SECOND page — `limit: 20` still spans two 16-wide pages.)
+    const resumeCalls = rig.fake.readCallsFor('agent.messages.list').slice(before)
+    expect(resumeCalls.slice(0, 2).map((call) => call['cursor'])).toEqual(['20', '20'])
+    // And the answer is the continuation, not the newest page again.
+    expect(ids(resumed)).toEqual(history(47).slice(20, 40).map((message) => message.messageId))
+    expect(ids(resumed)).not.toContain('m-0')
+  })
 })
