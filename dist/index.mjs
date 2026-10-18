@@ -325,10 +325,11 @@ var DeviceStore = class {
 	* miss.
 	*
 	* Order of precedence: an exact `deviceId` wins outright, then a prefix of
-	* EITHER the `deviceId` or the display name — the two abbreviations every
-	* tool documents ("exact deviceId, or a unique display-name prefix"), so a
-	* truncated id resolves like a truncated name does. Candidates keep archive
-	* order, so the same selector always answers the same list.
+	* EITHER the `deviceId` or the display name — the one abbreviation every
+	* tool documents ("exact deviceId, or a unique prefix of a deviceId or
+	* display name"), so a truncated id resolves like a truncated name does.
+	* Candidates keep archive order, so the same selector always answers the
+	* same list.
 	*
 	* A miss is its own member ({@link UnresolvedDevice}): nothing matching is
 	* not several things matching, and folding the two together made
@@ -4623,7 +4624,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					limit: {
 						type: "integer",
@@ -4655,7 +4656,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					agentId: {
 						type: "string",
@@ -4702,7 +4703,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					agentId: {
 						type: "string",
@@ -4741,13 +4742,13 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete` (with `unavailableParts`).",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable.",
 			parameters: {
 				type: "object",
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5005,7 +5006,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5065,7 +5066,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					agentId: {
 						type: "string",
@@ -5145,7 +5146,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5286,7 +5287,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5351,7 +5352,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5416,7 +5417,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5515,7 +5516,7 @@ var CherryToolEngine = class {
 				properties: {
 					device: {
 						type: "string",
-						description: "Device selector: exact deviceId, or a unique display-name prefix."
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 					},
 					sessionId: {
 						type: "string",
@@ -5636,12 +5637,12 @@ var CherryToolEngine = class {
 	#unpairTool() {
 		return defineCherryTool({
 			name: "cherry_unpair",
-			description: "Forget a paired desktop: tear its connection down and delete it from the device archive, so this harness no longer holds its access token. The `device` selector is REQUIRED (an exact deviceId, or a unique display-name prefix); unpairing is permanent and the device must be paired again from a fresh QR code.",
+			description: "Forget a paired desktop: tear its connection down and delete it from the device archive, so this harness no longer holds its access token. The `device` selector is REQUIRED (an exact deviceId, or a unique prefix of a deviceId or display name); unpairing is permanent and the device must be paired again from a fresh QR code.",
 			parameters: {
 				type: "object",
 				properties: { device: {
 					type: "string",
-					description: "Device selector: exact deviceId, or a unique display-name prefix."
+					description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
 				} },
 				required: ["device"],
 				additionalProperties: false

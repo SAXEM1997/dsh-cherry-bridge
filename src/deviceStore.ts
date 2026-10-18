@@ -524,10 +524,11 @@ export class DeviceStore {
    * miss.
    *
    * Order of precedence: an exact `deviceId` wins outright, then a prefix of
-   * EITHER the `deviceId` or the display name — the two abbreviations every
-   * tool documents ("exact deviceId, or a unique display-name prefix"), so a
-   * truncated id resolves like a truncated name does. Candidates keep archive
-   * order, so the same selector always answers the same list.
+   * EITHER the `deviceId` or the display name — the one abbreviation every
+   * tool documents ("exact deviceId, or a unique prefix of a deviceId or
+   * display name"), so a truncated id resolves like a truncated name does.
+   * Candidates keep archive order, so the same selector always answers the
+   * same list.
    *
    * A miss is its own member ({@link UnresolvedDevice}): nothing matching is
    * not several things matching, and folding the two together made
