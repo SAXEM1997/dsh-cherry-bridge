@@ -866,6 +866,51 @@ describe('⑤ the pinned protocol versions', () => {
     expect(text).not.toMatch(/iridesc|localhost|127\.0\.0\.1:\d+|192\.168\.\d+\.\d+:\d+/)
   })
 
+  it('every resolved tarball is `name-version.tgz` for that entry (C3: no `version` lies)', () => {
+    // C3 (v0.1.3 UltraReview / issue #31): two entries carried a `version` the
+    // resolved tarball contradicted — `@chainsafe/as-chacha20poly1305` and
+    // `unlimited-timeout` said 0.1.2 while `resolved`/`integrity` anchored
+    // 0.1.0 (the only version the parents' `^0.1.0` ranges admit from the
+    // registry). npm generated that mismatch itself; it is not edited by hand.
+    // The invariant that makes such a lie impossible to reintroduce is this
+    // one: for every entry with a `resolved` tarball, the LAST path segment is
+    // `<unscoped-name>-<version>.tgz` and that version is byte-identical to
+    // the entry's own `version` field.
+    const lock = JSON.parse(readFileSync(join(repoRoot, 'package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { version?: string; resolved?: string }>
+    }
+    const violations: string[] = []
+    let checked = 0
+    for (const [key, entry] of Object.entries(lock.packages ?? {})) {
+      if (!entry.resolved || !entry.version) continue
+      checked += 1
+      // The package name is the key minus any `node_modules/` chain, and the
+      // tarball name drops the scope: `@scope/name` -> `name`.
+      const name = key.split('node_modules/').pop()!.replace(/^@[^/]+\//, '')
+      const segment = entry.resolved.split(/[?#]/)[0]!.split('/').pop()!
+      // The tarball is `<name>-<version>.tgz`, and BOTH halves may contain
+      // '-' (`get-tsconfig`, `ms`, `4.0.0-nightly.…`, `5.0.0-beta.6`). Peel
+      // the name off the FRONT: the `startsWith(name + '-')` gate above has
+      // already proven the literal prefix, so the escaped anchored regex
+      // cannot miss, and the remainder is exactly `<version>`. An npm-alias
+      // dependency (entry name != tarball name) would fail that gate loudly
+      // by design — none exists in this lock today.
+      const stem = segment.endsWith('.tgz') ? segment.slice(0, -'.tgz'.length) : null
+      if (stem === null || stem === name || !stem.startsWith(`${name}-`)) {
+        violations.push(`${key}: resolved is not "${name}-<version>.tgz" (${entry.resolved})`)
+        continue
+      }
+      const front = new RegExp(`^(${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})-`).exec(stem)
+      const resolvedVersion = stem.slice(front![0].length)
+      if (resolvedVersion !== entry.version) {
+        violations.push(`${key}: tarball version ${resolvedVersion} != entry version ${entry.version}`)
+      }
+    }
+    // Guard the guard: an empty or shrunken scan must not pass vacuously.
+    expect(checked).toBeGreaterThan(200)
+    expect(violations).toEqual([])
+  })
+
   it('the INSTALLED packages really are those versions (the pin is not aspirational)', async () => {
     for (const [name, version] of [
       ['@cherrystudio/remote-protocol', '0.5.0'],
