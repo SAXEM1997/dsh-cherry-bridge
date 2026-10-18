@@ -525,7 +525,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(calls[2]!['cursor']).toBe(String(PARTS_LIST_PAGE_CLAMP * 2))
   })
 
-  it('④d a tripped parts circuit-breaker is SURFACED with a resume cursor, never silently truncated', async () => {
+  it('④d a tripped parts circuit-breaker is SURFACED with a stop-point cursor, never silently truncated', async () => {
     // The peer keeps serving pages; the plugin's safety bound is the only thing
     // that can stop the walk. Tripping it must be visible in the result — the
     // failure mode this replaces was a silent, wrongly-labelled truncation.
@@ -567,8 +567,9 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // triggers are distinct, and only one of them is countable).
     expect(result.messages[0]!.incomplete).toBe(true)
     expect(result.messages[0]).not.toHaveProperty('unavailableParts')
-    // The resume cursor is the peer's next-page offset, i.e. the 26th part —
-    // exactly where the walk stopped, not where its last page began.
+    // The stop-point cursor is the peer's next-page offset, i.e. the 26th part —
+    // exactly where the walk stopped, not where its last page began. It is a
+    // marker, not an input — no caller argument raises the parts breaker.
     expect(result.messages[0]!.partsResumeCursor).toBe('25')
     // It stopped at the breaker, not at the peer's end of data (which would
     // take ceil(60 / PARTS_LIST_PAGE_CLAMP) = 20 pages at the byte-safe size).
@@ -620,6 +621,95 @@ describe('read-only cherry tools over a real loopback channel', () => {
     for (const call of rig.fake.readCallsFor('agent.parts.list')) {
       expect(call['limit'] as number).toBeLessThanOrEqual(PARTS_LIST_PAGE_CLAMP)
     }
+  })
+
+  it('④s cherry_read pins the message STOP POINT: a truncated walk carries messagesResumeCursor, a complete one does not', async () => {
+    // ISSUE #36: `messagesResumeCursor` is a STOP-POINT MARKER, not an input —
+    // `cherry_read` accepts `device`/`sessionId`/`limit` only
+    // (`additionalProperties: false`), so the only honest reading of the field
+    // is "older messages are still unread", and nothing pinned that this face
+    // emits it at all. Both edges are asserted here so neither can move
+    // silently: DROPPING the projection (`#readOnce`, the `messagesResumeCursor`
+    // spread) goes red on (a); a walk that stopped complete must carry no field
+    // at all — (b) is red on any projection that leaks the stop point into a
+    // complete result, and it is the pin that would catch a wider `truncated`
+    // verdict on the read face.
+    //
+    // PEER SHAPE MATTERS. Two things were verified empirically before settling
+    // on this fixture: (1) with the default 100-item peer cap the walk always
+    // ends on the peer's LAST page, so `truncated` is false whatever the item
+    // count; (2) `#aggregate` combines its ceiling with the negotiated page cap,
+    // so the series a walk actually requests is not a simple page count. The
+    // peer here reports `hello.limits.pageItems = 16` and holds 47 messages, so
+    // every request is 16 wide except a truncated walk's last one:
+    //   (a) `limit: 20` → requests 16 + 4, both served whole, ceiling reached
+    //       on the next pass → `truncated`, holding the peer's `nextCursor: 20`
+    //   (b) `limit: 47` → requests 16 + 16 + 15, the last page is the peer's
+    //       end (`nextCursor: null`) → complete, nothing to mark
+    // The exact sequences are asserted on the recorded requests below.
+    const messages = Array.from({ length: 47 }, (_unused, index) => ({
+      messageId: `m-${index}`,
+      revision: `100${index}`,
+      role: 'user' as const,
+      status: 'success' as const,
+      parts: [{ kind: 'text' as const, text: `t-${index}` }],
+    }))
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: {
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages,
+      },
+    })
+
+    // (a) TRUNCATED: `limit: 20` cuts after 16 + 4, and the cursor the walk
+    // holds is the peer's offset for that second page — 16 + 4 = 20 (`pageOf`
+    // returns `start + limit`, and the walk asks for the remaining 4). It is
+    // reported, so both dropping the projection and projecting a different
+    // value are red.
+    const truncated = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 20 })) as {
+      messages: Array<{ messageId: string }>
+      truncated: boolean
+      truncationReason?: string
+      messagesResumeCursor?: string
+    }
+    expect(truncated.truncated).toBe(true)
+    expect(truncated.truncationReason).toBe('limit')
+    expect(truncated.messages).toHaveLength(20)
+    // The walk really paged: 16 then the remaining 4.
+    const messageCalls = rig.fake.readCallsFor('agent.messages.list')
+    expect(messageCalls).toHaveLength(2)
+    expect(messageCalls[0]!['limit']).toBe(LIST_PAGE_CLAMP)
+    expect(messageCalls[0]!['cursor']).toBeUndefined()
+    expect(messageCalls[1]!['cursor']).toBe(String(LIST_PAGE_CLAMP))
+    expect(messageCalls[1]!['limit']).toBe(4)
+    expect(truncated.messagesResumeCursor).toBe('20')
+    // The 20 returned are m-0..m-19: it is a stop point, and everything older
+    // is simply not here — which is what "raise `limit`" answers.
+    expect(truncated.messages[19]!.messageId).toBe('m-19')
+    expect(truncated.messages.map((message) => message.messageId)).not.toContain('m-20')
+
+    // (b) COMPLETE: `limit: 47` is exactly the peer's data, so the walk ends on
+    // a page whose `nextCursor` is null — pages 16 + 16 + 15 — and the aggregate
+    // answers complete. Nothing is unread, so there is no stop point to mark and
+    // the field must be ABSENT (not an `undefined`-valued key).
+    const complete = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 47 })) as {
+      messages: Array<{ messageId: string }>
+      truncated: boolean
+    }
+    expect(complete.truncated).toBe(false)
+    expect(complete.messages).toHaveLength(47)
+    expect(complete.messages[46]!.messageId).toBe('m-46')
+    const completeCalls = rig.fake.readCallsFor('agent.messages.list').slice(2)
+    expect(completeCalls.map((call) => call['limit'])).toEqual([LIST_PAGE_CLAMP, LIST_PAGE_CLAMP, 15])
+    expect(completeCalls[2]!['cursor']).toBe(String(LIST_PAGE_CLAMP * 2))
+    // Both forms: `toHaveProperty` also fails for an explicitly-`undefined`
+    // value, and the explicit key check names the field if either ever leaks.
+    expect(complete).not.toHaveProperty('messagesResumeCursor')
+    expect(Object.hasOwn(complete, 'messagesResumeCursor')).toBe(false)
+
   })
 
   it('④d3 BOTH triggers on one message: the circuit-broken walk and an unreadable part coexist', async () => {

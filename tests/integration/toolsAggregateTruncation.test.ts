@@ -20,7 +20,7 @@ import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherr
  * R3-F2 acceptance suite: the AGGREGATE SURFACING rule.
  *
  * `cherry_read` has always reported a walk that stopped early (`truncated` +
- * `truncationReason` + the resume cursor). The three results that ride the SAME
+ * `truncationReason` + the stop-point cursor). The three results that ride the SAME
  * `#readTerminalMessages` walk — `cherry_send`'s terminal aggregate, the timeout
  * result, and `cherry_wait`'s idle snapshot — did not: on a session whose
  * history exceeds the tool-side 1000-message aggregate ceiling they silently
@@ -306,7 +306,8 @@ describe('R3-F2: terminal/timeout/idle aggregates surface a truncated message wa
     // answers is `TERMINAL_AGGREGATE_MESSAGES` (20), which is set independently
     // of `MAX_AGGREGATE_LIMIT` and therefore reads as a caller limit.
     expect(idle.messagesTruncationReason).toBe('limit')
-    // Where to resume: the peer's cursor, as a decimal string.
+    // The stop point: the peer's cursor, as a decimal string. It marks where
+    // the unread history begins; it is not an input to any tool.
     expect(typeof idle.messagesResumeCursor).toBe('string')
     expect(Number(idle.messagesResumeCursor)).toBeGreaterThan(0)
     // The aggregate really is bounded (issue #3), and the text is best-effort —

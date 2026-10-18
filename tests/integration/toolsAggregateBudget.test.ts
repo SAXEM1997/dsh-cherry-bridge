@@ -355,16 +355,16 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
     expect(idle.messages.length).toBeLessThan(3)
   })
 
-  it('T5c a byte stop offers a resume cursor ONLY when it did not stop mid-page', async () => {
-    // A resume cursor is a PROMISE that resuming there loses nothing. The
-    // peer's `nextCursor` points past the WHOLE aggregate page it came with,
-    // and the byte budget runs over the aggregate's already-collected window
-    // (`#aggregate` fills up to TERMINAL_AGGREGATE_MESSAGES items FIRST, then
-    // the projection applies the budget), so the promise holds only when the
-    // budget spent itself exactly on the window's LAST item. A stop earlier
+  it('T5c a byte stop offers a stop-point cursor ONLY when it did not stop mid-page', async () => {
+    // The stop-point cursor is a PROMISE that it names where the unread history
+    // begins. The peer's `nextCursor` points past the WHOLE aggregate page it
+    // came with, and the byte budget runs over the aggregate's already-collected
+    // window (`#aggregate` fills up to TERMINAL_AGGREGATE_MESSAGES items FIRST,
+    // then the projection applies the budget), so the promise holds only when
+    // the budget spent itself exactly on the window's LAST item. A stop earlier
     // than that leaves in-window messages — newer than the cursor, older than
-    // the last one returned — that a caller chaining `cherry_read` from the
-    // cursor would never see again.
+    // the last one returned — that the cursor would silently jump over (no
+    // tool takes a history-walk cursor, so they can only be re-read).
     //
     // (a) WHOLE-WINDOW STOP: 19 tiny messages then ONE fat message as the 20th
     //     (last) item of the aggregate window, with a 21st message behind the
@@ -410,8 +410,9 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
     // is on the result, fat message and all.
     expect(whole.messages).toHaveLength(20)
     expect(whole.messages[19]!.messageId).toBe('w-fat')
-    // Nothing lies between the cursor and what was returned: resuming is safe,
-    // and it points at the first message this walk did NOT take (`t-0`).
+    // Nothing lies between the cursor and what was returned: it honestly marks
+    // where the unread history begins, at the first message this walk did NOT
+    // take (`t-0`).
     expect(typeof whole.messagesResumeCursor).toBe('string')
     expect(Number(whole.messagesResumeCursor)).toBe(20)
 
@@ -442,8 +443,8 @@ describe('issue #3 T1: a timeout answer is bounded — its message walk is cappe
     // The walk stopped BEFORE the end of its window: items 2..20 were
     // collected but are not on the result.
     expect(mid.messages.map((message) => message.messageId)).toEqual(['m-0'])
-    // So no cursor is offered: the peer's `nextCursor` would be past item 20,
-    // and resuming there would skip items 2..20 forever. (The parent commit
+    // So no stop point is offered: the peer's `nextCursor` would be past item
+    // 20, naming a position that skips items 2..20. (The parent commit
     // attached it here — this assertion is the red line for that behaviour.)
     expect(mid.messagesResumeCursor).toBeUndefined()
   })

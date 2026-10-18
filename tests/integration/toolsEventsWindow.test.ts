@@ -179,8 +179,10 @@ describe('issue #2: a baseline cursor handed out by the tools is servable by che
       'the session subscription',
     )
 
-    // A send whose window elapses mid-run answers `timeout` WITH the resume
-    // cursor — the tool-level way a caller learns "resume from here".
+    // A send whose window elapses mid-run answers `timeout` WITH the event
+    // cursor — the tool-level way a caller learns "events after here" (and
+    // unlike the message walk's stop point, this one IS fed back to
+    // `cherry_events`).
     const sent = (await rig.call('cherry_send', {
       device: 'dev-A',
       sessionId: SESSION.sessionId,

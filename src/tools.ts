@@ -208,7 +208,12 @@ export interface CherryPage<T> {
    * result is never silent — the caller always learns that content was left.
    */
   truncationReason?: CherryTruncationReason
-  /** The cursor to resume from, present only on a non-limit truncation. */
+  /**
+   * The peer's page position the walk was handed when it stopped. An internal
+   * pagination value (the walk resumes its own pages from it, see
+   * {@link CherryPage}); where it is projected into a tool result, it is a
+   * stop-point marker for the caller, not an input.
+   */
   nextCursor?: string
 }
 
@@ -262,11 +267,22 @@ export interface CherryReadMessage {
    * Present only when this message's parts could NOT all be read: the safety
    * circuit-breaker stopped the walk (always `'safety-bound'` here — parts
    * have no byte budget). The walk runs OLDEST-part-first, so what it drops is
-   * this message's LATER parts, resumable from `partsResumeCursor`. Absent
-   * means the part list is complete.
+   * this message's LATER parts. Absent means the part list is complete.
    */
   partsTruncated?: CherryTruncationReason
-  /** The `parts.list` cursor to resume this message's part walk from. */
+  /**
+   * Where the parts walk stopped — a STOP-POINT MARKER, not an input.
+   *
+   * `parts.list` has no cursor parameter on this tool, so the value cannot be
+   * handed back to read the rest; it is the peer's page position the parts walk
+   * was handed when it stopped (the end of the last page it touched). Its
+   * presence says those LATER parts are still unread (the message is also
+   * flagged `incomplete`). It is a marker, not a way in: no caller input can
+   * raise the parts circuit-breaker that cut this walk (it is an engine option,
+   * and the part walk is otherwise unbounded), so a caller cannot ask "give me
+   * the rest of THIS message" — the readable face of the loss is `incomplete`
+   * plus this stop point. Present exactly when `partsTruncated` is.
+   */
   partsResumeCursor?: string
   /**
    * Present (`true`) when any part of this message could not be fully read.
@@ -306,10 +322,16 @@ export interface CherryReadSnapshot {
    */
   truncationReason?: CherryTruncationReason
   /**
-   * The `agent.messages.list` cursor to continue the walk with, present only
-   * when `truncated` is true and the peer named one. Because the walk runs
-   * newest-first, resuming from it continues toward OLDER messages — the only
-   * direction a truncation ever leaves unread.
+   * Where the message walk stopped — a STOP-POINT MARKER, not an input.
+   *
+   * `cherry_read` accepts no cursor (`device`/`sessionId`/`limit` only), so
+   * this value cannot be handed back to fetch the rest: it is the peer's
+   * `agent.messages.list` page position the walk was handed when it stopped
+   * (the end of the last page it touched, so it may sit PAST the last returned
+   * message). Present exactly when `truncated` is true and the peer named one;
+   * because the walk runs newest-first, it marks OLDER messages as still
+   * unread — the only direction a truncation leaves behind. To read them,
+   * RAISE `limit` and re-read.
    */
   messagesResumeCursor?: string
 }
@@ -327,7 +349,8 @@ export interface CherryReadSnapshot {
  *
  * The flag never changes the STATUS: a truncated terminal aggregate is still
  * `completed`. Surfacing is the contract — the caller learns that the text may
- * be partial and where to resume, and decides what to do about it.
+ * be partial and that older history is still unread, and decides what to do
+ * about it.
  */
 export interface CherryMessageWalkVerdict {
   /**
@@ -344,16 +367,21 @@ export interface CherryMessageWalkVerdict {
   /** Why it stopped, present exactly when `messagesTruncated` is true. */
   messagesTruncationReason?: CherryTruncationReason
   /**
-   * The `agent.messages.list` cursor to resume the walk from — when, and only
-   * when, resuming there cannot SKIP a message.
+   * Where the walk stopped — a STOP-POINT MARKER, and deliberately omitted when
+   * handing it out would imply a hop that loses a message.
    *
-   * The peer's `nextCursor` points past the whole page it came with, so on a
-   * BYTE stop it is only truthful if that page was consumed completely. A byte
-   * stop in the MIDDLE of a page leaves in-page messages newer than the cursor
-   * and older than the last one returned: chaining `cherry_read` from
-   * `nextCursor` would jump over them, which is why the field is then OMITTED
-   * rather than handed out as a resume point that loses content. Those messages
-   * are reachable only through the result's own `messages` view / `cherry_read`.
+   * No tool takes an `agent.messages.list` / history-walk cursor (the terminal
+   * aggregates rebuild from the newest page every call; `cherry_events`' event
+   * cursor is a different stream), so the value is not a chaining input:
+   * it says the OLDER history was cut and names the peer's page position the
+   * walk was handed when it stopped. It is reported only when the WHOLE page
+   * was consumed. The peer's `nextCursor` points past the whole page it came
+   * with, so a BYTE stop in the MIDDLE of a page would name a position with
+   * messages NEWER than it and OLDER than the last one returned still unread —
+   * handing that out as a stop point would misdescribe where the truncation
+   * begins. Those messages are reachable only by re-reading (a terminal
+   * re-wait, or `cherry_read`, which projects the whole newest page before its
+   * own limit can cut).
    */
   messagesResumeCursor?: string
 }
@@ -372,7 +400,8 @@ export interface CherryMessageWalkVerdict {
  *  - `awaiting-interaction` — the SOFT terminal: an unanswered interaction
  *    arrived, so the run is still alive but cannot progress without the caller.
  *  - `timeout` — the window elapsed. NOT a failure (spec §6): the caller gets
- *    what arrived plus the cursor to resume from.
+ *    what arrived plus a stop-point cursor marking where the unread history
+ *    begins.
  *  - `idle` — `cherry_wait` on a session with no in-flight execution: the
  *    current snapshot, returned at once (no error, no waiting).
  *  - `subscription-lost` — the run's event stream went away mid-wait and could
@@ -432,10 +461,11 @@ const MAX_AGGREGATE_LIMIT = 1000
  * messages FIRST. Ten runs' worth of slack is therefore already an order of
  * magnitude more than the walk needs to see the current one.
  *
- * Truncation is SURFACED (`messagesTruncated` + reason + resume cursor), never
- * silent: a caller that really wants the deeper history resumes from the
- * cursor or reads the session with `cherry_read`, whose own `limit` is the
- * caller's to raise.
+ * Truncation is SURFACED (`messagesTruncated` + reason + stop-point cursor),
+ * never silent: a caller that really wants the deeper history re-waits or
+ * reads the session with `cherry_read`, whose own `limit` is the caller's to
+ * raise. (The stop-point field names a position, not an input — no tool takes
+ * a history-walk cursor.)
  */
 const TERMINAL_AGGREGATE_MESSAGES = 20
 /**
@@ -1174,8 +1204,8 @@ class CherryToolEngine {
    * `limit` is a CALLER contract, and reaching it is reported as
    * `truncationReason: 'limit'`. `safetyBound` is different in kind: it is an
    * internal circuit-breaker against a peer that never terminates, and tripping
-   * it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the resume
-   * cursor) — a walk never stops early and reports success.
+   * it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the
+   * stop-point cursor) — a walk never stops early and reports success.
    *
    * An EMPTY page with a non-null `nextCursor` is legal progress while the
    * cursor advances: the desktop's pinned-list walk answers exactly
@@ -1289,7 +1319,7 @@ class CherryToolEngine {
     }
   }
 
-  /** A stopped aggregate, always carrying why it stopped and where to resume. */
+  /** A stopped aggregate: always says why it stopped and where (stop point). */
   #truncated<T>(items: T[], reason: CherryTruncationReason, cursor: string | undefined): CherryPage<T> {
     return {
       items,
@@ -1629,8 +1659,9 @@ class CherryToolEngine {
       messages,
       truncated: page.truncated,
       ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
-      // Only a TRUNCATED walk has somewhere further to go, and the cursor then
-      // continues toward OLDER messages ({@link CherryReadSnapshot.messagesResumeCursor}).
+      // Only a TRUNCATED walk has unread history, and the cursor then marks the
+      // stop point (OLDER messages remain unread; raise `limit` to read them) —
+      // {@link CherryReadSnapshot.messagesResumeCursor}.
       ...(page.truncated && page.nextCursor !== undefined ? { messagesResumeCursor: page.nextCursor } : {}),
     }
   }
@@ -1680,9 +1711,10 @@ class CherryToolEngine {
       role: String(raw['role'] ?? ''),
       status: String(raw['status'] ?? ''),
       parts,
-      // A circuit-broken part list advertises itself, with the cursor to resume
-      // from: the caller can see that this message is incomplete and where to
-      // continue, so content is never dropped silently.
+      // A circuit-broken part list advertises itself: the caller can see that
+      // this message is incomplete and that later parts are still unread, so
+      // content is never dropped silently. `partsResumeCursor` below is that
+      // stop point — a marker, not an input (see the field's docblock).
       ...(partsTruncated === undefined
         ? {}
         : {
@@ -2186,7 +2218,8 @@ class CherryToolEngine {
         'interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with ' +
         'cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns ' +
         'the command receipt immediately. A timeout is NOT a failure — it returns the partial content ' +
-        'and the cursor to resume from. When content is cut, `messagesTruncated`/`messagesTruncationReason` ' +
+        'and a stop-point cursor marking where the unread history begins (re-wait or use cherry_read ' +
+        'to see more; the field is not an input). When content is cut, `messagesTruncated`/`messagesTruncationReason` ' +
         'report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a ' +
         'returned message missing its own parts carries `incomplete`.',
       parameters: {
@@ -3294,7 +3327,8 @@ class CherryToolEngine {
   }
 
   /**
-   * The session's current cursor, for a result that has to say where to resume.
+   * The session's current EVENT cursor, for a result that has to say where the
+   * event stream stands (this one IS an input: `cherry_events` takes it).
    * Read from the subscription cache without advancing the ACK cursor —
    * waiters CONSUME, they do not acknowledge (controller ruling: ack stays the
    * `cherry_events` delivery call site).
@@ -3806,12 +3840,13 @@ class CherryToolEngine {
    * id it named is no longer knowable from here, so a wait that has not yet
    * attached to that run degrades to what it would have been without adoption at
    * all: it parks out its window and answers `timeout` (with the partial content
-   * and the resume cursor, per spec §6) rather than `completed`. The bound is
-   * therefore ~2 MiB of buffered events per session — the default budget — and
-   * reaching it takes a run that both emits that much event traffic AND whose
-   * command receipt omitted `executionId`. The degradation is bounded and
-   * recoverable rather than silent: `timeout` is a non-failure answer, and
-   * `cherry_read` rebuilds the full picture without the buffer.
+   * and the stop-point cursor, per spec §6's timeout row) rather than
+   * `completed`. The bound is therefore ~2 MiB of buffered events per session —
+   * the default budget — and reaching it takes a run that both emits that much
+   * event traffic AND whose command receipt omitted `executionId`. The
+   * degradation is bounded and recoverable rather than silent: `timeout` is a
+   * non-failure answer, and `cherry_read` rebuilds the full picture without the
+   * buffer.
    *
    * It is NOT fixed by scanning the peer's journal, because the peer's replay
    * window is itself bounded and the tool has no cursor to offer it — the same
@@ -3965,8 +4000,14 @@ class CherryToolEngine {
   }
 
   /**
-   * The timeout result: NOT a failure. Partial content read so far + the
-   * cursor to resume from.
+   * The timeout result: NOT a failure. Partial content read so far + a
+   * stop-point cursor marking where the unread history begins.
+   *
+   * The spec's own sentence (§3.6, 2026-10-09 design: 「超时不是失败：返回已收到
+   * 的部分内容 + 当前游标，agent 可续查」) is a HISTORICAL statement of that
+   * contract in cursor terms: the "游标" it names is the event cursor (`cursor`,
+   * still returned) plus this stop point, and no tool accepts a history-walk
+   * cursor to "续查" through — "see more" means re-waiting or `cherry_read`.
    *
    * Unlike the terminal aggregate the text here is NOT run-scoped: the run has
    * not settled, so there is no terminal message to cut at, and the whole point
@@ -4161,15 +4202,16 @@ class CherryToolEngine {
    * `'aggregate-bytes'` is attributed here), and the three callers (terminal,
    * timeout, idle) each surface it.
    *
-   * A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
-   * points past the entire page it came with, so a byte stop in the MIDDLE of a
-   * page would hand out a cursor whose interval still holds messages this walk
-   * trimmed — newer than the cursor, older than the last one returned. A caller
-   * chaining `cherry_read` from it would never see them, and only `cherry_read`
-   * (or this result's own `messages`) can still fetch them; offering a cursor
-   * that jumps over content is worse than offering none. The cursor is
-   * therefore attached only when the WHOLE page was returned (nothing lies
-   * between it and what this result carries) — see
+   * The STOP-POINT CURSOR IS OMITTED WHEN IT WOULD MISDESCRIBE THE STOP. The
+   * peer's `nextCursor` points past the entire page it came with, so a byte
+   * stop in the MIDDLE of a page would report a position that still holds
+   * messages this walk trimmed — newer than the cursor, older than the last one
+   * returned. No tool takes a history-walk cursor, so it can never be
+   * "chained": the field only marks where the unread history begins, and
+   * naming a position the result itself contradicts is worse than naming none.
+   * Those trimmed messages are reachable by RE-READING (another wait, or
+   * `cherry_read`). The cursor is therefore attached only when the WHOLE page
+   * was returned (nothing lies between it and what this result carries) — see
    * {@link CherryMessageWalkVerdict.messagesResumeCursor}.
    */
   async #readTerminalMessages(
@@ -4208,21 +4250,22 @@ class CherryToolEngine {
     // aggregate's own boundary case records).
     const exhausted = outOfBudget && (messages.length < page.items.length || page.truncated)
     if (exhausted) {
-      // A RESUME CURSOR IS ONLY OFFERED WHEN IT CANNOT SKIP ANYTHING. The peer's
-      // `nextCursor` points PAST the page it came with (`pageOf` returns
+      // The STOP-POINT CURSOR IS ONLY REPORTED WHEN IT MATCHES THE STOP. The
+      // peer's `nextCursor` points PAST the page it came with (`pageOf` returns
       // `start + limit`, and `#aggregate` carries the last one it saw). So:
       //
       //  - WHOLE PAGE CONSUMED (`messages.length === page.items.length`): every
       //    message up to the cursor is either on this result or was never
-      //    served by this walk — nothing lies between them, and resuming at
-      //    `nextCursor` continues exactly where the walk stopped.
+      //    served by this walk — nothing lies between them, and the cursor
+      //    names exactly where the walk stopped.
       //  - MID-PAGE STOP (fewer messages than the page carried): the trimmed
       //    in-page messages are NEWER than the cursor and OLDER than the last
-      //    one returned, so a caller chaining `cherry_read` from `nextCursor`
-      //    would never see them again. Handing out a cursor that silently skips
-      //    content is worse than handing out none; those messages are reachable
-      //    only through `cherry_read` (or this result's own `messages` view),
-      //    and `messagesTruncated` still says the walk was cut.
+      //    one returned, so the cursor would name a position that is not where
+      //    the unread history begins. No tool accepts a history-walk cursor, so
+      //    nothing is "chained" either way — but a stop point the result itself
+      //    contradicts is worse than none; those messages are reachable by
+      //    re-reading (another wait, or `cherry_read`), and `messagesTruncated`
+      //    still says the walk was cut.
       //
       // The EXHAUSTED VERDICT above is unchanged: both stops are truncation.
       const verdict: { messages: CherryReadMessage[] } & CherryMessageWalkVerdict = {
@@ -4231,7 +4274,9 @@ class CherryToolEngine {
         messagesTruncationReason: 'aggregate-bytes',
       }
       // The cursor is attached ONLY when the whole page was consumed: on a
-      // mid-page stop it would point past messages this walk trimmed.
+      // mid-page stop it would point past messages this walk trimmed. It is a
+      // STOP-POINT MARKER, not an input (no tool here takes a cursor); a future
+      // cursor-taking read argument would branch off HERE.
       if (page.nextCursor !== undefined && messages.length === page.items.length) {
         verdict.messagesResumeCursor = page.nextCursor
       }
