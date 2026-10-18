@@ -11,7 +11,7 @@ import {
   type SecureChannel,
 } from '@cherrystudio/remote-transport'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
-import { JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
+import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 
 const PROTOCOL_VERSION = 1
 
@@ -660,5 +660,106 @@ describe('JsonRpcClient', () => {
     // structured reason instead of queueing onto a channel that can never
     // answer (which would surface as a confusing transport write error).
     await expect(client.request('echo.after', {})).rejects.toThrow(/^JSON-RPC channel closed$/)
+  })
+
+  /**
+   * The two write failures the upstream transport actually raises (issue #28).
+   * Both mean the frame never reached the peer AND the connection was aborted,
+   * so the request has no peer verdict — the TransportLostError definition.
+   * `label` says which upstream path raised it.
+   */
+  const WRITE_LOSS_MESSAGES = [
+    { label: 'remote-transport record budget', message: 'Remote record budget exceeded' },
+    { label: 'remote-transport socket congestion', message: 'Remote socket unavailable or congested' },
+  ] as const
+
+  for (const { label, message } of WRITE_LOSS_MESSAGES) {
+    it(`⑨a (issue #28) classifies a write failure as transport loss, preserving "${label}" as the cause`, async () => {
+      // A raw channel whose write always fails the way the upstream transport
+      // does. `read` never settles: nothing can answer a request that was never
+      // written, so the rejection under test can only come from the write.
+      const doomed: SecureChannel = {
+        remoteIdentity: 'peer',
+        write: () => Promise.reject(new Error(message)),
+        read: () => new Promise<unknown>(() => {}),
+        close: () => Promise.resolve(),
+      } as unknown as SecureChannel
+      const client = new JsonRpcClient(doomed)
+
+      const error = await client.request('agent.agents.list', {}).catch((reason: unknown) => reason)
+
+      // The CORRECTED face: the same classified signal every in-flight request
+      // on the dead link gets from the read loop, so the connection layer can
+      // recognise it as a transport loss (and replay a read) instead of passing
+      // the upstream text through unclassified.
+      expect(error).toBeInstanceOf(Error)
+      expect((error as Error).message).toBe('JSON-RPC channel closed')
+      // The upstream diagnosis is not lost: it rides along as the cause, so an
+      // operator can still tell a record-budget kill from socket congestion.
+      expect(((error as Error).cause as Error | undefined)?.message).toBe(message)
+      // The raw upstream text is NOT the top-level message any more: consumers
+      // key on the classified face.
+      expect((error as Error).message).not.toBe(message)
+      expect(isChannelClosedError(error)).toBe(true)
+    })
+  }
+
+  it('⑨b (issue #28) a write failure with no Error value still carries a diagnosed cause and the classified face', async () => {
+    // The transport contracts to reject with an Error, but a rejection value is
+    // never trustworthy: a string or undefined must not turn the classified
+    // message into "undefined", nor drop the fact that a write failed.
+    const doomed: SecureChannel = {
+      remoteIdentity: 'peer',
+      write: () => Promise.reject(undefined),
+      read: () => new Promise<unknown>(() => {}),
+      close: () => Promise.resolve(),
+    } as unknown as SecureChannel
+    const client = new JsonRpcClient(doomed)
+
+    const error = await client.request('connection.ping', {}).catch((reason: unknown) => reason)
+    expect((error as Error).message).toBe('JSON-RPC channel closed')
+    expect(String(((error as Error).cause as Error | undefined)?.message)).toMatch(/write failed/i)
+    expect(isChannelClosedError(error)).toBe(true)
+  })
+
+  it('⑨c (issue #28) a write failure fails EVERY request fail fast — queued ones never reach the channel', async () => {
+    // The record-budget path aborts the connection upstream. Once this client
+    // has seen that, no further request may attempt a write on a socket that is
+    // already gone — not the one made after the fact, and not the ones already
+    // QUEUED behind the in-flight window: a queued send is admitted by
+    // drainQueue the moment the window frees, which is exactly when a dead
+    // client must refuse instead of writing again.
+    //
+    // maxInFlight 1 makes the window hold three requests in sequence: the first
+    // is in flight, the other two are queued. The write always rejects (the
+    // channel is dead for every frame), so exactly ONE write may ever happen.
+    const write = vi.fn(() => Promise.reject(new Error('Remote record budget exceeded')))
+    const doomed: SecureChannel = {
+      remoteIdentity: 'peer',
+      write,
+      read: () => new Promise<unknown>(() => {}),
+      close: () => Promise.resolve(),
+    } as unknown as SecureChannel
+    const client = new JsonRpcClient(doomed, { maxInFlight: 1 })
+
+    const settled = await Promise.allSettled([
+      client.request('agent.agents.list', {}),
+      client.request('agent.agents.list', {}),
+      client.request('agent.agents.list', {}),
+    ])
+    // Every one of the three carries the classified face — including the two
+    // admitted after the loss, which fail fast rather than write.
+    for (const outcome of settled) {
+      expect(outcome.status).toBe('rejected')
+      if (outcome.status === 'rejected') {
+        expect((outcome.reason as Error).message).toBe('JSON-RPC channel closed')
+        expect(isChannelClosedError(outcome.reason)).toBe(true)
+      }
+    }
+    expect(write).toHaveBeenCalledTimes(1)
+
+    // And a request made later still fails fast with the same face.
+    await expect(client.request('agent.agents.list', {})).rejects.toThrow(/^JSON-RPC channel closed$/)
+    expect(write).toHaveBeenCalledTimes(1)
   })
 })

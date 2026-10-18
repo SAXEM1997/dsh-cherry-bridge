@@ -3,7 +3,7 @@ import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
 import { remoteConnectPath } from '@cherrystudio/remote-protocol'
-import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { digestIdentity } from './diagnostics.js'
 import { DEFAULT_RATE_BUDGET_PER_SECOND, DEFAULT_TRANSPORT_RETRY_WAIT_MS } from './defaults.js'
@@ -77,6 +77,16 @@ export interface DeviceConnectionOptions {
 }
 
 /**
+ * The transport call the dial hands a socket to (see
+ * {@link DeviceConnection}'s channel accessor). An exported SYMBOL rather than a
+ * `#`-name: `#` members are invisible to reflection by design, and issue #28's
+ * client-side write failure can be injected nowhere the dial can be observed —
+ * the transport captures its own write sink at construction, so a test needs
+ * this one seam, and a symbol is the narrowest one that can be found.
+ */
+export const CHANNEL_SEAM: unique symbol = Symbol('dsh-cherry-bridge.channel')
+
+/**
  * The structured §6 "设备离线" error: tool calls against a non-connected
  * device fail fast with `{device, state}` and never implicitly reconnect.
  */
@@ -106,9 +116,10 @@ export class TransportLostError extends Error {
   /** Always true: the peer never gave this request a verdict. */
   readonly retryable = true
 
-  constructor(device: string, state: DeviceState, method: string) {
+  constructor(device: string, state: DeviceState, method: string, options?: ErrorOptions) {
     super(
       `device ${device}: transport lost while "${method}" was in flight (request may be retried)`,
+      options,
     )
     this.name = 'TransportLostError'
     this.device = device
@@ -158,8 +169,6 @@ const RATE_WINDOW_MS = 1_000
  * the two apart, so the pacing gap carries margin on top of window/budget.
  */
 const RATE_WINDOW_MARGIN_MS = 150
-/** Bare rejection the rpc layer uses once the channel can no longer answer. */
-const CHANNEL_CLOSED_RE = /^JSON-RPC channel closed$/
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
 const DISPOSED_RE = /^JSON-RPC client disposed$/
 /**
@@ -452,6 +461,17 @@ export class DeviceConnection {
    */
   readonly #attachedHandlers = new Set<(method: string, params: unknown) => void>()
   readonly #timers = new Map<TimerName, Timer>()
+  /**
+   * The transport call the dial hands a socket to.
+   *
+   * A named accessor, not a bare module import, for the same reason
+   * `#houseCall` exists: the connect function is the ONE place the connection
+   * decides how a link is turned into a channel, and naming it makes that
+   * decision observable from a test (issue #28's client-side write failure can
+   * be injected nowhere else, since the `#`-private dial is not addressable and
+   * the transport captures its own write sink at construction).
+   */
+  readonly [CHANNEL_SEAM] = { connectSecureChannel }
 
   #state: DeviceState = 'offline'
   #limits: EffectiveLimits = { ...FALLBACK_LIMITS }
@@ -817,7 +837,7 @@ export class DeviceConnection {
     const stream = new RemoteSocketStream(toRemoteSocket(ws), silentComponentLogger.forComponent('device'), 'outbound')
     let channel: SecureChannel
     try {
-      channel = await connectSecureChannel(stream, {
+      channel = await this[CHANNEL_SEAM].connectSecureChannel(stream, {
         identity: this.#identity,
         logger: silentComponentLogger,
         protocolVersions: [...this.#protocolVersions],
@@ -989,7 +1009,7 @@ export class DeviceConnection {
       (error: unknown) => {
         // Only a pong (or a dead channel) clears a pending ping: a timed-out
         // ping is silence evidence and must stay for the window to judge.
-        if (error instanceof Error && CHANNEL_CLOSED_RE.test(error.message)) {
+        if (isChannelClosedError(error)) {
           this.#pendingPings.delete(ping)
           this.#onLinkLost(epoch, 'channel closed')
         }
@@ -1021,7 +1041,7 @@ export class DeviceConnection {
       this.#refreshFirstFailureAt = undefined
       this.#scheduleRefresh(epoch)
     } catch (error) {
-      if (error instanceof Error && CHANNEL_CLOSED_RE.test(error.message)) return // link-lost path owns it
+      if (isChannelClosedError(error)) return // link-lost path owns it
       const first = (this.#refreshFirstFailureAt ??= Date.now())
       if (Date.now() - first >= this.#refreshGraceMs) {
         console.error(
@@ -1151,7 +1171,10 @@ export class DeviceConnection {
       // supervisor has not necessarily observed the loss yet, and naming the
       // stale state would send a caller looking for an offline device when the
       // device was up and the link was what went away.
-      const lost = new TransportLostError(this.record.deviceId, 'connected', method)
+      // The underlying rejection rides along as `cause`: the classified faces
+      // are identical on purpose, but the operator still needs to tell a
+      // record-budget kill from socket congestion when reading the final error.
+      const lost = new TransportLostError(this.record.deviceId, 'connected', method, { cause: error })
       // Only a read is replayed (see RETRYABLE_READ_METHODS); only a live
       // lifecycle has a reconnect to wait for.
       if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost
@@ -1194,8 +1217,12 @@ export class DeviceConnection {
   #isTransportLoss(error: unknown): boolean {
     // A peer refusal is a verdict (JsonRpcRequestError) and a deliberate local
     // shutdown reads `JSON-RPC client disposed`; only the channel-closed face
-    // means "the request went out and no answer will ever arrive".
-    return error instanceof Error && !(error instanceof JsonRpcRequestError) && CHANNEL_CLOSED_RE.test(error.message)
+    // means "the request has no adjudicator". WHICH failures land on that face
+    // is the rpc layer's decision, not this layer's: a failed WRITE (the
+    // transport ran out of record budget or its socket queue) is reported there
+    // as the same classified error, with the transport's own message as its
+    // `cause`, precisely so this predicate needs no second literal to match.
+    return error instanceof Error && !(error instanceof JsonRpcRequestError) && isChannelClosedError(error)
   }
 
   /**
