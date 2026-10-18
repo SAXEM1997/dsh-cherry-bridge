@@ -1724,3 +1724,290 @@ describe('issue #17: the CUMULATIVE arm of the externalized-content ceiling', ()
     expect(overServed.content).toBe('')
   })
 })
+
+describe('issue #27: the externalized-content digest has TWO sources and both must agree', () => {
+  it('④u a slice digest that DISAGREES with the ref declaration degrades the part, never certifies it', async () => {
+    // The ref advertises a digest; so does every slice's `sha256`. The official
+    // client checks the SLICE's digest against the ref's on every page, so a
+    // peer whose two sources disagree is self-inconsistent and cannot be said
+    // to have served the content the ref describes — even when the bytes match
+    // the slice's own (lying) digest. Preferring the slice (the old
+    // `sha ?? declaredSha`) certified such a peer.
+    //
+    // This fake serves exactly that peer: the bytes are real and hash to the
+    // digest the SLICE reports, while the ref (and the pin) advertise a
+    // different digest.
+    const text = 'Q'.repeat(2_000)
+    const bytes = new TextEncoder().encode(text)
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'text', text: 'inline survives' },
+              { kind: 'text', text, external: true },
+            ],
+          },
+          {
+            messageId: 'm-2',
+            revision: '1002',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'later message survives' }],
+          },
+        ],
+      },
+    })
+
+    // The slice-level digest is the TRUE digest of the bytes served (so the
+    // digest-of-bytes check passes); the ref keeps the pin's own digest, which
+    // differs because it is the digest of DIFFERENT bytes.
+    const sliceDigest = createHash('sha256').update(bytes).digest('hex')
+    const refDigest = createHash('sha256').update('a different content entirely').digest('hex')
+    expect(sliceDigest).not.toBe(refDigest)
+    rig.fake.scriptContentSlice({
+      contentId: 'm-1:1',
+      revision: '1001',
+      offset: '0',
+      dataBase64: Buffer.from(bytes).toString('base64'),
+      nextOffset: String(bytes.length),
+      eof: true,
+      sha256: sliceDigest,
+    })
+    // The bytes hash to `sliceDigest`, so the ONLY way to reject this peer is
+    // to compare the two digest sources — the mutation this test pins.
+    expect(createHash('sha256').update(bytes).digest('hex')).toBe(sliceDigest)
+    // Keep the pin's advertised digest at what the ref already says: the fake's
+    // wire digest for slices is the pin's, so let the pin BE `refDigest`.
+    rig.fake.setContentDigest('m-1:1', '1001', refDigest)
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        messageId: string
+        parts: Array<{ partId: string; content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
+      }>
+    }
+
+    // The rest of the page is untouched: this is a per-part content failure.
+    expect(result.messages.map((message) => message.messageId)).toEqual(['m-1', 'm-2'])
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline survives')
+    expect(result.messages[1]!.parts[0]!.content).toBe('later message survives')
+    // The self-inconsistent part is marked unavailable with its content
+    // withheld — and the message advertises its lost content.
+    const inconsistent = result.messages[0]!.parts[1]!
+    expect(inconsistent.partId).toBe('m-1:1')
+    expect(inconsistent.content).toBe('')
+    expect(inconsistent.unavailable).toMatch(/sha256|digest|integrity/i)
+    expect(result.messages[0]!.incomplete).toBe(true)
+    expect(result.messages[0]!.unavailableParts).toBe(1)
+    // The message's walk was complete: this is a CONTENT verdict.
+    expect(result.messages[0]).not.toHaveProperty('partsTruncated')
+    // The healthy message carries neither flag.
+    expect(result.messages[1]).not.toHaveProperty('incomplete')
+    expect(result.messages[1]).not.toHaveProperty('unavailableParts')
+  })
+
+  it('④v bytes that match the digest but are NOT legal UTF-8 degrade the part — no U+FFFD is ever returned', async () => {
+    // A digest certifies the BYTES, not their legality: a peer can serve bytes
+    // whose sha256 is exactly what it promised and which still are not UTF-8.
+    // `Buffer.toString('utf8')` silently rewrites those to U+FFFD, so the
+    // certified-but-corrupt text would reach the model as substitution
+    // characters. The decode is FATAL: an illegal sequence is an integrity
+    // failure of this part (degradable, like any other unreadable content).
+    const raw = Buffer.concat([
+      Buffer.from('valid prefix '),
+      Buffer.from([0xff]), // a lone continuation byte: never legal UTF-8
+      Buffer.from(' valid suffix'),
+    ])
+    const trueDigest = createHash('sha256').update(raw).digest('hex')
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'text', text: 'inline survives' },
+              { kind: 'text', text: 'placeholder', external: true },
+            ],
+          },
+        ],
+      },
+    })
+
+    // The raw bytes AND the ref's digest both describe the same (illegal)
+    // content, so this peer is fully self-consistent: only the DECODE can tell
+    // that there is no text here.
+    rig.fake.setContentBytes('m-1:1', '1001', raw)
+    expect(rig.fake.contentDigestFor('m-1:1', '1001')).toBe(trueDigest)
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        parts: Array<{ partId: string; content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
+      }>
+    }
+
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline survives')
+    const undecodable = result.messages[0]!.parts[1]!
+    expect(undecodable.partId).toBe('m-1:1')
+    // The one thing that must NEVER happen: a certified digest must not buy a
+    // part its U+FFFD-filled text.
+    expect(undecodable.content).toBe('')
+    expect(undecodable.unavailable).toMatch(/utf-?8|decode/i)
+    expect(JSON.stringify(result)).not.toContain('\uFFFD')
+    expect(result.messages[0]!.incomplete).toBe(true)
+    expect(result.messages[0]!.unavailableParts).toBe(1)
+  })
+})
+
+describe('issue #27 follow-up: the agreement check is PER SLICE, not just on the last one', () => {
+  it('④w an EARLY slice that echoes a different digest is caught even when the last slice agrees with the ref', async () => {
+    // `sha` holds only the LAST slice's report, so checking agreement once at
+    // the end lets a peer disagree on every earlier slice and still be
+    // certified by its final one. The official client compares
+    // `page.sha256 === ref.sha256` on EVERY slice; so does this walk now.
+    //
+    // The bytes here are honest end to end — their whole-content digest IS the
+    // ref's — so the ONLY defect is the first slice's echoed digest.
+    const first = 'A'.repeat(24 * 1024)
+    const second = 'B'.repeat(512)
+    const text = first + second
+    const bytes = Buffer.from(text)
+    const trueDigest = createHash('sha256').update(bytes).digest('hex')
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              { kind: 'text', text: 'inline survives' },
+              { kind: 'text', text, external: true },
+            ],
+          },
+        ],
+      },
+    })
+    rig.fake.scriptContentSlice({
+      contentId: 'm-1:1',
+      revision: '1001',
+      offset: '0',
+      dataBase64: bytes.subarray(0, 24 * 1024).toString('base64'),
+      nextOffset: String(24 * 1024),
+      eof: false,
+      // The lie: the first slice echoes a digest that is not the ref's.
+      sha256: createHash('sha256').update('some other content').digest('hex'),
+    })
+    rig.fake.scriptContentSlice({
+      contentId: 'm-1:1',
+      revision: '1001',
+      offset: String(24 * 1024),
+      dataBase64: bytes.subarray(24 * 1024).toString('base64'),
+      nextOffset: String(bytes.length),
+      eof: true,
+      sha256: trueDigest,
+    })
+    // ...then fall through to the pin, whose slices echo the TRUE digest (this
+    // is asserted after the first read below, once the pin exists).
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        parts: Array<{ partId: string; content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
+      }>
+    }
+
+    expect(result.messages[0]!.parts[0]!.content).toBe('inline survives')
+    const inconsistent = result.messages[0]!.parts[1]!
+    expect(inconsistent.partId).toBe('m-1:1')
+    // The honest bytes and the honest final digest must NOT buy this part its
+    // text: one dishonest slice is enough to make the walk uncertifiable.
+    expect(inconsistent.content).toBe('')
+    expect(inconsistent.unavailable).toMatch(/sha256|digest|integrity|disagree/i)
+    // The diagnosis names WHERE: slice index and offset.
+    expect(inconsistent.unavailable).toMatch(/slice 1\b|offset 0\b/i)
+    expect(result.messages[0]!.incomplete).toBe(true)
+    expect(result.messages[0]!.unavailableParts).toBe(1)
+    // It stopped at the FIRST offending slice: the second was never requested.
+    expect(rig.fake.readCallsFor('agent.content.read')).toHaveLength(1)
+    // Precondition, checked once the pin has been created by that first
+    // listing: the ref (and every honest slice after the scripted pair) carries
+    // the TRUE whole-content digest, so the end-of-walk check alone would have
+    // passed and only the per-slice check can reject this walk.
+    expect(rig.fake.contentDigestFor('m-1:1', '1001')).toBe(trueDigest)
+  })
+
+  it('④x a leading BOM is STRIPPED, not returned, and the part stays usable', async () => {
+    // A digest certifies bytes; the DECODER decides the text. `TextDecoder`
+    // drops a leading U+FEFF by design (the WHATWG encoding rule, and what the
+    // official reducer's decode does), where the old `toString('utf8')` kept
+    // it. That is an alignment, and this pins it: the BOM must not survive
+    // into the model's context as an invisible zero-width character, and it
+    // must not be mistaken for content that fails to decode.
+    const raw = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('hello, world')])
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'placeholder', external: true }],
+          },
+        ],
+      },
+    })
+    // The fixture `text` is only long enough to reach the peer's inline limit
+    // (forcing the `{ref}` form); the bytes that get SERVED are the BOM ones,
+    // pinned after the fixture's own pin so they replace it outright — bytes
+    // and digest together, so this peer is self-consistent and only the decode
+    // decides the outcome.
+    rig.fake.setContentBytes('m-1:0', '1001', raw)
+    expect(rig.fake.contentDigestFor('m-1:0', '1001')).toBe(createHash('sha256').update(raw).digest('hex'))
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        parts: Array<{ partId: string; content: string; unavailable?: string }>
+        incomplete?: true
+        unavailableParts?: number
+      }>
+    }
+
+    const part = result.messages[0]!.parts[0]!
+    expect(part.unavailable).toBeUndefined()
+    expect(part.content).toBe('hello, world')
+    expect(part.content).not.toContain('\uFEFF')
+    expect(result.messages[0]).not.toHaveProperty('incomplete')
+    expect(result.messages[0]).not.toHaveProperty('unavailableParts')
+  })
+})

@@ -1877,7 +1877,14 @@ class CherryToolEngine {
     return !(error instanceof ContentIntegrityError)
   }
 
-  /** Paginate `agent.content.read` over one `{ref}` and verify its sha256. */
+  /**
+   * Paginate `agent.content.read` over one `{ref}` and verify its sha256.
+   *
+   * The digest is checked against BOTH its sources (the ref's declaration and
+   * the slices' own reports), which must agree when both are present, and the
+   * certified bytes must then decode as legal UTF-8 — a digest certifies bytes,
+   * not text.
+   */
   async #readExternalized(
     connection: DeviceConnection,
     sessionId: string,
@@ -1938,6 +1945,23 @@ class CherryToolEngine {
         )
       }
       const chunk = Buffer.from(data, 'base64')
+      // PER SLICE, not once at the end: `sha` below keeps only the LAST
+      // slice's report, so a single end-of-walk check would let a peer echo a
+      // different digest on every EARLY slice and still be certified by an
+      // honest final one. The official client compares `page.sha256` against
+      // the ref's on EVERY slice; this does the same, against the ref's
+      // declaration only (a slice cannot referee itself), and only when both
+      // values are present — the end-of-walk check covers what remains.
+      const sliceSha = typeof slice['sha256'] === 'string' ? slice['sha256'] : undefined
+      if (sliceSha !== undefined && declaredSha !== undefined && sliceSha !== declaredSha) {
+        // Same degradable class as the end-of-walk disagreement below: the
+        // content is self-inconsistent, so no certified value exists for it.
+        throw new Error(
+          `agent.content.read for ${contentId} returned a sha256 at slice ${sliceIndex + 1} ` +
+            `(offset ${offset}) that disagrees with the ref (slice ${sliceSha}, ref ${declaredSha}); ` +
+            'refusing to certify either',
+        )
+      }
       hash.update(chunk)
       chunks.push(chunk)
       read += chunk.length
@@ -1980,6 +2004,24 @@ class CherryToolEngine {
       )
     }
 
+    // TWO SOURCES, ONE DIGEST. The ref advertises the digest of the content it
+    // describes; every slice reports the digest of what it believes it served.
+    // When BOTH are present they must AGREE before either can certify anything:
+    // the official client enforces exactly this per slice, because a peer whose
+    // two sources disagree is self-inconsistent — one of them is describing
+    // different bytes — so neither can be trusted as the verification target.
+    // Preferring one (`sha ?? declaredSha`) would certify such a peer. (Only
+    // one source present keeps the previous behaviour: use what the peer
+    // offers.)
+    if (sha !== undefined && declaredSha !== undefined && sha !== declaredSha) {
+      // Degradable, NOT fatal: unlike a digest mismatch, no bytes are being
+      // reported under a dishonest certificate — there is simply no single
+      // certified value here. The part loses its text and says so.
+      throw new Error(
+        `agent.content.read for ${contentId} returned a sha256 that disagrees with the ref ` +
+          `(slice ${sha}, ref ${declaredSha}); refusing to certify either`,
+      )
+    }
     const expected = sha ?? declaredSha
     if (expected === undefined) {
       // Not degradable either: nothing can verify these bytes, so reporting
@@ -1995,7 +2037,23 @@ class CherryToolEngine {
         `agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`,
       )
     }
-    return Buffer.concat(chunks).toString('utf8')
+    // A MATCHING DIGEST CERTIFIES THE BYTES, NOT THEIR LEGALITY. The sha256 says
+    // these are the bytes the content is made of; it says nothing about whether
+    // those bytes ARE text. A lenient decode would rewrite every illegal
+    // sequence to U+FFFD and hand the model substitution characters as though
+    // they were the part's content — so the decode is FATAL, and content that
+    // is not legal UTF-8 fails like any other unreadable content (degradable,
+    // per part) rather than being silently mangled. The decoder also applies
+    // the standard encoding rule of DROPPING a leading U+FEFF — what the
+    // official reducer's decode does too, and what keeps an invisible zero-width
+    // character out of the model's context.
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
+    } catch {
+      throw new Error(
+        `agent.content.read for ${contentId} returned bytes that are not valid UTF-8; not decoded`,
+      )
+    }
   }
 
   // -------------------------------------------------------------------------
