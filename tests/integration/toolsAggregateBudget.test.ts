@@ -30,7 +30,7 @@ import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherr
  *     `agent.content.read`). On a 459-message session that was 29+ message pages
  *     plus >100 content pages AFTER the deadline had already passed — so a 1 s
  *     timeout took ~two minutes to answer. Bounded here by
- *     `TERMINAL_AGGREGATE_MESSAGES` and `TERMINAL_AGGREGATE_BYTES`.
+ *     `TERMINAL_AGGREGATE_MESSAGES` and `AGGREGATE_BYTES`.
  *  2. **The text anchor pointed at the OLDEST assistant message.** The peer's
  *     `listSessionMessages` walks NEWEST-FIRST (an absent cursor returns the
  *     most recent page; `nextCursor` walks one page OLDER), so the aggregated
@@ -216,10 +216,12 @@ const AGENT = { agentId: 'agent-1', name: 'Agent One' }
  *    newest-first walk reaches FIRST) with an order of magnitude to spare.
  *  - 256 KiB of projected JSON: the 13 MB / 459-message aggregate that broke
  *    the MCP boundary was a single call's worth of content. `JSON.stringify`
- *    length is the cheap approximation of the wire cost.
+ *    length is the cheap approximation of the wire cost. ONE budget, shared by
+ *    the terminal faces and `cherry_read` (issue #29) — mirrored here under the
+ *    source's own name, `AGGREGATE_BYTES`.
  */
 const TERMINAL_AGGREGATE_MESSAGES = 20
-const TERMINAL_AGGREGATE_BYTES = 262_144
+const AGGREGATE_BYTES = 262_144
 
 /** The message-walk verdict the three terminal faces must carry when bounded. */
 const BOUNDED_REASONS = ['limit', 'safety-bound', 'aggregate-bytes']
@@ -736,5 +738,139 @@ describe('issue #3 T4: a timeout answer carries a zero-round-trip heartbeat', ()
 
     expect(result.status).toBe('timeout')
     expect(result.progress).toBeUndefined()
+  })
+})
+
+describe('issue #29: `cherry_read` is bounded by BYTES at message boundaries too', () => {
+  /**
+   * The READ face's byte budget (UltraReview #8).
+   *
+   * `AGGREGATE_BYTES` bounded the three terminal aggregates, but
+   * `cherry_read` runs its OWN walk (`#readOnce`) whose only bound was the
+   * caller's `limit`. A fat session therefore paid for every round trip — every
+   * message, every part, every `{ref}` content read — and only THEN produced a
+   * result of tens of megabytes, which dies at the MCP boundary ("value is not
+   * lossless JSON", the same shape as the 13 MB field report). The fix applies
+   * the SAME budget to the same projected messages, with the same guarantees:
+   *
+   *  - the budget is checked only BETWEEN messages, so the newest message is
+   *    always returned whole;
+   *  - a stop is SURFACED (`truncated` + `truncationReason`) and carries the
+   *    stop-point cursor;
+   *  - it keeps the terminal face's vocabulary: `'aggregate-bytes'`, for the
+   *    same reason it was minted there — a caller told `'limit'` would look for
+   *    a `limit` it never passed.
+   *
+   * Every fat part here is EXTERNALIZED (`external: true`), which is the shape
+   * that made the field report expensive: each message costs its own
+   * `agent.content.read` round trips, so the budget must stop the WALK, not
+   * merely trim the answer.
+   */
+
+  /** One externalized message fixture carrying `kib` KiB of text. */
+  function fatExternalized(messageId: string, kib: number): FakeMessageRecord {
+    return {
+      messageId,
+      revision: '1',
+      role: 'assistant',
+      status: 'success',
+      parts: [{ kind: 'text', text: 'F'.repeat(kib * 1024), external: true }],
+    }
+  }
+
+  /** A `cherry_read` result, as the suite asserts on it. */
+  interface ReadResult {
+    messages: Array<{ messageId: string; parts: Array<{ content: string; unavailable?: string }>; incomplete?: true }>
+    truncated: boolean
+    truncationReason?: string
+    messagesResumeCursor?: string
+  }
+
+  it('R1 stops the fat walk at a message boundary, says why, and keeps the newest message whole', async () => {
+    // 25 externalized messages of 60 KiB each: 1.5 MB projected, far past the
+    // 256 KiB budget, with `limit: 1000` nowhere near being reached. Each part
+    // is read through its own `agent.content.read` slices, so a walk that is
+    // not stopped here pays for all 25 before the answer is even built.
+    //
+    // HOW THE WALK'S WINDOW ACTUALLY LANDS (measured, not assumed). The peer
+    // PAGES AT 10 — `agent.messages.list` honours `maxMessagePageSize` — below
+    // the plugin's own 16-item clamp, so `#aggregate` spends three round trips
+    // (10 + 10 + 5) and collects ALL 25 messages before the projection starts.
+    // It is therefore neither truncated (`page.truncated` false) nor holding a
+    // `nextCursor` (the walk ended on the peer's last page, which reports
+    // null): the window is the whole fixture. The byte budget still stops the
+    // projection after ~5 messages, so 20 messages that were ALREADY COLLECTED
+    // are left unprojected — and, because that stop is inside the window
+    // rather than past the last page, no peer cursor exists to name it (see
+    // (5)).
+    const messages = Array.from({ length: 25 }, (_unused, index) => fatExternalized(`fat-${index}`, 60))
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], messages, maxMessagePageSize: 10 },
+      hello: { limits: { pageItems: 100 } },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1000 })) as ReadResult
+
+    // (1) The stop is surfaced, in the TERMINAL face's vocabulary — the read
+    // face mints no reason of its own.
+    expect(result.truncated).toBe(true)
+    expect(result.truncationReason).toBe('aggregate-bytes')
+    // (2) `limit` was NOT what stopped it: only 1000 messages were asked for.
+    expect(result.truncationReason).not.toBe('limit')
+    // (3) The walk stopped BETWEEN messages and the newest one is WHOLE: it is
+    // `messages[0]` (newest-first) and no part of it was cut or degraded.
+    expect(result.messages[0]?.messageId).toBe('fat-0')
+    expect(result.messages[0]?.parts[0]?.content).toHaveLength(60 * 1024)
+    expect(result.messages[0]?.parts[0]?.unavailable).toBeUndefined()
+    expect(result.messages[0]).not.toHaveProperty('incomplete')
+    // (4) The result is bounded: at least one message, and the byte total is
+    // below the budget plus ONE message's allowance (the message that tripped
+    // it is always taken, as on the terminal face).
+    expect(result.messages.length).toBeGreaterThanOrEqual(1)
+    expect(result.messages.length).toBeLessThan(messages.length)
+    const carried = Buffer.byteLength(JSON.stringify(result.messages), 'utf8')
+    expect(carried).toBeLessThan(AGGREGATE_BYTES + 60 * 1024)
+    // (5) The stop point is reported, and it names where the unread OLDER
+    // history begins. This walk's page cursor is `undefined` (it ended on the
+    // peer's last page), so the value comes ONLY from the byte-stop derivation:
+    // the boundary the result itself establishes, one past the last message
+    // returned. A copied page cursor would have been `undefined` here, so this
+    // assertion is what pins the derivation rather than the page position.
+    expect(result.messagesResumeCursor).toBe(String(result.messages.length))
+    // Every retained message carries its text: the budget never cuts inside one.
+    for (const message of result.messages) {
+      expect(message.parts[0]?.content).toHaveLength(60 * 1024)
+      expect(message).not.toHaveProperty('incomplete')
+    }
+    // (6) The PROJECTION really stopped early — the per-message round trips are
+    // what the budget saves. 256 KiB / 60 KiB ≈ 5 messages, so a bounded walk
+    // projects ~5 of the 25 collected (the page round trips were already
+    // spent, see the fixture note); the old behaviour projected every one.
+    expect(rig.fake.readCallsFor('agent.parts.list')).toHaveLength(result.messages.length)
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBeLessThan(10)
+  })
+
+  it('R2 a `limit` that binds FIRST is still attributed to `limit` — the byte arm does not regress it', async () => {
+    // 47 tiny messages, peer paging at 16 (the same fixture ④s uses): `limit:
+    // 20` reaches the caller's ceiling long before 256 KiB, so the stop point
+    // is the caller's and must still say `'limit'`. This is the regression pin
+    // for adding a second arm: a budget check that ran unconditionally would
+    // have to keep this reason intact.
+    const messages = Array.from({ length: 47 }, (_unused, index) =>
+      assistantMessage(`m-${index}`, `t-${index}`),
+    )
+    const rig = await makeRig({
+      hello: { limits: { pageItems: 16 } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 20 })) as ReadResult
+
+    expect(result.truncated).toBe(true)
+    expect(result.truncationReason).toBe('limit')
+    expect(result.messages).toHaveLength(20)
+    expect(result.messagesResumeCursor).toBe('20')
+    // All 20 were projected: the byte budget never fired on a walk this small.
+    expect(rig.fake.readCallsFor('agent.parts.list')).toHaveLength(20)
   })
 })

@@ -33,7 +33,7 @@ import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherr
  * with the peer still holding pages.
  *
  * ISSUE #3 LOWERED THAT CEILING — from the generic 1000-item aggregate bound to
- * `TERMINAL_AGGREGATE_MESSAGES = 20`, with a `TERMINAL_AGGREGATE_BYTES` budget on
+ * `TERMINAL_AGGREGATE_MESSAGES = 20`, with an `AGGREGATE_BYTES` budget on
  * top. The rule under test is unchanged (a walk that stopped early is SURFACED,
  * never silent); what changed is the number and, therefore, WHICH bound trips:
  * a caller-limit stop is `'limit'`, and here the caller is the tool itself. The

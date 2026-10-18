@@ -96,7 +96,7 @@ profile 手工加行等价于：
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。 |
-| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。消息**从新到旧**排列（`messages[0]` 是最新的一条），因此 `limit` 丢掉的是**最旧**的消息；被截断的走查一定会说明（`truncated` 为 `true`，并带 `truncationReason`），`messagesResumeCursor` 只作**停点指示**——它标记「还有更旧的消息未读」，不是本工具接受的入参（`cherry_read` 的参数里没有游标）；读更旧的消息请提高 `limit` 重查；消息走查的截断只丢**更旧**的消息，绝不切开已返回消息内部的 parts（parts 走查熔断是另一层：`partsTruncated` 丢的是该消息**较后**的 parts）。某条消息自身的 parts 没能读全（有 part 带 `unavailable`，或 parts 走查熔断而带 `partsTruncated`）时，该消息带 `incomplete: true`，若有不可读的 part 还带 `unavailableParts` 计数——这是消息的内容判定，与走查是否截断无关。 |
+| `cherry_read` | 读取会话的消息历史快照（两级基线：`agent.sessions.get` + `agent.messages.list`/`agent.parts.list`；parts 按**每条消息自身**的 revision 读取）。附件部件只回 `name`/`mediaType`/`byteLength` 与**空** `content`——字节不取。消息**从新到旧**排列（`messages[0]` 是最新的一条），因此 `limit` 丢掉的是**最旧**的消息；被截断的走查一定会说明（`truncated` 为 `true`，并带 `truncationReason`），`messagesResumeCursor` 只作**停点指示**——它标记「还有更旧的消息未读」，不是本工具接受的入参（`cherry_read` 的参数里没有游标）；`truncationReason` 为 `limit` 时提高 `limit` 重查，为 `aggregate-bytes` 时则是**输出预算停点**（单次回答达到大小上限，与 `limit` 无关：提高 `limit` 只会多付往返、仍停在同一预算），此时本工具**没有任何参数能取到**被预算挡下的更旧消息（走查恒从最新端起步、无游标入参）——只能在桌面端查看，或等待未来的历史游标读取参数（#26 跟踪，当前不提供）；消息走查的截断只丢**更旧**的消息，绝不切开已返回消息内部的 parts（parts 走查熔断是另一层：`partsTruncated` 丢的是该消息**较后**的 parts）。某条消息自身的 parts 没能读全（有 part 带 `unavailable`，或 parts 走查熔断而带 `partsTruncated`）时，该消息带 `incomplete: true`，若有不可读的 part 还带 `unavailableParts` 计数——这是消息的内容判定，与走查是否截断无关。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后经 `agent.sessions.get` 回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的消息），返回的消息内部不会被切开；返回的消息自身 parts 没读全则带 `incomplete`。 |
@@ -131,7 +131,8 @@ profile 手工加行等价于：
   同一 id 配不同正文才报幂等冲突。
 - **单 ref 外置内容上限 32 MiB。** 超过上限的 part 直接标 `unavailable`，该消息带
   `incomplete: true`，并在有不可读 part 时带 `unavailableParts` 计数；不返回无法校验的
-  部分内容。
+  部分内容。上限是**每 ref 独立**的：组装一份内容时瞬时内存约为其大小的 3 倍，
+  一次聚合按顺序逐 ref 读取（峰值即单 ref 的 3 倍），但**并发读取按在途数放大**。
 - **list 走查容忍「游标前进的连续空过渡页」至多 2 页，第 3 页即拒绝**（桌面端分区切换
   时的正常过渡，任何非空页都会重置计数）；游标不前进或循环回已出现过的游标则直接拒绝，
   不空转。
