@@ -693,6 +693,11 @@ export class FakeCherry {
   #checkpointReadCalls: Array<{ subscriptionId: string; checkpointId: string; pageCursor: string | undefined }> = []
   #activateCalls: Array<{ subscriptionId: string; appliedCursor: AgentCursor; ok: boolean }> = []
   #ackCalls: Array<{ subscriptionId: string; cursor: AgentCursor }> = []
+  /**
+   * When set, EVERY `agent.subscriptions.ack` is refused with this failure —
+   * consumed by the call, not by success (see `refuseAcks`).
+   */
+  #ackFailure: FakeFailure | undefined
   #closeCalls: Array<{ subscriptionId: string; sessionId: string | undefined }> = []
   /** Per-subscription prepared-lease deadline (ms since epoch). */
   #leaseDeadlines = new Map<string, number>()
@@ -2124,11 +2129,27 @@ export class FakeCherry {
     return { subscriptionId, status: 'active' }
   }
 
+  /**
+   * Refuses every subsequent `agent.subscriptions.ack` with `failure`, or stops
+   * refusing when called with `undefined`.
+   *
+   * Distinct from the WINDOW refusal below, which a well-behaved client can
+   * avoid by acking inside the window: this is the peer answering the ack
+   * itself with an error (a vanished subscription appearing as CONFLICT, a
+   * transiently failing peer, a reset race), which the client cannot provably
+   * avoid and must therefore survive.
+   */
+  refuseAcks(failure: FakeFailure | undefined): void {
+    this.#ackFailure = failure
+  }
+
   /** `agent.subscriptions.ack`: only an ACTIVE subscription, within the window. */
   #handleAck(params: Record<string, unknown>): Record<string, unknown> {
     const subscriptionId = params['subscriptionId'] as string
     const cursor = params['cursor'] as AgentCursor
     this.#ackCalls.push({ subscriptionId, cursor })
+    const injected = this.#ackFailure
+    if (injected !== undefined) throw new FakeRpcError(injected)
     const subscription = this.#subscriptions.get(subscriptionId)
     const seq = Number(cursor.seq)
     if (

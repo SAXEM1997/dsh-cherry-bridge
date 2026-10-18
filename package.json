@@ -62,7 +62,7 @@
     "build:client": "vite build --mode client --config ui/vite.config.ts",
     "dev:ui": "vite --config ui/vite.config.ts",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.ui.json",
-    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run build:client"
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && npm run build:client && npm pack --dry-run"
   },
   "dependencies": {
     "@cherrystudio/remote-protocol": "0.5.0",
