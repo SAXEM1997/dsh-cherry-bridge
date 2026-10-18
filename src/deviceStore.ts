@@ -534,12 +534,23 @@ export class DeviceStore {
    * not several things matching, and folding the two together made
    * `cherry_devices` answer `ambiguous-device` with `candidates: []` on a
    * machine with a single paired device.
+   *
+   * AN EMPTY SELECTOR IS A MISS (v0.1.3 review, P3-1). `''.startsWith('')` is
+   * true, so the prefix branch used to match EVERY record: one paired device
+   * resolved silently to it and several answered `ambiguous` — an answer about
+   * a selector that names nothing. The guard sits AFTER the exact branch, not
+   * before it, so a record whose own `deviceId` is the empty string still
+   * resolves exactly; only the PREFIX branch refuses the empty selector.
    */
   resolve(device: string): DeviceResolution {
     const devices = this.list()
 
     const exact = devices.find((record) => record.deviceId === device)
     if (exact !== undefined) return exact
+
+    // Every non-empty selector used to reach the prefix branch; only the empty
+    // one is refused, because it prefixes everything.
+    if (device === '') return { notFound: true }
 
     // One `filter` over the archive list yields the UNION of the two prefix
     // spaces, already deduplicated by `deviceId` (the filter visits each record

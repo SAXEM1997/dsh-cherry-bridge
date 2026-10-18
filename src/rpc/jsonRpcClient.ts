@@ -8,8 +8,21 @@ import type { SecureChannel } from '@cherrystudio/remote-transport'
 
 /** Default cap on business requests in flight on a single connection. */
 const DEFAULT_MAX_IN_FLIGHT = 8
-/** Default per-request timeout in milliseconds. */
-const DEFAULT_TIMEOUT_MS = 30_000
+/**
+ * Default per-request timeout in milliseconds.
+ *
+ * ALIGNED WITH THE PROTOCOL'S IDLE TERM (v0.1.3 review, P3-4): the peer's
+ * `remoteLimits.idleMs` is 60,000ms, the window after which the desktop may
+ * consider the session idle and close it. A client-side timeout SHORTER than
+ * that decides a request is dead while the peer still considers the session
+ * live — it turns a slow-but-legal answer into a spurious local failure, and
+ * (because the connection replays reads) into a second arrival the peer never
+ * asked for. Waiting at least as long as the peer means every timeout this
+ * client reports is a real one. `remoteLimits` is not imported here on purpose:
+ * this module stays free of the protocol package's runtime surface, and the
+ * value is pinned by the review that set it.
+ */
+const DEFAULT_TIMEOUT_MS = 60_000
 /** Rejection message used once the channel can no longer carry responses. */
 const CHANNEL_CLOSED_MESSAGE = 'JSON-RPC channel closed'
 /** Bounded number of schema issues quoted in one drop warning. */

@@ -344,6 +344,41 @@ describe('JsonRpcClient', () => {
     await expect(client.request('echo.never', {}, { timeoutMs: 100 })).rejects.toThrow()
   })
 
+  it('④c (v0.1.3 P3-B4) an un-parameterised client waits 60s — the protocol idleMs — for an answer', async () => {
+    // The default is a PROTOCOL decision, not a taste one: a client timeout
+    // below `remoteLimits.idleMs` (60,000ms) calls a request dead while the
+    // peer still considers the session live. Fake timers make the 60s assertion
+    // exact instead of a CI-timing guess, and they are installed BEFORE the
+    // request is admitted, so the only timer in play is the request's own
+    // timeout (the loopback write and the peer's enqueue are promise work, not
+    // timers).
+    vi.useFakeTimers()
+    try {
+      const { client, peer } = await openLoopback({ timeoutMs: undefined })
+      const harness = new PeerHarness(peer)
+      harness.autoReply = false
+
+      const request = client.request('echo.pending', {})
+      await harness.waitForRequests(1)
+      let outcome: unknown = 'pending'
+      void request.then(
+        (value) => (outcome = value),
+        (reason: unknown) => (outcome = reason),
+      )
+      // One millisecond short of the protocol's idle term: still pending.
+      await vi.advanceTimersByTimeAsync(10)
+      await vi.advanceTimersByTimeAsync(1000)
+      await vi.advanceTimersByTimeAsync(48_989)
+      await vi.advanceTimersByTimeAsync(1)
+      // The idle term itself: settled by the timeout, naming the exact window.
+      await vi.runAllTimersAsync()
+      expect(outcome).toBeInstanceOf(Error)
+      expect((outcome as Error).message).toContain('timed out after 60000ms')
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 20_000)
+
   it('④b drops an id-less response frame for an outstanding request', async () => {
     const { client, peer } = await openLoopback()
     const harness = new PeerHarness(peer)

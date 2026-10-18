@@ -256,6 +256,26 @@ describe('DeviceStore.resolve', () => {
     expect(store.resolve('dev-')).toEqual({ ambiguous: ['dev-alpha workstation', 'Desk Beta'] })
     expect(store.resolve('a1b2c3d4')).toEqual({ notFound: true })
   })
+
+  it('treats the EMPTY selector as a miss, not as a prefix of everything (v0.1.3 P3-B1)', async () => {
+    // `''.startsWith('')` is true, so an empty selector used to match EVERY
+    // record: a one-device archive silently resolved to that device and a
+    // multi-device one answered `ambiguous` for a selector that names nothing.
+    // "Resolve ''" is not a request for a device at all, so it is a MISS.
+    const store = new DeviceStore(await makeStoreFile())
+    expect(store.resolve('')).toEqual({ notFound: true })
+
+    store.upsert(makeRecord({ deviceId: 'dev-alpha', displayName: 'Alpha Workstation' }))
+    expect(store.resolve('')).toEqual({ notFound: true })
+
+    store.upsert(makeRecord({ deviceId: 'dev-beta', displayName: 'Beta Box' }))
+    expect(store.resolve('')).toEqual({ notFound: true })
+
+    // A record whose OWN deviceId is the empty string is still reachable: the
+    // exact branch comes first and is untouched by the empty-selector guard.
+    store.upsert(makeRecord({ deviceId: '', displayName: 'Odd Box' }))
+    expect(store.resolve('')).toEqual(expect.objectContaining({ deviceId: '', displayName: 'Odd Box' }))
+  })
 })
 
 describe('DeviceStore schema migration', () => {

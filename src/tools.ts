@@ -1260,6 +1260,21 @@ class CherryToolEngine {
    * it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the
    * stop-point cursor) — a walk never stops early and reports success.
    *
+   * A page whose `items` are not all records is PROJECTED: every list face
+   * runs through `arrayOf`, which keeps the records and drops the rest (an
+   * item that is not an object cannot be an entry of anything this layer
+   * renders). Dropping is the only option for a mid-walk page, but it must
+   * never be SILENT, because a dropped item is a short answer that otherwise
+   * reads exactly like a complete one:
+   *
+   *  - one bounded `console.warn` per WALK, naming the method and the number of
+   *    dropped items — never their contents, which are peer-supplied payload;
+   *  - a TERMINAL page (`nextCursor: null`) that offered items and had ALL of
+   *    them dropped is a contradiction: the peer says the walk is over and
+   *    simultaneously retracts everything on its last page. It is thrown with
+   *    the exact diagnosis — same family as the stuck-cursor refusal — rather
+   *    than returned as `truncated: false` with a hole in it.
+   *
    * An EMPTY page with a non-null `nextCursor` is legal progress while the
    * cursor advances: the desktop's pinned-list walk answers exactly
    * `{items: [], nextCursor: 'entity:'}` when a pin anchor is unpinned or
@@ -1273,7 +1288,7 @@ class CherryToolEngine {
     connection: DeviceConnection,
     method: string,
     params: Record<string, unknown>,
-    extract: (page: Record<string, unknown>) => { items: T[]; nextCursor: unknown },
+    extract: (page: Record<string, unknown>) => { items: T[]; nextCursor: unknown; dropped?: number },
     limit: number,
     safetyBound: number = MAX_AGGREGATE_LIMIT,
     maxPerPage: number = LIST_PAGE_CLAMP,
@@ -1300,6 +1315,10 @@ class CherryToolEngine {
     const items: T[] = []
     let cursor: string | undefined
     let emptyPages = 0
+    // Non-record items this walk dropped. Reported ONCE for the walk (the
+    // warning says WHICH method, which a per-page line would repeat), and
+    // consulted again on a terminal page (see the fail-loud check below).
+    let droppedTotal = 0
     // Every cursor this walk has been HANDED back, so a loop of any length is
     // caught: the advance check below can only see a cursor that repeats
     // IMMEDIATELY, and a longer cycle (A → B → A) would otherwise spin to the
@@ -1333,12 +1352,34 @@ class CherryToolEngine {
       if (cursor !== undefined) request['cursor'] = cursor
       const result = (await connection.rpc.request(method, request)) as Record<string, unknown>
       const extracted = extract(result)
+      const dropped = extracted.dropped ?? 0
+      if (dropped > 0 && droppedTotal === 0) {
+        // Once per walk, and the ITEMS themselves never reach the log: a peer
+        // that answers with garbage may answer with payload-shaped garbage.
+        console.warn(
+          `[cherry-remote] ${method} dropped ${dropped} non-record items from a page ` +
+            `for ${JSON.stringify(params)}; they cannot be projected as entries`,
+        )
+      }
+      droppedTotal += dropped
       for (const item of extracted.items) {
         if (items.length >= ceiling) break
         items.push(item)
       }
       const next = extracted.nextCursor
-      if (next === null || next === undefined) return { items, truncated: false }
+      if (next === null || next === undefined) {
+        // A terminal page that OFFERED items and had every one of them dropped
+        // is not "an empty last page": the answers contradict each other, and
+        // returning what was collected would present a short result as the
+        // complete one. Refused with the count, like a stuck cursor.
+        if (dropped > 0 && extracted.items.length === 0) {
+          throw new Error(
+            `${method}: peer returned ${dropped} non-record items that were dropped from its terminal ` +
+              `page (nextCursor null) for ${JSON.stringify(params)}; refusing a silently short result`,
+          )
+        }
+        return { items, truncated: false }
+      }
       const advanced = String(next)
       // A cursor that does not move is zero progress whatever the page held, so
       // this is checked FIRST: when an empty page also echoes the cursor it was
@@ -1502,7 +1543,7 @@ class CherryToolEngine {
           connection,
           'agent.agents.list',
           {},
-          (page) => ({ items: arrayOf(page['items']), nextCursor: page['nextCursor'] }),
+          (page) => ({ ...arrayOf(page['items']), nextCursor: page['nextCursor'] }),
           aggregateLimit(args['limit']),
         )
       },
@@ -1545,7 +1586,7 @@ class CherryToolEngine {
             // The flag rides on every page; the last page read wins, and the
             // real peer always sends it.
             if (typeof result['systemWorkspace'] === 'boolean') systemWorkspace = result['systemWorkspace']
-            return { items: arrayOf(result['items']), nextCursor: result['nextCursor'] }
+            return { ...arrayOf(result['items']), nextCursor: result['nextCursor'] }
           },
           aggregateLimit(args['limit']),
         )
@@ -1597,7 +1638,7 @@ class CherryToolEngine {
             ...(agentId === undefined ? {} : { agentId }),
             ...(workspaceId === undefined ? {} : { workspaceId }),
           },
-          (page) => ({ items: arrayOf(page['items']), nextCursor: page['nextCursor'] }),
+          (page) => ({ ...arrayOf(page['items']), nextCursor: page['nextCursor'] }),
           aggregateLimit(args['limit']),
         )
       },
@@ -1737,7 +1778,7 @@ class CherryToolEngine {
       connection,
       'agent.messages.list',
       { sessionId, historyRevision },
-      (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       limit,
     )
 
@@ -1802,7 +1843,7 @@ class CherryToolEngine {
       connection,
       'agent.parts.list',
       { sessionId, messageId, messageRevision: revision },
-      (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       Number.POSITIVE_INFINITY,
       this.#partsSafetyBound,
       // Parts records are the fattest per item (inline text), so they ride the
@@ -2787,7 +2828,7 @@ class CherryToolEngine {
           connection,
           'agent.interactions.list',
           { sessionId },
-          (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+          (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
           aggregateLimit(args['limit']),
           MAX_AGGREGATE_LIMIT,
           // An interaction record carries an inline input AND an inline
@@ -3477,7 +3518,7 @@ class CherryToolEngine {
       connection,
       'agent.interactions.list',
       { sessionId },
-      (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       MAX_AGGREGATE_LIMIT,
       MAX_AGGREGATE_LIMIT,
       INTERACTIONS_LIST_PAGE_CLAMP,
@@ -4414,7 +4455,7 @@ class CherryToolEngine {
       connection,
       'agent.messages.list',
       { sessionId, historyRevision },
-      (result) => ({ items: arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       TERMINAL_AGGREGATE_MESSAGES,
     )
 
@@ -4509,10 +4550,20 @@ class CherryToolEngine {
 // Small shared readers
 // ---------------------------------------------------------------------------
 
-/** The array at `value`, or an empty array when the peer sent something else. */
-function arrayOf(value: unknown): Array<Record<string, unknown>> {
-  if (!Array.isArray(value)) return []
-  return value.filter(isRecord)
+/**
+ * The array at `value`, or an empty array when the peer sent something else —
+ * plus HOW MANY entries were dropped as non-records (v0.1.3 review, P3-6a).
+ *
+ * The count is returned rather than logged here because this helper has no
+ * idea which method it is projecting: the CALLER (`#aggregate`) owns the
+ * method name and the page's terminality, so it is the only place that can
+ * say "agent.sessions.list dropped 2" without guessing, and the only place
+ * that can decide what a wholesale drop means.
+ */
+function arrayOf(value: unknown): { items: Array<Record<string, unknown>>; dropped: number } {
+  if (!Array.isArray(value)) return { items: [], dropped: 0 }
+  const items = value.filter(isRecord)
+  return { items, dropped: value.length - items.length }
 }
 
 /** The caller's aggregate limit, defaulting to one page and capped at the max. */

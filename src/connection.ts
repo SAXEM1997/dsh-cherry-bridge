@@ -63,7 +63,7 @@ export interface DeviceConnectionOptions {
   refreshGraceMs?: number
   /** Per-host TCP/WS connect timeout (default 10s). */
   connectTimeoutMs?: number
-  /** Per-RPC timeout handed to JsonRpcClient (default: the client's 30s). */
+  /** Per-RPC timeout handed to JsonRpcClient (default: the client's 60s, the protocol's idleMs). */
   rpcTimeoutMs?: number
   /** Versions offered in the Noise prelude AND echoed in hello (default [1]). */
   protocolVersions?: readonly number[]
@@ -183,9 +183,20 @@ const RATE_WINDOW_MARGIN_MS = 150
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
 const DISPOSED_RE = /^JSON-RPC client disposed$/
 /**
- * The read methods whose transport loss may be replayed automatically (two
- * entries are not called today — kept so a future call site is covered the day
- * it appears rather than silently un-retried).
+ * The read methods whose transport loss may be replayed automatically.
+ *
+ * Two entries are DEAD today and are kept deliberately, so a future call site
+ * is covered the day it appears rather than silently un-retried:
+ *
+ *  - `connection.ping` — production housekeeping goes through `#houseCall`
+ *    straight to the link's client and never passes through this facade, so
+ *    no production ping can reach the replay path.
+ *  - `agent.interactions.get` — this plugin has no call site for it.
+ *
+ * A third entry can look equally dead from here and is NOT:
+ * `agent.checkpoints.read` is reached through the subscription layer
+ * (`sessionSubscriptions.#walkCheckpoints`), so it is a live read and its
+ * presence in this set is what makes a mid-flight loss on it recoverable.
  *
  * Reads are safe to replay by construction: the peer answers from stored
  * revisions and the call has no side effect, so a second copy costs one round
@@ -621,6 +632,15 @@ export class DeviceConnection {
   }
 
   /**
+   * TEST INJECTION ONLY: overrides the reconnect backoff computation for
+   * EVERY attempt until the test clears it (see {@link #backoffDelay}) — a
+   * test sequences a fast first reconnect with slow later ones by returning
+   * a small value while `attempts` is low and a large one afterwards. Never
+   * set in production wiring.
+   */
+  retryBackoffInitialMs?: () => number
+
+  /**
    * Whether a dialed link is currently committed.
    *
    * Read-only view of state this class already owns, exposed because the
@@ -812,7 +832,17 @@ export class DeviceConnection {
 
   #backoffDelay(): number {
     const exponent = Math.min(Math.max(this.#attempt - 1, 0), 30)
-    return Math.min(this.#backoffInitialMs * 2 ** exponent, this.#backoffMaxMs)
+    // The nominal first delay, overridable per attempt for tests only.
+    const initialMs = this.retryBackoffInitialMs?.() ?? this.#backoffInitialMs
+    const capped = Math.min(initialMs * 2 ** exponent, this.#backoffMaxMs)
+    // JITTER, 20% downward (aligned with the official desktop client's
+    // DesktopConnectionManager). A deterministic doubling re-connects every
+    // device of a fleet in the same instant after a shared outage, which is
+    // the thundering herd the peer's own rate line answers by closing
+    // sessions. Only the LOWER 20% is used, so the documented ceiling
+    // `backoffMaxMs` is a real ceiling and the first attempt is never later
+    // than its nominal delay by more than rounding.
+    return Math.round(capped * (0.8 + Math.random() * 0.2))
   }
 
   /**
@@ -1287,6 +1317,17 @@ export class DeviceConnection {
       )
       const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client)
       if (reconnected === undefined) throw lost
+      // The link GENERATION the wait resolved on, re-checked before the replay
+      // is spent. This is why `#awaitReconnect` returns the epoch at all: a
+      // link loss is not a teardown, so a wait parked across one is not
+      // drained — it simply settles on whatever reconnected link comes next.
+      // Without this check the ONE replay a read is granted could be spent on
+      // a client from a generation the caller never saw (or one already being
+      // torn down), and the stale-generation race would resurface with any
+      // answer rather than the classified loss. A mismatch means the link
+      // changed under the wait: report the loss the caller's own attempt
+      // suffered, and let the caller re-ask on the current link.
+      if (reconnected.epoch !== this.#epoch) throw lost
       // The replay is a NEW ARRIVAL at the peer, so it takes a fresh pacing
       // admission: a reconnect releases every parked replay at once, and an
       // un-paced burst is exactly the spike the peer answers with a session
