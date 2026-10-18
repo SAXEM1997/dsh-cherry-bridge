@@ -153,11 +153,23 @@ the peer's `INLINE_TEXT_LIMIT` of 4,096 characters, with a 2 KiB margin) are the
 fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 
 **Upstream context (#21854, merged but unreleased).** Upstream added a
-`PAGE_ITEM_BYTES`-style byte budget (62,279 bytes) to the six `agent.*.list`
-methods; an item that cannot fit raises `RESOURCE_EXHAUSTED`. It is **not in any
+`PAGE_ITEM_BYTES`-style byte budget (62,279 bytes) to every paged `agent.*.list`
+face (`pageOf` truncates, `queryPage` re-queries a keyset page at a halved
+limit); an item that cannot fit raises `RESOURCE_EXHAUSTED`. It is **not in any
 release** as of the verified range, so deployed peers (2.1.6 and earlier) still
 page by count alone and the clamps stay. Byte-safe pages must not be removed
 because of that upstream commit.
+
+Reviewed against the merged code (`7218842`) and followed up as
+[`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951): an item above
+the budget **dead-ends the cursor**, so it and everything behind it become
+unreachable (reachable through a schema-valid record — `partIds` has no bound),
+`RESOURCE_EXHAUSTED` presents that permanent condition as retryable, and
+`queryPage`'s halving leaves up to half the budget unused. A peer may therefore
+come back with a page **shorter** than requested while still promising more,
+which our walk already follows (`tests/integration/toolsListWalkCompat.test.ts`
+T2); it must never come back **longer**, and `CherryPage.pageOverflow` is what
+happens if it does.
 
 **Pacing: two tiers against the desktop's kill lines.**
 
@@ -232,9 +244,24 @@ These are load-bearing; the code comments are the long version.
 - A truncated walk is **always surfaced** (a `truncationReason` plus a
   stop-point token), never a silent short result. Hitting a safety bound fails
   or reports; it never returns a partial as if it were complete.
-- A **resume** (an `after:` anchor scan) obeys every guard above unchanged.
-  Its two failures are its own: an anchor that is not on any page up to the
-  peer's last one, and a scan longer than `MAX_ANCHOR_SCAN_PAGES`. Both throw.
+- **An overshooting page is absorbed, not refused.** `limit` is a MAXIMUM on a
+  list method, so a page carrying more items than were asked for is a peer fault
+  — but nothing is lost yet, and throwing would make the list unreadable (the
+  worse failure). The walk takes what its ceiling allows, stops with the
+  caller's own attribution, and **re-uses the position it SENT** for that page:
+  the page's own `nextCursor` sits past items the walk never collected, so a
+  resume from it would skip them, and a terminal overshooting page would
+  otherwise be reported complete while dropping its tail. `CherryPage.pageOverflow`
+  records the case and `messageResumeToken` then prefers the exact `after:`
+  anchor.
+- A **resume** (an `after:` anchor scan) obeys every guard above unchanged —
+  including the stuck-cursor and cycle checks, which are pinned during a scan by
+  their own tests. Its two failures are its own: an anchor that is not on any
+  page up to the peer's last one, and a scan longer than
+  `MAX_ANCHOR_SCAN_PAGES`. Both throw. A scan asks for a **full page**
+  regardless of the caller's `limit`: its items are discarded either way, and
+  paging at `limit: 1` would spend the page budget on a history a full page
+  reaches in dozens.
 
 ### Stop-point cursors (the teaching case)
 

@@ -139,9 +139,10 @@ with it).
 - One externalized content is capped at 32 MiB; a larger part is marked
   `unavailable` rather than returning unverifiable partial content.
 - A truncated history walk always says so (`truncationReason`; `limit` and
-  `aggregate-bytes` mean different things, see above) and carries a
-  `messagesResumeCursor` resume token; a message whose own parts could not be
-  fully read carries `incomplete: true`.
+  `aggregate-bytes` mean different things, see above) and, whenever a stop point
+  can be named honestly, carries a `messagesResumeCursor` resume token (absent
+  when the walk reached the peer's last page); a message whose own parts could
+  not be fully read carries `incomplete: true`.
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is

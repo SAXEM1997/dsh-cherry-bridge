@@ -123,7 +123,8 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   重试即可，桌面端的命令账本会回放原回执。
 - 单个外置内容上限 32 MiB，超过的 part 标 `unavailable`，不回无法校验的部分内容。
 - 历史走查被截断时一定说明（`truncationReason`，`limit` 与 `aggregate-bytes` 两种含义不同，见上），
-  并给出 `messagesResumeCursor` 续读令牌；某条消息自身 parts 没读全时带 `incomplete: true`。
+  并在能诚实标出停点时给出 `messagesResumeCursor` 续读令牌（走到对端末页时没有可标的位置，就不给）；
+  某条消息自身 parts 没读全时带 `incomplete: true`。
 - **已知限制**：`cherry_respond` 让 DSH agent 可代替用户批准 Cherry 端审批卡（MVP 不加拦截层，
   信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；仅 `ws://`（Noise 加密），不做 TLS 直连。
 

@@ -221,6 +221,23 @@ export interface CherryPage<T> {
    * no cursor-taking argument at all.
    */
   nextCursor?: string
+  /**
+   * True when the peer served MORE items than this walk asked for and the walk
+   * took only part of that page (review P2-2).
+   *
+   * `limit` is a MAXIMUM on a list method, so an overshooting page is a peer
+   * fault — but one this walk absorbs rather than refuses, unlike the
+   * stuck/cycling cursors: nothing has been lost yet, and throwing would make
+   * the list unreadable, which is the worse failure. What the walk must not do
+   * is TRUST that page's position: it sits past items the walk never collected,
+   * so a resume from it would skip them, and a terminal overshooting page would
+   * otherwise be reported complete while dropping its tail. The walk therefore
+   * stops with the caller's own attribution and re-uses the position it SENT for
+   * that page — a resume re-reads the page (duplicates, never a gap) — while the
+   * message faces prefer the exact `after:<last id>` anchor
+   * ({@link messageResumeToken}).
+   */
+  pageOverflow?: true
 }
 
 /** `cherry_events`' structured window verdict (spec §6: cursor-out-of-window). */
@@ -604,20 +621,21 @@ const RESUME_ANCHOR_PREFIX = 'after:'
  *
  * Derivation. An anchor is only ever emitted for a message this bridge
  * RETURNED, and the largest message walk here collects at most
- * {@link MAX_AGGREGATE_LIMIT} messages: an anchor can therefore be emitted at
- * most 1000 messages deep, whatever the caller asked for. A peer that pages at
- * the protocol's 100 items needs 10 pages to reach that depth; a peer that pages
- * smaller needs more, so the bound must be expressed against the smallest page
- * this walk can ask for. {@link LIST_PAGE_CLAMP} is that floor for every peer
- * whose negotiated `pageItems` is above it (1000 / 16 = 63 pages), and a peer
- * negotiating BELOW the clamp keeps its own smaller size — a 1-item page would
- * need 1000. 500 pages covers any page size the desktop offers in practice,
- * with room for the empty pages a pinned-list walk legally serves and for a
- * session that grew between the two calls (appends at the NEW end do not push
- * an anchor further away; appends at the old end never matter). A scan that
- * has not met its anchor after 500 pages is a session this tool should not
- * chase, and it fails LOUDLY rather than truncating a walk that never really
- * started.
+ * {@link MAX_AGGREGATE_LIMIT} messages, so an anchor is at most 1000 messages
+ * deep AT THE MOMENT IT IS EMITTED. The scan asks for a FULL page
+ * ({@link LIST_PAGE_CLAMP} items against any peer whose negotiated `pageItems`
+ * is at or above it), so reaching that depth costs at most 1000 / 16 = 63
+ * pages. A peer negotiating BELOW the clamp pages smaller and needs more — the
+ * floor is the clamp for every desktop build we support, and the clamp is also
+ * what our byte-safe page budget asks for.
+ *
+ * The slack between 63 and 500 covers two things that GROW the distance: every
+ * message appended since the token was emitted adds one item of scan distance
+ * (the scan starts at the newest end, so a busy session pushes the anchor
+ * further away, not closer), and a pinned-list walk legally serves empty pages
+ * that advance the cursor without advancing position. A scan that has still not
+ * met its anchor after 500 pages is a session this tool should not chase, and it
+ * fails LOUDLY rather than truncating a walk that never really started.
  */
 const MAX_ANCHOR_SCAN_PAGES = 500
 /** The device id separator inside every engine cache key (neither id may hold NUL). */
@@ -1533,7 +1551,16 @@ class CherryToolEngine {
         ...params,
         // The per-page clamp: never more than one page's worth, whatever the
         // remaining aggregate says.
-        limit: Math.min(ceiling - items.length, pageItems),
+        //
+        // A SCAN asks for a FULL page regardless (review P3-1). While the anchor
+        // is still owed nothing is collected, so `ceiling - items.length` would
+        // be the CALLER's remaining `limit` — and a caller resuming with
+        // `limit: 1` (the documented "walk it in successive answers" pattern)
+        // would then walk the history ONE ITEM PER PAGE, spending
+        // {@link MAX_ANCHOR_SCAN_PAGES} on a history a full page reaches in
+        // dozens. The scan's items are discarded either way, so the wider page
+        // costs nothing and is what the page bound is derived against.
+        limit: pendingAnchor === undefined ? Math.min(ceiling - items.length, pageItems) : pageItems,
       }
       if (cursor !== undefined) request['cursor'] = cursor
       const result = (await connection.rpc.request(method, request)) as Record<string, unknown>
@@ -1565,9 +1592,29 @@ class CherryToolEngine {
           start = extracted.items.length
         }
       }
-      for (let index = start; index < extracted.items.length; index += 1) {
+      let consumed = start
+      for (; consumed < extracted.items.length; consumed += 1) {
         if (items.length >= ceiling) break
-        items.push(extracted.items[index] as T)
+        items.push(extracted.items[consumed] as T)
+      }
+      // THE PEER SERVED MORE THAN THIS WALK ASKED FOR (review P2-2). `limit` is
+      // a MAXIMUM on a list method, so an overshooting page is a peer fault —
+      // but one this walk can absorb without losing anything, which is why it is
+      // NOT thrown like the stuck/cycling cursors below. What it must not do is
+      // fall through to the normal paths, because BOTH of them would misreport:
+      //
+      //  - the loop-top ceiling check of the next iteration would report THIS
+      //    page's `nextCursor`, a position past items the walk never collected —
+      //    and that position is now a resume token, so it would skip them;
+      //  - a terminal overshooting page (`nextCursor: null`) would be returned
+      //    as `truncated: false`, presenting a short result as the complete one.
+      //
+      // So the walk stops HERE, with the attribution the ceiling check would
+      // have given, and re-uses the position it SENT for this page: resuming
+      // from it re-reads the page (duplicates, never a gap), and
+      // {@link messageResumeToken} prefers the exact `after:` anchor anyway.
+      if (consumed < extracted.items.length) {
+        return this.#truncated(items, bindsCallerLimit ? 'limit' : 'safety-bound', cursor, true)
       }
       const next = extracted.nextCursor
       if (next === null || next === undefined) {
@@ -1630,12 +1677,18 @@ class CherryToolEngine {
   }
 
   /** A stopped aggregate: always says why it stopped and where (stop point). */
-  #truncated<T>(items: T[], reason: CherryTruncationReason, cursor: string | undefined): CherryPage<T> {
+  #truncated<T>(
+    items: T[],
+    reason: CherryTruncationReason,
+    cursor: string | undefined,
+    pageOverflow?: true,
+  ): CherryPage<T> {
     return {
       items,
       truncated: true,
       truncationReason: reason,
       ...(cursor === undefined ? {} : { nextCursor: cursor }),
+      ...(pageOverflow === undefined ? {} : { pageOverflow }),
     }
   }
 
@@ -1882,7 +1935,8 @@ class CherryToolEngine {
         '"aggregate-bytes"` means the walk stopped because the result reached its size limit, ' +
         'not because `limit` was reached — raising `limit` does NOT reach the messages left out ' +
         '(it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE ' +
-        'REACHED BY THE RESUME TOKEN: every truncated answer carries `messagesResumeCursor`, and ' +
+        'REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` whenever a ' +
+        'stop point can be named honestly (it is absent when the walk reached the peer\'s last page), and ' +
         'passing it back as `messagesResumeCursor` continues the walk from there (`limit` then ' +
         'bounds how many messages are returned FROM that point). The two token forms are ' +
         '`"cursor:<peer position>"` (the walk consumed its whole page window) and ' +
@@ -2035,9 +2089,14 @@ class CherryToolEngine {
           : {
               kind: 'anchor',
               messageId: resume.messageId,
-              // `optionalString` on purpose: an item with no message id can
-              // never BE the anchor, and must not match an empty id.
-              idOf: (raw) => optionalString(raw['messageId']),
+              // `messageIdOf` — the SAME reading `#projectMessage` prints, so
+              // this bridge can never emit an `after:` anchor its own scan
+              // cannot match. An item with no id reads as `''` and can never BE
+              // the anchor.
+              idOf: (raw) => {
+                const id = messageIdOf(raw)
+                return id === '' ? undefined : id
+              },
             },
     )
 
@@ -2090,7 +2149,7 @@ class CherryToolEngine {
     sessionId: string,
     raw: Record<string, unknown>,
   ): Promise<CherryReadMessage> {
-    const messageId = String(raw['messageId'] ?? '')
+    const messageId = messageIdOf(raw)
     const revision = String(raw['revision'] ?? '')
     // A message's parts are read to COMPLETION: the caller's `limit` bounds
     // MESSAGES, so any part budget here would drop content from the snapshot.
@@ -5093,23 +5152,35 @@ function parseQuestionInput(input: unknown): string[] | undefined {
  * `returned < page.items.length` says the walk stopped INSIDE the window it
  * collected: messages it already holds were trimmed, so the page's own
  * `nextCursor` — which sits past ALL of them — would skip them on the way back.
- * The token is then `after:<lastReturnedId>`, "strictly older than this one".
- * With no id to anchor (a peer item that carried none) NO token is invented:
- * a wrong anchor is worse than no anchor, and `truncated` still says the walk
- * was cut. Otherwise the whole collected window was consumed, and the peer's
- * page position is exactly where the unread history begins (`cursor:<pos>`).
+ * A peer that OVERSHOT the requested page leaves items in the same position
+ * ({@link CherryPage.pageOverflow}) and takes the same branch, for the same
+ * reason. The token is then `after:<lastReturnedId>`, "strictly older than this
+ * one". With no id to anchor (a peer item that carried none) NO token is
+ * invented: a wrong anchor is worse than no anchor, and `truncated` still says
+ * the walk was cut. Otherwise the whole collected window was consumed, and the
+ * peer's page position is exactly where the unread history begins
+ * (`cursor:<pos>`) — unless the peer answered an EMPTY position, which names
+ * nothing and is therefore not emitted at all.
  */
 function messageResumeToken(
   page: CherryPage<unknown>,
   returned: number,
   lastReturnedId: string | undefined,
 ): string | undefined {
-  if (returned < page.items.length) {
-    return optionalString(lastReturnedId) === undefined
-      ? undefined
-      : `${RESUME_ANCHOR_PREFIX}${lastReturnedId as string}`
+  const anchor = optionalString(lastReturnedId)
+  // TWO forms of "the walk stopped inside what it was given": it returned fewer
+  // items than it collected, or the PEER overshot the requested page and items
+  // were left in it ({@link CherryPage.pageOverflow}). Either way the page's own
+  // position sits past messages this walk never returned, so only the anchor is
+  // exact.
+  if (returned < page.items.length || page.pageOverflow === true) {
+    return anchor === undefined ? undefined : `${RESUME_ANCHOR_PREFIX}${anchor}`
   }
-  return page.nextCursor === undefined ? undefined : `${RESUME_CURSOR_PREFIX}${page.nextCursor}`
+  // An empty position is not a position: a peer answering `nextCursor: ''` on a
+  // non-terminal page would otherwise make this face emit a bare `cursor:`,
+  // which the same face REFUSES on the way back (review P3-4).
+  const position = optionalString(page.nextCursor)
+  return position === undefined ? undefined : `${RESUME_CURSOR_PREFIX}${position}`
 }
 
 /**
@@ -5136,6 +5207,40 @@ function messageWalkVerdict(
     ...(page.truncationReason === undefined ? {} : { messagesTruncationReason: page.truncationReason }),
     ...(resumeToken === undefined ? {} : { messagesResumeCursor: resumeToken }),
   }
+}
+
+/**
+ * Whether a token REMAINDER is one this bridge could not have emitted (review
+ * P2-1).
+ *
+ * Checking the prefix is not enough: `'cursor: 20'` (a token copied with a stray
+ * space) and `'cursor:\n7'` carry a remainder no emission can produce. Passing
+ * one on is the exact failure the prefix check exists to prevent — the real
+ * desktop SILENTLY falls back to the newest page for a malformed cursor, so the
+ * caller would receive the newest window as "continued history" — and an
+ * `after:` remainder that can never match a message id turns into a misleading
+ * "the message is probably gone" naming a phantom id. Blank, leading/trailing
+ * whitespace and control characters are refused. INTERIOR characters are left
+ * alone on purpose: the remainder is the peer's opaque token and this bridge does
+ * not know its alphabet.
+ */
+function mangledRemainder(remainder: string): boolean {
+  return remainder === '' || remainder !== remainder.trim() || /[\u0000-\u001f\u007f]/.test(remainder)
+}
+
+/**
+ * The message id a projection uses, read from a raw `agent.messages.list` item.
+ *
+ * ONE reading, TWO users: `#projectMessage` prints it into the result and the
+ * anchor scan compares against it, so a divergence would make this bridge emit
+ * an `after:` token its own scan can never match (review P3-4). Coerced exactly
+ * as the projection always has (`String(value)`), and `''` when the item carries
+ * none — which can never equal a non-empty anchor, so such an item is simply
+ * never the anchor.
+ */
+function messageIdOf(raw: Record<string, unknown>): string {
+  const value = raw['messageId']
+  return value === undefined || value === null ? '' : String(value)
 }
 
 /**
@@ -5169,12 +5274,12 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
   const token = value as string
   if (token.startsWith(RESUME_CURSOR_PREFIX)) {
     const cursor = token.slice(RESUME_CURSOR_PREFIX.length)
-    if (cursor === '') refuse()
+    if (mangledRemainder(cursor)) refuse()
     return { kind: 'cursor', cursor }
   }
   if (token.startsWith(RESUME_ANCHOR_PREFIX)) {
     const messageId = token.slice(RESUME_ANCHOR_PREFIX.length)
-    if (messageId === '') refuse()
+    if (mangledRemainder(messageId)) refuse()
     return { kind: 'anchor', messageId }
   }
   return refuse()

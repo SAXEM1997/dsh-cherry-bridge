@@ -198,6 +198,17 @@ function tiny(index: number): FakeMessageRecord {
   }
 }
 
+/** The wire shape `agent.messages.list` serves for `m-<index>`; scripted pages carry it verbatim. */
+function wire(index: number): Record<string, unknown> {
+  return {
+    messageId: `m-${index}`,
+    revision: `100${index}`,
+    role: 'user',
+    partIds: [`m-${index}:0`],
+    status: 'success',
+  }
+}
+
 /** `count` tiny messages, newest first (fixture index 0 is the NEWEST). */
 function history(count: number): FakeMessageRecord[] {
   return Array.from({ length: count }, (_unused, index) => tiny(index))
@@ -317,10 +328,10 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
     // page-position form.
     expect(Object.hasOwn(resumeCalls[0] ?? {}, 'cursor')).toBe(false)
     // Exactly the messages AFTER the anchor, in order, the anchor not repeated
-    // — and the page WITHOUT the anchor discarded whole. Two discarded
-    // consecutive pages would have tripped the empty-page run if the raw page
-    // had been judged by what the scan KEPT: a non-empty page nobody wanted is
-    // still a non-empty page the peer served, and it must read as progress.
+    // — and the page WITHOUT the anchor discarded whole. (One page is discarded
+    // here; the raw-page-counting rule it exercises is pinned by ②b's 500
+    // pages, where judging the page by what the scan KEPT would trip the
+    // three-empty-page run almost immediately.)
     expect(ids(resumed)).toEqual(['n-5', 'n-6'])
     expect(ids(resumed)).not.toContain('n-4')
     // The resume read the whole remaining history: nothing older is unread.
@@ -404,11 +415,22 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
     })
 
     // `'20'` is the RAW page position the old face emitted, `'garbage'` is what
-    // a caller invents, and `'after:'` / `'cursor:'` are the prefixes with an
-    // empty remainder. The real desktop SILENTLY falls back to the newest page
-    // for a malformed cursor, so forwarding any of these would present the
-    // newest page again as "continued history". Each must die HERE.
-    for (const token of ['20', 'garbage', '', 'after:', 'cursor:']) {
+    // a caller invents, `'after:'` / `'cursor:'` are the prefixes with an empty
+    // remainder, and the last four are tokens that carry OUR prefix but a
+    // remainder no emission can produce (a stray space, a trailing space, a
+    // newline, and a whole token glued on). The real desktop SILENTLY falls back
+    // to the newest page for a malformed cursor, so forwarding any of these
+    // would present the newest page again as "continued history" — and the
+    // `after:` variants would instead report a phantom message id as "probably
+    // gone". Each must die HERE.
+    //
+    // NOT in this list: `'cursor:after:x'`, a token glued together by hand. Its
+    // remainder is a syntactically plausible peer position, and refusing it would
+    // mean PARSING the peer's cursor format — which this bridge deliberately does
+    // not do (a desktop keyset token, a loopback offset and a future format are
+    // all valid). A nested prefix is also something we could genuinely emit, so
+    // refusing it would break the round trip it exists to guarantee.
+    for (const token of ['20', 'garbage', '', 'after:', 'cursor:', 'cursor: 20', 'cursor:20 ', 'after:\n7']) {
       await expect(
         rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: token }),
       ).rejects.toThrow(/messagesResumeCursor/)
@@ -531,5 +553,107 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
     // And the answer is the continuation, not the newest page again.
     expect(ids(resumed)).toEqual(history(47).slice(20, 40).map((message) => message.messageId))
     expect(ids(resumed)).not.toContain('m-0')
+  })
+  it('⑧ a peer that OVERSHOOTS the requested page cannot make the resume token skip the rest of it', async () => {
+    // `limit` is a MAXIMUM on a list method, so a page carrying more items than
+    // were asked for is a peer fault — and the loopback peer's scripted-pages
+    // face serves one verbatim, which is how this shape is reachable at all.
+    //
+    // The dangerous half is the STOP POINT, not the extra items. The walk takes
+    // what its ceiling allows and leaves the rest of that page uncollected, so
+    // the page's own `nextCursor` sits PAST messages the result does not carry:
+    // emitting it as `cursor:<pos>` would make the newly advertised resume skip
+    // them, and a TERMINAL overshooting page would have been reported COMPLETE
+    // while silently dropping its tail. The stop is therefore the anchor, and
+    // the position the walk re-uses is the one it SENT (duplicates, never a gap).
+    const rig = await makeRig({
+      hello: { limits: { pageItems: 2 } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1), tiny(2)] },
+    })
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0), wire(1), wire(2)], nextCursor: 'over' },
+    ])
+
+    const first = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })) as ReadResult
+    expect(ids(first)).toEqual(['m-0', 'm-1'])
+    expect(first.truncated).toBe(true)
+    expect(first.truncationReason).toBe('limit')
+    // NOT `cursor:over` — that position is past `m-2`, which this result does
+    // not carry.
+    expect(first.messagesResumeCursor).toBe('after:m-1')
+
+    // The resume proves nothing was skipped: `m-2` is the very next thing the
+    // caller sees.
+    const resumed = (await rig.call('cherry_read', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      limit: 10,
+      messagesResumeCursor: first.messagesResumeCursor,
+    })) as ReadResult
+    expect(ids(resumed)).toEqual(['m-2'])
+  })
+
+  it('⑨ an anchor scan keeps the no-progress guards in force', async () => {
+    // AGENTS.md: "Every existing guard stays in force during a scan". The
+    // empty-page run and the scan's own page bound are pinned by ②b; these are
+    // the two cursor guards, and without them a scan would spin on a peer whose
+    // pagination is broken — spending the whole page budget to learn what one
+    // Set lookup answers on the second visit.
+    const stuck = await makeRig({
+      hello: { limits: { pageItems: 2 } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0)] },
+    })
+    stuck.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0)], nextCursor: 'p1' },
+      { items: [wire(0)], nextCursor: 'p1' },
+    ])
+    await expect(
+      stuck.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: 'after:never-there' }),
+    ).rejects.toThrow(/did not advance/)
+
+    const cycling = await makeRig({
+      hello: { limits: { pageItems: 2 } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0)] },
+    })
+    cycling.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0)], nextCursor: 'p1' },
+      { items: [wire(0)], nextCursor: 'p2' },
+      { items: [wire(0)], nextCursor: 'p1' },
+    ])
+    await expect(
+      cycling.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: 'after:never-there' }),
+    ).rejects.toThrow(/cycled back to cursor p1/)
+  })
+
+  it('⑩ an anchor scan pages at the PEER page size, not the caller\'s `limit`', async () => {
+    // The documented "walk it in successive answers" pattern is a SMALL `limit`
+    // per answer, and a scan that paged at the caller's limit would walk the
+    // history one item at a time — spending MAX_ANCHOR_SCAN_PAGES on a history a
+    // full page reaches in dozens, and failing with a diagnosis ("a session this
+    // tool should not chase") that describes the wrong problem. The scan's items
+    // are discarded either way, so the wider page costs nothing.
+    const messages = Array.from({ length: 7 }, (_unused, index) => fat(`n-${index}`, 60))
+    const rig = await makeRig({
+      hello: { limits: { pageItems: 3 } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages },
+    })
+
+    const first = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1000 })) as ReadResult
+    expect(first.messagesResumeCursor).toBe('after:n-4')
+
+    const before = rig.fake.readCallsFor('agent.messages.list').length
+    const resumed = (await rig.call('cherry_read', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      limit: 1,
+      messagesResumeCursor: first.messagesResumeCursor,
+    })) as ReadResult
+    const resumeCalls = rig.fake.readCallsFor('agent.messages.list').slice(before)
+    // The scan asks for a FULL page even though the answer may carry one item.
+    expect(resumeCalls[0]?.['limit']).toBe(3)
+    // Two calls: the discarded page, then the anchor page. Paging at `limit: 1`
+    // would have needed five.
+    expect(resumeCalls).toHaveLength(2)
+    expect(ids(resumed)).toEqual(['n-5'])
   })
 })
