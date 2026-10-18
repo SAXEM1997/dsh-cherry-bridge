@@ -3983,10 +3983,11 @@ const MAX_AGGREGATE_LIMIT = 1e3;
 * messages FIRST. Ten runs' worth of slack is therefore already an order of
 * magnitude more than the walk needs to see the current one.
 *
-* Truncation is SURFACED (`messagesTruncated` + reason + resume cursor), never
-* silent: a caller that really wants the deeper history resumes from the
-* cursor or reads the session with `cherry_read`, whose own `limit` is the
-* caller's to raise.
+* Truncation is SURFACED (`messagesTruncated` + reason + stop-point cursor),
+* never silent: a caller that really wants the deeper history re-waits or
+* reads the session with `cherry_read`, whose own `limit` is the caller's to
+* raise. (The stop-point field names a position, not an input — no tool takes
+* a history-walk cursor.)
 */
 const TERMINAL_AGGREGATE_MESSAGES = 20;
 /**
@@ -4483,8 +4484,8 @@ var CherryToolEngine = class {
 	* `limit` is a CALLER contract, and reaching it is reported as
 	* `truncationReason: 'limit'`. `safetyBound` is different in kind: it is an
 	* internal circuit-breaker against a peer that never terminates, and tripping
-	* it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the resume
-	* cursor) — a walk never stops early and reports success.
+	* it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the
+	* stop-point cursor) — a walk never stops early and reports success.
 	*
 	* An EMPTY page with a non-null `nextCursor` is legal progress while the
 	* cursor advances: the desktop's pinned-list walk answers exactly
@@ -4533,7 +4534,7 @@ var CherryToolEngine = class {
 			cursor = advanced;
 		}
 	}
-	/** A stopped aggregate, always carrying why it stopped and where to resume. */
+	/** A stopped aggregate: always says why it stopped and where (stop point). */
 	#truncated(items, reason, cursor) {
 		return {
 			items,
@@ -5140,7 +5141,7 @@ var CherryToolEngine = class {
 	#sendTool() {
 		return defineCherryTool({
 			name: "cherry_send",
-			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and the cursor to resume from. When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`.",
+			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and a stop-point cursor marking where the unread history begins (re-wait or use cherry_read to see more; the field is not an input). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5883,7 +5884,8 @@ var CherryToolEngine = class {
 		if (raw["status"] === "pending") this.#executionCache.set(this.#cacheKey(deviceId, sessionId), executionId);
 	}
 	/**
-	* The session's current cursor, for a result that has to say where to resume.
+	* The session's current EVENT cursor, for a result that has to say where the
+	* event stream stands (this one IS an input: `cherry_events` takes it).
 	* Read from the subscription cache without advancing the ACK cursor —
 	* waiters CONSUME, they do not acknowledge (controller ruling: ack stays the
 	* `cherry_events` delivery call site).
@@ -6152,12 +6154,13 @@ var CherryToolEngine = class {
 	* id it named is no longer knowable from here, so a wait that has not yet
 	* attached to that run degrades to what it would have been without adoption at
 	* all: it parks out its window and answers `timeout` (with the partial content
-	* and the resume cursor, per spec §6) rather than `completed`. The bound is
-	* therefore ~2 MiB of buffered events per session — the default budget — and
-	* reaching it takes a run that both emits that much event traffic AND whose
-	* command receipt omitted `executionId`. The degradation is bounded and
-	* recoverable rather than silent: `timeout` is a non-failure answer, and
-	* `cherry_read` rebuilds the full picture without the buffer.
+	* and the stop-point cursor, per spec §6's timeout row) rather than
+	* `completed`. The bound is therefore ~2 MiB of buffered events per session —
+	* the default budget — and reaching it takes a run that both emits that much
+	* event traffic AND whose command receipt omitted `executionId`. The
+	* degradation is bounded and recoverable rather than silent: `timeout` is a
+	* non-failure answer, and `cherry_read` rebuilds the full picture without the
+	* buffer.
 	*
 	* It is NOT fixed by scanning the peer's journal, because the peer's replay
 	* window is itself bounded and the tool has no cursor to offer it — the same
@@ -6276,8 +6279,14 @@ var CherryToolEngine = class {
 		};
 	}
 	/**
-	* The timeout result: NOT a failure. Partial content read so far + the
-	* cursor to resume from.
+	* The timeout result: NOT a failure. Partial content read so far + a
+	* stop-point cursor marking where the unread history begins.
+	*
+	* The spec's own sentence (§3.6, 2026-10-09 design: 「超时不是失败：返回已收到
+	* 的部分内容 + 当前游标，agent 可续查」) is a HISTORICAL statement of that
+	* contract in cursor terms: the "游标" it names is the event cursor (`cursor`,
+	* still returned) plus this stop point, and no tool accepts a history-walk
+	* cursor to "续查" through — "see more" means re-waiting or `cherry_read`.
 	*
 	* Unlike the terminal aggregate the text here is NOT run-scoped: the run has
 	* not settled, so there is no terminal message to cut at, and the whole point
@@ -6440,15 +6449,16 @@ var CherryToolEngine = class {
 	* `'aggregate-bytes'` is attributed here), and the three callers (terminal,
 	* timeout, idle) each surface it.
 	*
-	* A RESUME CURSOR IS OMITTED WHEN IT WOULD SKIP. The peer's `nextCursor`
-	* points past the entire page it came with, so a byte stop in the MIDDLE of a
-	* page would hand out a cursor whose interval still holds messages this walk
-	* trimmed — newer than the cursor, older than the last one returned. A caller
-	* chaining `cherry_read` from it would never see them, and only `cherry_read`
-	* (or this result's own `messages`) can still fetch them; offering a cursor
-	* that jumps over content is worse than offering none. The cursor is
-	* therefore attached only when the WHOLE page was returned (nothing lies
-	* between it and what this result carries) — see
+	* The STOP-POINT CURSOR IS OMITTED WHEN IT WOULD MISDESCRIBE THE STOP. The
+	* peer's `nextCursor` points past the entire page it came with, so a byte
+	* stop in the MIDDLE of a page would report a position that still holds
+	* messages this walk trimmed — newer than the cursor, older than the last one
+	* returned. No tool takes a history-walk cursor, so it can never be
+	* "chained": the field only marks where the unread history begins, and
+	* naming a position the result itself contradicts is worse than naming none.
+	* Those trimmed messages are reachable by RE-READING (another wait, or
+	* `cherry_read`). The cursor is therefore attached only when the WHOLE page
+	* was returned (nothing lies between it and what this result carries) — see
 	* {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*/
 	async #readTerminalMessages(connection, sessionId, session) {
