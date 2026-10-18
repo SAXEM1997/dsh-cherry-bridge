@@ -623,6 +623,17 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
     // store record (see evictConnection for the four flows that need it).
     evict: evictConnection,
     subs: subsFor,
+    /**
+     * The per-device state channel the tool engine's session caches are
+     * invalidated from (v0.1.3 UltraReview P3-2). It joins the SAME
+     * `connection.onState` fan-out that `onDeviceState` below feeds the SSE hub
+     * with and that subscription recovery rides — no second channel, no
+     * polling. Two different questions, hence two deps: `onDeviceState` is the
+     * assembly-wide feed for observers, this one is a per-device subscription
+     * the engine's caches need. A device with no pooled connection has no
+     * states to report yet; the engine joins when it first resolves one.
+     */
+    watchDeviceState: (deviceId, cb) => state.connections.get(deviceId)?.onState(cb),
     // Both channels return a DETACHER: the listener sets live on this assembly,
     // not on the SSE hub that subscribes to them, so a hub cannot remove its
     // callbacks unless the seam hands it the means to. Without this, every

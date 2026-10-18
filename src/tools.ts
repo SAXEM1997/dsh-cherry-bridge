@@ -563,6 +563,38 @@ const DEFAULT_PARTS_SAFETY_BOUND = 10_000
  * returning a partial (or empty) result as though it were complete.
  */
 const MAX_AGGREGATE_PAGES = 10_000
+/** The device id separator inside every engine cache key (neither id may hold NUL). */
+const CACHE_KEY_SEPARATOR = '\u0000'
+/**
+ * CAP on each engine cache, PER DEVICE (v0.1.3 UltraReview P3-1).
+ *
+ * The three session caches ({@link CherryToolEngine.#revisionCache},
+ * `#executionCache`, `#interactionCache`) are keyed by device + session (+
+ * interaction), and before this bound they were cleared ONLY on
+ * `cherry_unpair`: a long-lived process accumulated one entry per session and
+ * per interaction card it had ever seen, for every device it ever talked to,
+ * with nothing to release it. 256 is chosen as "far above any live working
+ * set, far below anything that matters in memory":
+ *
+ *  - a single device's realistic working set is a handful of sessions and a few
+ *    cards — the MCP caller drives one session at a time in practice;
+ *  - 256 entries of short strings is tens of kilobytes per cache per device, so
+ *    even a fleet of devices keeps the maps trivial;
+ *  - eviction is CHEAP because every value is DERIVED state the desktop still
+ *    holds authoritatively (`agent.sessions.get`, `agent.interactions.list`).
+ *    An evicted entry costs one round trip on next use — the same cost a cold
+ *    process pays — and can never cost CORRECTNESS: eviction removes the
+ *    snapshot, so the next use re-queries instead of trusting it.
+ *
+ * The bound is per DEVICE rather than global so one busy desktop cannot evict
+ * a quiet one's snapshots: the caches describe pairings, and a device's
+ * snapshots are useless to every other device.
+ *
+ * INJECTABLE for tests (`cacheEntriesPerDevice`), because the production value
+ * needs 257 live sessions before it evicts and a loopback test should not.
+ */
+const CACHE_ENTRIES_PER_DEVICE = 256
+
 /**
  * EMPTY-PAGE RUN limit for every aggregate walk. The desktop's pinned-list walk
  * legally answers ONE empty page with an advancing cursor (the pin→entity
@@ -683,6 +715,27 @@ export interface CherryToolsDeps {
    * removes the archive entry, so no live socket outlives its record.
    */
   evict(deviceId: string): void | Promise<void>
+  /**
+   * Subscribe to a device's connection-state transitions — the channel the
+   * caches are INVALIDATED on (v0.1.3 UltraReview P3-2).
+   *
+   * OPTIONAL, and wired by the assembly from the SAME `connection.onState(cb)`
+   * it already uses for the SSE fan-out and subscription recovery. It is a dep
+   * rather than a new `Subscribe` method on `DeviceConnection` for the usual
+   * reason: the state channel already exists and is already multicast, so the
+   * tool face joins it instead of adding a second one.
+   *
+   * Absent (a bare engine, a test rig without it) means NO invalidation on
+   * state transitions — the caches then only shrink on the capacity bound and
+   * on `cherry_unpair`, which is the pre-P3-2 behaviour. It is not optional for
+   * correctness of a long-lived process: see
+   * {@link CherryToolEngine.#watchConnection}.
+   *
+   * Distinct from the assembly's own `onDeviceState` feed (which the SSE hub
+   * consumes): that one is a broadcast to observers of EVERY device, while
+   * this one subscribes the engine to ONE device's transitions.
+   */
+  watchDeviceState?: (deviceId: string, cb: (state: DeviceState) => void) => void
 }
 
 // ---------------------------------------------------------------------------
@@ -943,6 +996,15 @@ export interface CherryToolEngineOptions {
    * a quiet peer's answer later.
    */
   waitPollMs?: number
+  /**
+   * Cap on EACH of the engine's three session caches, per device. Omitted uses
+   * {@link CACHE_ENTRIES_PER_DEVICE}.
+   *
+   * Injectable so a test can drive the bound down to two and observe eviction:
+   * at the production value a proof needs 257 live sessions, which no loopback
+   * suite should spend its run on.
+   */
+  cacheEntriesPerDevice?: number
 }
 
 /**
@@ -1080,6 +1142,29 @@ class CherryToolEngine {
     string,
     { revision: string; executionId: string; inputDigest: string }
   >()
+  /**
+   * The per-device cap on EACH of the three caches above.
+   *
+   * COUNTS, not bytes, and that is deliberate: every value here is a handful of
+   * short strings the peer itself reported (a revision, an execution id, an
+   * interaction triple), so the memory per entry is bounded by the protocol's
+   * own field sizes rather than by anything this engine decides. A count cap is
+   * therefore a real bound on the maps, not a proxy for one, and it needs no
+   * bookkeeping to stay true.
+   */
+  readonly #cacheEntriesPerDevice: number
+  /**
+   * Connections whose state channel this engine already joined.
+   *
+   * `connect()` is called on EVERY tool entry point, so the watch is installed
+   * from there — and this set is what makes installing it idempotent. Without
+   * it every `cherry_read` would add another listener to the same connection
+   * for the life of the process, and a device going offline once would fire N
+   * invalidations. Keyed by the CONNECTION (not the device) so a re-built
+   * connection after `evict` is watched afresh; weak so an evicted instance is
+   * not pinned by bookkeeping.
+   */
+  readonly #watchedConnections = new WeakSet<DeviceConnection>()
 
   constructor(deps: CherryToolsDeps, options: CherryToolEngineOptions = {}) {
     this.#deps = deps
@@ -1092,6 +1177,10 @@ class CherryToolEngine {
       Math.floor(options.externalizedByteCap ?? MAX_EXTERNALIZED_BYTES),
     )
     this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS))
+    this.#cacheEntriesPerDevice = Math.max(
+      1,
+      Math.floor(options.cacheEntriesPerDevice ?? CACHE_ENTRIES_PER_DEVICE),
+    )
   }
 
   definitions(): CherryToolDefinition[] {
@@ -1136,6 +1225,12 @@ class CherryToolEngine {
     if ('notFound' in resolution) return this.#notFoundVerdict(device)
 
     const connection = this.#deps.connect(resolution.deviceId)
+    // EVERY tool that names a device comes through here, so this is where the
+    // device's state channel is joined — once per CONNECTION, see
+    // {@link #watchConnection}. It is installed BEFORE the state check: the
+    // transition this exists for can land while the device is already offline,
+    // and the watch must be in place from the first call either way.
+    this.#watchConnection(resolution.deviceId, connection)
     if (connection.state !== 'connected') {
       // The established Task 5 shape: the tool never dials implicitly, and the
       // caller gets the same `{device, state}` verdict the RPC layer throws.
@@ -2299,10 +2394,25 @@ class CherryToolEngine {
         // ACK AFTER DELIVERY (controller ruling ④): the peer may only advance
         // its view once the caller actually holds these events. A failing ack
         // is logged, never allowed to swallow the delivered events.
+        // A FAILING ACK ALSO RE-ENSURES THE SESSION (v0.1.3 UltraReview P3-3).
+        // The ack is the peer's verdict on the SUBSCRIPTION, not on the
+        // delivery: a refused ack says the cursor is outside the window this
+        // subscription is serving, i.e. the stream we are reading is no longer
+        // the one we think it is. Logging that alone left the session dead in
+        // whatever state caused it, and the NEXT call would fail on the same
+        // broken subscription rather than rebuilding it.
+        //
+        // FIRE-AND-FORGET, deliberately: the caller already holds these events,
+        // and the re-ensure is a peer round trip (close + subscribe). Awaiting
+        // it would charge the recovery's latency to an answer that is complete
+        // without it, and a re-ensure that fails must not turn a successful
+        // delivery into an error. The `.catch` is what keeps a REJECTED
+        // re-ensure from surfacing as an unhandled rejection.
         try {
           await subscriptions.ack(sessionId, result.nextCursor)
         } catch (error) {
           console.warn(`[cherry-remote] acknowledging session ${sessionId} at ${result.nextCursor.seq} failed`, error)
+          this.#reEnsureInBackground(record.deviceId, sessionId)
         }
         return { events: result.events, nextCursor: result.nextCursor }
       },
@@ -2663,7 +2773,7 @@ class CherryToolEngine {
     // guaranteed "Session is busy". Failing either condition leaves the first
     // receipt standing.
     if (idle === undefined || optionalString(session['activeExecutionId']) !== undefined) return first
-    this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle)
+    this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), idle)
 
     // THE HEALED VALUE IS PASSED THROUGH, not re-derived. `#idleRevision`
     // prefers the EVENT STREAM, and that stream is exactly what went stale here:
@@ -2736,7 +2846,12 @@ class CherryToolEngine {
           // event buffer had gone blind.
           const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
           if (idle !== undefined) {
-            this.#revisionCache.set(this.#cacheKey(record.deviceId, sessionId), idle)
+            this.#remember(
+              this.#revisionCache,
+              record.deviceId,
+              this.#cacheKey(record.deviceId, sessionId),
+              idle,
+            )
           }
 
           // The IDLE answer, not a failure and not a wait: nothing is in flight,
@@ -3320,6 +3435,125 @@ class CherryToolEngine {
   }
 
   /**
+   * The ONE write path into {@link CherryToolEngine.#revisionCache} and
+   * {@link CherryToolEngine.#executionCache}.
+   *
+   * Every writer goes through here instead of touching the map, because the
+   * capacity bound is only as good as its coverage: a single `map.set` left
+   * raw would be an unbounded growth path that no test at a small bound would
+   * notice. The mechanics are the same for all three caches, and they are
+   * deliberately trivial:
+   *
+   *  - `Map` iterates in INSERTION order, so the first key is the oldest;
+   *  - an INSERT whose key is NEW first makes room (evicting this device's
+   *    oldest entry when the device is already at the bound) and then sets the
+   *    new key at the END — it becomes the newest. Steady state therefore holds
+   *    at most `cacheEntriesPerDevice` entries per device; the check runs
+   *    BEFORE the insert, so the map never passes the bound by one.
+   *  - a REFRESH (an existing key) overwrites the value in place. `Map.set` on
+   *    an existing key keeps its position, which is why no delete-then-set is
+   *    used: that WOULD move the key to the back.
+   *
+   * WHY FIFO rather than LRU. Both bound the map, so the choice is not about
+   * the cap; it is about what it costs to maintain and to reason about. FIFO
+   * needs no bookkeeping at all — `Map` insertion order IS the policy — so
+   * there is no recency structure to keep in sync with three caches and two
+   * write paths. And eviction here never costs correctness, only a re-read:
+   * every value is derived state the desktop serves authoritatively, so an
+   * evicted (or wrongly evicted) entry costs one round trip on next use, not a
+   * wrong answer. LRU's extra bookkeeping would buy a hit-rate improvement on
+   * exactly the wrong shapes — a working set larger than the bound, where
+   * either policy evicts something live.
+   *
+   * The warning names only the device and the count — never session ids.
+   */
+  #remember<V>(cache: Map<string, V>, deviceId: string, key: string, value: V): void {
+    if (!cache.has(key)) this.#evictOldestForKey(cache, deviceId)
+    // `set` on an EXISTING key overwrites in place and keeps its position, so
+    // a refresh does not reorder — see the docblock. Deliberately NOT
+    // delete-then-set: that moves the key to the back and makes this LRU.
+    cache.set(key, value)
+  }
+
+  /**
+   * Drops the device's oldest entry when the device is already AT the bound.
+   *
+   * `Map` iteration is insertion-ordered, so the first matching key is the
+   * oldest one for that device. The scan is bounded by the map's own size —
+   * which the bound keeps small — and stops at the first hit.
+   */
+  #evictOldestForKey<V>(cache: Map<string, V>, deviceId: string): void {
+    const prefix = `${deviceId}${CACHE_KEY_SEPARATOR}`
+    let own = 0
+    let oldest: string | undefined
+    for (const key of cache.keys()) {
+      if (!key.startsWith(prefix)) continue
+      own += 1
+      if (oldest === undefined) oldest = key
+    }
+    if (own < this.#cacheEntriesPerDevice || oldest === undefined) return
+    cache.delete(oldest)
+    // One line per eviction, naming the device and the bound — never the
+    // session id, which is peer-supplied payload (see the logging contract).
+    console.warn(
+      `[cherry-remote] cache for device ${deviceId} reached its ${this.#cacheEntriesPerDevice}-entry ` +
+        'bound; evicted the oldest entry (it will be re-read from the desktop on next use)',
+    )
+  }
+
+  /** Removes one key from a cache — the ONE delete path, beside `#remember`. */
+  #forget<V>(cache: Map<string, V>, key: string): void {
+    cache.delete(key)
+  }
+
+  /**
+   * Joins the device's connection-state channel ONCE, so its caches can be
+   * invalidated when the pairing itself stops being good (P3-2).
+   *
+   * What this closes: the caches outlive every ordinary reconnect — that is
+   * their point — so a device that was re-paired (or whose grant was revoked
+   * and re-granted) would keep answering from snapshots taken against the OLD
+   * pairing. The two transitions that say "this evidence is void" are the ones
+   * where the peer REFUSED us rather than merely went away:
+   *
+   *  - `offline` — reached on a rejected `authenticate` (`GRANT_REVOKED` /
+   *    `UNAUTHENTICATED`) and on the refresh-grace expiry, both of which mean
+   *    the stored credential no longer describes a valid pairing. A transient
+   *    network drop ALSO lands here and clears the caches unnecessarily; that
+   *    is accepted, because the cost is one round trip per session on reuse and
+   *    the alternative is keeping snapshots across an identity change.
+   *  - `identity-mismatch` — the peer's pinned key changed: the pairing is over.
+   *
+   * {@link CherryToolEngine.#resolve} installs the watch on every tool call that
+   * names a device, and {@link CherryToolEngine.#watchedConnections} makes that
+   * idempotent.
+   *
+   * RESIDUAL WINDOW, stated where the hook is: invalidation happens on STATE
+   * TRANSITIONS, and a live session's revisions can move WITHOUT one. A message
+   * edited on the desktop while the link stays up leaves a cached
+   * `expectedIdleRevision` behind, and `cherry_send` then eats the peer's
+   * CONFLICT ("Session is not idle at the expected revision") with no re-list
+   * hint in the verdict. `#admitSend`'s single self-heal absorbs the common
+   * case; the rest is the documented cost of caching at all, and closing it
+   * (a verdict shape change) is deliberately OUT of this batch.
+   */
+  #watchConnection(deviceId: string, connection: DeviceConnection): void {
+    const watch = this.#deps.watchDeviceState
+    if (watch === undefined) return
+    // PER CONNECTION INSTANCE, not per device: `evict` (a re-pair, a disable,
+    // `cherry_unpair`) drops the pooled connection and the next `connect()`
+    // builds a NEW one — a handler left on the old instance would watch a
+    // socket nobody uses any more and miss every transition of the live one.
+    // The WeakSet keeps that correct without holding dead connections alive.
+    if (this.#watchedConnections.has(connection)) return
+    this.#watchedConnections.add(connection)
+    watch(deviceId, (state) => {
+      if (state !== 'offline' && state !== 'identity-mismatch') return
+      this.#forgetDevice(deviceId)
+    })
+  }
+
+  /**
    * Every cache key that belongs to one device, for eviction.
    *
    * A prefix match is safe because the device id is the FIRST component and the
@@ -3332,13 +3566,13 @@ class CherryToolEngine {
   #forgetDevice(deviceId: string): void {
     const prefix = `${deviceId}\u0000`
     for (const key of [...this.#revisionCache.keys()]) {
-      if (key.startsWith(prefix)) this.#revisionCache.delete(key)
+      if (key.startsWith(prefix)) this.#forget(this.#revisionCache, key)
     }
     for (const key of [...this.#executionCache.keys()]) {
-      if (key.startsWith(prefix)) this.#executionCache.delete(key)
+      if (key.startsWith(prefix)) this.#forget(this.#executionCache, key)
     }
     for (const key of [...this.#interactionCache.keys()]) {
-      if (key.startsWith(prefix)) this.#interactionCache.delete(key)
+      if (key.startsWith(prefix)) this.#forget(this.#interactionCache, key)
     }
   }
 
@@ -3362,7 +3596,7 @@ class CherryToolEngine {
   ): Promise<string> {
     const streamed = this.#streamedIdleRevision(subscriptions, sessionId)
     if (streamed !== undefined) {
-      this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), streamed)
+      this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), streamed)
       return streamed
     }
     const cached = this.#revisionCache.get(this.#cacheKey(deviceId, sessionId))
@@ -3377,7 +3611,7 @@ class CherryToolEngine {
     if (idle === undefined) {
       throw new Error(`agent.sessions.get returned no idle revision for session ${sessionId}`)
     }
-    this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle)
+    this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), idle)
     return idle
   }
 
@@ -3421,7 +3655,7 @@ class CherryToolEngine {
   ): Promise<string | undefined> {
     const streamed = this.#streamedActiveExecution(subscriptions, sessionId)
     if (streamed !== undefined) {
-      this.#executionCache.set(this.#cacheKey(deviceId, sessionId), streamed)
+      this.#remember(this.#executionCache, deviceId, this.#cacheKey(deviceId, sessionId), streamed)
       return streamed
     }
 
@@ -3452,14 +3686,16 @@ class CherryToolEngine {
     //  - the peer's revision is MONOTONIC, so a mid-run value is never newer
     //    than the truth and can only ever be too old — the recoverable side.
     const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
-    if (idle !== undefined) this.#revisionCache.set(this.#cacheKey(deviceId, sessionId), idle)
+    if (idle !== undefined) {
+      this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), idle)
+    }
     const active = optionalString(session['activeExecutionId'])
     if (active !== undefined) {
-      this.#executionCache.set(this.#cacheKey(deviceId, sessionId), active)
+      this.#remember(this.#executionCache, deviceId, this.#cacheKey(deviceId, sessionId), active)
       return active
     }
     // The peer says the session is idle: any cached id is stale by definition.
-    this.#executionCache.delete(this.#cacheKey(deviceId, sessionId))
+    this.#forget(this.#executionCache, this.#cacheKey(deviceId, sessionId))
     return undefined
   }
 
@@ -3547,12 +3783,15 @@ class CherryToolEngine {
     // let `cherry_respond` send a half-complete staleness triple.
     if (interactionId === undefined || revision === undefined || executionId === undefined) return
     if (inputDigest === undefined) return
-    this.#interactionCache.set(this.#interactionKey(deviceId, sessionId, interactionId), {
-      revision,
-      executionId,
-      inputDigest,
-    })
-    if (raw['status'] === 'pending') this.#executionCache.set(this.#cacheKey(deviceId, sessionId), executionId)
+    this.#remember(
+      this.#interactionCache,
+      deviceId,
+      this.#interactionKey(deviceId, sessionId, interactionId),
+      { revision, executionId, inputDigest },
+    )
+    if (raw['status'] === 'pending') {
+      this.#remember(this.#executionCache, deviceId, this.#cacheKey(deviceId, sessionId), executionId)
+    }
   }
 
   /**
@@ -4199,7 +4438,14 @@ class CherryToolEngine {
     // does not have to re-read the session. Done BEFORE the aggregate: it does
     // not depend on the content read, so a failed assembly must not cost it.
     const idle = optionalString(session['idleRevision']) ?? optionalString(session['historyRevision'])
-    if (idle !== undefined) this.#revisionCache.set(this.#cacheKey(connection.record.deviceId, sessionId), idle)
+    if (idle !== undefined) {
+      this.#remember(
+        this.#revisionCache,
+        connection.record.deviceId,
+        this.#cacheKey(connection.record.deviceId, sessionId),
+        idle,
+      )
+    }
     const cursor = this.#cursorOf(subscriptions, sessionId)
 
     const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
@@ -4518,6 +4764,34 @@ class CherryToolEngine {
     const subscriptions = this.#deps.subs(deviceId)
     if (subscriptions.activeSessions().includes(sessionId)) return
     await subscriptions.ensure(sessionId)
+  }
+
+  /**
+   * Rebuilds one session's subscription in the BACKGROUND, for the recovery
+   * paths that must not block the answer they are attached to (P3-3).
+   *
+   * It goes through the SAME `ensure` entry every other re-ensure uses — the
+   * layer closes the old peer subscription first and subscribes once — rather
+   * than inventing a second recovery route. Cursorless on purpose: the caller's
+   * delivered cursor has just been REFUSED, so handing it back would ask the
+   * peer to replay from exactly the position it said is outside its window.
+   * The layer falls back to checkpoint mode, which rebuilds peer-side state
+   * without events — the right mode when the cursor is the thing that is wrong.
+   *
+   * A failure here is logged and dropped: the delivery already succeeded, and
+   * the caller can still `cherry_read` the history without this subscription.
+   */
+  #reEnsureInBackground(deviceId: string, sessionId: string): void {
+    let layer: SessionSubscriptions
+    try {
+      layer = this.#deps.subs(deviceId)
+    } catch (error) {
+      console.warn(`[cherry-remote] could not re-ensure session ${sessionId} of ${deviceId}`, error)
+      return
+    }
+    void layer.ensure(sessionId).catch((error: unknown) => {
+      console.warn(`[cherry-remote] re-ensuring session ${sessionId} of ${deviceId} failed`, error)
+    })
   }
 
   /**
