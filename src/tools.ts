@@ -182,7 +182,7 @@ export type CherryTruncationReason =
   | 'safety-bound'
   /**
    * A BYTE budget was spent while the walk still had items to project
-   * ({@link TERMINAL_AGGREGATE_BYTES}).
+   * ({@link AGGREGATE_BYTES}).
    *
    * Its own member rather than a reuse of `'limit'`/`'safety-bound'`: neither
    * describes what happened. No caller asked for this, and no peer misbehaved
@@ -195,6 +195,10 @@ export type CherryTruncationReason =
    * The budget is only checked BETWEEN messages, so this drops the OLDER
    * messages like every other reason and never cuts inside one: the newest
    * message is always returned whole.
+   *
+   * TWO faces emit it, one budget: the terminal/timeout/idle aggregates
+   * (`CherryMessageWalkVerdict.messagesTruncationReason`) and `cherry_read`
+   * (`CherryReadSnapshot.truncationReason`, issue #29).
    */
   | 'aggregate-bytes'
 
@@ -319,6 +323,10 @@ export interface CherryReadSnapshot {
    * whether to go on. A returned message is never cut inside its parts — if its
    * own content could not be fully read, IT says so
    * ({@link CherryReadMessage.incomplete}), not this field.
+   *
+   * This walk is bounded by the caller's `limit` AND by an output budget
+   * ({@link AGGREGATE_BYTES}, the terminal faces' budget): the two arms have
+   * different remedies, which is why they are different reasons.
    */
   truncationReason?: CherryTruncationReason
   /**
@@ -328,10 +336,32 @@ export interface CherryReadSnapshot {
    * this value cannot be handed back to fetch the rest: it is the peer's
    * `agent.messages.list` page position the walk was handed when it stopped
    * (the end of the last page it touched, so it may sit PAST the last returned
-   * message). Present exactly when `truncated` is true and the peer named one;
-   * because the walk runs newest-first, it marks OLDER messages as still
-   * unread — the only direction a truncation leaves behind. To read them,
-   * RAISE `limit` and re-read.
+   * message). Present exactly when `truncated` is true and a stop point can be
+   * named honestly; because the walk runs newest-first, it marks OLDER
+   * messages as still unread — the only direction a truncation leaves behind.
+   *
+   * WHAT REACHES THEM DEPENDS ON THE REASON. A `'limit'` stop was the caller's
+   * own ceiling: raise `limit` and re-read. An `'aggregate-bytes'` stop was the
+   * OUTPUT budget, which raising `limit` does not move — a larger `limit` pays
+   * for more round trips and still stops at the same byte budget, leaving the
+   * OLDEST messages out.
+   *
+   * AND ON A BYTE STOP, THIS BRIDGE CANNOT FETCH THE REST AT ALL. The walk
+   * always starts at the NEWEST message and takes no cursor, so messages past
+   * the budget are unreachable through `cherry_read` under ANY combination of
+   * its arguments: the only entrances are the desktop itself, and the
+   * history-cursor read parameter a future release would add (tracked as
+   * issue #26; not provided today). The field exists so that loss is STATED,
+   * not so it can be chained or worked around by re-reading.
+   *
+   * ONE CAVEAT ON WHAT THE VALUE COUNTS. On a `'limit'` stop it is the peer's
+   * page position, which may sit PAST the last message returned. A
+   * `'aggregate-bytes'` stop happens INSIDE the window the walk had collected,
+   * where that position would skip the unread messages between it and the
+   * result — so there the field is the boundary the result establishes itself
+   * (one past the last message returned). It may also be ABSENT on such a stop,
+   * when the walk reached the peer's last page and has no position to name: the
+   * byte stop is truncation regardless, and no marker is invented for it.
    */
   messagesResumeCursor?: string
 }
@@ -469,9 +499,10 @@ const MAX_AGGREGATE_LIMIT = 1000
  */
 const TERMINAL_AGGREGATE_MESSAGES = 20
 /**
- * BYTE BUDGET for the terminal/timeout/idle aggregate, applied to the
- * PROJECTED messages (each one after `#projectMessage`, measured with
- * `JSON.stringify`'s length as a cheap approximation of its wire cost).
+ * BYTE BUDGET for a MESSAGE aggregate, applied to the PROJECTED messages (each
+ * one after `#projectMessage`, measured with `JSON.stringify`'s length as a
+ * cheap approximation of its wire cost). Shared by the terminal/timeout/idle
+ * aggregates and by `cherry_read` — one budget, one vocabulary (issue #29).
  *
  * The message ceiling alone does not bound the RESULT: one message can carry
  * hundreds of parts, each an externalized `{ref}` resolved through a separate
@@ -481,12 +512,24 @@ const TERMINAL_AGGREGATE_MESSAGES = 20
  * content. 256 KiB is a deliberate fraction of a tool result: enough for a
  * long reply plus its reasoning, small enough to stay well inside the limit.
  *
+ * WHY `cherry_read` REUSES IT RATHER THAN GETTING ITS OWN (issue #29). The
+ * read face is a batch history tool, so a LARGER budget would read more per
+ * call — but the constraint that failed in the field is the MCP output
+ * boundary, and it does not care which tool produced the oversized answer: a
+ * `cherry_read(limit: 1000)` over a fat session produced tens of megabytes
+ * after paying for every round trip first. A SECOND value would also mean two
+ * answers to "how big may one aggregate be?", drifting apart silently, on two
+ * faces that already share the reason vocabulary. What differs between them is
+ * the MESSAGE CEILING, not the byte cost of one message. The read face's own
+ * way to ask for more is progressive: each stop is surfaced, and the older
+ * history is re-read at a larger `limit` (the budget still bounds each answer).
+ *
  * THE NEWEST MESSAGE IS ALWAYS WHOLE. The budget is checked only AFTER a
  * message's projection completes, and the first message is always taken before
- * any check runs — it is the run's own reply, so a budget that could truncate
- * it would defeat the purpose of reading the history in the first place.
+ * any check runs — it is the run's own reply, and on `cherry_read` it is the
+ * one message a caller asking "what is the latest?" cannot do without.
  */
-const TERMINAL_AGGREGATE_BYTES = 262_144
+const AGGREGATE_BYTES = 262_144
 /**
  * What a caller whose terminal aggregate could not be assembled should do.
  *
@@ -551,6 +594,16 @@ const DEFAULT_CONTENT_SLICE_BOUND = 4_096
  * the desktop really does externalize never approaches it, and a part above it
  * degrades to `unavailable` exactly like any other part this client will not
  * read.
+ *
+ * PER REF, NOT PER CALL — the memory contract (issue #7). The cap bounds ONE
+ * ref, and a walk holds its content at roughly THREE times its size while
+ * assembling it (the decoded slices, their concatenation, and the decoded
+ * string — see {@link CherryToolEngine.#readExternalized}). An aggregate that
+ * reads refs sequentially pays that peak one ref at a time; when several
+ * partition reads are in flight at once (independent tool calls, not this
+ * engine's own walk), the peak multiplies by the number of in-flight reads.
+ * A process-wide gate over that product is deliberately NOT here; callers
+ * that issued the concurrency are the ones that know its size.
  */
 const MAX_EXTERNALIZED_BYTES = 32 * 1024 * 1024
 
@@ -1567,7 +1620,16 @@ class CherryToolEngine {
         'are deliberately not fetched into a text channel. Messages come NEWEST-first, so the ' +
         'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
         'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
-        'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable.',
+        'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The ' +
+        'answer is ALSO bounded by an output budget: `truncated` with `truncationReason: ' +
+        '"aggregate-bytes"` means the walk stopped because the result reached its size limit, ' +
+        'not because `limit` was reached — raising `limit` does NOT reach the older messages ' +
+        'left out (it only costs more round trips and stops at the same budget), and this tool ' +
+        'offers no other way to reach them: it always starts at the newest message and takes no ' +
+        'cursor, so they are viewable only on the desktop (or through a history-cursor read ' +
+        'parameter, which is tracked as #26 and not provided today). A `truncationReason` ' +
+        'of "limit" is the caller\'s own ceiling and is reached by raising `limit`. Either way ' +
+        'the newest message is always returned whole.',
       parameters: {
         type: 'object',
         properties: {
@@ -1577,7 +1639,10 @@ class CherryToolEngine {
             type: 'integer',
             minimum: 1,
             maximum: MAX_AGGREGATE_LIMIT,
-            description: 'Maximum number of messages to return in total across pages (default 100).',
+            description:
+              'Maximum number of messages to return in total across pages (default 100). Distinct from ' +
+              'the output budget: the answer may stop earlier with `truncationReason: "aggregate-bytes"`, ' +
+              'which a larger `limit` does not extend.',
           },
         },
         required: ['device', 'sessionId'],
@@ -1627,6 +1692,32 @@ class CherryToolEngine {
     }
   }
 
+  /**
+   * One read round, bounded on TWO arms: the caller's `limit` (a message
+   * count) and {@link AGGREGATE_BYTES} (the projected messages' size).
+   *
+   * The byte arm is the terminal faces' budget applied to this walk (issue
+   * #29). Without it the COUNT was the only bound, so `cherry_read(limit:
+   * 1000)` over a fat session paid for every message, every part and every
+   * externalized content read before producing an answer of tens of megabytes
+   * that the MCP boundary rejects — the caller lost the verdict along with the
+   * content. The guarantees are the terminal walk's, restated:
+   *
+   *  - the budget is checked only AFTER a message is fully projected, so what a
+   *    stop leaves out is the OLDER end and {@link CherryReadSnapshot.messages}
+   *    are all returned WHOLE — the newest first, already taken before any
+   *    check runs;
+   *  - a stop is SURFACED (`truncated` + `truncationReason`), never silent;
+   *  - the reason is `'aggregate-bytes'`, the terminal face's own member. It is
+   *    NOT `'limit'`: the caller set no such limit, and telling them to raise
+   *    one they already set above the budget would teach a remedy that cannot
+   *    work (see {@link CherryReadSnapshot.messagesResumeCursor}).
+   *
+   * The verdict describes the walk that ACTUALLY happened, so the page
+   * aggregate's own verdict is only inherited when the byte arm did not fire —
+   * a walk the budget cut is not the page aggregate's `'limit'`/`'safety-bound'`
+   * stop, even when the page aggregate also ran out.
+   */
   async #readOnce(
     connection: DeviceConnection,
     sessionId: string,
@@ -1651,18 +1742,46 @@ class CherryToolEngine {
     )
 
     const messages: CherryReadMessage[] = []
+    let projectedBytes = 0
+    let outOfBudget = false
     for (const raw of page.items) {
-      messages.push(await this.#projectMessage(connection, sessionId, raw))
+      const message = await this.#projectMessage(connection, sessionId, raw)
+      messages.push(message)
+      projectedBytes += JSON.stringify(message).length
+      // AFTER the message is complete — the budget trims what comes NEXT, never
+      // what has already been taken, so `messages[0]` is always whole.
+      if (projectedBytes >= AGGREGATE_BYTES) {
+        outOfBudget = true
+        break
+      }
     }
+    // A BYTE stop is truncation only when messages were LEFT BEHIND: spending
+    // the budget on the peer's last message is a complete walk (same boundary
+    // rule as the terminal walk).
+    const exhausted = outOfBudget && (messages.length < page.items.length || page.truncated)
+    const truncated = exhausted || page.truncated
+    const truncationReason: CherryTruncationReason | undefined = exhausted
+      ? 'aggregate-bytes'
+      : page.truncationReason
+    const resumeCursor =
+      exhausted && page.items.length > messages.length ? String(messages.length) : page.nextCursor
     return {
       session,
       messages,
-      truncated: page.truncated,
-      ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
+      truncated,
+      ...(truncationReason === undefined ? {} : { truncationReason }),
       // Only a TRUNCATED walk has unread history, and the cursor then marks the
-      // stop point (OLDER messages remain unread; raise `limit` to read them) —
-      // {@link CherryReadSnapshot.messagesResumeCursor}.
-      ...(page.truncated && page.nextCursor !== undefined ? { messagesResumeCursor: page.nextCursor } : {}),
+      // stop point (OLDER messages remain unread) —
+      // {@link CherryReadSnapshot.messagesResumeCursor}. On a BYTE stop it is
+      // derived from what was RETURNED rather than copied from the page walk:
+      // that walk's `nextCursor` sits past every message it collected, so on a
+      // mid-window stop it would skip the unread ones between them (the same
+      // honesty the terminal walk applies, expressed for a walk whose unread
+      // tail is INSIDE the window). When the walk reached the peer's last page
+      // there is no position to name, and the key is OMITTED rather than
+      // emitted undefined: the absence says "no marker", the `truncated` flag
+      // still says the walk was cut.
+      ...(truncated && resumeCursor !== undefined ? { messagesResumeCursor: resumeCursor } : {}),
     }
   }
 
@@ -1884,6 +2003,17 @@ class CherryToolEngine {
    * the slices' own reports), which must agree when both are present, and the
    * certified bytes must then decode as legal UTF-8 — a digest certifies bytes,
    * not text.
+   *
+   * THE MEMORY CONTRACT (issue #7). {@link MAX_EXTERNALIZED_BYTES} caps ONE
+   * ref, and this walk holds its content at roughly 3x that cap at its peak:
+   * the decoded slice buffers, the single concatenation the digest and the
+   * decoder both need, and the decoded string handed back. Three copies is the
+   * price of never hashing or decoding a buffer that the caller could mutate,
+   * and it is paid ONE REF AT A TIME by this engine's walks — messages and
+   * parts are projected sequentially, so an aggregate's own peak is one ref's.
+   * It is NOT a process-wide bound: independent reads (separate tool calls)
+   * in flight together multiply the peak by their count. A global gate or
+   * budget is a separate concern, deliberately outside this walk.
    */
   async #readExternalized(
     connection: DeviceConnection,
@@ -2571,7 +2701,7 @@ class CherryToolEngine {
           // The IDLE answer, not a failure and not a wait: nothing is in flight,
           // so the current snapshot IS the result. The message walk is bounded
           // like every other aggregate ({@link TERMINAL_AGGREGATE_MESSAGES} /
-          // {@link TERMINAL_AGGREGATE_BYTES}), so its verdict rides along — an
+          // {@link AGGREGATE_BYTES}), so its verdict rides along — an
           // idle snapshot of a session past either bound is a PARTIAL history,
           // and a caller stacking it against a later read would otherwise see
           // content vanish with nothing to explain it.
@@ -4000,7 +4130,7 @@ class CherryToolEngine {
    * falls back to the NEWEST assistant message (see
    * {@link aggregateAssistantText}). Either way the `messages` array stays on
    * the result as context, bounded by {@link TERMINAL_AGGREGATE_MESSAGES} and
-   * {@link TERMINAL_AGGREGATE_BYTES}.
+   * {@link AGGREGATE_BYTES}.
    *
    * A CONTENT ASSEMBLY FAILURE DOES NOT UNDO THE VERDICT (issue #3). The run
    * really did settle on `status`; only the history read behind `text` failed.
@@ -4243,7 +4373,7 @@ class CherryToolEngine {
    *     history past the ceiling is not what a wait is asking for.
    *  2. **Bytes** — the projected messages are accumulated (their
    *     `JSON.stringify` length as a wire-cost proxy) and the projection stops
-   *     once {@link TERMINAL_AGGREGATE_BYTES} is exceeded. The message COUNT
+   *     once {@link AGGREGATE_BYTES} is exceeded. The message COUNT
    *     alone bounds nothing: one message may carry hundreds of parts, each a
    *     separate `agent.content.read`.
    *
@@ -4297,7 +4427,7 @@ class CherryToolEngine {
       projectedBytes += JSON.stringify(message).length
       // Checked AFTER the message is complete: the budget trims what comes
       // NEXT, never what has already been taken, so message 0 is always whole.
-      if (projectedBytes >= TERMINAL_AGGREGATE_BYTES) {
+      if (projectedBytes >= AGGREGATE_BYTES) {
         outOfBudget = true
         break
       }
@@ -4534,7 +4664,7 @@ function messageWalkVerdict(page: CherryPage<unknown>): CherryMessageWalkVerdict
  * ## The scope is bounded, and that is flagged
  *
  * The walk this reads was bounded by the caller
- * (`TERMINAL_AGGREGATE_MESSAGES` / `TERMINAL_AGGREGATE_BYTES`), so on a long
+ * (`TERMINAL_AGGREGATE_MESSAGES` / `AGGREGATE_BYTES`), so on a long
  * session the text is assembled from the newest window only. When even that
  * window was cut, the result carries the walk verdict
  * ({@link CherryMessageWalkVerdict}) and `terminalMessageId` may fall outside

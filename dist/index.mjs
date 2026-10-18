@@ -4052,9 +4052,10 @@ const MAX_AGGREGATE_LIMIT = 1e3;
 */
 const TERMINAL_AGGREGATE_MESSAGES = 20;
 /**
-* BYTE BUDGET for the terminal/timeout/idle aggregate, applied to the
-* PROJECTED messages (each one after `#projectMessage`, measured with
-* `JSON.stringify`'s length as a cheap approximation of its wire cost).
+* BYTE BUDGET for a MESSAGE aggregate, applied to the PROJECTED messages (each
+* one after `#projectMessage`, measured with `JSON.stringify`'s length as a
+* cheap approximation of its wire cost). Shared by the terminal/timeout/idle
+* aggregates and by `cherry_read` — one budget, one vocabulary (issue #29).
 *
 * The message ceiling alone does not bound the RESULT: one message can carry
 * hundreds of parts, each an externalized `{ref}` resolved through a separate
@@ -4064,12 +4065,24 @@ const TERMINAL_AGGREGATE_MESSAGES = 20;
 * content. 256 KiB is a deliberate fraction of a tool result: enough for a
 * long reply plus its reasoning, small enough to stay well inside the limit.
 *
+* WHY `cherry_read` REUSES IT RATHER THAN GETTING ITS OWN (issue #29). The
+* read face is a batch history tool, so a LARGER budget would read more per
+* call — but the constraint that failed in the field is the MCP output
+* boundary, and it does not care which tool produced the oversized answer: a
+* `cherry_read(limit: 1000)` over a fat session produced tens of megabytes
+* after paying for every round trip first. A SECOND value would also mean two
+* answers to "how big may one aggregate be?", drifting apart silently, on two
+* faces that already share the reason vocabulary. What differs between them is
+* the MESSAGE CEILING, not the byte cost of one message. The read face's own
+* way to ask for more is progressive: each stop is surfaced, and the older
+* history is re-read at a larger `limit` (the budget still bounds each answer).
+*
 * THE NEWEST MESSAGE IS ALWAYS WHOLE. The budget is checked only AFTER a
 * message's projection completes, and the first message is always taken before
-* any check runs — it is the run's own reply, so a budget that could truncate
-* it would defeat the purpose of reading the history in the first place.
+* any check runs — it is the run's own reply, and on `cherry_read` it is the
+* one message a caller asking "what is the latest?" cannot do without.
 */
-const TERMINAL_AGGREGATE_BYTES = 262144;
+const AGGREGATE_BYTES = 262144;
 /**
 * What a caller whose terminal aggregate could not be assembled should do.
 *
@@ -4133,6 +4146,16 @@ const DEFAULT_CONTENT_SLICE_BOUND = 4096;
 * the desktop really does externalize never approaches it, and a part above it
 * degrades to `unavailable` exactly like any other part this client will not
 * read.
+*
+* PER REF, NOT PER CALL — the memory contract (issue #7). The cap bounds ONE
+* ref, and a walk holds its content at roughly THREE times its size while
+* assembling it (the decoded slices, their concatenation, and the decoded
+* string — see {@link CherryToolEngine.#readExternalized}). An aggregate that
+* reads refs sequentially pays that peak one ref at a time; when several
+* partition reads are in flight at once (independent tool calls, not this
+* engine's own walk), the peak multiplies by the number of in-flight reads.
+* A process-wide gate over that product is deliberately NOT here; callers
+* that issued the concurrency are the ones that know its size.
 */
 const MAX_EXTERNALIZED_BYTES = 33554432;
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
@@ -4804,7 +4827,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the older messages left out (it only costs more round trips and stops at the same budget), and this tool offers no other way to reach them: it always starts at the newest message and takes no cursor, so they are viewable only on the desktop (or through a history-cursor read parameter, which is tracked as #26 and not provided today). A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -4820,7 +4843,7 @@ var CherryToolEngine = class {
 						type: "integer",
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of messages to return in total across pages (default 100)."
+						description: "Maximum number of messages to return in total across pages (default 100). Distinct from the output budget: the answer may stop earlier with `truncationReason: \"aggregate-bytes\"`, which a larger `limit` does not extend."
 					}
 				},
 				required: ["device", "sessionId"],
@@ -4856,6 +4879,32 @@ var CherryToolEngine = class {
 			throw error;
 		}
 	}
+	/**
+	* One read round, bounded on TWO arms: the caller's `limit` (a message
+	* count) and {@link AGGREGATE_BYTES} (the projected messages' size).
+	*
+	* The byte arm is the terminal faces' budget applied to this walk (issue
+	* #29). Without it the COUNT was the only bound, so `cherry_read(limit:
+	* 1000)` over a fat session paid for every message, every part and every
+	* externalized content read before producing an answer of tens of megabytes
+	* that the MCP boundary rejects — the caller lost the verdict along with the
+	* content. The guarantees are the terminal walk's, restated:
+	*
+	*  - the budget is checked only AFTER a message is fully projected, so what a
+	*    stop leaves out is the OLDER end and {@link CherryReadSnapshot.messages}
+	*    are all returned WHOLE — the newest first, already taken before any
+	*    check runs;
+	*  - a stop is SURFACED (`truncated` + `truncationReason`), never silent;
+	*  - the reason is `'aggregate-bytes'`, the terminal face's own member. It is
+	*    NOT `'limit'`: the caller set no such limit, and telling them to raise
+	*    one they already set above the budget would teach a remedy that cannot
+	*    work (see {@link CherryReadSnapshot.messagesResumeCursor}).
+	*
+	* The verdict describes the walk that ACTUALLY happened, so the page
+	* aggregate's own verdict is only inherited when the byte arm did not fire —
+	* a walk the budget cut is not the page aggregate's `'limit'`/`'safety-bound'`
+	* stop, even when the page aggregate also ran out.
+	*/
 	async #readOnce(connection, sessionId, limit) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
@@ -4869,13 +4918,27 @@ var CherryToolEngine = class {
 			nextCursor: result["nextCursor"]
 		}), limit);
 		const messages = [];
-		for (const raw of page.items) messages.push(await this.#projectMessage(connection, sessionId, raw));
+		let projectedBytes = 0;
+		let outOfBudget = false;
+		for (const raw of page.items) {
+			const message = await this.#projectMessage(connection, sessionId, raw);
+			messages.push(message);
+			projectedBytes += JSON.stringify(message).length;
+			if (projectedBytes >= AGGREGATE_BYTES) {
+				outOfBudget = true;
+				break;
+			}
+		}
+		const exhausted = outOfBudget && (messages.length < page.items.length || page.truncated);
+		const truncated = exhausted || page.truncated;
+		const truncationReason = exhausted ? "aggregate-bytes" : page.truncationReason;
+		const resumeCursor = exhausted && page.items.length > messages.length ? String(messages.length) : page.nextCursor;
 		return {
 			session,
 			messages,
-			truncated: page.truncated,
-			...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason },
-			...page.truncated && page.nextCursor !== void 0 ? { messagesResumeCursor: page.nextCursor } : {}
+			truncated,
+			...truncationReason === void 0 ? {} : { truncationReason },
+			...truncated && resumeCursor !== void 0 ? { messagesResumeCursor: resumeCursor } : {}
 		};
 	}
 	/** One message: list ALL its parts under the message's OWN revision, then aggregate. */
@@ -5020,6 +5083,17 @@ var CherryToolEngine = class {
 	* the slices' own reports), which must agree when both are present, and the
 	* certified bytes must then decode as legal UTF-8 — a digest certifies bytes,
 	* not text.
+	*
+	* THE MEMORY CONTRACT (issue #7). {@link MAX_EXTERNALIZED_BYTES} caps ONE
+	* ref, and this walk holds its content at roughly 3x that cap at its peak:
+	* the decoded slice buffers, the single concatenation the digest and the
+	* decoder both need, and the decoded string handed back. Three copies is the
+	* price of never hashing or decoding a buffer that the caller could mutate,
+	* and it is paid ONE REF AT A TIME by this engine's walks — messages and
+	* parts are projected sequentially, so an aggregate's own peak is one ref's.
+	* It is NOT a process-wide bound: independent reads (separate tool calls)
+	* in flight together multiply the peak by their count. A global gate or
+	* budget is a separate concern, deliberately outside this walk.
 	*/
 	async #readExternalized(connection, sessionId, ref) {
 		const contentId = String(ref["contentId"] ?? "");
@@ -6317,7 +6391,7 @@ var CherryToolEngine = class {
 	* falls back to the NEWEST assistant message (see
 	* {@link aggregateAssistantText}). Either way the `messages` array stays on
 	* the result as context, bounded by {@link TERMINAL_AGGREGATE_MESSAGES} and
-	* {@link TERMINAL_AGGREGATE_BYTES}.
+	* {@link AGGREGATE_BYTES}.
 	*
 	* A CONTENT ASSEMBLY FAILURE DOES NOT UNDO THE VERDICT (issue #3). The run
 	* really did settle on `status`; only the history read behind `text` failed.
@@ -6507,7 +6581,7 @@ var CherryToolEngine = class {
 	*     history past the ceiling is not what a wait is asking for.
 	*  2. **Bytes** — the projected messages are accumulated (their
 	*     `JSON.stringify` length as a wire-cost proxy) and the projection stops
-	*     once {@link TERMINAL_AGGREGATE_BYTES} is exceeded. The message COUNT
+	*     once {@link AGGREGATE_BYTES} is exceeded. The message COUNT
 	*     alone bounds nothing: one message may carry hundreds of parts, each a
 	*     separate `agent.content.read`.
 	*
@@ -6553,7 +6627,7 @@ var CherryToolEngine = class {
 			const message = await this.#projectMessage(connection, sessionId, raw);
 			messages.push(message);
 			projectedBytes += JSON.stringify(message).length;
-			if (projectedBytes >= TERMINAL_AGGREGATE_BYTES) {
+			if (projectedBytes >= AGGREGATE_BYTES) {
 				outOfBudget = true;
 				break;
 			}
@@ -6745,7 +6819,7 @@ function messageWalkVerdict(page) {
 * ## The scope is bounded, and that is flagged
 *
 * The walk this reads was bounded by the caller
-* (`TERMINAL_AGGREGATE_MESSAGES` / `TERMINAL_AGGREGATE_BYTES`), so on a long
+* (`TERMINAL_AGGREGATE_MESSAGES` / `AGGREGATE_BYTES`), so on a long
 * session the text is assembled from the newest window only. When even that
 * window was cut, the result carries the walk verdict
 * ({@link CherryMessageWalkVerdict}) and `terminalMessageId` may fall outside
