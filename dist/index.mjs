@@ -335,11 +335,19 @@ var DeviceStore = class {
 	* not several things matching, and folding the two together made
 	* `cherry_devices` answer `ambiguous-device` with `candidates: []` on a
 	* machine with a single paired device.
+	*
+	* AN EMPTY SELECTOR IS A MISS (v0.1.3 review, P3-1). `''.startsWith('')` is
+	* true, so the prefix branch used to match EVERY record: one paired device
+	* resolved silently to it and several answered `ambiguous` — an answer about
+	* a selector that names nothing. The guard sits AFTER the exact branch, not
+	* before it, so a record whose own `deviceId` is the empty string still
+	* resolves exactly; only the PREFIX branch refuses the empty selector.
 	*/
 	resolve(device) {
 		const devices = this.list();
 		const exact = devices.find((record) => record.deviceId === device);
 		if (exact !== void 0) return exact;
+		if (device === "") return { notFound: true };
 		const matches = devices.filter((record) => record.deviceId.startsWith(device) || record.displayName.startsWith(device));
 		if (matches.length === 1) return matches[0];
 		if (matches.length === 0) return { notFound: true };
@@ -466,8 +474,21 @@ async function generateIdentity(dataDir, path) {
 //#region src/rpc/jsonRpcClient.ts
 /** Default cap on business requests in flight on a single connection. */
 const DEFAULT_MAX_IN_FLIGHT = 8;
-/** Default per-request timeout in milliseconds. */
-const DEFAULT_TIMEOUT_MS = 3e4;
+/**
+* Default per-request timeout in milliseconds.
+*
+* ALIGNED WITH THE PROTOCOL'S IDLE TERM (v0.1.3 review, P3-4): the peer's
+* `remoteLimits.idleMs` is 60,000ms, the window after which the desktop may
+* consider the session idle and close it. A client-side timeout SHORTER than
+* that decides a request is dead while the peer still considers the session
+* live — it turns a slow-but-legal answer into a spurious local failure, and
+* (because the connection replays reads) into a second arrival the peer never
+* asked for. Waiting at least as long as the peer means every timeout this
+* client reports is a real one. `remoteLimits` is not imported here on purpose:
+* this module stays free of the protocol package's runtime surface, and the
+* value is pinned by the review that set it.
+*/
+const DEFAULT_TIMEOUT_MS = 6e4;
 /** Rejection message used once the channel can no longer carry responses. */
 const CHANNEL_CLOSED_MESSAGE = "JSON-RPC channel closed";
 /** Bounded number of schema issues quoted in one drop warning. */
@@ -2282,9 +2303,20 @@ const SILENCE_FACTOR = 2;
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
 const DISPOSED_RE = /^JSON-RPC client disposed$/;
 /**
-* The read methods whose transport loss may be replayed automatically (two
-* entries are not called today — kept so a future call site is covered the day
-* it appears rather than silently un-retried).
+* The read methods whose transport loss may be replayed automatically.
+*
+* Two entries are DEAD today and are kept deliberately, so a future call site
+* is covered the day it appears rather than silently un-retried:
+*
+*  - `connection.ping` — production housekeeping goes through `#houseCall`
+*    straight to the link's client and never passes through this facade, so
+*    no production ping can reach the replay path.
+*  - `agent.interactions.get` — this plugin has no call site for it.
+*
+* A third entry can look equally dead from here and is NOT:
+* `agent.checkpoints.read` is reached through the subscription layer
+* (`sessionSubscriptions.#walkCheckpoints`), so it is a live read and its
+* presence in this set is what makes a mid-flight loss on it recoverable.
 *
 * Reads are safe to replay by construction: the peer answers from stored
 * revisions and the call has no side effect, so a second copy costs one round
@@ -2608,6 +2640,14 @@ var DeviceConnection = class {
 		return this.#state;
 	}
 	/**
+	* TEST INJECTION ONLY: overrides the reconnect backoff computation for
+	* EVERY attempt until the test clears it (see {@link #backoffDelay}) — a
+	* test sequences a fast first reconnect with slow later ones by returning
+	* a small value while `attempts` is low and a large one afterwards. Never
+	* set in production wiring.
+	*/
+	retryBackoffInitialMs;
+	/**
 	* Whether a dialed link is currently committed.
 	*
 	* Read-only view of state this class already owns, exposed because the
@@ -2733,7 +2773,9 @@ var DeviceConnection = class {
 	}
 	#backoffDelay() {
 		const exponent = Math.min(Math.max(this.#attempt - 1, 0), 30);
-		return Math.min(this.#backoffInitialMs * 2 ** exponent, this.#backoffMaxMs);
+		const initialMs = this.retryBackoffInitialMs?.() ?? this.#backoffInitialMs;
+		const capped = Math.min(initialMs * 2 ** exponent, this.#backoffMaxMs);
+		return Math.round(capped * (.8 + Math.random() * .2));
 	}
 	/**
 	* One establishment pass: try each candidate host in order. Per-host
@@ -3026,6 +3068,7 @@ var DeviceConnection = class {
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
 			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
 			if (reconnected === void 0) throw lost;
+			if (reconnected.epoch !== this.#epoch) throw lost;
 			await this.#limiter.acquire(method);
 			if (!this.#running || this.#state !== "connected") throw lost;
 			try {
@@ -4673,6 +4716,21 @@ var CherryToolEngine = class {
 	* it is ALWAYS surfaced (`truncationReason: 'safety-bound'` plus the
 	* stop-point cursor) — a walk never stops early and reports success.
 	*
+	* A page whose `items` are not all records is PROJECTED: every list face
+	* runs through `arrayOf`, which keeps the records and drops the rest (an
+	* item that is not an object cannot be an entry of anything this layer
+	* renders). Dropping is the only option for a mid-walk page, but it must
+	* never be SILENT, because a dropped item is a short answer that otherwise
+	* reads exactly like a complete one:
+	*
+	*  - one bounded `console.warn` per WALK, naming the method and the number of
+	*    dropped items — never their contents, which are peer-supplied payload;
+	*  - a TERMINAL page (`nextCursor: null`) that offered items and had ALL of
+	*    them dropped is a contradiction: the peer says the walk is over and
+	*    simultaneously retracts everything on its last page. It is thrown with
+	*    the exact diagnosis — same family as the stuck-cursor refusal — rather
+	*    than returned as `truncated: false` with a hole in it.
+	*
 	* An EMPTY page with a non-null `nextCursor` is legal progress while the
 	* cursor advances: the desktop's pinned-list walk answers exactly
 	* `{items: [], nextCursor: 'entity:'}` when a pin anchor is unpinned or
@@ -4692,6 +4750,7 @@ var CherryToolEngine = class {
 		const items = [];
 		let cursor;
 		let emptyPages = 0;
+		let droppedTotal = 0;
 		const seen = /* @__PURE__ */ new Set();
 		for (let pages = 0;; pages += 1) {
 			if (items.length >= ceiling) return this.#truncated(items, bindsCallerLimit ? "limit" : "safety-bound", cursor);
@@ -4702,15 +4761,21 @@ var CherryToolEngine = class {
 			};
 			if (cursor !== void 0) request["cursor"] = cursor;
 			const extracted = extract(await connection.rpc.request(method, request));
+			const dropped = extracted.dropped ?? 0;
+			if (dropped > 0 && droppedTotal === 0) console.warn(`[cherry-remote] ${method} dropped ${dropped} non-record items from a page for ${JSON.stringify(params)}; they cannot be projected as entries`);
+			droppedTotal += dropped;
 			for (const item of extracted.items) {
 				if (items.length >= ceiling) break;
 				items.push(item);
 			}
 			const next = extracted.nextCursor;
-			if (next === null || next === void 0) return {
-				items,
-				truncated: false
-			};
+			if (next === null || next === void 0) {
+				if (dropped > 0 && extracted.items.length === 0) throw new Error(`${method}: peer returned ${dropped} non-record items that were dropped from its terminal page (nextCursor null) for ${JSON.stringify(params)}; refusing a silently short result`);
+				return {
+					items,
+					truncated: false
+				};
+			}
 			const advanced = String(next);
 			if (advanced === cursor) throw new Error(`${method} did not advance its cursor (stuck at ${advanced}) for ${JSON.stringify(params)}`);
 			if (seen.has(advanced)) throw new Error(`${method} cycled back to cursor ${advanced} it already served for ${JSON.stringify(params)}; refusing to spin on a peer whose pagination loops`);
@@ -4828,7 +4893,7 @@ var CherryToolEngine = class {
 				if (resolved.link === void 0) return resolved.verdict;
 				const { connection } = resolved.link;
 				return this.#aggregate(connection, "agent.agents.list", {}, (page) => ({
-					items: arrayOf(page["items"]),
+					...arrayOf(page["items"]),
 					nextCursor: page["nextCursor"]
 				}), aggregateLimit(args["limit"]));
 			}
@@ -4868,7 +4933,7 @@ var CherryToolEngine = class {
 				const page = await this.#aggregate(connection, "agent.workspaces.list", { agentId }, (result) => {
 					if (typeof result["systemWorkspace"] === "boolean") systemWorkspace = result["systemWorkspace"];
 					return {
-						items: arrayOf(result["items"]),
+						...arrayOf(result["items"]),
 						nextCursor: result["nextCursor"]
 					};
 				}, aggregateLimit(args["limit"]));
@@ -4920,7 +4985,7 @@ var CherryToolEngine = class {
 					...agentId === void 0 ? {} : { agentId },
 					...workspaceId === void 0 ? {} : { workspaceId }
 				}, (page) => ({
-					items: arrayOf(page["items"]),
+					...arrayOf(page["items"]),
 					nextCursor: page["nextCursor"]
 				}), aggregateLimit(args["limit"]));
 			}
@@ -5016,7 +5081,7 @@ var CherryToolEngine = class {
 			sessionId,
 			historyRevision
 		}, (result) => ({
-			items: arrayOf(result["items"]),
+			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
 		}), limit);
 		const messages = [];
@@ -5052,7 +5117,7 @@ var CherryToolEngine = class {
 			messageId,
 			messageRevision: revision
 		}, (result) => ({
-			items: arrayOf(result["items"]),
+			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
 		}), Number.POSITIVE_INFINITY, this.#partsSafetyBound, PARTS_LIST_PAGE_CLAMP);
 		const parts = [];
@@ -5631,7 +5696,7 @@ var CherryToolEngine = class {
 				const sessionId = requiredString(args, "sessionId");
 				await this.#ensureSubscription(record.deviceId, sessionId);
 				const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
-					items: arrayOf(result["items"]),
+					...arrayOf(result["items"]),
 					nextCursor: result["nextCursor"]
 				}), aggregateLimit(args["limit"]), MAX_AGGREGATE_LIMIT, INTERACTIONS_LIST_PAGE_CLAMP);
 				const includeAnswered = args["includeAnswered"] === true;
@@ -6104,7 +6169,7 @@ var CherryToolEngine = class {
 		const streamed = this.#interactionCache.get(this.#interactionKey(deviceId, sessionId, interactionId));
 		if (streamed !== void 0) return streamed;
 		const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
-			items: arrayOf(result["items"]),
+			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
 		}), MAX_AGGREGATE_LIMIT, MAX_AGGREGATE_LIMIT, INTERACTIONS_LIST_PAGE_CLAMP);
 		for (const item of page.items) this.#rememberInteraction(deviceId, sessionId, item);
@@ -6719,7 +6784,7 @@ var CherryToolEngine = class {
 			sessionId,
 			historyRevision
 		}, (result) => ({
-			items: arrayOf(result["items"]),
+			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
 		}), TERMINAL_AGGREGATE_MESSAGES);
 		const messages = [];
@@ -6778,10 +6843,26 @@ var CherryToolEngine = class {
 		return subscriptions.windowStart(sessionId) ?? null;
 	}
 };
-/** The array at `value`, or an empty array when the peer sent something else. */
+/**
+* The array at `value`, or an empty array when the peer sent something else —
+* plus HOW MANY entries were dropped as non-records (v0.1.3 review, P3-6a).
+*
+* The count is returned rather than logged here because this helper has no
+* idea which method it is projecting: the CALLER (`#aggregate`) owns the
+* method name and the page's terminality, so it is the only place that can
+* say "agent.sessions.list dropped 2" without guessing, and the only place
+* that can decide what a wholesale drop means.
+*/
 function arrayOf(value) {
-	if (!Array.isArray(value)) return [];
-	return value.filter(isRecord);
+	if (!Array.isArray(value)) return {
+		items: [],
+		dropped: 0
+	};
+	const items = value.filter(isRecord);
+	return {
+		items,
+		dropped: value.length - items.length
+	};
 }
 /** The caller's aggregate limit, defaulting to one page and capped at the max. */
 function aggregateLimit(value) {

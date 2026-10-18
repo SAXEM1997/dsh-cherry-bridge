@@ -1413,6 +1413,72 @@ describe('DeviceConnection over a real loopback channel', () => {
     await waitForState(connection, 'connected', 5_000)
   })
 
+  it('(B2) a link rotated while the replay waits for pacing is NOT replayed: the one replay stays on its own epoch', async () => {
+    // The drain-guarded wait (⑮a) proves the replay never rides a life `close()`
+    // ended, but a PLAIN link loss inside this connection's own lifecycle is
+    // not a teardown: the wait is not drained, it parks across a second kill
+    // and wakes on a later reconnected link. The `{client, epoch}` the wait
+    // hands back carries that epoch so the replay is bound to the generation it
+    // settled on; the line after it refuses to fire when the link has moved on.
+    //
+    // WHAT THIS TEST PROVES, AND WHAT IT DOES NOT. It pins the observable
+    // contract: the walk's ONE replay arrives once, is never appended to a
+    // later link's record, and the walk always ends classified — the original
+    // arrival plus the replay arrival, no re-dial of the original. It is NOT
+    // independent mutation evidence for the epoch re-check: measurements against
+    // the pre-fix tree showed this second kill does not propagate a client-side
+    // rejection in time, so deleting the re-check leaves the test green (the
+    // replay is bounded by the class's other invariants instead). That is
+    // disclosed here rather than papered over: the re-check closes a race whose
+    // shipped manifestation was not reachable in this fake.
+    //
+    // The rotation is driven CLIENT-SIDE, with no sleep racing a handshake:
+    //  - the WALK's original arrival is killed by the fake's one-shot hook and
+    //    its replay parks for its fresh pacing admission;
+    //  - a SIBLING read is admitted on the freshly reconnected link, so the
+    //    walk's replay is next in the tier's FIFO when the link is rotated
+    //    again;
+    //  - a PERMANENT hook keeps killing the walk's arrivals, so its count is
+    //    pinned whatever the timing.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: { heartbeatMs: 60_000 },
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        workspaces: [{ workspaceId: 'ws-1', name: 'Workspace One' }],
+      },
+    })
+    const WALK = 'agent.agents.list'
+    const SIBLING = 'agent.workspaces.list'
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 1,
+      transportRetryWaitMs: 10_000,
+      rateBudgetPerSecond: 2,
+    })
+    await connection.connect()
+    let attempts = 1
+    connection.retryBackoffInitialMs = (): number => (++attempts > 2 ? 200 : 1)
+    fakeInfo.fake.beforeNextCall(WALK, () => fakeInfo.fake.dropConnections())
+    fakeInfo.fake.alwaysBeforeCall(WALK, () => fakeInfo.fake.dropConnections())
+
+    const walk = connection.rpc.request(WALK, {}).catch((reason: unknown) => reason)
+    await waitFor(() => fakeInfo.fake.methodCount(WALK) >= 1)
+    await waitFor(() => connection.state === 'connected', 5_000)
+    const sibling = connection.rpc.request(SIBLING, { agentId: 'agent-1' }).catch((reason: unknown) => reason)
+    await waitFor(() => fakeInfo.fake.methodCount(SIBLING) >= 1, 5_000)
+
+    const error = (await walk) as TransportLostError
+    await sibling
+    expect(error).toBeInstanceOf(TransportLostError)
+    expect(error.retryable).toBe(true)
+    expect(error.method).toBe(WALK)
+    // Exactly ONE replay arrival: the walk left the client of the generation
+    // it was parked for, and never landed on a later one.
+    expect(fakeInfo.fake.methodCount(WALK)).toBe(2)
+  }, 20_000)
+
   it('⑮c a link dying while the replay waits for its pacing admission never leaks disposal text', async () => {
     // The replay takes a fresh rate admission, and the pacing wait can outlast
     // the link it resolved on — the primary path re-judges after its own

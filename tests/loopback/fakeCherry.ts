@@ -714,6 +714,8 @@ export class FakeCherry {
   #afterReadOnce = new Map<string, () => void>()
   /** One-shot hooks that fire AS a method's next frame arrives (see `beforeNextCall`). */
   #beforeNextCall = new Map<string, () => void>()
+  /** Persistent per-method hooks (see `alwaysBeforeCall`); checked after the one-shot entry. */
+  #alwaysBeforeCall = new Map<string, () => void>()
   /** Scripted pages per read-face method, served INSTEAD of the normal page. */
   #scriptedPages = new Map<string, Array<(params: Record<string, unknown>) => Record<string, unknown>>>()
   /** Externalized content bytes, keyed `<contentId>:<revision>` (the peer's pins). */
@@ -1183,6 +1185,27 @@ export class FakeCherry {
   }
 
   /**
+   * The permanent sibling of {@link beforeNextCall}: `hook` runs on EVERY
+   * later arrival of `method` (until {@link clearAlwaysBeforeCall}) and is
+   * never consumed. A one-shot entry still wins for the arrival that meets it,
+   * because it is checked first.
+   *
+   * Review isolation, v0.1.3 P3-B2: a hook that fires from inside a previous
+   * hook's closure is registered too late in practice — it can only kill an
+   * arrival that comes after it, while the arrival the test means to kill may
+   * already be in the frame queue. A permanent entry is armed BEFORE the first
+   * arrival and survives every reconnect.
+   */
+  alwaysBeforeCall(method: string, hook: () => void): void {
+    this.#alwaysBeforeCall.set(method, hook)
+  }
+
+  /** Disarms a {@link alwaysBeforeCall} hook for `method`. */
+  clearAlwaysBeforeCall(method: string): void {
+    this.#alwaysBeforeCall.delete(method)
+  }
+
+  /**
    * Corrupt one `{ref}` content: the stored bytes are replaced while the
    * digest the pin ADVERTISED stays as it was. A caller that trusts the bytes
    * without verifying sha256 therefore accepts corrupted text; a caller that
@@ -1631,9 +1654,10 @@ export class FakeCherry {
       // Runs BEFORE the handler answers, so a hook that drops the link leaves
       // the request genuinely IN FLIGHT: arrived, counted, never answered.
       const before = this.#beforeNextCall.get(method)
-      if (before !== undefined) {
-        this.#beforeNextCall.delete(method)
-        before()
+      const always = this.#alwaysBeforeCall.get(method)
+      if (before !== undefined || always !== undefined) {
+        if (before !== undefined) this.#beforeNextCall.delete(method)
+        ;(before ?? always)?.()
         return
       }
       if (this.#rateLimited(live)) return // session terminated; nothing further to say

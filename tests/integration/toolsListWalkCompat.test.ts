@@ -436,3 +436,65 @@ describe('issue #11 T8: the run bound is exactly three', () => {
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(4)
   })
 })
+
+describe('v0.1.3 P3 (group B): a page of malformed items is never absorbed silently', () => {
+  it('B6a drops a NON-RECORD item mid-walk, names the count in one warning, and still completes', async () => {
+    // Every list page is projected through `arrayOf`, which drops a non-object
+    // item on the floor. Dropping is the only option for a mid-walk page (the
+    // caller's limit may already be beyond it), but dropping SILENTLY made a
+    // short answer indistinguishable from a complete one at the peer's own
+    // fault. The tolerated case still completes and still says nothing false;
+    // it only leaves ONE bounded warning naming the method and the count.
+    const fixture = sessions(20)
+    const rig = await makeRig({ agent: { sessions: fixture } })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      // One record and three non-records (a string, a number, null).
+      { items: [summaryOf(fixture[0]!), 'not-a-session', 42, null], nextCursor: 'c-1' },
+      pageOf(fixture, 1, 3, null),
+    ])
+
+    const result = (await rig.call('cherry_sessions', { device: 'dev-A' })) as {
+      items: Array<{ sessionId: string }>
+      truncated?: boolean
+    }
+
+    // The well-formed items survived; the malformed ones are gone.
+    expect(result.items.map((session) => session.sessionId)).toEqual(
+      fixture.slice(0, 3).map((session) => session.sessionId),
+    )
+    expect(result.truncated).toBe(false)
+    // ONE warning for the walk, naming the method and the count — never the
+    // items' contents (they are peer-supplied payload).
+    const droppedWarnings = vi
+      .mocked(console.warn).mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes('agent.sessions.list') && line.includes('dropped'))
+    expect(droppedWarnings).toHaveLength(1)
+    expect(droppedWarnings[0]).toContain('3')
+    for (const line of droppedWarnings) expect(line).not.toContain('not-a-session')
+  })
+
+  it('B6b REFUSES a terminal page whose items were dropped wholesale, instead of answering truncated:false', async () => {
+    // The fail-loud case: the peer's LAST page says `nextCursor: null` (nothing
+    // more) and every item on it is malformed, so the walk would return a
+    // SHORT result while claiming it is complete. An empty page is legitimate
+    // (the pinned-list transition) and a page that keeps at least one real item
+    // is only lossy; a terminal page with items that ALL vanished is a
+    // contradiction, and it is thrown with the exact diagnosis — same family
+    // as the stuck-cursor refusal.
+    const fixture = sessions(20)
+    const rig = await makeRig({ agent: { sessions: fixture } })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      pageOf(fixture, 0, LIST_PAGE_CLAMP, String(LIST_PAGE_CLAMP)),
+      { items: [3, 'garbage'], nextCursor: null },
+    ])
+
+    const error = await rejectionOf(rig.call('cherry_sessions', { device: 'dev-A' }))
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('peer returned 2 non-record items that were dropped')
+    expect((error as Error).message).toContain('refusing a silently short result')
+    expect((error as Error).message).toContain('agent.sessions.list')
+    // The walk stopped AT the terminal page rather than inventing another one.
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(2)
+  })
+})
