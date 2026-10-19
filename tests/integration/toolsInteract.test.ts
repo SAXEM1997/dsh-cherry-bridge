@@ -1106,6 +1106,56 @@ describe('interactive cherry tools over a real loopback channel', () => {
   })
 
   // -------------------------------------------------------------------------
+  // Issue #51: the idle precondition rides the answer's budget
+  // -------------------------------------------------------------------------
+
+  it('⑯a (issue #51) an idle wait whose snapshot outlasts the budget fails with guidance, not the 60 s default', async () => {
+    // The snapshot is the ONE wait-answer request that used to have no absolute
+    // bound: on a flapping link it could spend transportRetryWaitMs waiting for
+    // a reconnect plus its one replay — 5-10 s after a 500 ms window. It now
+    // rides an `AssemblyDeadline` anchored at tool entry (window + bounded
+    // tail), so the whole call is bounded by the patience the caller declared.
+    //
+    // The reply is delayed past the budget on purpose: the request times out at
+    // the budget instead of waiting for the 2.5 s answer, and because there is
+    // no answer to degrade to (idleness is only known FROM this snapshot), the
+    // caller gets a guidance error rather than a verdict.
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    rig.fake.setMethodDelay('agent.sessions.get', 2_500)
+    const started = Date.now()
+    const error = await rig.call('cherry_wait', { device: 'dev-A', sessionId: 's-1', timeoutMs: 200 }).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
+    const elapsed = Date.now() - started
+    expect(error).toBeInstanceOf(Error)
+    const message = (error as Error).message
+    // It names the tool, the precondition, the bound and what is still unknown.
+    expect(message).toContain('cherry_wait')
+    expect(message).toMatch(/session snapshot/i)
+    expect(message).toContain('UNKNOWN')
+    expect(message).toMatch(/retry/i)
+    // 200 ms window + 1000 ms tail floor = 1200 ms; the 2.5 s reply never lands.
+    expect(elapsed).toBeLessThan(2_200)
+    // The underlying timeout is preserved as the cause, not swallowed.
+    expect((error as Error).cause).toBeInstanceOf(Error)
+  })
+
+  it('⑯b (issue #51) a snapshot inside the budget still answers idle', async () => {
+    // The bound must not turn a merely slow-but-working device into a failure:
+    // 300 ms is well inside 500 ms + the tail, so the ordinary idle answer is
+    // unchanged.
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    rig.fake.setMethodDelay('agent.sessions.get', 300)
+    const result = (await rig.call('cherry_wait', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      timeoutMs: 500,
+    })) as { status: string }
+    expect(result.status).toBe('idle')
+  })
+
+  // -------------------------------------------------------------------------
   // Registration
   // -------------------------------------------------------------------------
 

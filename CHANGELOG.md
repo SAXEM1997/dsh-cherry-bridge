@@ -82,6 +82,15 @@ surface change.
 
 ### Fixed
 
+- `fix(tools)`: `cherry_wait`'s idle precondition — the `agent.sessions.get`
+  that decides whether anything is running — now rides an assembly deadline
+  anchored at **tool entry**, so an idle wait on a flapping link is bounded by
+  the caller's window instead of waiting out a reconnect plus a replay (5–10 s
+  behind a 500 ms window). A spent budget **fails the call with guidance**: the
+  run's state is UNKNOWN and a retry is the recovery, rather than returning a
+  verdict it never learned. The idle answer's history walk keeps its own anchor
+  after the snapshot, so a slow-but-successful snapshot cannot squeeze the walk
+  to nothing (#51).
 - `fix(http)`: an IPv6 `--host` bind is folded into the trust fence as a
   PARSEABLE authority (`fe80::1` → `[fe80::1]`), so a browser on that LAN bind is
   admitted instead of the deployment silently falling back to loopback only. The

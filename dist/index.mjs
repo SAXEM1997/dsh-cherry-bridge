@@ -6343,7 +6343,7 @@ var CherryToolEngine = class {
 	#waitTool() {
 		return defineCherryTool({
 			name: "cherry_wait",
-			description: "Wait for a session's in-flight execution to reach a terminal state, without sending anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, never a park. Use it to resume after answering an interaction. Its message walk is bounded like `cherry_send`'s, with the same verdict wording: a cut drops the OLDER messages, and a returned message missing its own parts carries `incomplete`. A cut whose reason is `deadline` means the ANSWER's own assembly budget ran out — the content read so far is still returned.",
+			description: "Wait for a session's in-flight execution to reach a terminal state, without sending anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight execution answers with its current snapshot (status `idle`) and never parks for the window; the snapshot that decides idleness rides the answer's own budget, so a device that cannot answer it in time fails the call with guidance (whether anything is running is then unknown). Use it to resume after answering an interaction. Its message walk is bounded like `cherry_send`'s, with the same verdict wording: a cut drops the OLDER messages, and a returned message missing its own parts carries `incomplete`. A cut whose reason is `deadline` means the ANSWER's own assembly budget ran out — the content read so far is still returned.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6369,15 +6369,25 @@ var CherryToolEngine = class {
 				if (resolved.link === void 0) return resolved.verdict;
 				const { connection, record } = resolved.link;
 				const sessionId = requiredString(args, "sessionId");
+				const window = waitTimeout(args["timeoutMs"]);
+				const entryAt = performance.now();
+				const precondition = new AssemblyDeadline(entryAt, window);
+				const preconditionBudgetMs = Math.round(precondition.instant - entryAt);
 				await this.#ensureSubscription(record.deviceId, sessionId);
 				const subscriptions = this.#deps.subs(record.deviceId);
-				const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
+				let sessionResult;
+				try {
+					sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId }, { deadline: precondition.instant });
+				} catch (error) {
+					if (!deadlineExhaustion(error)) throw error;
+					throw new Error(`cherry_wait: could not read the session snapshot for ${sessionId} on ${record.deviceId} within the wait answer's ${preconditionBudgetMs} ms budget (the ${window} ms window plus its bounded tail); whether anything is running is UNKNOWN — retry \`cherry_wait\` (a later call rebuilds the subscription), and check \`cherry_devices\` if the device stays silent`, { cause: error });
+				}
 				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
 				const activeExecutionId = optionalString(session["activeExecutionId"]);
 				if (activeExecutionId === void 0) {
 					const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 					if (idle !== void 0) this.#remember(this.#revisionCache, record.deviceId, this.#cacheKey(record.deviceId, sessionId), idle);
-					const answerDeadline = new AssemblyDeadline(performance.now(), waitTimeout(args["timeoutMs"]));
+					const answerDeadline = new AssemblyDeadline(performance.now(), window);
 					const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
 						status: "idle",
 						sessionId,
@@ -6399,7 +6409,7 @@ var CherryToolEngine = class {
 					};
 				}
 				return this.#awaitRun(connection, subscriptions, sessionId, {
-					timeoutMs: waitTimeout(args["timeoutMs"]),
+					timeoutMs: window,
 					startedAt: performance.now(),
 					executionId: activeExecutionId
 				});
