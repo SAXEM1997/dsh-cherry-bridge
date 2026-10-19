@@ -6383,25 +6383,30 @@ var CherryToolEngine = class {
 	* The entry is sized with `JSON.stringify(page.items).length`, the same cheap
 	* approximation of wire cost {@link AGGREGATE_BYTES} uses — and here it is a
 	* fair one, because what is held IS a subset of what travelled on the wire.
-	* It holds descriptors, not resolved text, so {@link MESSAGE_CACHE_ENTRY_BYTES}
-	* rarely binds; the bound stays as the guard.
+	* What it keeps OUT is the `{ref}` text (the multi-megabyte half); what it
+	* KEEPS IN is inline part text, up to the peer's 4,096-character
+	* `INLINE_TEXT_LIMIT` per part, and the entry is the AGGREGATED page rather
+	* than one 3-item RPC page. A few hundred fat inline parts therefore reach
+	* {@link MESSAGE_CACHE_ENTRY_BYTES}, which is what the bound is for: no single
+	* entry may evict the device's working set. That it rarely bites for real
+	* traffic is an expectation, not a measurement.
 	*/
 	#rememberPartsPage(deviceId, messageId, revision, page) {
 		if (revision === "") return;
 		if (page.truncated) return;
 		const bytes = JSON.stringify(page.items).length;
-		if (bytes > this.#messageCacheEntryBytes) return;
+		if (bytes > Math.min(this.#messageCacheEntryBytes, this.#messageCacheBytesPerDevice)) return;
 		const key = this.#messageKey(deviceId, messageId);
-		const existing = this.#messageCache.has(key);
+		const previous = this.#messageCache.get(key)?.bytes ?? 0;
+		const growth = Math.max(0, bytes - previous);
 		let evicted = 0;
-		if (!existing) for (const candidate of [...this.#messageCache.keys()]) {
-			if ((this.#deviceMessageCacheBytes.get(deviceId) ?? 0) + bytes <= this.#messageCacheBytesPerDevice) break;
+		for (const candidate of [...this.#messageCache.keys()]) {
+			if ((this.#deviceMessageCacheBytes.get(deviceId) ?? 0) + growth <= this.#messageCacheBytesPerDevice) break;
 			if (!candidate.startsWith(`${deviceId}${CACHE_KEY_SEPARATOR}`)) continue;
 			if (candidate === key) continue;
 			this.#dropCachedMessage(candidate);
 			evicted += 1;
 		}
-		const previous = this.#messageCache.get(key)?.bytes ?? 0;
 		this.#messageCache.set(key, {
 			revision,
 			bytes,

@@ -3912,8 +3912,13 @@ class CherryToolEngine {
    * The entry is sized with `JSON.stringify(page.items).length`, the same cheap
    * approximation of wire cost {@link AGGREGATE_BYTES} uses — and here it is a
    * fair one, because what is held IS a subset of what travelled on the wire.
-   * It holds descriptors, not resolved text, so {@link MESSAGE_CACHE_ENTRY_BYTES}
-   * rarely binds; the bound stays as the guard.
+   * What it keeps OUT is the `{ref}` text (the multi-megabyte half); what it
+   * KEEPS IN is inline part text, up to the peer's 4,096-character
+   * `INLINE_TEXT_LIMIT` per part, and the entry is the AGGREGATED page rather
+   * than one 3-item RPC page. A few hundred fat inline parts therefore reach
+   * {@link MESSAGE_CACHE_ENTRY_BYTES}, which is what the bound is for: no single
+   * entry may evict the device's working set. That it rarely bites for real
+   * traffic is an expectation, not a measurement.
    */
   #rememberPartsPage(
     deviceId: string,
@@ -3933,35 +3938,42 @@ class CherryToolEngine {
     // trip into a permanently truncated part list for as long as the revision
     // stands, so it is retried on the next read instead.
     if (page.truncated) return
+    // An entry bigger than the DEVICE budget can never fit, whatever the entry
+    // cap says, so both ceilings judge it. Without this, an injection that puts
+    // the entry cap above the device budget (a test, a future option) would let
+    // one entry evict the whole device and then be stored anyway — the thrash
+    // the cap exists to prevent.
     const bytes = JSON.stringify(page.items).length
-    if (bytes > this.#messageCacheEntryBytes) return
+    if (bytes > Math.min(this.#messageCacheEntryBytes, this.#messageCacheBytesPerDevice)) return
     const key = this.#messageKey(deviceId, messageId)
-    const existing = this.#messageCache.has(key)
+    const previous = this.#messageCache.get(key)?.bytes ?? 0
+    // GROWTH is what has to fit, not the whole entry. A REFRESH replaces an
+    // entry in place, so only the difference is new memory — and a refresh that
+    // SHRINKS needs no room, so it must not evict anything to make some. Getting
+    // this wrong is what let a refresh (the revision moved because the message
+    // was EDITED, so its list grew) raise the device total with no eviction at
+    // all, straight through the budget.
+    const growth = Math.max(0, bytes - previous)
     // Make room BEFORE the insert, so the device never passes its budget, not
-    // even by the one entry being written. A REFRESH (an existing key) evicts
-    // nothing: `set` overwrites in place, and the total is corrected below by
-    // the difference between the old and new sizes.
+    // even by the bytes being written.
     let evicted = 0
-    if (!existing) {
-      for (const candidate of [...this.#messageCache.keys()]) {
-        // Re-read the total each pass: `#dropCachedMessage` is what lowered it,
-        // so a snapshot taken once would keep evicting after the room was made.
-        const total = this.#deviceMessageCacheBytes.get(deviceId) ?? 0
-        if (total + bytes <= this.#messageCacheBytesPerDevice) break
-        if (!candidate.startsWith(`${deviceId}${CACHE_KEY_SEPARATOR}`)) continue
-        // The entry being written is not a victim: only ANOTHER entry frees
-        // memory the new one needs.
-        if (candidate === key) continue
-        this.#dropCachedMessage(candidate)
-        evicted += 1
-      }
+    for (const candidate of [...this.#messageCache.keys()]) {
+      // Re-read the total each pass: `#dropCachedMessage` is what lowered it,
+      // so a snapshot taken once would keep evicting after the room was made.
+      const total = this.#deviceMessageCacheBytes.get(deviceId) ?? 0
+      if (total + growth <= this.#messageCacheBytesPerDevice) break
+      if (!candidate.startsWith(`${deviceId}${CACHE_KEY_SEPARATOR}`)) continue
+      // The entry being written is not a victim: replacing it IS this call, and
+      // its old bytes are already excluded from `growth`.
+      if (candidate === key) continue
+      this.#dropCachedMessage(candidate)
+      evicted += 1
     }
     // A refresh replaces the value IN PLACE (`Map.set` keeps the key's
     // position, so eviction order is insert-order, not write-order) and the
     // running total is corrected by the size difference. The entry itself never
     // leaves the map, so `#dropCachedMessage` is not involved — it owns every
     // REMOVAL, and a refresh removes nothing.
-    const previous = this.#messageCache.get(key)?.bytes ?? 0
     this.#messageCache.set(key, { revision, bytes, page })
     this.#deviceMessageCacheBytes.set(
       deviceId,

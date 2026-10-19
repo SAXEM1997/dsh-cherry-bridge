@@ -15,7 +15,7 @@ import type {
   CherryToolsDeps,
 } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
-import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions, FakeMessageRecord, FakeSessionRecord } from '../loopback/fakeCherry.js'
 
 /**
  * Issue #15: the `agent.parts.list` RESULT cache.
@@ -94,6 +94,8 @@ interface Rig {
   states(): DeviceState[]
   /** How many `connection.authenticate` calls the peer has answered. */
   authenticateCount(): number
+  /** Brings a device's connection up, as the host would on first use. */
+  connect(deviceId: string): Promise<void>
   /** Lets the connection's backoff loop run one more attempt. */
   reconnect(): Promise<void>
   stop(): Promise<void>
@@ -125,7 +127,11 @@ interface RigOptions {
   engine?: CherryToolEngineOptions
 }
 
-async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions = {}): Promise<Rig> {
+async function makeRig(
+  options: FakeCherryOptions = {},
+  rigOptions: RigOptions = {},
+  extraSessions: FakeSessionRecord[] = [],
+): Promise<Rig> {
   const fake = new FakeCherry(options)
   const { host, port } = await fake.start()
   const identity = await createDeviceIdentity()
@@ -144,6 +150,11 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     enabled: true,
   }
   store.upsert(record)
+  // Extra sessions for fixtures that need a second conversation on the same
+  // peer (T6b's second device). Appended to whatever the options already carry.
+  if (extraSessions.length > 0) {
+    options.agent = { ...options.agent, sessions: [...(options.agent?.sessions ?? []), ...extraSessions] }
+  }
 
   const connections = new Map<string, DeviceConnection>()
   const subscriptions = new Map<string, SessionSubscriptions>()
@@ -214,6 +225,9 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     tmp,
     tool,
     call: (name, args = {}) => tool(name).execute(args),
+    connect: async (deviceId) => {
+      await connect(deviceId).connect()
+    },
     states: () => [...seenStates],
     authenticateCount: () => fake.authenticateCount,
     reconnect: async () => {
@@ -305,13 +319,36 @@ function walkedIds(rig: Rig): unknown[] {
  * them, not the projection. `revision` is the message revision the parts were
  * listed under, which is what the `{ref}` inside each record carries.
  */
-function partsPageBytes(messageId: string, revision: string, partCount: number): number {
+function partsPageBytes(messageId: string, revision: string, partCount: number, text = 'x'): number {
   return JSON.stringify(
     Array.from({ length: partCount }, (_unused, index) => ({
       partId: `${messageId}:${index}`,
-      kind: 'text',
       revision,
-      content: { text: 'x' },
+      kind: 'text',
+      content: { text },
+      // The peer's text records carry `state` too (see `FakeCherry#part`); a
+      // model that omitted it would under-count every entry by a constant, and
+      // a budget derived from the model would then not mean what the test says.
+      state: 'completed',
+    })),
+  ).length
+}
+
+/**
+ * The bytes an entry costs for a whole FIXTURE message — the model above driven
+ * by the record the peer will actually serve, so a fixture's text cannot drift
+ * away from the size its budget was derived from. (It did exactly that once:
+ * the helper hard-coded `'x'` while a fixture served `'body 0'`, and the budget
+ * silently held one entry fewer than the test claimed.)
+ */
+function entryBytesOf(record: FakeMessageRecord): number {
+  return JSON.stringify(
+    record.parts.map((part, index) => ({
+      partId: `${record.messageId}:${index}`,
+      revision: record.revision,
+      kind: part.kind,
+      content: { text: part.text },
+      state: 'completed',
     })),
   ).length
 }
@@ -582,6 +619,142 @@ describe('issue #15: the parts-list read cache', () => {
     expect(partsCalls(rig)).toBe(4)
   })
 
+  it('T5d an entry that cannot fit the DEVICE budget is refused, whatever the entry cap says', async () => {
+    // The two ceilings judge independently, and the entry cap alone is not
+    // enough: an injection that puts `messageCacheEntryBytes` ABOVE
+    // `messageCacheBytesPerDevice` would let one oversized entry evict the
+    // whole device's cache and then be stored anyway — the thrash the cap
+    // exists to prevent, arriving through the knob that is supposed to be the
+    // guard. An entry larger than the device budget can never fit, so it is
+    // refused before the eviction loop is even reached.
+    //
+    // Observable: with the guard, the entry is never held and the second read
+    // walks again. Without it, the entry occupies the cache and the second read
+    // is a pure hit.
+    const history = [message('m-1', '1001', [{ kind: 'text' as const, text: 'first' }])]
+    const entry = entryBytesOf(history[0]!)
+    const rig = await makeRig(options(history), {
+      // The cap is raised far ABOVE the device budget — the pathological
+      // injection this guard exists for.
+      engine: { messageCacheEntryBytes: 100_000, messageCacheBytesPerDevice: entry - 1 },
+    })
+
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    expect(walkedIds(rig)).toEqual(['m-1'])
+
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    // Refused: the entry is one byte too large for the device, so it is walked
+    // fresh. (Under the broken guard this list is empty — the entry was held.)
+    expect(walkedIds(rig)).toEqual(['m-1', 'm-1'])
+  })
+
+  it('T5c a REFRESH that GROWS makes room for its growth — the budget holds on the refresh path too', async () => {
+    // The refresh path is the one that is easy to get wrong, and it was: with
+    // room-making guarded by "is this a NEW key", a refresh skipped it entirely
+    // and raised the device total straight through the budget. The reachable
+    // shape is ordinary — a message is EDITED, so its revision moves and its
+    // parts list grows — which is exactly the case here: m-2 gains a part.
+    //
+    // Budget: two one-part entries. m-1 and m-2 fill it; m-2 is then re-listed
+    // at a new revision with an extra part, so replacing it needs room for the
+    // DIFFERENCE, and the only way to find that room is to evict m-1.
+    const onePart = (id: string, revision: string, text: string): FakeMessageRecord =>
+      message(id, revision, [{ kind: 'text' as const, text }])
+    const history = [onePart('m-1', '1001', 'first'), onePart('m-2', '1002', 'second')]
+    const sizeOfOne = entryBytesOf(history[0]!)
+    // The budget must (a) hold BOTH one-part entries — otherwise neither is
+    // ever cached and the refresh path is never reached — and (b) still hold
+    // the GROWN entry on its own, or the store would simply refuse it and the
+    // test would prove nothing about room-making. The grown size is computed
+    // from a throwaway copy of the edited record, so the two bounds stay in the
+    // right relation whatever the JSON overhead turns out to be.
+    const grown = entryBytesOf(
+      message('m-2', '2002', [
+        { kind: 'text' as const, text: 'second' },
+        { kind: 'text' as const, text: 'and a second part' },
+      ]),
+    )
+    expect(grown).toBeGreaterThan(sizeOfOne * 2)
+    expect(grown + 1).toBeGreaterThan(sizeOfOne * 2)
+    const budget = grown + 1
+
+    // NO deep copy: the fixture array is handed to the fake BY REFERENCE, and
+    // mutating a record is how the peer's "the message was edited" is modelled
+    // (T3 does the same).
+    const rig = await makeRig(options(history), {
+      engine: { messageCacheEntryBytes: 100_000, messageCacheBytesPerDevice: budget },
+    })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    const afterFirst = walkedIds(rig).length
+    expect(afterFirst).toBe(2)
+
+    // EDIT m-2: new revision, and a second part — the list grows.
+    history[1]!.revision = '2002'
+    history[1]!.parts = [
+      { kind: 'text', text: 'second' },
+      { kind: 'text', text: 'and a second part' },
+    ]
+
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    // The re-listed message is projected at its NEW revision.
+    expect(walkedIds(rig).slice(afterFirst)).toEqual(['m-2'])
+
+    // THE ASSERTION: m-1 was evicted to make room for m-2's growth. If the
+    // refresh skipped room-making, m-1 is still held and the next read issues
+    // no parts RPC at all — a silent budget breach (2 entries' worth of bytes
+    // for one entry that no longer fits beside its neighbour).
+    const beforeProbe = walkedIds(rig).length
+    const probe = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as ReadResult
+    // The FIRST re-walked entry is the policy claim: m-1 was evicted for m-2's
+    // growth. (The probe then cascades — re-inserting m-1 makes room against
+    // the grown m-2 — which is a size consequence, not a second claim.)
+    expect(walkedIds(rig).slice(beforeProbe)[0]).toBe('m-1')
+    expect(probe.messages.map((entry) => entry.messageId)).toEqual(['m-1', 'm-2'])
+  })
+
+  it('T6c a REFRESH keeps the key\'s INSERTION position — eviction order is insert-order, not write-order', async () => {
+    // FIFO, not LRU, and the difference only shows after a refresh. A refresh
+    // is not a new use of the entry — the same key is rewritten in place — so
+    // it must NOT move to the back. (A `delete`-then-`set` refresh would make it
+    // do exactly that, turning the policy into LRU-on-write.)
+    //
+    //   read 1 (limit 2): m-1, m-2 enter        → order m-1, m-2
+    //   edit m-1 (same size): read 2 refreshes it → order must STAY m-1, m-2
+    //   read 3 (limit 3): m-3 needs room         → evict the oldest = m-1
+    //
+    // A delete-then-set refresh would have left the order m-2, m-1 and evicted
+    // m-2 instead, which the probe read below reads off the wire.
+    const onePart = (id: string, revision: string, text: string): FakeMessageRecord =>
+      message(id, revision, [{ kind: 'text' as const, text }])
+    const history = [
+      onePart('m-1', '1001', 'first'),
+      onePart('m-2', '1002', 'second'),
+      onePart('m-3', '1003', 'third'),
+    ]
+    const sizeOfOne = entryBytesOf(history[0]!)
+    const budget = sizeOfOne * 2 + 1
+
+    // By reference, as in T5c: mutating the record is the peer's "edited".
+    const rig = await makeRig(options(history), {
+      engine: { messageCacheEntryBytes: 100_000, messageCacheBytesPerDevice: budget },
+    })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })
+    const afterFirst = walkedIds(rig).length
+    expect(afterFirst).toBe(2)
+
+    // Same size, new revision: the refresh replaces the entry in place.
+    history[0]!.revision = '2001'
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })
+    expect(walkedIds(rig).slice(afterFirst)).toEqual(['m-1'])
+
+    // m-3 arrives and needs room. FIFO drops m-1 (still the oldest INSERTION);
+    // a write-order policy would drop m-2.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 3 })
+    const beforeProbe = walkedIds(rig).length
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 3 })
+    expect(walkedIds(rig).slice(beforeProbe)[0]).toBe('m-1')
+  })
+
   it('T6 the per-device byte budget evicts the OLDEST entry first, and warns once without a message id', async () => {
     // THREE messages (sizes recomputed by `partsPageBytes`, never assumed) and a
     // budget one byte under their total, so the third insert cannot simply
@@ -595,8 +768,14 @@ describe('issue #15: the parts-list read cache', () => {
     //                                              re-check and insert
     //
     // The re-read proves WHICH entry went, on the wire: the first message walked
-    // again is m-1, the OLDEST. An LRU-shaped policy would have dropped the
-    // NEWEST (m-3) instead and served m-1 from memory.
+    // again is m-1, the OLDEST.
+    //
+    // THIS DOES NOT BY ITSELF DISTINGUISH FIFO FROM LRU, and saying otherwise
+    // would be the kind of claim this suite exists to refuse. Nothing here was
+    // ever HIT — three inserts, then a re-read — so no entry carries any recency
+    // and the two policies order the entries identically. T6b is the case that
+    // separates them (a hit before the pressure), and the cross-device half of
+    // T6b is what pins the device filter the eviction loop needs.
     //
     // The CONTROL below runs the identical fixtures under a budget that holds
     // every entry, so "the wrong entry was walked" cannot hide behind a cache
@@ -667,11 +846,10 @@ describe('issue #15: the parts-list read cache', () => {
     }
 
     // WHICH entry went, read off the WIRE rather than inferred: the re-read's
-    // FIRST re-walked message is m-1, the OLDEST — never m-3, the newest, which
-    // is what an LRU-shaped policy would have dropped. Nothing beyond that first
-    // step is pinned: at this budget m-1 is the WIDEST entry, so its re-entry
-    // cannot fit beside the two survivors and FIFO evicts more of them. That
-    // cascade is a consequence of the sizes, not the policy claim.
+    // FIRST re-walked message is m-1, the OLDEST. Nothing beyond that first step
+    // is pinned: at this budget m-1 is the WIDEST entry, so its re-entry cannot
+    // fit beside the two survivors and FIFO evicts more of them. That cascade is
+    // a consequence of the sizes, not a policy claim.
     const reread = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as ReadResult
     expect(reread.messages.map((entry) => entry.messageId)).toEqual([longId, 'm-2', 'm-3'])
     const rewaked = walkedIds(rig).slice(3)
@@ -680,6 +858,100 @@ describe('issue #15: the parts-list read cache', () => {
     expect(evictionWarnings().length).toBeGreaterThanOrEqual(1)
     expect(evictionWarnings()).toHaveLength(4)
     for (const line of evictionWarnings()) expect(line).toMatch(/evicted 1 oldest entry/)
+  })
+
+  it('T6b a HIT before the pressure is what separates FIFO from LRU — and eviction never crosses devices', async () => {
+    // T6 cannot tell the two policies apart: nothing is ever hit there, so no
+    // entry has a recency and FIFO order ≡ LRU order. This fixture inserts the
+    // discrimination: touch an entry, THEN force the eviction.
+    //
+    //   read 1: insert A, B            → order A, B
+    //   read 2: A is a HIT             → LRU would move A to the back; FIFO keeps it
+    //   read 3: insert C under pressure → FIFO drops A (oldest INSERTED)
+    //                                     LRU drops B (least recently USED)
+    //
+    // So the next read's FIRST re-walked message is A under FIFO, B under LRU.
+    // That single byte of order is the whole policy claim.
+    //
+    // The pairing of rigs is the second point: the SAME fixture runs on a
+    // two-device store, so an eviction loop that forgot its device-prefix check
+    // would reach into the other device's entries. Both devices are read first,
+    // and the assertion is that dev-B's entries are untouched when dev-A makes
+    // room.
+    //
+    // Sizes come from `partsPageBytes`; the budget below holds exactly two of
+    // the three, so the third insert must evict precisely one.
+    const ids = ['m-1', 'm-2', 'm-3']
+    const history = ids.map((id, index) =>
+      message(id, `100${index + 1}`, [{ kind: 'text' as const, text: `body ${index}` }]),
+    )
+    const sizes = history.map(entryBytesOf)
+    const twoOfThree = sizes[0]! + sizes[1]! + 1
+    // The budget has to fit two entries and refuse three — the same shape T6
+    // needs, derived rather than hard-coded.
+    expect(twoOfThree).toBeGreaterThanOrEqual(sizes[0]! + sizes[1]!)
+    expect(twoOfThree).toBeLessThan(sizes[0]! + sizes[1]! + sizes[2]!)
+
+    // A SECOND session for the second device: the loopback peer keys
+    // subscriptions by session per connection, so two devices sharing one
+    // session on one fake peer would collide before the cache is ever reached.
+    // Both sessions serve the same message history, which is all this fixture
+    // needs.
+    const rig = await makeRig(
+      options(JSON.parse(JSON.stringify(history))),
+      { engine: { messageCacheEntryBytes: 100_000, messageCacheBytesPerDevice: twoOfThree } },
+      [{ sessionId: 's-2', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Other', historyRevision: '1' }],
+    )
+    // A SECOND device pointing at the same loopback peer: the cache is
+    // device-scoped, so its entries must occupy their own budget and survive
+    // dev-A's evictions. Warm it first, so its entries exist before dev-A ever
+    // needs room.
+    rig.store.upsert({ ...rig.store.list()[0]!, deviceId: 'dev-B', displayName: 'Desk Beta' })
+    await rig.connect('dev-B')
+    // TWO messages, so both fit and the second read is a pure hit: the budget
+    // holds exactly two entries, and a three-message warm-up would evict on the
+    // way in and start the cascade this fixture needs to control.
+    await rig.call('cherry_read', { device: 'dev-B', sessionId: 's-2', limit: 2 })
+    await rig.call('cherry_read', { device: 'dev-B', sessionId: 's-2', limit: 2 })
+    const devBWarm = walkedIds(rig).length
+    expect(devBWarm).toBe(2)
+
+    // Read 1: A and B enter, newest-first, and both fit.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })
+    expect(walkedIds(rig).slice(devBWarm)).toEqual(['m-1', 'm-2'])
+
+    // Read 2: both are HITS — and this is the touch that makes the policies
+    // disagree. Under LRU, m-1 is now the most recently used and m-2 the least.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })
+    expect(walkedIds(rig).slice(devBWarm + 2)).toEqual([])
+
+    // Read 3: m-3 is new and does not fit beside the two cached entries, so
+    // exactly one is evicted to make room.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 3 })
+
+    // The probe: whichever entry was evicted is walked again. FIFO evicted m-1
+    // (oldest INSERTED, and the hit above must not have re-ordered it); an LRU
+    // would have kept m-1 and evicted m-2 instead. This assertion is the whole
+    // policy claim, and it is the only place in the suite where a hit precedes
+    // the pressure.
+    const beforeProbe = walkedIds(rig).length
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 3 })
+    const probe = walkedIds(rig).slice(beforeProbe)
+    // ONLY the first element is a policy claim, and it is enough: the budget
+    // holds two equal-sized entries, so whichever one was evicted comes back,
+    // its re-insertion evicts another, and the probe re-walks the whole history
+    // — a size consequence, not a second policy. Under FIFO the first re-walked
+    // entry is m-1; under LRU (where the hit in read 2 made m-1 the most
+    // recently used) it would be m-2.
+    expect(probe[0]).toBe('m-1')
+
+    // CROSS-DEVICE ISOLATION: dev-A's evictions never reached into dev-B's
+    // entries, which still occupy their own budget. Without the device-prefix
+    // filter in the eviction loop, dev-A's pressure would have freed dev-B's
+    // room instead.
+    const beforeB = walkedIds(rig).length
+    await rig.call('cherry_read', { device: 'dev-B', sessionId: 's-2', limit: 2 })
+    expect(walkedIds(rig).slice(beforeB)).toEqual([])
   })
 
   it('T7 reaching `offline` drops the device\'s message entries with its session caches', async () => {
