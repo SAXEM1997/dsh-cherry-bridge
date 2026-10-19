@@ -175,7 +175,8 @@ with it).
   is known about the run, so a retry is the recovery — and a 500 ms window can no
   longer turn into 5–10 s of reconnect-plus-replay (#51). After a successful
   snapshot the idle answer's history walk starts its own budget, so a slow but
-  successful snapshot does not squeeze the walk to nothing.
+  successful snapshot does not squeeze the walk to nothing. The cost is that the
+  two phases are counted separately: a pathological call can spend both.
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is

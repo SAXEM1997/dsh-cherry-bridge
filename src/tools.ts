@@ -3534,9 +3534,10 @@ class CherryToolEngine {
         'Wait for a session\'s in-flight execution to reach a terminal state, without sending ' +
         'anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight ' +
         'execution answers with its current snapshot (status `idle`) and never parks for the window; ' +
-        'the snapshot that decides idleness rides the answer\'s own budget, so a device that cannot ' +
-        'answer it in time fails the call with guidance (whether anything is running is then ' +
-        'unknown). Use it to resume after answering an interaction. Its message walk is bounded ' +
+        'the snapshot that decides idleness is bounded too, by a deadline derived from the same ' +
+        'window, so a device that cannot answer it in time fails the call with guidance (whether ' +
+        'anything is running is then unknown). Use it to resume after answering an interaction. Its ' +
+        'message walk is bounded ' +
         'like `cherry_send`\'s, with the same verdict wording: a cut drops the OLDER messages, and a ' +
         'returned message missing its own parts carries `incomplete`. A cut whose reason is `deadline` ' +
         'means the ANSWER\'s own assembly budget ran out — the content read so far is still returned.',
@@ -3566,8 +3567,11 @@ class CherryToolEngine {
         // it could spend `transportRetryWaitMs` waiting for a reconnect and then
         // its one replay — 5-10 s after a 500 ms window. It now rides an
         // {@link AssemblyDeadline} anchored at TOOL ENTRY, on the same clock and
-        // with the same window+tail shape as the answer's own budget, so the
-        // whole call is bounded by the patience the caller declared.
+        // with the same window+tail shape as the answer's own budget, so this
+        // PHASE is bounded by the patience the caller declared. The idle
+        // answer's history walk is bounded by its own instant (see below): the
+        // two phases are counted separately, so a pathological call can spend
+        // both.
         //
         // It does NOT get the degrade arm the terminal/timeout faces have: there
         // is no answer yet to degrade (idleness is only known FROM this
