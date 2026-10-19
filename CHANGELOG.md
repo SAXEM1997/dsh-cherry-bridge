@@ -49,6 +49,17 @@ surface change.
   device work. The peer's cursor format is never parsed or validated, because a
   malformed cursor is silently swallowed by the real desktop (it falls back to
   the newest page).
+- `fix(tools)`: externalized `{ref}` assembly is bounded by ONE process-wide
+  gate (#39). `MAX_EXTERNALIZED_BYTES` caps a single ref and its assembly peaks
+  at ~3× that, so before this the process peak was that product times however
+  many independent tool calls happened to be reading — with no number anywhere
+  saying so. At most 4 refs are assembled at once now (the official client's
+  read-concurrency policy), which makes the worst case `4 × 3 × 32 MiB`; the
+  gate is FIFO with a direct slot hand-off, its release is idempotent, and a
+  caller waiting for a slot honours the answer's time budget (it leaves the
+  queue at its deadline, and a slot that frees after it is re-checked and
+  passed on). The limit is an engine option (`contentReadConcurrency`), not a
+  config key.
 - The terminal/timeout/idle aggregate's mid-window byte stop now carries
   `messagesResumeCursor: "after:<lastReturnedId>"` instead of nothing, from the
   same helper the read face uses.

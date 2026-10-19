@@ -719,6 +719,8 @@ export class FakeCherry {
   #afterReadOnce = new Map<string, () => void>()
   /** One-shot hooks that fire AS a method's next frame arrives (see `beforeNextCall`). */
   #beforeNextCall = new Map<string, () => void>()
+  /** PASSIVE arrival observers: the frame is logged and then served normally. */
+  #arrivalObservers = new Map<string, () => void>()
   /** Persistent per-method hooks (see `alwaysBeforeCall`); checked after the one-shot entry. */
   #alwaysBeforeCall = new Map<string, () => void>()
   /** Scripted pages per read-face method, served INSTEAD of the normal page. */
@@ -1211,6 +1213,26 @@ export class FakeCherry {
   }
 
   /**
+   * A PASSIVE observer for `method`'s arrivals: the hook runs as each frame
+   * arrives and the frame is then served normally.
+   *
+   * The sibling hooks all CONSUME the frame — `beforeNextCall` and
+   * `alwaysBeforeCall` answer nothing by design (they exist to drop links and
+   * silence methods), so using one as an observer silently swallows every
+   * response. This one only observes, which is what a test measuring
+   * concurrency needs: it must see the arrival WITHOUT changing what happens to
+   * it. One hook per method; `clearArrivalObserver` disarms it.
+   */
+  onArrival(method: string, hook: () => void): void {
+    this.#arrivalObservers.set(method, hook)
+  }
+
+  /** Disarms {@link onArrival} for `method`. */
+  clearArrivalObserver(method: string): void {
+    this.#arrivalObservers.delete(method)
+  }
+
+  /**
    * Corrupt one `{ref}` content: the stored bytes are replaced while the
    * digest the pin ADVERTISED stays as it was. A caller that trusts the bytes
    * without verifying sha256 therefore accepts corrupted text; a caller that
@@ -1643,6 +1665,10 @@ export class FakeCherry {
     const method = frame.method
     const params = parseParams(method, frame.params)
     this.#countArrival(method)
+    // PASSIVE observers run FIRST, and never change the frame's fate: a hook
+    // that wants to consume the frame is a `beforeNextCall`/`alwaysBeforeCall`
+    // one (those return below without answering).
+    this.#arrivalObservers.get(method)?.()
     // The per-SOCKET arrival, which is the window the rate cap is judged over.
     live.arrivals.push(Date.now())
     if (method === 'connection.hello' && Array.isArray(params?.['protocolVersions'])) {
