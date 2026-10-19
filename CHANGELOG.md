@@ -82,6 +82,14 @@ surface change.
 
 ### Fixed
 
+- `fix(http)`: an IPv6 `--host` bind is folded into the trust fence as a
+  PARSEABLE authority (`fe80::1` → `[fe80::1]`), so a browser on that LAN bind is
+  admitted instead of the deployment silently falling back to loopback only. The
+  normalization brackets IPv6 literals once, leaves IPv4/DNS entries untouched,
+  and does not relax the fence (the bare spelling is still refused); zone-scoped
+  literals still parse to nothing (#9). The `scopeHttpApi` fixture no longer
+  hands the injected callback a `webRuntime` payload that no host generation can
+  produce.
 - `test(connection)`: the two promises a test started and never awaited are now
   settled deterministically and ASSERTED (#43) — the abandoned handshake must
   REJECT, and the never-answered ping is released by `close()` with a classified

@@ -112,19 +112,22 @@ class FakeResponse implements HttpResponseLike {
   }
 }
 
-/** The fake `ctx.webServer` / `ctx.webRuntime` pair, as the host injects it. */
+/** The fake `ctx.webServer`, as the host injects it (issue #9: `webServer` alone). */
 interface FakeCtx {
   server: FakeWebServer
-  trustedHosts: string[]
   inject(deps: string[], cb: (wctx: unknown) => void | (() => void)): void
 }
 
-function makeCtx(server: FakeWebServer, trustedHosts: string[] = []): FakeCtx {
+function makeCtx(server: FakeWebServer): FakeCtx {
   return {
     server,
-    trustedHosts,
     inject(_deps, cb) {
-      cb({ webServer: server, webRuntime: { trustedHosts } })
+      // The injected ctx carries `webServer` ALONE and nothing else. The old
+      // scratch payload also handed over `webRuntime`, a shape no cordis
+      // generation can produce (0.2.1 moved `trustedHosts` to `webStartup`,
+      // and the callback injects only `['webServer']` anyway) — inert here,
+      // but it invited a `wctx.webRuntime` read that a real host rejects.
+      cb({ webServer: server })
     },
   }
 }

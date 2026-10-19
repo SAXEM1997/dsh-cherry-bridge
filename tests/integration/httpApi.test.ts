@@ -8,7 +8,7 @@ import type { DeviceRecord } from '../../src/deviceStore.js'
 import { PairingError } from '../../src/pairing.js'
 import type { PairWithPayloadOptions } from '../../src/pairing.js'
 import type { DeviceState } from '../../src/connection.js'
-import { isTrustedWebRequest, registerHttpApi } from '../../src/httpApi.js'
+import { isTrustedWebRequest, registerHttpApi, resolveTrustedHosts } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
 import { ToolScopeState } from '../../src/toolScope.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
@@ -1313,6 +1313,32 @@ describe('⑥ lifecycle', () => {
     expect(await statusFor(fake, 'evil.example.com')).toBe(403)
     // Loopback is inherent, not configuration.
     expect(await statusFor(fake, HOST)).toBe(200)
+  })
+
+  it('#9 an IPv6 listener bind is folded in as a PARSEABLE (bracketed) authority', async () => {
+    // `--host fe80::1` arrives as a BARE hostname in `webStartup.host`, while
+    // the fence's entries are AUTHORITIES: `parseAuthority` runs
+    // `new URL('http://' + entry)`, and an IPv6 literal must be bracketed there
+    // (`new URL('http://fe80::1')` throws). Before this, an IPv6 LAN bind folded
+    // in an entry the fence could never parse, so it contributed NOTHING and the
+    // deployment kept only loopback — fail-closed (no security hole), but a real
+    // availability gap for a browser on the LAN.
+    const fake = mountOn({ shape: 'webserver-only', host: 'fe80::1' })
+    // What the browser actually sends: the WHATWG serialization KEEPS the
+    // brackets, and `isLoopbackHostname` documents the same fact.
+    expect(await statusFor(fake, '[fe80::1]:23023')).toBe(200)
+    // The BARE spelling is not an authority: it stays refused, so this is a
+    // normalization of OUR entry, not a relaxation of the fence.
+    expect(await statusFor(fake, 'fe80::1:23023')).toBe(403)
+    // One entry, bracketed ONCE, and nothing else was added.
+    expect(resolveTrustedHosts(fake as unknown as CherryHttpContext)).toEqual(['[fe80::1]'])
+
+    // An already-bracketed bind is not double-bracketed (a hand-written
+    // `--host [fe80::2]` would otherwise become `[[fe80::2]]` and parse to
+    // nothing, re-creating the gap it was meant to close).
+    const bracketed = mountOn({ shape: 'webserver-only', host: '[fe80::2]' })
+    expect(resolveTrustedHosts(bracketed as unknown as CherryHttpContext)).toEqual(['[fe80::2]'])
+    expect(await statusFor(bracketed, '[fe80::2]:23023')).toBe(200)
   })
 
   it('#7 0.2.0 wins: get("webRuntime") answers before get("webStartup") is ever consulted', async () => {
