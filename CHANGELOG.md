@@ -82,6 +82,11 @@ surface change.
 
 ### Fixed
 
+- `test(connection)`: the two promises a test started and never awaited are now
+  settled deterministically and ASSERTED (#43) — the abandoned handshake must
+  REJECT, and the never-answered ping is released by `close()` with a classified
+  error inside the test instead of waiting out the 60 s client default behind a
+  `void ... .catch()`.
 - `fix(tools)`: a list page whose `items` is not an array — wrong type, or
   absent — is refused as a protocol violation instead of being read as an empty
   page (#46). On a terminal page (`nextCursor: null`) that used to answer
