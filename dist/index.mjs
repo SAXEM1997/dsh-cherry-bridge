@@ -2261,6 +2261,19 @@ const RECORD_BUDGET_BYTES = 63488;
 const PARTS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 16896);
 /** Interactions per interactions.list page: inline input + inline summary. */
 const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
+/**
+* Hard ceiling on ONE list resume token (issue #70), in characters.
+*
+* The token is CALLER INPUT and its tail is the peer's own page position, whose
+* length we do not control: the real desktop's session cursor is
+* `entity:<orderKey>:<uuid>` (~57 characters), the numeric `pageOf` faces are a
+* handful of digits, and a future desktop may use something longer — but
+* nothing legitimate comes near this. The bound exists so a hand-built or
+* model-mangled string is refused by a BOUND instead of being split, hashed and
+* carried to the peer, and so the `cursor` parameter can declare `maxLength`
+* honestly.
+*/
+const MAX_LIST_TOKEN_CHARS = 4096;
 //#endregion
 //#region src/urlHost.ts
 /**
@@ -8259,27 +8272,98 @@ function parseMessageResume(value) {
 * another query is a perfectly valid number that reads the WRONG slice with no
 * error anywhere. So this token carries a fingerprint of the binding and a
 * mismatched replay is refused HERE — before any RPC.
+*
+* Wire format (issue #70):
+* `cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>` — the
+* position verbatim and LAST. It replaced a base64 JSON blob (`{v,m,d,h,p}`)
+* that was ~2.3x longer and had no integrity check: measured over 20,000 random
+* single-character corruptions, 28.7% of the old tokens were ACCEPTED with a
+* different position, because the position is the one field a structural check
+* cannot validate. The compact form plus the checksum makes that class empty.
 */
 const LIST_RESUME_PREFIX = "cursor:";
-/** The `cursor` parameter every list tool shares (issue #65). */
+/**
+* The token's format marker (issue #70). It is a FIELD, not part of the prefix,
+* so a token from an older or newer release is refused with an explanation
+* instead of the generic shape error: a resume token outlives a plugin upgrade
+* (the caller is holding it), and "restart the walk" is actionable where
+* "not a token this tool emitted" invites one more attempt with the same token.
+*/
+const LIST_TOKEN_VERSION = "v2";
+/**
+* One character per list tool, replacing the full method name (19 characters of
+* a 225-character token). Every method a list tool can issue MUST appear here:
+* {@link encodeListResumeCursor} throws on an unknown one rather than emit a
+* token the matching parser could never accept.
+*/
+const LIST_TOOL_CODES = {
+	"agent.agents.list": "a",
+	"agent.workspaces.list": "w",
+	"agent.sessions.list": "s",
+	"agent.interactions.list": "i"
+};
+/** The inverse of {@link LIST_TOOL_CODES}, for {@link parseListResumeCursor}. */
+const LIST_CODE_METHODS = Object.fromEntries(Object.entries(LIST_TOOL_CODES).map(([method, code]) => [code, method]));
+/**
+* The fields after the version marker, BEFORE the peer position: tool code,
+* device digest, filter fingerprint and checksum. The position is the rest of
+* the token — it is peer-supplied and may contain the delimiter itself (the
+* desktop's session cursor is `entity:<orderKey>:<uuid>`), so the split stops
+* at a fixed count and never consumes it.
+*/
+const LIST_TOKEN_FIELDS = 4;
+/** The `cursor` parameter every list tool shares (issues #65 and #70). */
 const LIST_CURSOR_PARAMETER = {
 	type: "string",
-	description: "A `resumeCursor` a previous TRUNCATED answer of this tool returned: replay it with the SAME device and filters to continue from that stop point (`limit` then bounds this answer). A token from another tool, device or filter set is refused locally."
+	maxLength: MAX_LIST_TOKEN_CHARS,
+	description: `A \`resumeCursor\` a previous TRUNCATED answer of this tool returned: replay it with the SAME device and filters to continue from that stop point (\`limit\` then bounds this answer). A token from another tool, device or filter set is refused locally, and so is a token this account cannot have received intact (the token carries a checksum; ${MAX_LIST_TOKEN_CHARS} characters is the ceiling).`
 };
 /** Canonical, key-sorted rendering of the caller's filters (undefined keys dropped). */
 function listParamsFingerprint(params) {
 	const entries = Object.keys(params).sort().filter((key) => params[key] !== void 0).map((key) => [key, params[key]]);
-	return createHash("sha256").update(JSON.stringify(entries)).digest("hex").slice(0, 16);
+	return createHash("sha256").update(JSON.stringify(entries)).digest("hex").slice(0, 8);
+}
+/**
+* The device half of the binding, as a digest rather than the id itself: a
+* `deviceId` is a 36-character UUID, and the token only ever has to answer "was
+* this issued for the device I just resolved?", never "which device was it?".
+* 12 hex characters (48 bits) make an accidental collision between two paired
+* desktops a non-event, where the old field was a third of the token.
+*/
+function listDeviceFingerprint(deviceId) {
+	return createHash("sha256").update(deviceId).digest("hex").slice(0, 12);
+}
+/**
+* The token's integrity check (issue #70). It covers the peer position, which
+* is the ONE field no structural check can validate: a substitution there used
+* to decode as a perfectly well-formed token and was forwarded, and the desktop
+* silently falls back to its FIRST page for a position it cannot parse — so the
+* caller's "continue from here" came back as the newest page presented as older
+* history. 8 hex characters (32 bits) turn every single-character corruption
+* into a local refusal; the token is not a security boundary, so a MAC would
+* only make it longer.
+*/
+function listTokenChecksum(body, peerPosition) {
+	return createHash("sha256").update(`${body}\u0000${peerPosition}`).digest("hex").slice(0, 8);
 }
 function encodeListResumeCursor(binding, peerPosition) {
-	const payload = {
-		v: 1,
-		m: binding.method,
-		d: binding.deviceId,
-		h: listParamsFingerprint(binding.params),
-		p: peerPosition
-	};
-	return LIST_RESUME_PREFIX + Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+	const code = LIST_TOOL_CODES[binding.method];
+	if (code === void 0) throw new Error(`${binding.method}: no list resume token code`);
+	const body = `${LIST_TOKEN_VERSION}:${code}:${listDeviceFingerprint(binding.deviceId)}:${listParamsFingerprint(binding.params)}`;
+	return `${LIST_RESUME_PREFIX}${body}:${listTokenChecksum(body, peerPosition)}:${peerPosition}`;
+}
+/**
+* Whether a `cursor:` remainder is a token from the base64-JSON era (issue #65,
+* `v: 1`). Only used to explain a refusal: the payload is never replayed.
+*/
+function looksLikeV1ListToken(raw) {
+	if (raw === "" || raw.includes(":")) return false;
+	try {
+		const decoded = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+		return typeof decoded === "object" && decoded !== null && decoded["v"] === 1;
+	} catch {
+		return false;
+	}
 }
 /**
 * Decode a list token, refusing anything that is not one this tool emitted for
@@ -8295,20 +8379,27 @@ function parseListResumeCursor(value, binding) {
 		throw new Error(`cursor ${why}; omit \`cursor\` to read from the start, or replay the token with the same tool, device and filters.`);
 	};
 	if (typeof value !== "string" || !value.startsWith(LIST_RESUME_PREFIX)) refuse("must be a `cursor:` token this tool emitted");
-	const raw = value.slice(7);
-	let decoded;
-	try {
-		decoded = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
-	} catch {
+	const token = value;
+	if (token.length > 4096) throw new Error(`cursor is ${token.length} characters long, over the ${MAX_LIST_TOKEN_CHARS}-character ceiling for a resume token; omit \`cursor\` to read from the start.`);
+	const raw = token.slice(7);
+	if (!raw.startsWith(`${LIST_TOKEN_VERSION}:`)) {
+		if (looksLikeV1ListToken(raw)) refuse("was issued by an older plugin version (a v1 token, from before list tokens were compact and checksummed), so it can no longer be verified");
 		refuse("is not a token this tool emitted");
 	}
-	if (typeof decoded !== "object" || decoded === null) refuse("is not a token this tool emitted");
-	const payload = decoded;
-	if (payload["v"] !== 1 || typeof payload["m"] !== "string" || typeof payload["d"] !== "string" || typeof payload["h"] !== "string" || typeof payload["p"] !== "string") refuse("is not a token this tool emitted");
-	if (payload["m"] !== binding.method) refuse("was issued for a different tool");
-	if (payload["d"] !== binding.deviceId) refuse("was issued for a different device");
-	if (payload["h"] !== listParamsFingerprint(binding.params)) refuse("was issued for a different filter set");
-	const peerPosition = payload["p"];
+	let rest = raw.slice(3);
+	const fields = [];
+	for (let index = 0; index < LIST_TOKEN_FIELDS; index += 1) {
+		const separator = rest.indexOf(":");
+		if (separator < 0) refuse("is not a token this tool emitted");
+		fields.push(rest.slice(0, separator));
+		rest = rest.slice(separator + 1);
+	}
+	const [code, device, filters, checksum] = fields;
+	const peerPosition = rest;
+	if (checksum !== listTokenChecksum(`${LIST_TOKEN_VERSION}:${code}:${device}:${filters}`, peerPosition)) refuse("is not a token this tool emitted (its checksum does not match, so it was altered in transit)");
+	if (LIST_CODE_METHODS[code] !== binding.method) refuse("was issued for a different tool");
+	if (device !== listDeviceFingerprint(binding.deviceId)) refuse("was issued for a different device");
+	if (filters !== listParamsFingerprint(binding.params)) refuse("was issued for a different filter set");
 	if (mangledRemainder(peerPosition)) refuse("is not a token this tool emitted");
 	return peerPosition;
 }

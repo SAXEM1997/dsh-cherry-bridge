@@ -161,7 +161,11 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
       expect(keys).not.toContain('nextCursor')
       if (listTools.includes(definition.name)) {
         expect(keys).toContain('cursor')
-        expect(properties(definition)['cursor']).toMatchObject({ type: 'string' })
+        // Issue #70: the token is caller input with a peer-supplied tail, so
+        // the declaration carries the ceiling the parser enforces. The number
+        // is pinned LITERALLY: moving it is a declaration change, not a
+        // refactor.
+        expect(properties(definition)['cursor']).toMatchObject({ type: 'string', maxLength: 4096 })
       } else if (definition.name !== 'cherry_events') {
         // `cherry_events` has its own cursor OBJECT, declared since Task 8.
         expect(keys).not.toContain('cursor')

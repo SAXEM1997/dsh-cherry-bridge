@@ -137,3 +137,17 @@ export const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(
 
 /** Items per every other aggregated list page (agents/sessions/messages). */
 export const LIST_PAGE_CLAMP = 16
+
+/**
+ * Hard ceiling on ONE list resume token (issue #70), in characters.
+ *
+ * The token is CALLER INPUT and its tail is the peer's own page position, whose
+ * length we do not control: the real desktop's session cursor is
+ * `entity:<orderKey>:<uuid>` (~57 characters), the numeric `pageOf` faces are a
+ * handful of digits, and a future desktop may use something longer — but
+ * nothing legitimate comes near this. The bound exists so a hand-built or
+ * model-mangled string is refused by a BOUND instead of being split, hashed and
+ * carried to the peer, and so the `cursor` parameter can declare `maxLength`
+ * honestly.
+ */
+export const MAX_LIST_TOKEN_CHARS = 4_096
