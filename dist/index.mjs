@@ -4321,15 +4321,20 @@ const CACHE_ENTRIES_PER_DEVICE = 256;
 * way {@link AGGREGATE_BYTES} measures a message, with
 * `JSON.stringify(page.items).length`, i.e. the same wire-cost proxy.
 *
-* What an entry holds is a message's parts RECORDS — small descriptors (ids,
-* kinds, a text body up to the peer's 4,096-character inline limit, or a
-* `{ref}`) — never the resolved text: `{ref}` content is re-fetched and
-* re-verified on every read, which is the whole point of caching the list
-* result rather than the projection. So in practice this cap RARELY BINDS: a
-* parts page is bounded by the page clamp (`PARTS_LIST_PAGE_CLAMP` items) and
-* the walk only stops early at
-* {@link DEFAULT_PARTS_SAFETY_BOUND} parts, so even a maximum-length inline
-* body per part stays orders of magnitude below 1 MiB.
+* What an entry holds is a message's part RECORDS: ids, kinds, and either an
+* inline text body (up to the peer's 4,096-character `INLINE_TEXT_LIMIT` per
+* part) or a `{ref}` — never the resolved text, which is re-fetched and
+* re-verified on every read. That is the whole point of caching the list result
+* rather than the projection.
+*
+* Note what this does NOT bound: an entry is the AGGREGATED page, i.e. EVERY
+* part record of one message, and {@link DEFAULT_PARTS_SAFETY_BOUND} lets a
+* parts walk collect up to 10,000 of them. Ten thousand inline bodies at 4,096
+* characters is ~40 MB, far ABOVE this cap — so the bound is not decorative.
+* It bites on exactly the message a cache can least afford to hold: one whose
+* records alone would evict everything else for nothing (the `{ref}` byte
+* payload is not what is being cached). That it rarely bites for ordinary
+* history is an expectation, not a measurement.
 *
 * It stays as the guard it is: the protocol bounds neither a part's inline text
 * nor a message's part count, so an entry that did outgrow the device budget on
@@ -4347,10 +4352,11 @@ const MESSAGE_CACHE_ENTRY_BYTES = 1048576;
 *
 * Derivation: it equals {@link MAX_EXTERNALIZED_BYTES}, the 32 MiB the official
 * client and this bridge already accept as the ceiling for a single `{ref}` —
-* the largest piece of content the read path will ever assemble. Entries are
-* descriptors, not content, so this is far more headroom than a real session
-* needs; it is chosen to be a bound that never forces churn on ordinary
-* history, not a memory claim of its own.
+* the largest piece of content the read path will ever assemble. An entry is
+* the AGGREGATED part-record list (inline text included, `{ref}` payload
+* excluded), so this is far more headroom than ordinary history needs; it is
+* chosen to be a bound that never forces churn on ordinary traffic, not a
+* memory claim of its own.
 *
 * PER DEVICE, not global, for the same reason the session caches are: the
 * cached lists describe one peer, and a busy desktop must not evict a quiet
@@ -4727,9 +4733,9 @@ var CherryToolEngine = class {
 	* are still the peer's complete answer, the next read re-attempts every part,
 	* and an incomplete projection is no longer a reason to forget a good list.
 	*
-	* BYTES, not entries: `{ref}` descriptors and inline text sizes are bounded
-	* only by the paste the user made, so a count cap would bound the map without
-	* bounding its memory. {@link CherryToolEngine.#deviceMessageCacheBytes}
+	* BYTES, not entries: a part record carries inline text (bounded only by the
+	* paste the user made) and a `{ref}` descriptor, so a count cap would bound
+	* the map without bounding its memory. {@link CherryToolEngine.#deviceMessageCacheBytes}
 	* carries the running total, maintained ONLY by
 	* {@link CherryToolEngine.#dropCachedMessage} (every removal) and by the
 	* insert/refresh arithmetic in
@@ -5373,8 +5379,12 @@ var CherryToolEngine = class {
 	*     the cached page ({@link CherryToolEngine.#cachedPartsPage}). Fenced by
 	*     the row's message revision, which is the peer's own rule (it refuses
 	*     `agent.parts.list` with `REVISION_EXPIRED` for a stale
-	*     `messageRevision`), so a hit is EXACTLY the list a fresh walk would
-	*     have returned.
+	*     `messageRevision`). A hit is therefore the list a fresh walk would have
+	*     returned UNDER THAT RULE — no stronger: the revision is
+	*     `String(Date.parse(updatedAt))`, a millisecond clock, so two writes
+	*     inside one millisecond keep the revision equal while the parts differ.
+	*     That is the protocol's own assumption about the fence, shared by every
+	*     revision-checked operation, not something the cache introduces.
 	*  2. THE PROJECTION — {@link CherryToolEngine.#projectPart} over those
 	*     records, which fetches and sha256-verifies every `{ref}`. This step runs
 	*     on EVERY read, hit or miss: the revision fence says nothing about the

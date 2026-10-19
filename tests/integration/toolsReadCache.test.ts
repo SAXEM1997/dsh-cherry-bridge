@@ -506,13 +506,15 @@ describe('issue #15: the parts-list read cache', () => {
     // and the cap below is set BETWEEN the two sizes, so the cap selects rather
     // than blankets:
     //
-    //   m-1 whose id is 200 characters   → ~275 bytes  (over the cap)
-    //   m-2 / m-3, short ids             →  ~75 bytes  (under it)
+    //   m-1 whose id is 200 characters   → ~2.3 KB     (over the cap)
+    //   m-2 / m-3, short ids             →  ~100 bytes  (under it)
     //
-    // m-1's raw TEXT is irrelevant to its entry size — 2 KiB of inline text is
-    // ONE record exactly like a 6-byte one. That is the point of the new shape:
-    // descriptors, not text. (The ids are made deliberately different in
-    // LENGTH, because the record size is what the cap judges: two ids of equal
+    // The ID dominates, and that is what makes the cap select — but the entry
+    // is NOT text-free: inline part text IS in `page.items` and IS counted
+    // (2 KiB here), which is why the numbers above are kilobytes rather than
+    // the "~275 bytes" an earlier version of this comment claimed. What the
+    // cache does NOT hold is the resolved `{ref}` text. (The ids are made
+    // deliberately different in LENGTH for the same reason: two ids of equal
     // length would produce two equal-sized entries and the cap could not
     // select.)
     const big = 'I'.repeat(2048)
@@ -549,10 +551,11 @@ describe('issue #15: the parts-list read cache', () => {
     // total would drift upward, and the NEXT insert would evict a survivor that
     // plainly fits.
     //
-    // The sizes are the RECORD sizes, recomputed rather than assumed: an edit
-    // that changes a part's TEXT does not change its record size at all (the
-    // record is a descriptor), so the discriminator has to be an edit that
-    // changes the record SHAPE — here m-2 gains a part.
+    // The sizes are the RECORD sizes, recomputed rather than assumed. An edit
+    // that changes a part's text DOES change the record's size (the text is in
+    // the record), but only slightly and non-monotonically, so the
+    // discriminator here is an edit that changes the record SHAPE — m-2 gains a
+    // part — which reliably grows the entry.
     const onePart = (id: string, revision: string, text: string): FakeMessageRecord =>
       message(id, revision, [{ kind: 'text', text }])
     const m1 = onePart('m-1', '1001', 'first')
@@ -861,56 +864,56 @@ describe('issue #15: the parts-list read cache', () => {
   })
 
   it('T6b a HIT before the pressure is what separates FIFO from LRU — and eviction never crosses devices', async () => {
-    // T6 cannot tell the two policies apart: nothing is ever hit there, so no
-    // entry has a recency and FIFO order ≡ LRU order. This fixture inserts the
-    // discrimination: touch an entry, THEN force the eviction.
+    // T6 cannot tell the two policies apart: nothing there is ever HIT, so no
+    // entry carries a recency and FIFO order ≡ LRU order.
     //
-    //   read 1: insert A, B            → order A, B
-    //   read 2: A is a HIT             → LRU would move A to the back; FIFO keeps it
-    //   read 3: insert C under pressure → FIFO drops A (oldest INSERTED)
-    //                                     LRU drops B (least recently USED)
+    // IT TAKES MORE THAN A HIT TO SEPARATE THEM, and the first version of this
+    // fixture got that wrong. A FULL read touches the cached entries in
+    // newest-first order, which is the order they were INSERTED in, so any
+    // LRU-on-hit leaves exactly the FIFO victim — the two policies are
+    // observationally identical under that access pattern, and a hit alone
+    // discriminates nothing.
     //
-    // So the next read's FIRST re-walked message is A under FIFO, B under LRU.
-    // That single byte of order is the whole policy claim.
+    // What separates them is a partial touch followed by an insert that does
+    // NOT touch the cached entries on its way in:
     //
-    // The pairing of rigs is the second point: the SAME fixture runs on a
-    // two-device store, so an eviction loop that forgot its device-prefix check
-    // would reach into the other device's entries. Both devices are read first,
-    // and the assertion is that dev-B's entries are untouched when dev-A makes
-    // room.
+    //   read 1 (limit 2): insert A=m-1, B=m-2          → order A, B
+    //   read 2 (limit 1): hit A ONLY                   → LRU order becomes B, A
+    //                                                     FIFO order stays A, B
+    //   read 3 (RESUME past B): insert C=m-3           → touches neither A nor B
+    //                                                     FIFO evicts A (oldest inserted)
+    //                                                     LRU evicts B (least recently used)
     //
-    // Sizes come from `partsPageBytes`; the budget below holds exactly two of
-    // the three, so the third insert must evict precisely one.
+    // The resume cursor is what makes read 3 skip the cached messages: a plain
+    // `limit: 3` read would hit A and B first (restoring their relative
+    // recency) and hand both policies the same victim. The probe's FIRST
+    // re-walked id is therefore the whole policy claim: 'm-1' under FIFO,
+    // 'm-2' under LRU.
+    //
+    // The second device is the other point: the same fixture runs beside a
+    // TWO-device store, so an eviction loop that forgot its device-prefix check
+    // would free dev-A's room out of dev-B's entries.
     const ids = ['m-1', 'm-2', 'm-3']
     const history = ids.map((id, index) =>
       message(id, `100${index + 1}`, [{ kind: 'text' as const, text: `body ${index}` }]),
     )
     const sizes = history.map(entryBytesOf)
     const twoOfThree = sizes[0]! + sizes[1]! + 1
-    // The budget has to fit two entries and refuse three — the same shape T6
-    // needs, derived rather than hard-coded.
+    // The budget fits two entries and refuses three, so the third insert must
+    // evict exactly one.
     expect(twoOfThree).toBeGreaterThanOrEqual(sizes[0]! + sizes[1]!)
     expect(twoOfThree).toBeLessThan(sizes[0]! + sizes[1]! + sizes[2]!)
 
     // A SECOND session for the second device: the loopback peer keys
     // subscriptions by session per connection, so two devices sharing one
-    // session on one fake peer would collide before the cache is ever reached.
-    // Both sessions serve the same message history, which is all this fixture
-    // needs.
+    // session on one fake peer would collide before the cache is reached.
     const rig = await makeRig(
       options(JSON.parse(JSON.stringify(history))),
       { engine: { messageCacheEntryBytes: 100_000, messageCacheBytesPerDevice: twoOfThree } },
       [{ sessionId: 's-2', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Other', historyRevision: '1' }],
     )
-    // A SECOND device pointing at the same loopback peer: the cache is
-    // device-scoped, so its entries must occupy their own budget and survive
-    // dev-A's evictions. Warm it first, so its entries exist before dev-A ever
-    // needs room.
     rig.store.upsert({ ...rig.store.list()[0]!, deviceId: 'dev-B', displayName: 'Desk Beta' })
     await rig.connect('dev-B')
-    // TWO messages, so both fit and the second read is a pure hit: the budget
-    // holds exactly two entries, and a three-message warm-up would evict on the
-    // way in and start the cascade this fixture needs to control.
     await rig.call('cherry_read', { device: 'dev-B', sessionId: 's-2', limit: 2 })
     await rig.call('cherry_read', { device: 'dev-B', sessionId: 's-2', limit: 2 })
     const devBWarm = walkedIds(rig).length
@@ -920,35 +923,33 @@ describe('issue #15: the parts-list read cache', () => {
     await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })
     expect(walkedIds(rig).slice(devBWarm)).toEqual(['m-1', 'm-2'])
 
-    // Read 2: both are HITS — and this is the touch that makes the policies
-    // disagree. Under LRU, m-1 is now the most recently used and m-2 the least.
-    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })
+    // Read 2: ONE message — a hit on A alone, which is the recency asymmetry
+    // the policies disagree about.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1 })
     expect(walkedIds(rig).slice(devBWarm + 2)).toEqual([])
 
-    // Read 3: m-3 is new and does not fit beside the two cached entries, so
-    // exactly one is evicted to make room.
-    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 3 })
+    // Read 3: resume PAST B, so the walk starts at C and never touches A or B.
+    // C is new and does not fit beside them: exactly one is evicted.
+    await rig.call('cherry_read', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      limit: 1,
+      messagesResumeCursor: 'cursor:2',
+    })
+    expect(walkedIds(rig).slice(devBWarm + 2)).toEqual(['m-3'])
 
-    // The probe: whichever entry was evicted is walked again. FIFO evicted m-1
-    // (oldest INSERTED, and the hit above must not have re-ordered it); an LRU
-    // would have kept m-1 and evicted m-2 instead. This assertion is the whole
-    // policy claim, and it is the only place in the suite where a hit precedes
-    // the pressure.
+    // THE PROBE: whichever entry was evicted is walked again. FIFO dropped A
+    // (oldest inserted; read 2's hit must not have re-ordered it), LRU dropped
+    // B (least recently used after read 2 touched A). Only the FIRST re-walked
+    // id is asserted — the probe then cascades, which is a size consequence.
     const beforeProbe = walkedIds(rig).length
     await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 3 })
     const probe = walkedIds(rig).slice(beforeProbe)
-    // ONLY the first element is a policy claim, and it is enough: the budget
-    // holds two equal-sized entries, so whichever one was evicted comes back,
-    // its re-insertion evicts another, and the probe re-walks the whole history
-    // — a size consequence, not a second policy. Under FIFO the first re-walked
-    // entry is m-1; under LRU (where the hit in read 2 made m-1 the most
-    // recently used) it would be m-2.
     expect(probe[0]).toBe('m-1')
 
-    // CROSS-DEVICE ISOLATION: dev-A's evictions never reached into dev-B's
-    // entries, which still occupy their own budget. Without the device-prefix
-    // filter in the eviction loop, dev-A's pressure would have freed dev-B's
-    // room instead.
+    // CROSS-DEVICE ISOLATION: dev-A's eviction never reached into dev-B's
+    // entries. Without the device-prefix filter, dev-A's pressure would have
+    // freed its room out of the other device.
     const beforeB = walkedIds(rig).length
     await rig.call('cherry_read', { device: 'dev-B', sessionId: 's-2', limit: 2 })
     expect(walkedIds(rig).slice(beforeB)).toEqual([])
