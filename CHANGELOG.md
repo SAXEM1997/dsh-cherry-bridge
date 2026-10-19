@@ -20,6 +20,16 @@ surface change.
   error naming the message id, and an anchor scan is bounded by
   `MAX_ANCHOR_SCAN_PAGES` (500 pages) — both loud, never an empty page presented
   as "no older history".
+- `feat(tools)`: a read cache for PROJECTED messages (#15). A message whose
+  revision `agent.messages.list` still reports is served from memory, so a
+  repeated read of a quiet session costs no `agent.parts.list` and no
+  `agent.content.read` RPCs, and the terminal/timeout/idle aggregates share the
+  same cache. Entries are fenced by the peer's own revision rule (a moved
+  revision re-fetches), never held when the projection is `incomplete`, holds a
+  `{ref}`-resolved part (its bytes are digest-verified on every read, so they
+  are never served from memory), or the row has no revision; capped at 1 MiB
+  each and 32 MiB per device with FIFO eviction; and dropped with the device's
+  session caches when it goes offline.
 
 ### Changed
 

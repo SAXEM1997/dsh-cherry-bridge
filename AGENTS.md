@@ -229,6 +229,58 @@ These are load-bearing; the code comments are the long version.
   their number in flight (still no total bound). A global budget is a separate
   concern and deliberately not in the walk.
 
+### Read cache: one projection, fenced by the peer's own revision
+
+`cherry_read` and the terminal/timeout/idle aggregates share ONE projection
+(`#projectMessage`), and the projected-message cache lives inside it — the
+lookup at its top, the store at its end. One entry saves one message's
+`agent.parts.list` walk plus one `agent.content.read` walk per externalized
+part, so an agent doing send → wait → read stops paying for the same unchanged
+history on every round.
+
+- **Key**: `<deviceId>\0<messageId>`. Device-scoped for the same reason every
+  engine cache is: a message id is the peer's, and two desktops can issue the
+  same one.
+- **Fence**: a hit requires the stored `revision` to EQUAL the revision the
+  current `agent.messages.list` row carries. The peer refuses `agent.parts.list`
+  with `REVISION_EXPIRED` for a stale `messageRevision`, so a projection keyed
+  by the same revision is exactly what a fresh parts walk would have returned.
+  The cache inherits **that** staleness class; it adds none of its own.
+- **The fence does NOT cover a `{ref}`'s content store.** A message revision
+  describes the message's parts RECORDS, not the bytes behind a `{ref}`: content
+  corrupted there while the revision stays put would be re-verified by a fresh
+  walk and skipped by a cache hit, turning a `ContentIntegrityError` into a
+  confident answer. So a message holding ANY ref-resolved part is **never
+  cached** — `CherryReadPart.fromRef` records the fact internally and
+  `#publicMessage` strips it before the projection reaches a caller. The read
+  still verifies every ref's sha256 on every read; what the cache gives up is
+  the round trips for ref-bearing messages (the 2.1.6 common case), which is
+  the price of keeping the integrity guarantee absolute.
+- **Never cached**: an `incomplete` projection (a failed part, or a
+  circuit-broken parts walk — a transient failure must never become permanent),
+  a projection containing a ref-resolved part (above), a row whose revision is
+  EMPTY (no fence to trust), and a projection above
+  `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB; served fresh every time rather than
+  allowed to crowd out every other message).
+- **Two bounds, both per device**: `MESSAGE_CACHE_ENTRY_BYTES` = 1 MiB and
+  `MESSAGE_CACHE_BYTES_PER_DEVICE` = 32 MiB (the size of one `{ref}`, i.e. the
+  largest piece of content the read path will assemble). Eviction is **FIFO**,
+  oldest insertion first — `Map` order IS the policy, the same deliberate choice
+  `#remember` documents for the session caches. Room is made BEFORE an insert,
+  so a device never passes its budget. `#dropCachedMessage` is the ONE delete
+  path, so the per-device byte total cannot drift from the map. Eviction warns
+  once per insert that dropped anything: device and count only, never a message
+  id.
+- **A hit is served BY REFERENCE.** Every face treats a projection as immutable
+  (it serializes it or reads its text), so a hit is not deep-copied — a copy per
+  hit would spend the CPU the cache exists to save. A future face that mutates a
+  projection must copy first.
+- **Invalidation** rides the existing seam: `#forgetDevice` drops the device's
+  message entries with its three session caches, and `#watchConnection` already
+  routes `offline` / `identity-mismatch` there. Note what that seam covers: an
+  ordinary link loss also publishes `offline`, so a reconnect drops the cache
+  too — one re-read per session, the documented cost of the seam.
+
 ### Walks: what is tolerated, what is refused
 
 - **Empty pages.** The desktop's pinned-list walk legally answers
