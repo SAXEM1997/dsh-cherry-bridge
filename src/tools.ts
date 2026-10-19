@@ -2222,9 +2222,10 @@ class CherryToolEngine {
         'List the Cherry Studio agents available on a device. Paginated: `limit` bounds ' +
         'the TOTAL across pages (default 100, max 1000) and is aggregated internally. ' +
         'A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran ' +
-        'out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). A truncated ' +
-        'answer also carries `resumeCursor`: replay it as `cursor` with the same tool, device and ' +
-        'filters to continue from that stop point (`limit` then bounds the next answer).',
+        'out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). When the ' +
+        'stop point can be named it carries `resumeCursor`: replay it as `cursor` with the same ' +
+        'tool, device and filters to continue from that stop point (`limit` then bounds the next ' +
+        'answer).',
       parameters: {
         type: 'object',
         properties: {
@@ -2265,8 +2266,9 @@ class CherryToolEngine {
         'List an agent\'s REGISTERED workspaces, plus whether a system workspace exists. ' +
         'The system workspace has no enumerable id: it is not in `items`, and its identity ' +
         'is only observable by creating a session in it and reading it back. A truncated ' +
-        'answer (`truncated` + `truncationReason`) stopped before the peer ran out and carries ' +
-        '`resumeCursor`: replay it as `cursor` with the same filters to continue.',
+        'answer (`truncated` + `truncationReason`) stopped before the peer ran out; when the stop ' +
+        'point can be named it carries `resumeCursor` — replay it as `cursor` with the same ' +
+        'filters to continue.',
       parameters: {
         type: 'object',
         properties: {
@@ -2317,9 +2319,10 @@ class CherryToolEngine {
         '`workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds ' +
         'the TOTAL across pages (default 100, max 1000) and is aggregated internally. ' +
         'A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran ' +
-        'out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). A truncated ' +
-        'answer also carries `resumeCursor`: replay it as `cursor` with the same tool, device and ' +
-        'filters to continue from that stop point (`limit` then bounds the next answer).',
+        'out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). When the ' +
+        'stop point can be named it carries `resumeCursor`: replay it as `cursor` with the same ' +
+        'tool, device and filters to continue from that stop point (`limit` then bounds the next ' +
+        'answer).',
       parameters: {
         type: 'object',
         properties: {
@@ -2389,8 +2392,9 @@ class CherryToolEngine {
         '"aggregate-bytes"` means the walk stopped because the result reached its size limit, ' +
         'not because `limit` was reached — raising `limit` does NOT reach the messages left out ' +
         '(it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE ' +
-        'REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` whenever a ' +
-        'stop point can be named honestly (it is absent when the walk reached the peer\'s last page), and ' +
+        'REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the ' +
+        'stop point can be named — absent when it cannot, e.g. an empty or malformed position, a ' +
+        'token past the length ceiling, or no anchor id — and ' +
         'passing it back as `messagesResumeCursor` continues the walk from there (`limit` then ' +
         'bounds how many messages are returned FROM that point). The two token forms are ' +
         '`"cursor:<peer position>"` (the walk consumed its whole page window) and ' +
@@ -2412,7 +2416,8 @@ class CherryToolEngine {
             description:
               'Maximum number of messages to return in total across pages (default 100). Distinct from ' +
               'the output budget: the answer may stop earlier with `truncationReason: "aggregate-bytes"`, ' +
-              'which a larger `limit` does not extend — the resume token is how older messages are reached.',
+              'which a larger `limit` does not extend — the resume token, when one is returned, is how ' +
+              'older messages are reached.',
           },
           messagesResumeCursor: {
             type: 'string',
@@ -3760,8 +3765,8 @@ class CherryToolEngine {
         'pending filter is applied here. Each entry carries its `kind` (question|decision) and a ' +
         'summary; answer questions with cherry_respond\'s `response` form and decisions with ' +
         '`decision`. A truncated answer (`truncated` + `truncationReason`) stopped before the ' +
-        'peer ran out and carries `resumeCursor`: replay it as `cursor` with the same filters to ' +
-        'continue.',
+        'peer ran out; when the stop point can be named it carries `resumeCursor` — replay it as ' +
+        '`cursor` from the same `sessionId` to continue.',
       parameters: {
         type: 'object',
         properties: {
