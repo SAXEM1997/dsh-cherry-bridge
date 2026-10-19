@@ -583,16 +583,23 @@ describe('issue #15: the parts-list read cache', () => {
     //             exceed the budget and evicts a survivor that fits.
     // Both totals are built from the SAME recomputed record sizes, so the only
     // difference between them is what the refresh left behind. The budget is
-    // placed strictly between the two PEAKS (each total plus the incoming
-    // entry): enough room for an honest refresh, none for a drifted one.
-    const steady = sizeM1 + sizeM2After + sizeM3
+    // placed strictly between the two DECISIONS m-3's insert has to make — the
+    // total it sees plus its own growth:
+    //
+    //   honest   (m1 + m2after) + m3   must FIT      → budget ≥ this
+    //   drifted  (m1 + m2before + m2after) + m3  must NOT fit → budget < this
+    //
+    // Note both quantities ALREADY include m3 — they are decisions at the
+    // insert, not totals at rest. An earlier version of this fixture added m3 a
+    // second time and put the budget ABOVE the drifted decision, which made the
+    // whole test vacuous: the drift mutant passed it. Sizes are strictly
+    // positive, so `drifted - 1 ≥ honest` holds and the window is non-empty.
+    const honest = sizeM1 + sizeM2After + sizeM3
     const drifted = sizeM1 + sizeM2Before + sizeM2After + sizeM3
-    const honestPeak = steady + sizeM3
-    const driftedPeak = drifted + sizeM3
-    expect(drifted).toBeGreaterThan(steady)
-    const budget = Math.max(driftedPeak - 1, honestPeak)
-    expect(budget).toBeGreaterThanOrEqual(honestPeak)
-    expect(budget).toBeLessThan(driftedPeak)
+    expect(drifted).toBeGreaterThan(honest)
+    const budget = Math.max(drifted - 1, honest)
+    expect(budget).toBeGreaterThanOrEqual(honest)
+    expect(budget).toBeLessThan(drifted)
     const rig = await makeRig(options([structuredClone(m1), structuredClone(m2Before)]), {
       engine: { messageCacheBytesPerDevice: budget },
     })
@@ -620,6 +627,58 @@ describe('issue #15: the parts-list read cache', () => {
     // All three are held: a fourth read walks nothing.
     await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
     expect(partsCalls(rig)).toBe(4)
+  })
+
+  it('T5e a REFRESH never evicts the key it is writing, even when that key is the oldest', async () => {
+    // The eviction loop walks `Map` insertion order and must SKIP the key being
+    // written: replacing it IS this call, and its previous bytes are already
+    // excluded from the growth being made room for. Refreshing the OLDEST entry
+    // under pressure is where that skip matters — without it the loop evicts
+    // the entry it is about to write, and re-inserting it moves it to the BACK
+    // of the order, silently breaking the insert-order policy pinned by T6c.
+    //
+    // Observable in the SAME read: with the guard, the refresh evicts the OTHER
+    // entry, and because that entry is projected later in the same walk it is a
+    // MISS and is re-walked. Without the guard, the refreshed key removes and
+    // re-adds ITSELF, the other entry survives as a HIT, and the read issues one
+    // fewer parts call. (A later probe read cannot show this: the eviction
+    // cascade that follows leaves either final cache one entry deep, so the two
+    // paths are indistinguishable there — the call count during the refresh is
+    // the difference.)
+    const onePart = (id: string, revision: string, text: string): FakeMessageRecord =>
+      message(id, revision, [{ kind: 'text' as const, text }])
+    const history = [onePart('m-1', '1001', 'first'), onePart('m-2', '1002', 'second')]
+    const one = entryBytesOf(history[0]!)
+    const grown = entryBytesOf(
+      message('m-1', '2001', [
+        { kind: 'text' as const, text: 'first' },
+        { kind: 'text' as const, text: 'and a second part' },
+      ]),
+    )
+    // Room for the honest refresh's growth only after evicting the OTHER entry;
+    // the grown entry itself must still fit on its own.
+    const budget = grown + 1
+    expect(budget).toBeGreaterThanOrEqual(one + one)
+    expect(grown).toBeGreaterThan(one)
+
+    const rig = await makeRig(options(history), {
+      engine: { messageCacheEntryBytes: 100_000, messageCacheBytesPerDevice: budget },
+    })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    expect(walkedIds(rig)).toEqual(['m-1', 'm-2'])
+
+    // m-1 — the FIRST entry in device order — is edited and grows.
+    history[0]!.revision = '2001'
+    history[0]!.parts = [
+      { kind: 'text', text: 'first' },
+      { kind: 'text', text: 'and a second part' },
+    ]
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+
+    // With the skip: m-2 was evicted to make room for m-1's growth, so m-2 is a
+    // MISS when the walk reaches it and is re-walked. Without it: m-1 evicted
+    // itself, m-2 is still held, and only m-1 is walked.
+    expect(walkedIds(rig)).toEqual(['m-1', 'm-2', 'm-1', 'm-2'])
   })
 
   it('T5d an entry that cannot fit the DEVICE budget is refused, whatever the entry cap says', async () => {

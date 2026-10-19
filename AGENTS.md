@@ -309,8 +309,10 @@ verifies every byte it hands back.
   is the path that is easy to miss, and getting it wrong is what let an edited
   message's larger list through the budget untouched.
   `#dropCachedMessage` is the ONE delete path, so the per-device byte total
-  cannot drift from the map. Eviction warns once per insert that dropped
-  anything: device and count only, never a message id.
+  cannot drift from the map, and the eviction loop skips the key being written
+  (replacing it IS this call — self-evicting it would move it to the back and
+  break insert-order). Eviction warns once per insert that dropped anything:
+  device and count only, never a message id.
 - **A hit hands the PAGE out BY REFERENCE**, which is safe because it is a list
   of records: the projection loop only reads it and builds new part objects
   from it. A future reader that mutates a cached page must copy first.
