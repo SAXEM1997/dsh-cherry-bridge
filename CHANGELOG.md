@@ -40,6 +40,19 @@ surface change.
   point being nameable, and `cherry_read`'s names the exceptions it can name
   (an empty or malformed position, a token past the length ceiling, no anchor
   id) as examples rather than as an exhaustive list.
+- **A peer position shaped like our retired v1 token is no longer named either**
+  (#85). The parsers have two refusals on a `cursor:` remainder —
+  `mangledRemainder` and `looksLikeV1ListToken` — and the emitters mirrored only
+  the first, so a position that happened to BE the v1 payload shape was wrapped
+  into a token the same tool then refused as "issued by an older plugin
+  version". Both guards now live in one pair of helpers (`nameableRemainder` for
+  content, `nameablePeerPosition` for positions), and a round-trip test asserts
+  that every token these emitters produce is one the parser takes — so a parser
+  clause added without mirroring it turns that test red for any probe shape that
+  reaches it (a clause no probe reaches would still slip through, which is why
+  the table is varied and its non-vacuity is asserted). The `after:` anchor
+  deliberately takes only the content one, because that is exactly what its
+  parser checks.
 
 ## v0.1.7 (2026-10-19)
 

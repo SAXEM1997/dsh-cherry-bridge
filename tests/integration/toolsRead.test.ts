@@ -2525,6 +2525,24 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
     expect(rig.fake.methodCount('agent.agents.list')).toBeGreaterThan(arrivalsBefore)
   })
 
+  it('⑦i a v1-shaped peer position is not named on the list face either (issue #85)', async () => {
+    const agents = Array.from({ length: 12 }, (_unused, index) => ({ agentId: `a-${index}`, name: `A${index}` }))
+    const rig = await makeRig({ agent: { agents: agents as never } })
+    // The v1 payload shape: 102 characters, colon-free base64url of `{v:1,…}`.
+    // `parseListResumeCursor` names and refuses it BEFORE the binding checks, so
+    // wrapping it would hand the caller a token refused as "an older plugin
+    // version" — a diagnosis about our own retired format, produced by us.
+    const v1Shaped = Buffer.from(
+      JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+      'utf8',
+    ).toString('base64url')
+    rig.fake.scriptListPages('agent.agents.list', [{ items: agents.slice(0, 2), nextCursor: v1Shaped }])
+
+    const page = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
+    expect(page.truncated).toBe(true)
+    expect(page.resumeCursor).toBeUndefined()
+  })
+
   it('⑦g a MESSAGE-face token is refused by a list tool, naming the face that owns it (issue #72)', async () => {
     const rig = await makeRig({
       agent: { agents: [{ agentId: 'a1', name: 'A' }] as never, sessions: sessions(40) as never },

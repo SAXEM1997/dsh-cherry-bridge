@@ -583,22 +583,37 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   invalidates a held token, and "start the walk over" is the actionable answer,
   so that refusal does NOT reuse the generic "…or replay the token" tail: a v1
   token can never be replayed, whoever holds it.
-- **Both faces name only a remainder their own parser would accept.** The
-  message face's `cursor:` position and `after:` anchor, and the list face's
-  peer position, are judged by `mangledRemainder` — the SAME predicate
-  `parseMessageResume` and `parseListResumeCursor` apply on replay — so the
-  two sides cannot drift into two dialects. It refuses an empty remainder, one
-  that is not equal to its own `.trim()` (leading/trailing whitespace), and one
-  carrying a control character ANYWHERE; an interior plain space is legal and
-  round-trips (`a b`). The failure mode it prevents is the emitter minting a
-  stop point the same tool then refuses: the caller holds a token that can
-  never be used, and the refusal surfaces at the resume call instead of at the
-  answer that produced it. A refused remainder yields no token at all —
-  `truncated` already says the walk was cut, and a wider `limit` is the remedy
-  that works. The message face applies this to the `after:` anchor as well as
-  the `cursor:` position: a message id is an `opaqueId` too, so a padded id is
-  schema-valid and really does reach the anchor arm. The LENGTH ceiling is the
-  sibling guard in the next bullet.
+- **Both faces name only a remainder their own parser would accept, and the rule
+  lives in ONE pair of helpers.** `nameableRemainder` is the content dimension —
+  `mangledRemainder` itself, the predicate `parseMessageResume` and
+  `parseListResumeCursor` apply on replay — so the two sides cannot drift into
+  two dialects. It refuses an empty remainder, one that is not equal to its own
+  `.trim()` (leading/trailing whitespace), and one carrying a control character
+  ANYWHERE; an interior plain space is legal and round-trips (`a b`).
+  `nameablePeerPosition` adds the one refusal that applies to a POSITION and not
+  to an anchor: `looksLikeV1ListToken`, because our retired 0.1.6 token
+  (colon-free base64url of `{v,m,d,h,p}`) is indistinguishable from a peer
+  position and both parsers name it. The `after:` arm deliberately does NOT take
+  that second check — `parseMessageResume`'s `after:` branch never consults the
+  detector, so applying it there would be the same bug mirrored: refusing to name
+  a token the parser takes.
+  **The round trip itself is a test, not a promise.** `parseMessageResume` is
+  exported for one property: every token these emitters NAME is one it ACCEPTS.
+  It is asserted over a varied probe table (numeric, keyset, unicode, interior
+  space, base64url-shaped, the retired v1 payload) rather than per-clause, so a
+  refusal added to the parser WITHOUT mirroring it here turns red for any probe
+  that reaches it — the compensations are that a clause no probe reaches still
+  slips through, and that over-refusal (naming less than the parser would take)
+  is allowed by design, since it costs resumability rather than correctness.
+  The failure mode all of this prevents is the emitter minting a stop point the
+  same tool then refuses: the caller holds a token that can never be used, and
+  the refusal surfaces at the resume call instead of at the answer that produced
+  it. A refused remainder yields no token at all — `truncated` already says the
+  walk was cut, and a wider `limit` is the remedy that works. The message face
+  applies the content rule to the `after:` anchor as well as the `cursor:`
+  position: a message id is an `opaqueId` too, so a padded id is schema-valid and
+  really does reach the anchor arm. The LENGTH ceiling is the sibling guard in
+  the next bullet.
 - **The ceiling is enforced on the way OUT too — the same refusal in one more
   dimension.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
   over it is one this tool would refuse on replay, and emitting it would hand

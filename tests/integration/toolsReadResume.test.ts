@@ -960,3 +960,37 @@ describe('issue #80: the emit side applies the parser’s content predicate to B
     expect(page.messagesResumeCursor).toBe('after:m-0')
   })
 })
+
+/**
+ * Issue #85: the message face must not name a position that its own parser
+ * refuses as a RETIRED v1 list token.
+ *
+ * `parseMessageResume`'s `cursor:` branch runs `mangledRemainder` and then
+ * `looksLikeV1ListToken`, and only the first was mirrored. A peer answering with
+ * the v1 payload shape therefore got a `messagesResumeCursor` back that the next
+ * `cherry_read` refused — with the diagnosis "issued by an older plugin version",
+ * about a token this tool had printed a moment earlier.
+ *
+ * The position here is schema-legal for the peer (`opaqueId` is 1–256 characters
+ * of Unicode text): 102 characters, colon-free base64url.
+ */
+describe('issue #85: a v1-shaped peer position is not named', () => {
+  const v1Shaped = Buffer.from(
+    JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+    'utf8',
+  ).toString('base64url')
+
+  it('⑭g a `cursor:` position in the retired format mints no token, and the content survives', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1)] },
+    })
+    rig.fake.scriptListPages('agent.messages.list', [{ items: [wire(0), wire(1)], nextCursor: v1Shaped }])
+
+    const page = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })) as ReadResult
+    expect(ids(page)).toEqual(['m-0', 'm-1'])
+    expect(page.truncated).toBe(true)
+    expect(page.truncationReason).toBe('limit')
+    expect(page.messagesResumeCursor).toBeUndefined()
+  })
+})
