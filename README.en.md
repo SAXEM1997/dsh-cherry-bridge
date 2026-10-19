@@ -37,14 +37,14 @@ flowchart TB
 > **DSH version requirement**: `>=0.2.0-rc.2 <0.3.0-0` (declared via `engines.dsh` in `package.json`; when unmet the bundle is skipped and its settings-page row disabled — `dsh plugin allow-version` grants an explicit exemption; 0.3.0 needs a fresh compatibility pass before the range widens).
 
 ```bash
-# From GitHub (recommended)
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge
+# From npm (recommended, pinned)
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.1.5
 
-# Pinned to a version tag (recommended for production)
+# Install the latest npm release
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge
+
+# From GitHub source (same commit as the npm release)
 npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.5
-
-# Or from the npm registry
-dsh plugin --profile <name> add dsh-cherry-bridge
 ```
 
 The package ships `cordis.patch.yml` (`package.json`'s `dsh.bundle.patch` points
