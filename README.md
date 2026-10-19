@@ -35,14 +35,14 @@ flowchart TB
 > **DSH 版本需求**：`>=0.2.0-rc.2 <0.3.0-0`（由 `package.json` 的 `engines.dsh` 声明；不满足时 bundle 被跳过、设置页里该插件的行被禁用，确需在区间外使用可用 `dsh plugin allow-version` 精确豁免。0.3.0 需重新评估兼容性后再放开）。
 
 ```bash
-# 从 GitHub 安装（推荐）
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge
+# 从 npm 安装（推荐，钉住版本）
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.1.5
 
-# 钉住版本标签（生产推荐）
+# 安装 npm 最新发布版
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge
+
+# 从 GitHub 源码安装（与 npm 发布同一提交）
 npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.5
-
-# 或从 npm registry 安装
-dsh plugin --profile <name> add dsh-cherry-bridge
 ```
 
 本包自带 `cordis.patch.yml`（`package.json` 的 `dsh.bundle.patch` 指向它），
