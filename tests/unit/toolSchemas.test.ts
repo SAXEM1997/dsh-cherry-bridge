@@ -182,6 +182,55 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     })
   })
 
+  it('issue #82: a description promises a resume token only when one can be named', () => {
+    // The description IS the contract a model reads, so an unconditional promise
+    // is a claim the tool then contradicts: the emitters withhold the token
+    // whenever naming it would break the round trip (an empty or mangled peer
+    // position, a token past `MAX_RESUME_TOKEN_CHARS`, or no message id to anchor
+    // the `after:` form). Before this, the four list tools said a truncated
+    // answer "also carries `resumeCursor`", and `cherry_read` named the WRONG
+    // absent case — "the walk reached the peer's last page", which a truncated
+    // walk by definition never reaches.
+    //
+    // The POSITIVE half selects by CONTENT, not by tool name: any top-level
+    // description that mentions the token has to carry the clause, so a future
+    // tool cannot reintroduce the claim by being absent from a list.
+    for (const definition of registerAll()) {
+      const description = definition.description ?? ''
+      if (!/`(messages)?resumeCursor`/i.test(description)) continue
+      expect(description, `${definition.name} must make the token conditional`).toMatch(
+        /stop point can be named/i,
+      )
+    }
+    // ...and no description anywhere keeps a retired UNCONDITIONAL clause,
+    // including the two variants the four list tools used and the wrong absent
+    // case `cherry_read` used.
+    for (const definition of registerAll()) {
+      const description = definition.description ?? ''
+      for (const retired of [
+        /reached the peer's last page/i,
+        /answer also carries `resumeCursor`/i,
+        /ran out and carries `resumeCursor`/i,
+      ]) {
+        expect(description, `${definition.name} keeps a retired claim`).not.toMatch(retired)
+      }
+    }
+    // Anchor: the six descriptions that speak about tokens in a RESULT are the
+    // ones the positive half above must have covered — assert the count so a
+    // silently narrowed regex cannot pass by matching nothing.
+    const mentioning = registerAll().filter((definition) =>
+      /`(messages)?resumeCursor`/i.test(definition.description ?? ''),
+    )
+    expect(mentioning.map((definition) => definition.name).sort()).toEqual([
+      'cherry_agents',
+      'cherry_interactions',
+      'cherry_read',
+      'cherry_send',
+      'cherry_sessions',
+      'cherry_workspaces',
+    ])
+  })
+
   it('every read-only tool declares the aggregate limit as an integer within [1, 1000]', () => {
     for (const definition of registerReadOnly()) {
       const limit = properties(definition)['limit']

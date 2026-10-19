@@ -5567,7 +5567,7 @@ var CherryToolEngine = class {
 	#agentsTool() {
 		return defineCherryTool({
 			name: "cherry_agents",
-			description: "List the Cherry Studio agents available on a device. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). A truncated answer also carries `resumeCursor`: replay it as `cursor` with the same tool, device and filters to continue from that stop point (`limit` then bounds the next answer).",
+			description: "List the Cherry Studio agents available on a device. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). When the stop point can be named it carries `resumeCursor`: replay it as `cursor` with the same tool, device and filters to continue from that stop point (`limit` then bounds the next answer).",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5610,7 +5610,7 @@ var CherryToolEngine = class {
 	#workspacesTool() {
 		return defineCherryTool({
 			name: "cherry_workspaces",
-			description: "List an agent's REGISTERED workspaces, plus whether a system workspace exists. The system workspace has no enumerable id: it is not in `items`, and its identity is only observable by creating a session in it and reading it back. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out and carries `resumeCursor`: replay it as `cursor` with the same filters to continue.",
+			description: "List an agent's REGISTERED workspaces, plus whether a system workspace exists. The system workspace has no enumerable id: it is not in `items`, and its identity is only observable by creating a session in it and reading it back. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out; when the stop point can be named it carries `resumeCursor` — replay it as `cursor` with the same filters to continue.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5665,7 +5665,7 @@ var CherryToolEngine = class {
 	#sessionsTool() {
 		return defineCherryTool({
 			name: "cherry_sessions",
-			description: "List an agent's sessions, optionally filtered by workspace. The `agentId` and `workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). A truncated answer also carries `resumeCursor`: replay it as `cursor` with the same tool, device and filters to continue from that stop point (`limit` then bounds the next answer).",
+			description: "List an agent's sessions, optionally filtered by workspace. The `agentId` and `workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). When the stop point can be named it carries `resumeCursor`: replay it as `cursor` with the same tool, device and filters to continue from that stop point (`limit` then bounds the next answer).",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5722,7 +5722,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` whenever a stop point can be named honestly (it is absent when the walk reached the peer's last page), and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5738,7 +5738,7 @@ var CherryToolEngine = class {
 						type: "integer",
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of messages to return in total across pages (default 100). Distinct from the output budget: the answer may stop earlier with `truncationReason: \"aggregate-bytes\"`, which a larger `limit` does not extend — the resume token is how older messages are reached."
+						description: "Maximum number of messages to return in total across pages (default 100). Distinct from the output budget: the answer may stop earlier with `truncationReason: \"aggregate-bytes\"`, which a larger `limit` does not extend — the resume token, when one is returned, is how older messages are reached."
 					},
 					messagesResumeCursor: {
 						type: "string",
@@ -6497,7 +6497,7 @@ var CherryToolEngine = class {
 	#interactionsTool() {
 		return defineCherryTool({
 			name: "cherry_interactions",
-			description: "List the session's PENDING interactions (questions and approval decisions) that need an answer. The peer serves the full four-state set (pending/approved/denied/expired) — the pending filter is applied here. Each entry carries its `kind` (question|decision) and a summary; answer questions with cherry_respond's `response` form and decisions with `decision`. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out and carries `resumeCursor`: replay it as `cursor` with the same filters to continue.",
+			description: "List the session's PENDING interactions (questions and approval decisions) that need an answer. The peer serves the full four-state set (pending/approved/denied/expired) — the pending filter is applied here. Each entry carries its `kind` (question|decision) and a summary; answer questions with cherry_respond's `response` form and decisions with `decision`. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out; when the stop point can be named it carries `resumeCursor` — replay it as `cursor` from the same `sessionId` to continue.",
 			parameters: {
 				type: "object",
 				properties: {

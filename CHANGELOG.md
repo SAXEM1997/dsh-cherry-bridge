@@ -32,6 +32,14 @@ surface change.
   the `cursor:` position and the `after:` anchor, so a mangled remainder yields
   no token at all — `truncated` still says the walk was cut, and a wider
   `limit` is the remedy that works. The list face already ran that guard.
+- **The tool DESCRIPTIONS no longer promise a resume token unconditionally**
+  (#82). They are the contract a model reads, and the four list tools promised
+  `resumeCursor` for every truncated answer, while `cherry_read` named the wrong
+  absent case ("the walk reached the peer's last page" — a truncated walk never
+  reaches it). Each description now makes the token conditional on the stop
+  point being nameable, and `cherry_read`'s names the exceptions it can name
+  (an empty or malformed position, a token past the length ceiling, no anchor
+  id) as examples rather than as an exhaustive list.
 
 ## v0.1.7 (2026-10-19)
 

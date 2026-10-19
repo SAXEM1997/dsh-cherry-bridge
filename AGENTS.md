@@ -627,6 +627,19 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   arms through the tools. The `cursor:` arm and the list face keep their
   end-to-end tests as well (`toolsReadResume.test.ts` ⑭a/⑭b,
   `toolsRead.test.ts` ⑦h), which is why that helper is exported.
+- **The tool DESCRIPTION is part of the contract, and it is pinned.** The guards
+  above bound what a tool ACCEPTS and NAMES, so a description promising a token
+  unconditionally is a claim the tool contradicts — and it is the claim a model
+  reads first, more consequentially than the READMEs. Every TOP-LEVEL description
+  that mentions a resume token says "when the stop point can be named", and none
+  names the wrong absent case ("reached the peer's last page" was the stale one:
+  a TRUNCATED walk by definition never reaches it). `cherry_read` states the
+  exceptions, and it states them as EXAMPLES, deliberately: an exhaustive list is
+  a promise that the next guard will falsify.
+  `tests/unit/toolSchemas.test.ts` asserts the clause on every description that
+  mentions the token (naming the tools would let a future one slip in) and the
+  retired wording across all fourteen, so reverting one to the old text is a red
+  test rather than a review catch.
 
 ### `AGGREGATE_BYTES`: one budget, two faces
 
