@@ -350,7 +350,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(result.truncationReason).toBe('safety-bound')
     // The peer still had data, and the resume TOKEN is reported (issue #65:
     // the raw peer position never leaves the tool).
-    expect(result.resumeCursor).toMatch(/^cursor:/)
+    expect(result.resumeCursor).toMatch(/^list:/)
     expect(result.nextCursor).toBeUndefined()
   })
 
@@ -2030,7 +2030,7 @@ describe('issue #27 follow-up: the agreement check is PER SLICE, not just on the
 
 /**
  * A truncated list walk answers a self-describing `resumeCursor`
- * (`cursor:<opaque>`), and the same tool accepts it back as `cursor` with the
+ * (`list:<opaque>`), and the same tool accepts it back as `cursor` with the
  * SAME filters: the round trip the message face already has. The token is bound
  * to (tool, device, filters), so reuse against a different query is refused
  * LOCALLY — a peer position from another query would silently read the wrong
@@ -2066,7 +2066,7 @@ describe('issue #65: list walks are resumable', () => {
     expect(first.items).toHaveLength(LIST_PAGE_CLAMP)
     expect(first.truncated).toBe(true)
     expect(first.truncationReason).toBe('limit')
-    expect(first.resumeCursor).toMatch(/^cursor:/)
+    expect(first.resumeCursor).toMatch(/^list:/)
     expect(first.nextCursor).toBeUndefined()
 
     const second = (await rig.call('cherry_sessions', {
@@ -2117,7 +2117,7 @@ describe('issue #65: list walks are resumable', () => {
     ): Promise<string[]> => {
       const first = (await rig.call(tool, { ...args, limit: 2 })) as ListPage
       expect(first.truncated).toBe(true)
-      expect(first.resumeCursor).toMatch(/^cursor:/)
+      expect(first.resumeCursor).toMatch(/^list:/)
       const second = (await rig.call(tool, { ...args, limit: 2, cursor: first.resumeCursor })) as ListPage
       expect(second.nextCursor).toBeUndefined()
       return [...ids(first, key), ...ids(second, key)]
@@ -2129,7 +2129,7 @@ describe('issue #65: list walks are resumable', () => {
     const wsFirst = (await rig.call('cherry_workspaces', { device: 'dev-A', agentId: 'a-0', limit: 2 })) as ListPage & {
       systemWorkspace?: boolean
     }
-    expect(wsFirst.resumeCursor).toMatch(/^cursor:/)
+    expect(wsFirst.resumeCursor).toMatch(/^list:/)
     const wsSecond = (await rig.call('cherry_workspaces', {
       device: 'dev-A',
       agentId: 'a-0',
@@ -2174,11 +2174,11 @@ describe('issue #65: list walks are resumable', () => {
     // by the PREFIX: neither can be a token this tool emitted (issue #70 kept
     // the two faces on one prefix so this stays true).
     await expect(rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: '16' })).rejects.toThrow(
-      /must be a `cursor:` token/i,
+      /must be a `list:` token/i,
     )
     await expect(
       rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: 'after:msg-1' }),
-    ).rejects.toThrow(/must be a `cursor:` token/i)
+    ).rejects.toThrow(/must be a `list:` token/i)
   })
 
   it('⑰e a token issued by one device is refused on another', async () => {
@@ -2235,7 +2235,7 @@ describe('issue #65: list walks are resumable', () => {
       })) as ListPage
       for (const item of page.items) seen.push(String(item['interactionId']))
       if (page.truncated !== true) break
-      expect(page.resumeCursor).toMatch(/^cursor:/)
+      expect(page.resumeCursor).toMatch(/^list:/)
       cursor = page.resumeCursor
     }
     expect(seen).toEqual(['p-0', 'p-1', 'p-2', 'p-3', 'p-4', 'p-5'])
@@ -2258,7 +2258,7 @@ describe('issue #65: list walks are resumable', () => {
 
     const first = (await rig.call('cherry_agents', { device: 'dev-A', limit: 4 })) as ListPage
     expect(ids(first, 'agentId')).toEqual(['a-0', 'a-1', 'a-2', 'a-3'])
-    expect(first.resumeCursor).toMatch(/^cursor:/)
+    expect(first.resumeCursor).toMatch(/^list:/)
 
     // The token names the position the walk SENT for the overshooting page (4),
     // never the advertised 9: a resume from 9 would skip a-8 entirely.
@@ -2316,7 +2316,7 @@ describe('issue #65: list walks are resumable', () => {
  * EVERY single-character corruption of a token this tool emitted is refused
  * locally, without a dial.
  *
- * Shape: `cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<position>` — a
+ * Shape: `list:v2:<tool>:<device12>:<filters8>:<checksum8>:<position>` — a
  * one-char tool code, a digest instead of the 36-char deviceId, an 8-hex filter
  * fingerprint, an 8-hex checksum, and the peer position VERBATIM and last. It
  * has to be last: the real desktop's session cursor is
@@ -2372,7 +2372,7 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
     expect(first.truncationReason).toBe('limit')
     // tool code `s`, 12-hex device digest, 8-hex filter hash, 8-hex checksum,
     // then the position with its own colons.
-    expect(first.resumeCursor).toMatch(/^cursor:v2:s:[0-9a-f]{12}:[0-9a-f]{8}:[0-9a-f]{8}:entity:1757923200000:/)
+    expect(first.resumeCursor).toMatch(/^list:v2:s:[0-9a-f]{12}:[0-9a-f]{8}:[0-9a-f]{8}:entity:1757923200000:/)
     expect(first.resumeCursor).toMatch(new RegExp(`:${KEYSET}$`))
     expect((first.resumeCursor as string).length).toBeLessThan(120)
 
@@ -2452,7 +2452,7 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
   it('⑦d an over-long cursor is refused by its LENGTH, not by a decode failure', async () => {
     const { rig } = await keysetRig()
     const before = rig.fake.readCallsFor('agent.sessions.list').length
-    const huge = `cursor:v2:s:${'0'.repeat(12)}:${'0'.repeat(8)}:${'0'.repeat(8)}:${'9'.repeat(5000)}`
+    const huge = `list:v2:s:${'0'.repeat(12)}:${'0'.repeat(8)}:${'0'.repeat(8)}:${'9'.repeat(5000)}`
     await expect(rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: huge })).rejects.toThrow(
       /4096/,
     )
@@ -2476,6 +2476,25 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
       expect(page.truncated).toBe(true)
       expect(page.resumeCursor).toBeUndefined()
     }
+  })
+
+  it('⑦g a MESSAGE-face token is refused by a list tool, naming the face that owns it (issue #72)', async () => {
+    const rig = await makeRig({
+      agent: { agents: [{ agentId: 'a1', name: 'A' }] as never, sessions: sessions(40) as never },
+    })
+    const before = rig.fake.readCallsFor('agent.sessions.list').length
+    // `cursor:<peer position>` is `cherry_read`'s own token shape. A list walk
+    // cannot use it, and forwarding it would ask the peer for a slice of the
+    // SESSION list at an offset taken from a MESSAGE history.
+    await expect(
+      rig.call('cherry_sessions', {
+        device: 'dev-A',
+        agentId: 'a1',
+        limit: 2,
+        cursor: 'cursor:1757923200000:9c1f0a2e-6b3d-4a71-8f55-2d6e0b1c7a44',
+      }),
+    ).rejects.toThrow(/a list token starts with `list:`/i)
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
   })
 
   it('⑦e each list tool stamps its own one-character code, and a numeric position stays short', async () => {
@@ -2506,7 +2525,7 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
     for (const [tool, args, code] of cases) {
       const page = (await rig.call(tool, { ...args, limit: 2 })) as ListPage
       expect(page.truncated).toBe(true)
-      expect(page.resumeCursor).toMatch(new RegExp(`^cursor:v2:${code}:[0-9a-f]{12}:[0-9a-f]{8}:[0-9a-f]{8}:`))
+      expect(page.resumeCursor).toMatch(new RegExp(`^list:v2:${code}:[0-9a-f]{12}:[0-9a-f]{8}:[0-9a-f]{8}:`))
       // A numeric peer position is a handful of digits: the whole token stays
       // under 60 characters where the old base64 form needed ~150.
       expect((page.resumeCursor as string).length).toBeLessThan(60)

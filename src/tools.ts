@@ -6243,6 +6243,19 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
     if (mangledRemainder(messageId)) refuse()
     return { kind: 'anchor', messageId }
   }
+  if (token.startsWith(LIST_RESUME_PREFIX)) {
+    // Issue #72, the other direction: a token the four list tools minted. The
+    // two faces are told apart by PREFIX — the peer's position inside a
+    // `cursor:` token is never inspected, so `cursor:list:20` above is still a
+    // message cursor while `list:…` is not. Forwarding one would hand the
+    // desktop a position it cannot parse, and it answers that by serving its
+    // FIRST page as if it were the continuation.
+    throw new Error(
+      'cherry_read: messagesResumeCursor is a LIST `resumeCursor` (`list:…`) — it resumes a list walk ' +
+        '(cherry_agents / cherry_workspaces / cherry_sessions / cherry_interactions), not a message history. ' +
+        'Omit the argument to read from the newest message, or pass the token this tool returned.',
+    )
+  }
   return refuse()
 }
 
@@ -6258,14 +6271,23 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
  * mismatched replay is refused HERE — before any RPC.
  *
  * Wire format (issue #70):
- * `cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>` — the
+ * `list:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>` — the
  * position verbatim and LAST. It replaced a base64 JSON blob (`{v,m,d,h,p}`)
  * that was ~2.3x longer and had no integrity check: measured over 20,000 random
  * single-character corruptions, 28.7% of the old tokens were ACCEPTED with a
  * different position, because the position is the one field a structural check
  * cannot validate. The compact form plus the checksum makes that class empty.
+ *
+ * The prefix is `list:` and NOT `cursor:` (issue #72): the message face already
+ * owns `cursor:` / `after:`, and while the two faces shared a prefix a list
+ * token was a legal `messagesResumeCursor` payload — it was forwarded to the
+ * desktop, which answers an unparseable position by serving its FIRST page, so
+ * "continue from here" silently re-read the newest page. Two faces, two
+ * prefixes: the refusal is a PREFIX check on either side, never an inspection
+ * of the peer's position (a position that merely starts with `list:` still
+ * travels verbatim inside its own `cursor:` token).
  */
-const LIST_RESUME_PREFIX = 'cursor:'
+const LIST_RESUME_PREFIX = 'list:'
 
 /**
  * The token's format marker (issue #70). It is a FIELD, not part of the prefix,
@@ -6403,15 +6425,37 @@ function parseListResumeCursor(value: unknown, binding: ListResumeBinding): stri
         'device and filters.',
     )
   }
-  if (typeof value !== 'string' || !value.startsWith(LIST_RESUME_PREFIX)) {
-    refuse('must be a `cursor:` token this tool emitted')
-  }
+  if (typeof value !== 'string') refuse('must be a `list:` token this tool emitted')
   const token = value as string
+  // Length first: the bound is about CALLER INPUT and must not depend on which
+  // face the string appears to belong to.
   if (token.length > MAX_LIST_TOKEN_CHARS) {
     throw new Error(
       `cursor is ${token.length} characters long, over the ${MAX_LIST_TOKEN_CHARS}-character ceiling for a ` +
         'resume token; omit `cursor` to read from the start.',
     )
+  }
+  if (token.startsWith(RESUME_CURSOR_PREFIX)) {
+    // Issue #72. Two faces, two prefixes: a token starting with `cursor:` was
+    // minted by `cherry_read`'s message face, and replaying it here would ask a
+    // LIST method for a slice at an offset taken from a MESSAGE history — a
+    // perfectly valid number that reads the wrong rows with no error anywhere.
+    // Until #70 the list face shared this prefix, so an old token is named
+    // FIRST: "start the walk over" is the only thing that works there, and it
+    // is not what this branch's other verdict says.
+    if (looksLikeV1ListToken(token.slice(RESUME_CURSOR_PREFIX.length))) {
+      throw new Error(
+        'cursor was issued by an older plugin version (a v1 list token, from before list tokens were ' +
+          'compact and checksummed), so it can no longer be verified; start this walk over with `cursor` omitted.',
+      )
+    }
+    refuse(
+      'is a MESSAGE-face token (`cursor:<peer position>`, i.e. a `messagesResumeCursor`), which a list walk ' +
+        'never issues — a list token starts with `list:`',
+    )
+  }
+  if (!token.startsWith(LIST_RESUME_PREFIX)) {
+    refuse('must be a `list:` token this tool emitted')
   }
   const raw = token.slice(LIST_RESUME_PREFIX.length)
   if (!raw.startsWith(`${LIST_TOKEN_VERSION}:`)) {
