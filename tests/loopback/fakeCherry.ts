@@ -654,6 +654,8 @@ export class FakeCherry {
   #authenticateFailure: FakeFailure | undefined
   #dropPings: boolean
   #requestDelayMs: number | undefined
+  /** Per-METHOD reply delays, layered over {@link #requestDelayMs}. */
+  #methodDelayMs = new Map<string, number>()
 
   // Observation surface.
   #socketCount = 0
@@ -1502,6 +1504,21 @@ export class FakeCherry {
   }
 
   /**
+   * Delays ONE method's reply, leaving every other method at its own pace.
+   *
+   * The global {@link setRequestDelay} is the wrong tool when the test must
+   * slow a request that happens AFTER a handshake and a subscription exists:
+   * delaying everything would also hold back the very calls that set the stage
+   * (or make the client's handshake look slow). A method delay is applied at
+   * reply time, in `#handleMethod`, so the arrival is still counted and the
+   * in-flight slot is still held for the duration.
+   */
+  setMethodDelay(method: string, ms: number | undefined): void {
+    if (ms === undefined) this.#methodDelayMs.delete(method)
+    else this.#methodDelayMs.set(method, ms)
+  }
+
+  /**
    * Abruptly closes every LIVE socket while leaving the listener up, so the
    * client observes a mid-run link loss and its own supervisor decides what to
    * do next (backoff → reconnect). Distinct from {@link stop}, which also takes
@@ -1724,7 +1741,7 @@ export class FakeCherry {
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    const delay = this.#requestDelayMs ?? this.#options.requestDelayMs
+    const delay = this.#methodDelayMs.get(method) ?? this.#requestDelayMs ?? this.#options.requestDelayMs
     if (delay !== undefined) await sleep(delay)
     switch (method) {
       case 'connection.hello':

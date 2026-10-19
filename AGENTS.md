@@ -445,13 +445,18 @@ requests could absorb that wait — a 1 s window answering ~150 s later, the sha
   the stub receipt (`aggregateError` + `guidance`) exactly like a failed walk —
   the #3 invariant: a run's verdict and its identifiers survive a content
   failure. Before #21 a dead link there made `cherry_send` reject.
-  The IDLE face is the exception, and it is a known gap (issue #51): its
+  The IDLE face is different, and it is no longer a gap (issue #51): its
   `agent.sessions.get` is the §6 PRECONDITION that decides whether the session
-  is idle at all, taken before any answer exists — so there is nothing to
-  degrade to, and a budget that cut it would turn "is anything running?" into a
-  timeout error. That request keeps the transport's ordinary bounds (one
-  reconnect wait + one replay) and no deadline; the answer's own budget starts
-  after it.
+  is idle at all, so there is nothing to degrade to — but it now rides an
+  `AssemblyDeadline` of its own, anchored at TOOL ENTRY with the caller's window.
+  A spent budget FAILS the call with a guidance error: nothing was learned about
+  the run, so a retry is the recovery, and the caller is never handed a verdict
+  the snapshot never produced. Before this it was the one wait-answer request
+  with no absolute bound, and a flapping link could put 5–10 s of reconnect +
+  replay behind a 500 ms window. The idle answer's HISTORY walk keeps its own
+  anchor AFTER the snapshot, deliberately: a snapshot that was slow but
+  succeeded must not leave the walk with nothing, so the two phases are bounded
+  separately (a pathological call can spend both).
 
 What this is NOT: a global time budget for `cherry_read` or the list tools. They
 have no deadline argument, so nothing above applies to them — their bounds are

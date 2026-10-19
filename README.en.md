@@ -168,10 +168,15 @@ with it).
   `cherry_read`. The same budget covers the session snapshot the **terminal and
   timeout answers** read: when it cannot be read the answer degrades
   (`aggregateError` + `guidance`) instead of losing the run's verdict and its
-  identifiers. **Exception**: the snapshot `cherry_wait` takes to decide whether
-  anything is in flight is a *precondition* — there is no answer yet to degrade
-  — so it keeps the transport's ordinary bounds (one reconnect wait + one
-  replay) and is not inside the budget (#51).
+  identifiers. The snapshot `cherry_wait` takes to decide whether anything is in
+  flight is a *precondition* — there is no answer yet to degrade — and it is
+  bounded too, by an assembly deadline anchored at tool entry (your window plus
+  the tail). When that budget is spent the call **fails with guidance**: nothing
+  is known about the run, so a retry is the recovery — and a 500 ms window can no
+  longer turn into 5–10 s of reconnect-plus-replay (#51). After a successful
+  snapshot the idle answer's history walk starts its own budget, so a slow but
+  successful snapshot does not squeeze the walk to nothing. The cost is that the
+  two phases are counted separately: a pathological call can spend both.
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is

@@ -3533,8 +3533,11 @@ class CherryToolEngine {
       description:
         'Wait for a session\'s in-flight execution to reach a terminal state, without sending ' +
         'anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight ' +
-        'execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, ' +
-        'never a park. Use it to resume after answering an interaction. Its message walk is bounded ' +
+        'execution answers with its current snapshot (status `idle`) and never parks for the window; ' +
+        'the snapshot that decides idleness is bounded too, by a deadline derived from the same ' +
+        'window, so a device that cannot answer it in time fails the call with guidance (whether ' +
+        'anything is running is then unknown). Use it to resume after answering an interaction. Its ' +
+        'message walk is bounded ' +
         'like `cherry_send`\'s, with the same verdict wording: a cut drops the OLDER messages, and a ' +
         'returned message missing its own parts carries `incomplete`. A cut whose reason is `deadline` ' +
         'means the ANSWER\'s own assembly budget ran out — the content read so far is still returned.',
@@ -3557,15 +3560,52 @@ class CherryToolEngine {
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
+        const window = waitTimeout(args['timeoutMs'])
+        // THE PRECONDITION IS INSIDE THE CALLER'S BUDGET TOO (issue #51). This
+        // snapshot decides whether the session is idle at all, and it used to be
+        // the ONE wait-answer request with no absolute bound: on a flapping link
+        // it could spend `transportRetryWaitMs` waiting for a reconnect and then
+        // its one replay — 5-10 s after a 500 ms window. It now rides an
+        // {@link AssemblyDeadline} anchored at TOOL ENTRY, on the same clock and
+        // with the same window+tail shape as the answer's own budget, so this
+        // PHASE is bounded by the patience the caller declared. The idle
+        // answer's history walk is bounded by its own instant (see below): the
+        // two phases are counted separately, so a pathological call can spend
+        // both.
+        //
+        // It does NOT get the degrade arm the terminal/timeout faces have: there
+        // is no answer yet to degrade (idleness is only known FROM this
+        // snapshot), so a spent budget rejects. The rejection carries guidance
+        // instead of being a bare timeout: nothing was learned about the run, and
+        // "the device did not answer" is exactly the condition a retry resolves.
+        const entryAt = performance.now()
+        const precondition = new AssemblyDeadline(entryAt, window)
+        const preconditionBudgetMs = Math.round(precondition.instant - entryAt)
 
         await this.#ensureSubscription(record.deviceId, sessionId)
         const subscriptions = this.#deps.subs(record.deviceId)
 
         // The session snapshot is the authority on whether anything is running.
-        const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
-          string,
-          unknown
-        >
+        let sessionResult: Record<string, unknown>
+        try {
+          sessionResult = (await connection.rpc.request(
+            'agent.sessions.get',
+            { sessionId },
+            { deadline: precondition.instant },
+          )) as Record<string, unknown>
+        } catch (error) {
+          // ONLY the budget's expiry is converted. A peer refusal, an offline
+          // device or an integrity failure is still itself: reporting it as a
+          // timeout would point the caller at their own clock.
+          if (!deadlineExhaustion(error)) throw error
+          throw new Error(
+            `cherry_wait: could not read the session snapshot for ${sessionId} on ${record.deviceId} ` +
+              `within the wait answer's ${preconditionBudgetMs} ms budget (the ${window} ms window plus ` +
+              'its bounded tail); whether anything is running is UNKNOWN — retry `cherry_wait` (a later ' +
+              'call rebuilds the subscription), and check `cherry_devices` if the device stays silent',
+            { cause: error },
+          )
+        }
         const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
         const activeExecutionId = optionalString(session['activeExecutionId'])
 
@@ -3601,11 +3641,12 @@ class CherryToolEngine {
           // The answer's own budget (issue #21) starts HERE, for an idle
           // answer: nothing was waited for, so the caller's window is what its
           // history read may spend (plus the bounded tail — see
-          // `AssemblyDeadline`). Anchoring it at the assembly rather than at the
-          // tool entry is deliberate: the window is the WAIT's, and there was
-          // no wait; the snapshot above is the §6 precondition, not part of the
-          // answer's content.
-          const answerDeadline = new AssemblyDeadline(performance.now(), waitTimeout(args['timeoutMs']))
+          // `AssemblyDeadline`). The snapshot above now has its own bound
+          // (issue #51); anchoring the WALK after it is deliberate — a snapshot
+          // that was slow but succeeded must not leave the history read with
+          // nothing. The cost is stated: the two phases are bounded separately,
+          // so a pathological call can spend both.
+          const answerDeadline = new AssemblyDeadline(performance.now(), window)
           const assembled = await this.#assembledTerminalMessages(
             connection,
             sessionId,
@@ -3632,7 +3673,7 @@ class CherryToolEngine {
         }
 
         return this.#awaitRun(connection, subscriptions, sessionId, {
-          timeoutMs: waitTimeout(args['timeoutMs']),
+          timeoutMs: window,
           // MONOTONIC, not `Date.now()`: see `#awaitRun`'s `startedAt`.
           startedAt: performance.now(),
           executionId: activeExecutionId,
