@@ -4317,6 +4317,61 @@ const CACHE_KEY_SEPARATOR = "\0";
 */
 const CACHE_ENTRIES_PER_DEVICE = 256;
 /**
+* CAP on ONE cached parts page, in bytes (issue #15) — measured the same cheap
+* way {@link AGGREGATE_BYTES} measures a message, with
+* `JSON.stringify(page.items).length`, i.e. the same wire-cost proxy.
+*
+* What an entry holds is a message's part RECORDS: ids, kinds, and either an
+* inline text body (up to the peer's 4,096-character `INLINE_TEXT_LIMIT` per
+* part) or a `{ref}` — never the resolved text, which is re-fetched and
+* re-verified on every read. That is the whole point of caching the list result
+* rather than the projection.
+*
+* Note what this does NOT bound: an entry is the AGGREGATED page, i.e. EVERY
+* part record of one message, and {@link DEFAULT_PARTS_SAFETY_BOUND} lets a
+* parts walk collect up to 10,000 of them. Ten thousand inline bodies at 4,096
+* characters is ~40 MB, far ABOVE this cap — so the bound is not decorative.
+* It bites on exactly the message a cache can least afford to hold: one whose
+* records alone would evict everything else for nothing (the `{ref}` byte
+* payload is not what is being cached). That it rarely bites for ordinary
+* history is an expectation, not a measurement.
+*
+* It stays as the guard it is: the protocol bounds neither a part's inline text
+* nor a message's part count, so an entry that did outgrow the device budget on
+* its own would evict every other message — a cache that thrashes on the one
+* entry it cannot afford to lose. An over-cap entry is simply walked FRESH on
+* every read: correct, and the same cost a cold process pays.
+*
+* INJECTABLE for tests (`messageCacheEntryBytes`), because no loopback fixture
+* should have to allocate a megabyte to prove the bound.
+*/
+const MESSAGE_CACHE_ENTRY_BYTES = 1048576;
+/**
+* BYTE BUDGET for ONE DEVICE's parts-page cache, across every session that
+* device served (issue #15).
+*
+* Derivation: it equals {@link MAX_EXTERNALIZED_BYTES}, the 32 MiB the official
+* client and this bridge already accept as the ceiling for a single `{ref}` —
+* the largest piece of content the read path will ever assemble. An entry is
+* the AGGREGATED part-record list (inline text included, `{ref}` payload
+* excluded), so this is far more headroom than ordinary history needs; it is
+* chosen to be a bound that never forces churn on ordinary traffic, not a
+* memory claim of its own.
+*
+* PER DEVICE, not global, for the same reason the session caches are: the
+* cached lists describe one peer, and a busy desktop must not evict a quiet
+* one's.
+*
+* Eviction is FIFO (`Map` insertion order, oldest first) — the policy
+* {@link CherryToolEngine.#remember} documents, and for the same reason: an
+* evicted entry costs one re-walk from a peer that still holds the message
+* authoritatively, never a wrong answer.
+*
+* INJECTABLE for tests (`messageCacheBytesPerDevice`), because a test cannot
+* drive 32 MiB honestly.
+*/
+const MESSAGE_CACHE_BYTES_PER_DEVICE = 33554432;
+/**
 * EMPTY-PAGE RUN limit for every aggregate walk. The desktop's pinned-list walk
 * legally answers ONE empty page with an advancing cursor (the pin→entity
 * section transition, `{items: [], nextCursor: 'entity:'}`), so a single empty
@@ -4635,6 +4690,68 @@ var CherryToolEngine = class {
 	*/
 	#cacheEntriesPerDevice;
 	/**
+	* One cached parts page's size ceiling and the device's whole byte budget
+	* (issue #15) — see {@link MESSAGE_CACHE_ENTRY_BYTES} and
+	* {@link MESSAGE_CACHE_BYTES_PER_DEVICE}. Both injected, so the bounds are
+	* policy rather than magic numbers scattered through the store below.
+	*/
+	#messageCacheEntryBytes;
+	#messageCacheBytesPerDevice;
+	/**
+	* The parts pages already walked, keyed `<deviceId>\0<messageId>`.
+	*
+	* WHAT IS HELD is the RESULT of `agent.parts.list` — the raw part records plus
+	* the walk's verdict — NOT the projection built from it. Every face projects
+	* through {@link CherryToolEngine.#projectMessage}, so a hit skips that
+	* message's `agent.parts.list` walk and then runs the ordinary projection loop
+	* over the cached records: every `{ref}` is still fetched and sha256-verified
+	* on every read.
+	*
+	* THAT IS THE WHOLE ARGUMENT. A message revision fences the parts RECORDS the
+	* peer serves — its own `agent.parts.list` raises `REVISION_EXPIRED` for a
+	* stale `messageRevision` — and says nothing about the content store behind a
+	* `{ref}`. Caching the PROJECTION would therefore serve text the peer has
+	* since corrupted, turning a `ContentIntegrityError` into a confident answer.
+	* Caching the RECORDS re-resolves the content on every hit, so the integrity
+	* guarantee is untouched and the staleness class is exactly the peer's own,
+	* with no new one. The trade-off is stated rather than hidden: externalized
+	* content still costs its `agent.content.read` walk on every read (the 2.1.6
+	* common case); what the cache saves is the list walk.
+	*
+	* NEVER CACHED (each is a correctness or a permanence argument, not a memory
+	* one):
+	*
+	*  - a row with an EMPTY revision — there is no fence to trust, so the entry
+	*    could never be validated against anything;
+	*  - a TRUNCATED page — the circuit breaker stopped the walk, so the list is
+	*    short. Remembering it would make a transient short walk permanent;
+	*  - a page above {@link MESSAGE_CACHE_ENTRY_BYTES} — walked fresh every time
+	*    rather than allowed to crowd out every other message.
+	*
+	* EVERYTHING ELSE MAY BE HELD — including a message whose parts failed to
+	* resolve. That degradation happens at PROJECTION time: the cached records
+	* are still the peer's complete answer, the next read re-attempts every part,
+	* and an incomplete projection is no longer a reason to forget a good list.
+	*
+	* BYTES, not entries: a part record carries inline text (bounded only by the
+	* paste the user made) and a `{ref}` descriptor, so a count cap would bound
+	* the map without bounding its memory. {@link CherryToolEngine.#deviceMessageCacheBytes}
+	* carries the running total, maintained ONLY by
+	* {@link CherryToolEngine.#dropCachedMessage} (every removal) and by the
+	* insert/refresh arithmetic in
+	* {@link CherryToolEngine.#rememberPartsPage}, so it cannot drift from the
+	* map.
+	*/
+	#messageCache = /* @__PURE__ */ new Map();
+	/**
+	* The running byte total of {@link CherryToolEngine.#messageCache}, per
+	* device. Kept beside the map rather than recomputed on eviction: summing a
+	* device's entries on every insert would make a long session quadratic.
+	* A device with no live entry has its key REMOVED (not zeroed), so the map
+	* describes exactly the devices that hold cache memory.
+	*/
+	#deviceMessageCacheBytes = /* @__PURE__ */ new Map();
+	/**
 	* Connections whose state channel this engine already joined.
 	*
 	* `connect()` is called on EVERY tool entry point, so the watch is installed
@@ -4652,6 +4769,8 @@ var CherryToolEngine = class {
 		this.#externalizedByteCap = Math.max(1, Math.floor(options.externalizedByteCap ?? MAX_EXTERNALIZED_BYTES));
 		this.#waitPollMs = Math.max(1, Math.floor(options.waitPollMs ?? DEFAULT_WAIT_POLL_MS));
 		this.#cacheEntriesPerDevice = Math.max(1, Math.floor(options.cacheEntriesPerDevice ?? CACHE_ENTRIES_PER_DEVICE));
+		this.#messageCacheEntryBytes = Math.max(1, Math.floor(options.messageCacheEntryBytes ?? MESSAGE_CACHE_ENTRY_BYTES));
+		this.#messageCacheBytesPerDevice = Math.max(1, Math.floor(options.messageCacheBytesPerDevice ?? MESSAGE_CACHE_BYTES_PER_DEVICE));
 	}
 	definitions() {
 		return [
@@ -5107,7 +5226,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` whenever a stop point can be named honestly (it is absent when the walk reached the peer's last page), and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` whenever a stop point can be named honestly (it is absent when the walk reached the peer's last page), and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5245,18 +5364,50 @@ var CherryToolEngine = class {
 			...truncated && resumeToken !== void 0 ? { messagesResumeCursor: resumeToken } : {}
 		};
 	}
-	/** One message: list ALL its parts under the message's OWN revision, then aggregate. */
+	/**
+	* One message: obtain its parts under the message's OWN revision, then resolve
+	* each part's content.
+	*
+	* THE ONE PROJECTION every face uses (`cherry_read` and the terminal/timeout/
+	* idle aggregates), which is why the read cache lives HERE and nowhere else:
+	* the parts lookup is at the top, the store right after a miss, and no caller
+	* keeps a second path.
+	*
+	* TWO STEPS, and the cache sits between them on purpose:
+	*
+	*  1. THE LIST — the parts RECORDS, from `agent.parts.list` or, on a hit, from
+	*     the cached page ({@link CherryToolEngine.#cachedPartsPage}). Fenced by
+	*     the row's message revision, which is the peer's own rule (it refuses
+	*     `agent.parts.list` with `REVISION_EXPIRED` for a stale
+	*     `messageRevision`). A hit is therefore the list a fresh walk would have
+	*     returned UNDER THAT RULE — no stronger: the revision is
+	*     `String(Date.parse(updatedAt))`, a millisecond clock, so two writes
+	*     inside one millisecond keep the revision equal while the parts differ.
+	*     That is the protocol's own assumption about the fence, shared by every
+	*     revision-checked operation, not something the cache introduces.
+	*  2. THE PROJECTION — {@link CherryToolEngine.#projectPart} over those
+	*     records, which fetches and sha256-verifies every `{ref}`. This step runs
+	*     on EVERY read, hit or miss: the revision fence says nothing about the
+	*     content store behind a ref, so the cache must never be able to serve
+	*     unverified bytes. A missed re-walk therefore costs one
+	*     `agent.parts.list`; a hit costs zero of those and still pays every
+	*     content read it owes.
+	*/
 	async #projectMessage(connection, sessionId, raw) {
 		const messageId = messageIdOf(raw);
 		const revision = String(raw["revision"] ?? "");
-		const page = await this.#aggregate(connection, "agent.parts.list", {
-			sessionId,
-			messageId,
-			messageRevision: revision
-		}, (result) => ({
-			...arrayOf(result["items"]),
-			nextCursor: result["nextCursor"]
-		}), Number.POSITIVE_INFINITY, this.#partsSafetyBound, PARTS_LIST_PAGE_CLAMP);
+		let page = this.#cachedPartsPage(connection.record.deviceId, messageId, revision);
+		if (page === void 0) {
+			page = await this.#aggregate(connection, "agent.parts.list", {
+				sessionId,
+				messageId,
+				messageRevision: revision
+			}, (result) => ({
+				...arrayOf(result["items"]),
+				nextCursor: result["nextCursor"]
+			}), Number.POSITIVE_INFINITY, this.#partsSafetyBound, PARTS_LIST_PAGE_CLAMP);
+			this.#rememberPartsPage(connection.record.deviceId, messageId, revision, page);
+		}
 		const parts = [];
 		for (const part of page.items) parts.push(await this.#projectPart(connection, sessionId, part));
 		const partsTruncated = page.truncated ? page.truncationReason ?? "safety-bound" : void 0;
@@ -6179,6 +6330,123 @@ var CherryToolEngine = class {
 		return `${deviceId}\u0000${sessionId}\u0000${interactionId}`;
 	}
 	/**
+	* One message's cache key (issue #15). Device-scoped for exactly the reason
+	* {@link CherryToolEngine.#cacheKey} is: a message id is the PEER's, and two
+	* desktops can hand out the same one. The revision is deliberately NOT part of
+	* the key — it is the FENCE, checked on lookup, so a moved revision finds the
+	* stale entry, rejects it, and the store overwrites it in place (see
+	* {@link CherryToolEngine.#rememberPartsPage}).
+	*/
+	#messageKey(deviceId, messageId) {
+		return `${deviceId}${CACHE_KEY_SEPARATOR}${messageId}`;
+	}
+	/**
+	* The cached parts page of one message, or `undefined` when this call must
+	* walk `agent.parts.list`.
+	*
+	* THE ONE LOOKUP every face reaches through
+	* {@link CherryToolEngine.#projectMessage}, and it returns the PARTS LIST, not
+	* a projection: the caller re-resolves every part's content from it, so a hit
+	* never short-circuits the digest verification. A hit requires a stored entry
+	* whose revision EQUALS the revision the current `agent.messages.list` row
+	* carries; anything else is a miss, which costs exactly the walk a cold
+	* process pays.
+	*
+	* The page is handed out BY REFERENCE, and that is safe precisely because it
+	* is a list of RECORDS: the projection loop only reads it (it builds new part
+	* objects), so no caller can mutate what a later hit reads.
+	*/
+	#cachedPartsPage(deviceId, messageId, revision) {
+		const lookupKey = this.#messageKey(deviceId, messageId);
+		const found = this.#messageCache.get(lookupKey);
+		if (found === void 0 || found.revision !== revision) return void 0;
+		return found.page;
+	}
+	/**
+	* Holds one `agent.parts.list` RESULT for as long as the peer keeps serving
+	* the message under the same revision, and makes room first.
+	*
+	* The refusal list is the mirror of {@link CherryToolEngine.#cachedPartsPage}
+	* and belongs HERE, at the one store path, so no future caller can cache
+	* something the lookup would never serve correctly:
+	*
+	*  - `revision === ''` — nothing to fence;
+	*  - `page.truncated` — the parts walk was cut by the circuit breaker, so the
+	*    list is SHORT. A short walk is a transient fault and must be retried,
+	*    never remembered;
+	*  - `bytes > messageCacheEntryBytes` — walked fresh every time instead.
+	*
+	* NOT a refusal: a message whose parts then FAILED to resolve. That
+	* degradation happens in the projection loop, not in the list, so the held
+	* records are still the peer's complete answer and the next read re-attempts
+	* every part. (The previous, projection-cached design had to refuse an
+	* `incomplete` message because the projection WAS the entry, and holding a
+	* degraded one would have made a transient content failure permanent for as
+	* long as the revision stood.)
+	*
+	* EVICTION IS FIFO, oldest insertion first, and it drops the device's entries
+	* only: `Map` iterates in insertion order, which IS the policy, so no recency
+	* structure has to be kept in sync. A refresh (`set` on an existing key) keeps
+	* its position — deliberately not delete-then-set, which would make this LRU
+	* (the reason is spelled out in {@link CherryToolEngine.#remember}).
+	*
+	* The entry is sized with `JSON.stringify(page.items).length`, the same cheap
+	* approximation of wire cost {@link AGGREGATE_BYTES} uses — and here it is a
+	* fair one, because what is held IS a subset of what travelled on the wire.
+	* What it keeps OUT is the `{ref}` text (the multi-megabyte half); what it
+	* KEEPS IN is inline part text, up to the peer's 4,096-character
+	* `INLINE_TEXT_LIMIT` per part, and the entry is the AGGREGATED page rather
+	* than one 3-item RPC page. A few hundred fat inline parts therefore reach
+	* {@link MESSAGE_CACHE_ENTRY_BYTES}, which is what the bound is for: no single
+	* entry may evict the device's working set. That it rarely bites for real
+	* traffic is an expectation, not a measurement.
+	*/
+	#rememberPartsPage(deviceId, messageId, revision, page) {
+		if (revision === "") return;
+		if (page.truncated) return;
+		const bytes = JSON.stringify(page.items).length;
+		if (bytes > Math.min(this.#messageCacheEntryBytes, this.#messageCacheBytesPerDevice)) return;
+		const key = this.#messageKey(deviceId, messageId);
+		const previous = this.#messageCache.get(key)?.bytes ?? 0;
+		const growth = Math.max(0, bytes - previous);
+		let evicted = 0;
+		for (const candidate of [...this.#messageCache.keys()]) {
+			if ((this.#deviceMessageCacheBytes.get(deviceId) ?? 0) + growth <= this.#messageCacheBytesPerDevice) break;
+			if (!candidate.startsWith(`${deviceId}${CACHE_KEY_SEPARATOR}`)) continue;
+			if (candidate === key) continue;
+			this.#dropCachedMessage(candidate);
+			evicted += 1;
+		}
+		this.#messageCache.set(key, {
+			revision,
+			bytes,
+			page
+		});
+		this.#deviceMessageCacheBytes.set(deviceId, (this.#deviceMessageCacheBytes.get(deviceId) ?? 0) - previous + bytes);
+		if (evicted > 0) console.warn(`[cherry-remote] message cache for device ${deviceId} reached its ${this.#messageCacheBytesPerDevice}-byte budget; evicted ${evicted} ${evicted === 1 ? "oldest entry" : "oldest entries"} (they will be re-read from the desktop on next use)`);
+	}
+	/**
+	* Removes one entry and returns its bytes to the device's total — the ONE
+	* path by which an entry LEAVES {@link CherryToolEngine.#messageCache}.
+	*
+	* One delete path is what keeps {@link CherryToolEngine.#deviceMessageCacheBytes}
+	* true: every route that removes (an eviction, a device being forgotten) runs
+	* through here, so no caller can drop from the map and leave the total
+	* counting bytes nothing holds. (A REFRESH is not a removal — it replaces the
+	* value in place and the store corrects the total by the size difference.)
+	* A device whose last entry leaves has its total key REMOVED rather than
+	* zeroed, so the totals map describes exactly the devices holding memory.
+	*/
+	#dropCachedMessage(key) {
+		const entry = this.#messageCache.get(key);
+		if (entry === void 0) return;
+		this.#messageCache.delete(key);
+		const deviceId = key.slice(0, key.indexOf(CACHE_KEY_SEPARATOR));
+		const remaining = (this.#deviceMessageCacheBytes.get(deviceId) ?? 0) - entry.bytes;
+		if (remaining > 0) this.#deviceMessageCacheBytes.set(deviceId, remaining);
+		else this.#deviceMessageCacheBytes.delete(deviceId);
+	}
+	/**
 	* The ONE write path into {@link CherryToolEngine.#revisionCache} and
 	* {@link CherryToolEngine.#executionCache}.
 	*
@@ -6295,6 +6563,7 @@ var CherryToolEngine = class {
 		for (const key of [...this.#revisionCache.keys()]) if (key.startsWith(prefix)) this.#forget(this.#revisionCache, key);
 		for (const key of [...this.#executionCache.keys()]) if (key.startsWith(prefix)) this.#forget(this.#executionCache, key);
 		for (const key of [...this.#interactionCache.keys()]) if (key.startsWith(prefix)) this.#forget(this.#interactionCache, key);
+		for (const key of [...this.#messageCache.keys()]) if (key.startsWith(prefix)) this.#dropCachedMessage(key);
 	}
 	/**
 	* The session's current idle revision, from the SUBSCRIPTION CACHE.

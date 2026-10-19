@@ -20,6 +20,23 @@ surface change.
   error naming the message id, and an anchor scan is bounded by
   `MAX_ANCHOR_SCAN_PAGES` (500 pages) — both loud, never an empty page presented
   as "no older history".
+- `feat(tools)`: a read cache for message part LISTS (#15). The
+  `agent.parts.list` result — the raw part records plus the walk's verdict — is
+  held per message and reused while `agent.messages.list` still reports the same
+  revision, so a repeated read of a quiet session costs no `agent.parts.list`
+  RPC for an unchanged message; the terminal/timeout/idle aggregates share the
+  same cache. A hit still re-projects the records: every externalized `{ref}` is
+  re-fetched through `agent.content.read` and sha256-verified on every read, so
+  the cache never serves unverified bytes and a tampered content store still
+  fails the read. What it saves is the list walk; what it holds is the part
+  RECORDS (the resolved `{ref}` text is never retained, though inline part text
+  is). Entries are never held for a row with no revision, for a TRUNCATED parts
+  page (a circuit-broken walk must be retried), or above either byte bound (1
+  MiB per entry, 32 MiB per device — an entry that cannot fit the device budget
+  is refused whatever the entry cap says). Eviction is FIFO, a refresh keeps the
+  entry's insertion position and makes room for its GROWTH, and each evicting
+  insert warns once naming only the device and the count; the entries are
+  dropped with the device's session caches when it goes offline.
 
 ### Changed
 
