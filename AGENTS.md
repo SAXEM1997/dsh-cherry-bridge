@@ -270,10 +270,12 @@ verifies every byte it hands back.
   marker and `#publicMessage` that existed only to support it) is gone.
 - **Never cached**: a row whose revision is EMPTY (no fence to trust —
   defensive only: the protocol's `messageRevision` is a strict decimal, so no
-  test can drive it), a TRUNCATED parts page (the circuit breaker stopped the
-  walk, so the list is short — a transient fault must be retried, never
-  remembered), and a page above `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB; walked fresh
-  every time rather than allowed to crowd out every other message).
+  test can drive it), a TRUNCATED parts page (the walk stopped early — the
+  circuit breaker, or a wait answer's deadline — so the list is short; a
+  transient fault must be retried, never remembered; the refusal is
+  reason-blind so a future reason cannot reintroduce the bug), and a page above
+  `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB; walked fresh every time rather than
+  allowed to crowd out every other message).
 - **A failed part is NOT a reason to forget the list.** Degradation happens in
   the projection step; the held records are still the peer's complete answer and
   the next read re-attempts every part. (The projection-cached design had to
@@ -377,18 +379,25 @@ requests could absorb that wait — a 1 s window answering ~150 s later, the sha
 - **Every wait is charged to it, where the wait happens.** The rpc layer clamps
   a request's own timeout to `min(timeoutMs, remaining)` (so a budget farther
   away never lengthens one, and one stuck request cannot eat a whole answer);
-  the connection caps the reconnect wait by the remaining budget and refuses a
-  replay once it has expired (`RpcDeadlineExceededError`). The walk re-judges
-  the deadline BEFORE every request so a spent budget never spends an admission
-  and a round trip, and between messages so one message's parts walk cannot
-  start with no time left.
-- **A spent budget is a STOP, not a failure.** The message walk, the parts walk
-  and each content slice all stop where they are and report `'deadline'` — the
-  third `truncationReason`, beside `'limit'` and `'aggregate-bytes'` — and the
-  content already read is returned (spec §3.6: a timeout answer exists to hand
-  back partial content). A message whose own parts were cut carries
-  `partsTruncated: 'deadline'` + `incomplete`; a `{ref}` that could not be
-  verified in time is `unavailable` (the degradable class). **Only** the two
+  the connection refuses a request — and a replay — once it has expired
+  (`RpcDeadlineExceededError`), caps the reconnect wait by the remaining budget,
+  and judges the PACING ADMISSION before taking it (a spent budget buys no
+  slot) as well as after (taking one can consume the last of the budget). The
+  walk re-judges the deadline BEFORE every request so a spent budget never
+  spends an admission and a round trip, and between messages so one message's
+  parts walk cannot start with no time left. One bound is left over: a request
+  ALREADY queued for its pacing slot is released by the limiter, so it can be
+  refused up to one `#minGapMs` late (36 ms shared, 5 ms content). Refusing it
+  earlier needs deadline-aware pacing — a separate piece of work.
+- **A spent budget is a STOP, not a failure.** The message walk and the parts
+  walk stop where they are and report `'deadline'` — the third
+  `truncationReason`, beside `'limit'` and `'aggregate-bytes'` — and the content
+  already read is returned (spec §3.6: a timeout answer exists to hand back
+  partial content). A message whose own parts were cut carries
+  `partsTruncated: 'deadline'` + `incomplete`. A CONTENT slice has no verdict of
+  its own to report: it is one part inside a message, so the part is marked
+  `unavailable` (the degradable class — the bytes could not be verified) and the
+  message's ordinary projection flags it `incomplete`. **Only** the two
   time-exhaustion classes are converted: a peer refusal, an offline device or an
   integrity failure after the deadline still surfaces as itself, because
   reporting it as `'deadline'` would send the caller looking at their own clock.
@@ -398,12 +407,19 @@ requests could absorb that wait — a 1 s window answering ~150 s later, the sha
   DERIVED from the deadline, which is a fact about how the error was produced.
   A plain client timeout (the 60 s default) is not the budget and is not
   converted.
-- **The snapshot is inside the budget and inside the degrade arm.** Every wait
-  answer starts with `agent.sessions.get` (it carries `historyRevision`). It
-  rides the same deadline, and its failure degrades to the stub receipt
-  (`aggregateError` + `guidance`) exactly like a failed walk — the #3 invariant:
-  a run's verdict and its identifiers survive a content failure. This covers
-  BOTH wait faces; before #21 a dead link there made `cherry_send` reject.
+- **The snapshot is inside the budget and inside the degrade arm — on the
+  terminal and timeout faces.** Both start with `agent.sessions.get` (it carries
+  `historyRevision`); it rides the same deadline, and its failure degrades to
+  the stub receipt (`aggregateError` + `guidance`) exactly like a failed walk —
+  the #3 invariant: a run's verdict and its identifiers survive a content
+  failure. Before #21 a dead link there made `cherry_send` reject.
+  The IDLE face is the exception, and it is a known gap (issue #51): its
+  `agent.sessions.get` is the §6 PRECONDITION that decides whether the session
+  is idle at all, taken before any answer exists — so there is nothing to
+  degrade to, and a budget that cut it would turn "is anything running?" into a
+  timeout error. That request keeps the transport's ordinary bounds (one
+  reconnect wait + one replay) and no deadline; the answer's own budget starts
+  after it.
 
 What this is NOT: a global time budget for `cherry_read` or the list tools. They
 have no deadline argument, so nothing above applies to them — their bounds are

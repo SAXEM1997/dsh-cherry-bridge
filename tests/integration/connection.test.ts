@@ -1832,6 +1832,46 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
   }, 20_000)
 
+  it('⑰ (issue #21) a request whose deadline is ALREADY spent does not buy a pacing admission', async () => {
+    // Review finding 3: the admission (one `#minGapMs` per request) used to be
+    // taken before the post-admission deadline guard, so a walk that kept asking
+    // after its budget was gone paid one queueing gap per remaining part — up to
+    // ~1 s of overshoot on a "absolute" instant. With a 2/s shared budget the
+    // gap is ceil(1150/2) = 575 ms, so the two behaviours are far apart: refuse
+    // before the admission (fast) vs after it (≥575 ms).
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: { heartbeatMs: 60_000 },
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 60_000,
+      transportRetryWaitMs: 5_000,
+      rateBudgetPerSecond: 2,
+    })
+    await connection.connect()
+
+    // Spend the tier's only admission so the NEXT request cannot be admitted
+    // for ~575 ms.
+    await connection.rpc.request('connection.ping', { nonce: 'first' })
+
+    const started = Date.now()
+    const error = await connection.rpc
+      .request('agent.agents.list', {}, { deadline: performance.now() - 1 })
+      .catch((reason: unknown) => reason)
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(RpcDeadlineExceededError)
+    // Refused BEFORE the admission: no 575 ms gap was paid, and no request was
+    // put on the wire. (A request admitted just BEFORE expiry can still straddle
+    // it by at most one gap — the limiter, not the deadline, releases a queued
+    // request; that residue is documented in AGENTS.md.)
+    expect(elapsed).toBeLessThan(300)
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(0)
+  }, 20_000)
+
   it('⑭d a peer REFUSAL under a live link is neither reclassified nor retried', async () => {
     const identity = await createDeviceIdentity()
     // The fake has no interaction `i-1`, so the peer answers its own NOT_FOUND.

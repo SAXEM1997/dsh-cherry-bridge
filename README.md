@@ -131,8 +131,10 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   同样长度的时间」，下限 1 秒、上限 15 秒（即窗口 1 秒 → 最多再等 1 秒；窗口 20 秒 → 最多再等 15 秒）。
   链路抖动时不会再有「每个请求各等 5 秒重连」把回答拖到几分钟之后；时限用尽就停走查，
   已读到的内容照常返回并标 `messagesTruncationReason: "deadline"`，更旧的历史用 `cherry_read` 续读。
-  同一条时限也覆盖读会话快照：快照读不到时回执降级（`aggregateError` + `guidance`），
-  不会把已经确定的运行结局（`status` 与各 id）一起丢掉。
+  同一条时限也覆盖 **终态与超时回答**所读的会话快照：快照读不到时
+  回执降级（`aggregateError` + `guidance`），不会把已经确定的运行结局（`status` 与各 id）一起丢掉。
+  **例外**：`cherry_wait` 判断「会话是否还有在途执行」的那次快照是**前置查询**——此时还没有回答可降级，
+  所以它保持传输层原有的边界（一次重连等待 + 一次重放），不在该时限内（#51）。
 - **已知限制**：`cherry_respond` 让 DSH agent 可代替用户批准 Cherry 端审批卡（MVP 不加拦截层，
   信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；仅 `ws://`（Noise 加密），不做 TLS 直连。
 

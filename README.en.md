@@ -154,9 +154,13 @@ with it).
   turn each request's 5 s reconnect wait into minutes of extra latency; when the
   budget is spent the walk stops, the content already read is returned with
   `messagesTruncationReason: "deadline"`, and older history is reached with
-  `cherry_read`. The same budget covers the session snapshot: when it cannot be
-  read the answer degrades (`aggregateError` + `guidance`) instead of losing the
-  run's verdict and its identifiers.
+  `cherry_read`. The same budget covers the session snapshot the **terminal and
+  timeout answers** read: when it cannot be read the answer degrades
+  (`aggregateError` + `guidance`) instead of losing the run's verdict and its
+  identifiers. **Exception**: the snapshot `cherry_wait` takes to decide whether
+  anything is in flight is a *precondition* — there is no answer yet to degrade
+  — so it keeps the transport's ordinary bounds (one reconnect wait + one
+  replay) and is not inside the budget (#51).
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is

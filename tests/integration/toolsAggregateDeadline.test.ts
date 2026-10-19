@@ -279,7 +279,7 @@ describe('issue #21 T1: a post-deadline aggregate stops at ITS deadline and keep
   it('T2 an IDLE answer is bounded by the same rule (the wait never happened, the walk still must end)', async () => {
     const rig = await makeRig({
       requestDelayMs: RPC_DELAY_MS,
-      agent: { agents: [AGENT], sessions: [SESSION], messages: history(12) },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: history(20) },
     })
 
     const result = (await rig.call('cherry_wait', {
@@ -349,6 +349,21 @@ describe('issue #21 T5: a request that hangs is cut at the deadline, not at the 
     // THE BOUND: the answer came back on its budget. Without the derived
     // per-request timeout the hung part would ride the 60 s default.
     expect(elapsed).toBeLessThan(2_000)
+
+    // AND ITS SHORT PART LIST IS NOT REMEMBERED (issue #21 review finding 6a).
+    // The message's parts walk was cut, so the page is short — a transient
+    // state that must be retried, never cached: the next read has to re-walk
+    // it. The refusal itself is reason-blind (`page.truncated`), which is what
+    // makes it cover a `'deadline'` page as well as a `'safety-bound'` one.
+    const partsBefore = rig.fake.readCallsFor('agent.parts.list').length
+    const reread = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1 })) as {
+      messages: Array<{ messageId: string; parts: unknown[]; partsTruncated?: string }>
+    }
+    expect(reread.messages[0]?.messageId).toBe('m-0')
+    // The part is there this time: the re-walk was not served from a cache.
+    expect(reread.messages[0]?.parts.length).toBe(1)
+    expect(reread.messages[0]?.partsTruncated).toBeUndefined()
+    expect(rig.fake.readCallsFor('agent.parts.list').length).toBeGreaterThan(partsBefore)
   }, 20_000)
 })
 

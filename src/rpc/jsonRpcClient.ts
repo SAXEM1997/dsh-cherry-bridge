@@ -306,11 +306,20 @@ export class JsonRpcClient {
     // answer's budget, and it is why a timeout observed on a deadline-bounded
     // call means the budget ran out rather than that the peer is silent.
     const requestedTimeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs
-    const remainingMs =
-      opts?.deadline === undefined ? undefined : opts.deadline - performance.now()
-    const clampedMs = remainingMs === undefined ? undefined : Math.max(1, Math.ceil(remainingMs))
-    const clipped = clampedMs !== undefined && clampedMs < requestedTimeoutMs
-    const timeoutMs = clipped ? clampedMs : requestedTimeoutMs
+    // DERIVED AT ADMISSION, not at enqueue time (review finding 4). A request
+    // whose in-flight window is full waits in `queue`, and its timer only starts
+    // when `send()` admits it; a timeout computed now would begin D ms into the
+    // future once admitted, letting the request outlive the deadline by that
+    // queueing delay. The clamp is therefore recomputed inside `send()`, which
+    // is the single admission point.
+    const timeoutFor = (): { timeoutMs: number; clipped: boolean } => {
+      const remainingMs = opts?.deadline === undefined ? undefined : opts.deadline - performance.now()
+      if (remainingMs === undefined) return { timeoutMs: requestedTimeoutMs, clipped: false }
+      const clampedMs = Math.max(1, Math.ceil(remainingMs))
+      return clampedMs < requestedTimeoutMs
+        ? { timeoutMs: clampedMs, clipped: true }
+        : { timeoutMs: requestedTimeoutMs, clipped: false }
+    }
 
     return new Promise<T>((resolve, reject) => {
       const send = (abortError?: Error): void => {
@@ -335,6 +344,7 @@ export class JsonRpcClient {
         }
         // Register before writing: the response can land as soon as the write
         // is queued, and an unregistered id would be dropped as unknown.
+        const { timeoutMs, clipped } = timeoutFor()
         const timer = setTimeout(() => {
           this.finish(id, new RequestTimeoutError(method, timeoutMs, clipped))
         }, timeoutMs)

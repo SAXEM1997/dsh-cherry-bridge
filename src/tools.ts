@@ -1460,8 +1460,9 @@ class CherryToolEngine {
    *
    *  - a row with an EMPTY revision — there is no fence to trust, so the entry
    *    could never be validated against anything;
-   *  - a TRUNCATED page — the circuit breaker stopped the walk, so the list is
-   *    short. Remembering it would make a transient short walk permanent;
+   *  - a TRUNCATED page — the walk stopped early (the circuit breaker, or a
+   *    wait answer's deadline), so the list is short. Remembering it would make
+   *    a transient short walk permanent; the refusal is reason-blind;
    *  - a page above {@link MESSAGE_CACHE_ENTRY_BYTES} — walked fresh every time
    *    rather than allowed to crowd out every other message.
    *
@@ -1811,6 +1812,12 @@ class CherryToolEngine {
       // a reconnect wait on a request whose answer could not be used. Re-judged
       // here on every page for the same reason the transport re-judges it after
       // its pacing admission — every wait in between is charged to the budget.
+      //
+      // ORDERED BEFORE THE CEILING CHECK on purpose: when the budget and the
+      // caller's `limit` bind at the same item, `'deadline'` is reported. Both
+      // are true, but the deadline is the one that would stop the NEXT answer
+      // too, and `'limit'` would send the caller to raise a bound that cannot
+      // help. (Neither is wrong to re-ask: the stop point is emitted either way.)
       if (deadline !== undefined && deadline.expired()) {
         return this.#truncated(items, 'deadline', cursor)
       }
@@ -4115,9 +4122,13 @@ class CherryToolEngine {
    * something the lookup would never serve correctly:
    *
    *  - `revision === ''` — nothing to fence;
-   *  - `page.truncated` — the parts walk was cut by the circuit breaker, so the
-   *    list is SHORT. A short walk is a transient fault and must be retried,
-   *    never remembered;
+   *  - `page.truncated` — the parts walk stopped early, so the list is SHORT.
+   *    REASON-BLIND on purpose: the circuit breaker (`'safety-bound'`) and a
+   *    wait answer's spent budget (`'deadline'`) are both transient from the
+   *    cache's point of view — the next read may well complete — and the ONE
+   *    thing that must not happen is remembering a short list as if it were the
+   *    peer's complete answer. Matching on the reason would leave the next
+   *    reason word free to reintroduce that bug;
    *  - `bytes > messageCacheEntryBytes` — walked fresh every time instead.
    *
    * NOT a refusal: a message whose parts then FAILED to resolve. That

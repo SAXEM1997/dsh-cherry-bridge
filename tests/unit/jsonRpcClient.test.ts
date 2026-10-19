@@ -378,6 +378,40 @@ describe('JsonRpcClient', () => {
     expect(elapsed).toBeLessThan(2_000)
   }, 20_000)
 
+  it('④e (issue #21) a QUEUED request derives its deadline-clamped timeout at ADMISSION, not at enqueue', async () => {
+    // Review finding 4: the timeout used to be computed in `request()` and only
+    // START when a queued send was admitted, so a request that waited D ms in
+    // the in-flight queue outlived its deadline by D. The clamp is now derived
+    // inside `send()`, the single admission point.
+    //
+    // Two clocks, far apart on purpose: A holds the only slot for 200 ms, and
+    // B's deadline is 400 ms from enqueue. Re-clamped, B's timer is 200 ms and
+    // it rejects at ~400 ms; computed at enqueue it would be 400 ms and reject
+    // at ~600 ms.
+    // No harness: the peer half is never read, so neither request is answered
+    // and both settle by their own timeouts — which is the clock under test.
+    const { client } = await openLoopback({ maxInFlight: 1 })
+
+    const held = client.request('echo.pending', {}, { timeoutMs: 200 }).catch((reason: unknown) => reason)
+    const started = Date.now()
+    const queued = client
+      .request('echo.pending', {}, { deadline: performance.now() + 400 })
+      .catch((reason: unknown) => reason)
+
+    const error = (await queued) as Error
+    const elapsed = Date.now() - started
+    await held
+
+    expect(error).toBeInstanceOf(RequestTimeoutError)
+    // The timeout itself was derived from what was LEFT of the budget when the
+    // request was admitted, and it is reported as deadline-clipped.
+    expect((error as RequestTimeoutError).clampedByDeadline).toBe(true)
+    expect((error as RequestTimeoutError).timeoutMs).toBeLessThanOrEqual(400)
+    // 400 ms (admission-time clamp) vs 600 ms (enqueue-time clamp): the bound
+    // sits between them with >100 ms of slack on both sides.
+    expect(elapsed).toBeLessThan(520)
+  }, 20_000)
+
   it('④c (v0.1.3 P3-B4) an un-parameterised client waits 60s — the protocol idleMs — for an answer', async () => {
     // The default is a PROTOCOL decision, not a taste one: a client timeout
     // below `remoteLimits.idleMs` (60,000ms) calls a request dead while the

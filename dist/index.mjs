@@ -693,10 +693,21 @@ var JsonRpcClient = class {
 		const parsed = jsonRpcRequestSchema.safeParse(envelope);
 		if (!parsed.success) return Promise.reject(/* @__PURE__ */ new Error(`Invalid JSON-RPC request for method "${method}"`));
 		const requestedTimeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
-		const remainingMs = opts?.deadline === void 0 ? void 0 : opts.deadline - performance.now();
-		const clampedMs = remainingMs === void 0 ? void 0 : Math.max(1, Math.ceil(remainingMs));
-		const clipped = clampedMs !== void 0 && clampedMs < requestedTimeoutMs;
-		const timeoutMs = clipped ? clampedMs : requestedTimeoutMs;
+		const timeoutFor = () => {
+			const remainingMs = opts?.deadline === void 0 ? void 0 : opts.deadline - performance.now();
+			if (remainingMs === void 0) return {
+				timeoutMs: requestedTimeoutMs,
+				clipped: false
+			};
+			const clampedMs = Math.max(1, Math.ceil(remainingMs));
+			return clampedMs < requestedTimeoutMs ? {
+				timeoutMs: clampedMs,
+				clipped: true
+			} : {
+				timeoutMs: requestedTimeoutMs,
+				clipped: false
+			};
+		};
 		return new Promise((resolve, reject) => {
 			const send = (abortError) => {
 				if (this.disposed || abortError !== void 0) {
@@ -708,6 +719,7 @@ var JsonRpcClient = class {
 					for (const send of this.queue.splice(0, this.queue.length)) send();
 					return;
 				}
+				const { timeoutMs, clipped } = timeoutFor();
 				const timer = setTimeout(() => {
 					this.finish(id, new RequestTimeoutError(method, timeoutMs, clipped));
 				}, timeoutMs);
@@ -3127,18 +3139,28 @@ var DeviceConnection = class {
 	/**
 	* Business request: offline fail-fast, then rate smoothing, then the rpc window.
 	*
-	* A caller-supplied `deadline` ({@link JsonRpcRequestOptions}) bounds the two
-	* waits this layer owns — the reconnect wait before a replay, and the replay
-	* itself — while the rpc layer bounds the request's own timeout with it. That
-	* is the whole point of the option: without it, a flapping link lets every
-	* read absorb another `transportRetryWaitMs`, so an answer whose deadline
-	* already passed can still take minutes (issue #21).
+	* A caller-supplied `deadline` ({@link JsonRpcRequestOptions}) bounds EVERY
+	* wait this layer owns: the pacing admission, the reconnect wait before a
+	* replay, and the replay itself — while the rpc layer bounds the request's own
+	* timeout with it. That is the whole point of the option: without it, a
+	* flapping link lets every read absorb another `transportRetryWaitMs`, so an
+	* answer whose deadline already passed can still take minutes (issue #21).
+	*
+	* The pacing admission is judged BEFORE it is taken (so a spent budget never
+	* spends a slot, which would otherwise make a walk over many `{ref}` parts
+	* pay one queueing gap per part after the budget is gone) and AGAIN after it
+	* (the admission itself can consume a whole gap). One gap of overshoot
+	* remains, unavoidably: a request already queued for its slot is released by
+	* the limiter, not by the deadline, so it may be refused one gap late — that
+	* bound is the limiter's `#minGapMs`, and refusing it earlier would mean
+	* deadline-aware pacing, which is a different piece of work.
 	*/
 	async #businessRequest(method, params, opts) {
 		if (this.#state !== "connected") {
 			console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`);
 			throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		}
+		if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 		await this.#limiter.acquire(method);
 		const link = this.#link;
 		if (this.#state !== "connected" || link === void 0) {
@@ -3154,7 +3176,7 @@ var DeviceConnection = class {
 			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
 			const remaining = this.#remainingMs(opts);
 			if (remaining !== void 0 && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method);
-			const waitMs = remaining === void 0 ? this.#transportRetryWaitMs : Math.min(this.#transportRetryWaitMs, remaining);
+			const waitMs = remaining === void 0 ? this.#transportRetryWaitMs : Math.min(this.#transportRetryWaitMs, Math.ceil(remaining));
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${Math.round(waitMs)}ms for a reconnect to replay it`);
 			const waited = await this.#awaitReconnect(waitMs, link.client);
 			if (waited.kind === "abandoned") throw lost;
@@ -4899,8 +4921,9 @@ var CherryToolEngine = class {
 	*
 	*  - a row with an EMPTY revision — there is no fence to trust, so the entry
 	*    could never be validated against anything;
-	*  - a TRUNCATED page — the circuit breaker stopped the walk, so the list is
-	*    short. Remembering it would make a transient short walk permanent;
+	*  - a TRUNCATED page — the walk stopped early (the circuit breaker, or a
+	*    wait answer's deadline), so the list is short. Remembering it would make
+	*    a transient short walk permanent; the refusal is reason-blind;
 	*  - a page above {@link MESSAGE_CACHE_ENTRY_BYTES} — walked fresh every time
 	*    rather than allowed to crowd out every other message.
 	*
@@ -6581,9 +6604,13 @@ var CherryToolEngine = class {
 	* something the lookup would never serve correctly:
 	*
 	*  - `revision === ''` — nothing to fence;
-	*  - `page.truncated` — the parts walk was cut by the circuit breaker, so the
-	*    list is SHORT. A short walk is a transient fault and must be retried,
-	*    never remembered;
+	*  - `page.truncated` — the parts walk stopped early, so the list is SHORT.
+	*    REASON-BLIND on purpose: the circuit breaker (`'safety-bound'`) and a
+	*    wait answer's spent budget (`'deadline'`) are both transient from the
+	*    cache's point of view — the next read may well complete — and the ONE
+	*    thing that must not happen is remembering a short list as if it were the
+	*    peer's complete answer. Matching on the reason would leave the next
+	*    reason word free to reintroduce that bug;
 	*  - `bytes > messageCacheEntryBytes` — walked fresh every time instead.
 	*
 	* NOT a refusal: a message whose parts then FAILED to resolve. That

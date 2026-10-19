@@ -1339,18 +1339,35 @@ export class DeviceConnection {
   /**
    * Business request: offline fail-fast, then rate smoothing, then the rpc window.
    *
-   * A caller-supplied `deadline` ({@link JsonRpcRequestOptions}) bounds the two
-   * waits this layer owns — the reconnect wait before a replay, and the replay
-   * itself — while the rpc layer bounds the request's own timeout with it. That
-   * is the whole point of the option: without it, a flapping link lets every
-   * read absorb another `transportRetryWaitMs`, so an answer whose deadline
-   * already passed can still take minutes (issue #21).
+   * A caller-supplied `deadline` ({@link JsonRpcRequestOptions}) bounds EVERY
+   * wait this layer owns: the pacing admission, the reconnect wait before a
+   * replay, and the replay itself — while the rpc layer bounds the request's own
+   * timeout with it. That is the whole point of the option: without it, a
+   * flapping link lets every read absorb another `transportRetryWaitMs`, so an
+   * answer whose deadline already passed can still take minutes (issue #21).
+   *
+   * The pacing admission is judged BEFORE it is taken (so a spent budget never
+   * spends a slot, which would otherwise make a walk over many `{ref}` parts
+   * pay one queueing gap per part after the budget is gone) and AGAIN after it
+   * (the admission itself can consume a whole gap). One gap of overshoot
+   * remains, unavoidably: a request already queued for its slot is released by
+   * the limiter, not by the deadline, so it may be refused one gap late — that
+   * bound is the limiter's `#minGapMs`, and refusing it earlier would mean
+   * deadline-aware pacing, which is a different piece of work.
    */
   async #businessRequest<T>(method: string, params: unknown, opts?: JsonRpcRequestOptions): Promise<T> {
     if (this.#state !== 'connected') {
       console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
       throw new DeviceUnavailableError(this.record.deviceId, this.#state)
     }
+    // A SPENT BUDGET DOES NOT BUY A PACING SLOT (issue #21, review finding 3):
+    // the admission is a real wait — one `#minGapMs` per request — so a walk
+    // that keeps asking after its deadline would pay a gap per remaining part
+    // before the post-admission guard refused it, overshooting the "absolute"
+    // instant by the Σ of those gaps. Refusing here costs no admission and no
+    // round trip; the check is repeated after the admission because TAKING one
+    // can consume the last of the budget.
+    if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method)
     // The pacing wait can outlast the link: `acquire` may block for a whole
     // rate window, and a socket lost (or replaced by a reconnect mid-handshake)
     // during it leaves `#link` pointing at a client that is not authenticated.
@@ -1393,8 +1410,13 @@ export class DeviceConnection {
       // two apart, and only the first is the caller's own deadline.
       const remaining = this.#remainingMs(opts)
       if (remaining !== undefined && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+      // CEILED like every other budget-derived timer: `setTimeout` truncates a
+      // fractional delay, and a budget-capped wait that fires a millisecond
+      // early would report the deadline as expired sub-ms before it is.
       const waitMs =
-        remaining === undefined ? this.#transportRetryWaitMs : Math.min(this.#transportRetryWaitMs, remaining)
+        remaining === undefined
+          ? this.#transportRetryWaitMs
+          : Math.min(this.#transportRetryWaitMs, Math.ceil(remaining))
       // The bound LOGGED is the one actually waited for: reporting the configured
       // allowance while a caller's deadline shortened it would make the operator
       // read a 5 s wait where there was 200 ms.
