@@ -747,4 +747,33 @@ describe('issue #74: the message token has a length ceiling', () => {
     }
     expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
   })
+
+  it('⑬ the ceiling is judged on the WHOLE token, before the form it looks like', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: history(10) },
+    })
+    const messageOf = (token: string): Promise<string> =>
+      rig
+        .call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: token })
+        .then(
+          () => '(resolved)',
+          (error: unknown) => (error as Error).message,
+        )
+
+    // EXACTLY at the ceiling: accepted STRUCTURALLY — our refusal is absent, so
+    // the position was forwarded and the PEER's verdict is what came back (the
+    // fake peer's own schema rejects a 4 KiB cursor before it pages). This pins
+    // the off-by-one: `>` must never become `>=`.
+    const atCeiling = `cursor:${'9'.repeat(4096 - 'cursor:'.length)}`
+    expect(atCeiling).toHaveLength(4096)
+    const accepted = await messageOf(atCeiling)
+    expect(accepted).not.toMatch(/4096|ceiling/)
+
+    // OVER the ceiling with the OTHER face's prefix: the length verdict wins, so
+    // the two mistakes are never reported as each other.
+    const overLimit = await messageOf(`list:v2:s:${'9'.repeat(5000)}`)
+    expect(overLimit).toMatch(/4096/)
+    expect(overLimit).not.toMatch(/a LIST `resumeCursor`/)
+  })
 })
