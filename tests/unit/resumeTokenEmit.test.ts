@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { MAX_RESUME_TOKEN_CHARS } from '../../src/defaults.js'
-import { messageResumeToken } from '../../src/tools.js'
+import { messageResumeToken, parseMessageResume } from '../../src/tools.js'
 import type { CherryPage } from '../../src/tools.js'
 
 /**
@@ -114,5 +114,128 @@ describe('issue #80: the message token is never minted from a mangled remainder'
     expect(messageResumeToken(stoppedInside(), 1, 'm-1')).toBe('after:m-1')
     // Interior space, same rule as the cursor arm.
     expect(messageResumeToken(stoppedInside(), 1, 'a b')).toBe('after:a b')
+  })
+})
+
+/**
+ * Issue #85: the third refusal a `cursor:` remainder can meet.
+ *
+ * `parseMessageResume` has TWO checks in its `cursor:` branch — `mangledRemainder`
+ * (#80) and `looksLikeV1ListToken` (#72) — and the emitter mirrored only the
+ * first. A peer position that IS our retired v1 list-token shape (colon-free
+ * base64url of `{v,m,d,h,p}`) would therefore be wrapped into `cursor:<shape>`,
+ * and the same tool would answer it with "issued by an older plugin version"
+ * about a token it had just printed.
+ *
+ * The asymmetry in the opposite direction is deliberate and pinned here too: the
+ * `after:` branch of the parser never consults the detector, so an ANCHOR of that
+ * shape is a token it accepts — the emitter must keep naming it.
+ */
+describe('issue #85: the retired-format detector is mirrored where the parser applies it', () => {
+  /** Exactly what a v1 list token's payload looked like: colon-free base64url JSON. */
+  const v1Shaped = Buffer.from(
+    JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+    'utf8',
+  ).toString('base64url')
+
+  const consumedWhole = (nextCursor: string): CherryPage<unknown> => ({
+    items: ['m-0', 'm-1'],
+    truncated: true,
+    nextCursor,
+  })
+  const stoppedInside = (): CherryPage<unknown> => ({ items: ['m-0', 'm-1'], truncated: true })
+
+  it('the fixture really is colon-free base64url JSON carrying `v: 1`', () => {
+    // Guards the TEST: if this ever stopped being the shape the detector looks
+    // for, the two assertions below would pass for the wrong reason.
+    expect(v1Shaped).not.toContain(':')
+    expect(JSON.parse(Buffer.from(v1Shaped, 'base64url').toString('utf8'))).toMatchObject({ v: 1 })
+  })
+
+  it('names no `cursor:` position shaped like a v1 list token', () => {
+    expect(messageResumeToken(consumedWhole(v1Shaped), 2, 'm-1')).toBeUndefined()
+    // ...while an ordinary position of the same SHAPE (colon-free, base64url-ish,
+    // same length budget) is still named — the guard rejects the format, not
+    // "anything that decodes".
+    expect(messageResumeToken(consumedWhole('Zm9vYmFy'), 2, 'm-1')).toBe('cursor:Zm9vYmFy')
+  })
+
+  it('STILL names an `after:` anchor of that shape — the parser accepts it back', () => {
+    // Over-refusal tripwire: `parseMessageResume`'s `after:` branch runs
+    // `mangledRemainder` and nothing else. Applying the detector to the anchor
+    // would refuse a token the tool takes, which is the mirror of this issue.
+    expect(messageResumeToken(stoppedInside(), 1, v1Shaped)).toBe(`after:${v1Shaped}`)
+  })
+})
+
+/**
+ * Issue #85, the part that makes "we mirrored every refusal" checkable rather
+ * than promised.
+ *
+ * The invariant the whole token design rests on is one-directional: every token
+ * an emitter NAMES must be one its parser ACCEPTS (`emitted => accepted`).
+ * Over-refusal is allowed — refusing to name something replayable only costs
+ * resumability — but the reverse is the bug every issue in this family fixed
+ * (#76 length, #80 content, #85 retired format): the caller holds a token the
+ * tool then refuses, with a diagnosis about the wrong thing.
+ *
+ * So the property is asserted over a PROBE TABLE instead of per-clause: whatever
+ * refusal the parser grows, any probe shape that hits it turns this red without
+ * anyone remembering to mirror it. The table is deliberately varied (numeric,
+ * keyset, unicode, interior space, base64url-shaped, the retired v1 payload) and
+ * the non-vacuity count stops "refuse everything" from passing.
+ */
+describe('issue #85: every token these emitters name is one the parser accepts', () => {
+  const consumedWhole = (nextCursor: string): CherryPage<unknown> => ({
+    items: ['m-0', 'm-1'],
+    truncated: true,
+    nextCursor,
+  })
+  const stoppedInside = (messageId: string): CherryPage<unknown> => ({ items: ['m-0', 'm-1'], truncated: true })
+
+  const V1_SHAPED = Buffer.from(
+    JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+    'utf8',
+  ).toString('base64url')
+
+  /** Every shape a real (or adversarial) peer position could take. */
+  const POSITIONS = [
+    '20',
+    '0',
+    'entity:1757923200000:9c1f0a2e-6b3d-4a71-8f55-2d6e0b1c7a44',
+    '4 5', // interior plain space: legal
+    '编号-①',
+    '😀id',
+    'Zm9vYmFy', // base64url-shaped but not our format
+    'MTIz', // base64url of the JSON scalar 123
+    '', // empty: refused by both sides
+    ' 4 ', // padding: refused by both sides
+    '4\u00007', // control char: refused by both sides
+    V1_SHAPED, // retired v1 payload: refused by both sides
+  ]
+
+  it('emitted => accepted, for every probed POSITION (and nothing is named in a way the parser refuses)', () => {
+    let named = 0
+    for (const position of POSITIONS) {
+      const token = messageResumeToken(consumedWhole(position), 2, 'm-1')
+      if (token === undefined) continue
+      named += 1
+      // The property: the parser must take back the exact string just minted.
+      expect(() => parseMessageResume(token), `emitter named ${JSON.stringify(token)}`).not.toThrow()
+    }
+    // Non-vacuity: most of the table is legal, so a "refuse everything" emitter
+    // (or a table that drifted into all-illegal shapes) cannot pass.
+    expect(named).toBeGreaterThanOrEqual(7)
+  })
+
+  it('emitted => accepted, for every probed ANCHOR', () => {
+    let named = 0
+    for (const messageId of ['m-1', 'a b', '编号-①', '😀id', V1_SHAPED, '', ' m-1 ']) {
+      const token = messageResumeToken(stoppedInside(messageId), 1, messageId)
+      if (token === undefined) continue
+      named += 1
+      expect(() => parseMessageResume(token), `emitter named ${JSON.stringify(token)}`).not.toThrow()
+    }
+    expect(named).toBeGreaterThanOrEqual(4)
   })
 })

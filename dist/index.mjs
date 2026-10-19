@@ -5482,8 +5482,8 @@ var CherryToolEngine = class {
 	* #65). What a caller can act on is a token, so that is what is emitted.
 	*/
 	#listPage(page, binding) {
-		const position = optionalString(page.nextCursor);
-		const token = !page.truncated || position === void 0 || mangledRemainder(position) ? void 0 : withinResumeTokenCeiling(encodeListResumeCursor(binding, position));
+		const position = nameablePeerPosition(optionalString(page.nextCursor));
+		const token = !page.truncated || position === void 0 ? void 0 : withinResumeTokenCeiling(encodeListResumeCursor(binding, position));
 		return {
 			items: page.items,
 			truncated: page.truncated,
@@ -8168,10 +8168,49 @@ function parseQuestionInput(input) {
 * toolsReadResume.test.ts` ⑭d/⑭e drive it through the tools.
 */
 function messageResumeToken(page, returned, lastReturnedId) {
-	const anchor = optionalString(lastReturnedId);
-	if (returned < page.items.length || page.pageOverflow === true) return anchor === void 0 || mangledRemainder(anchor) ? void 0 : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`);
-	const position = optionalString(page.nextCursor);
-	return position === void 0 || mangledRemainder(position) ? void 0 : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`);
+	const anchor = nameableRemainder(optionalString(lastReturnedId));
+	if (returned < page.items.length || page.pageOverflow === true) return anchor === void 0 ? void 0 : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`);
+	const position = nameablePeerPosition(optionalString(page.nextCursor));
+	return position === void 0 ? void 0 : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`);
+}
+/**
+* The CONTENT dimension of "a remainder this bridge may name", or `undefined`
+* when it must not name one.
+*
+* The parsers run `mangledRemainder` on every remainder they read, so one that
+* fails it is a remainder this tool would refuse on replay: naming it hands the
+* caller a stop point that can never be used, and the refusal then surfaces at
+* the RESUME call instead of at the answer that produced it (issues #70, #80).
+* What it rejects, exactly: empty, not equal to its own `.trim()` (leading/
+* trailing whitespace), or a control character ANYWHERE — an interior plain space
+* is legal and round-trips.
+*
+* This is the parser's own predicate, not a copy of it, so the two sides cannot
+* drift into two dialects. The sibling dimension is the LENGTH ceiling, judged
+* on the FINAL token ({@link withinResumeTokenCeiling}).
+*/
+function nameableRemainder(value) {
+	return value === void 0 || mangledRemainder(value) ? void 0 : value;
+}
+/**
+* A remainder this bridge may name AS A PAGE POSITION: {@link nameableRemainder}
+* plus the one refusal that applies to positions and NOT to anchors.
+*
+* `looksLikeV1ListToken` exists because a v1 list token (0.1.6: base64url of
+* `{v,m,d,h,p}`) lives under `cursor:` and is indistinguishable from a peer
+* position, so both parsers NAME and refuse it rather than forwarding it to a
+* desktop that would silently serve its FIRST page. An emitter that wrapped such
+* a position would mint `cursor:<v1 shape>` and then have its own parser answer
+* "issued by an older plugin version" about a token this tool had just printed —
+* the same broken round trip as #76/#80, one detector further out (issue #85).
+*
+* The `after:` arm deliberately does NOT use this: `parseMessageResume`'s
+* `after:` branch never consults the detector, so an `after:` remainder of that
+* shape is a token it accepts.
+*/
+function nameablePeerPosition(value) {
+	const remainder = nameableRemainder(value);
+	return remainder === void 0 || looksLikeV1ListToken(remainder) ? void 0 : remainder;
 }
 /**
 * The token ceiling, enforced on the way OUT as well as in. A token this tool
@@ -8281,6 +8320,12 @@ function messageIdOf(raw) {
 * `undefined`/`null` means "from the newest message", which is the ordinary
 * read. An empty remainder (`'cursor:'`, `'after:'`) is refused like any other
 * foreign token: an empty anchor could never match a message.
+*
+* EXPORTED FOR ITS OWN TESTS — specifically for the round-trip property, which
+* is the invariant this whole file is built around: every token the emitters
+* NAME must be one this function ACCEPTS. Pinning that with a probe table is
+* what turns "we mirrored every refusal" from a promise into a check
+* (`tests/unit/resumeTokenEmit.test.ts`, issue #85).
 */
 function parseMessageResume(value) {
 	if (value === void 0 || value === null) return void 0;

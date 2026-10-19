@@ -129,10 +129,10 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   等待槽位也计入等待类回答的时限：排到时限就放弃并把这一 part 标 `unavailable`。
 - 历史走查被截断时一定说明（`truncationReason`，`limit` / `aggregate-bytes` / `deadline` 三种含义不同，见上），
   并在停点可命名时给出 `messagesResumeCursor` 续读令牌。**停点不可命名时就不给**：对端位置为空、
-  带首尾空白或任意控制字符、令牌会超过 4096 字符上限、或没有可当锚点的消息 id——此时 `truncated`
-  仍为 `true`，提高 `limit` 是可用的补救（wait 类回答被时限截断时则是改用 `cherry_read` 续读）。
-  **两个面是同一条规则**：消息面的 `messagesResumeCursor` 与四个列表工具的 `resumeCursor` 都只发出
-  本工具会收回的令牌；位置内部的普通空格合法，被拒的只有首尾空白与控制字符。
+  带首尾空白或任意控制字符、形如已停用的 v1 令牌、令牌会超过 4096 字符上限、或没有可当锚点的
+  消息 id——此时 `truncated` 仍为 `true`，提高 `limit` 是可用的补救（wait 类回答被时限截断时则是
+  改用 `cherry_read` 续读）。**两个面是同一条规则**：消息面的 `messagesResumeCursor` 与四个列表工具的
+  `resumeCursor` 都只发出本工具会收回的令牌；位置内部的普通空格合法，不会因此被拒。
   某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带 `partsTruncated: "deadline"`）。
 - **等待类回答有自己的装配时限**：`cherry_send(wait: true)` / `cherry_wait` 在窗口结束后仍要读一段历史
   （消息页 + 每条消息的 parts + 每个外置 `{ref}` 内容），这一步现在是**有时限的**——截至「你的窗口 +

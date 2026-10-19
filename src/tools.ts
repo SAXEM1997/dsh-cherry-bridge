@@ -2100,19 +2100,20 @@ class CherryToolEngine {
   #listPage(page: CherryPage<Record<string, unknown>>, binding: ListResumeBinding): Record<string, unknown> {
     // A position this face would REFUSE is not a position it may name. The
     // round-trip symmetry (a token a tool emits is a token that tool accepts) is
-    // the whole point of the token, so a peer answering `nextCursor: ''` — or a
-    // position carrying whitespace/control characters, which `mangledRemainder`
-    // rejects on the way back — gets NO token; `truncated` still says the walk
-    // was cut and a wider `limit` is the remedy. `messageResumeToken` guards the
-    // same hole for the message face.
-    const position = optionalString(page.nextCursor)
+    // the whole point of the token, so a peer answering `nextCursor: ''`, one
+    // carrying whitespace/control characters, or one shaped like our retired v1
+    // token gets NO token; `truncated` still says the walk was cut and a wider
+    // `limit` is the remedy. The rule is NOT restated here or in the message
+    // face: `nameablePeerPosition` is the one place it lives, so the emitters and
+    // their parsers cannot drift (issue #85).
+    const position = nameablePeerPosition(optionalString(page.nextCursor))
     // The same refusal one dimension further: an encoded token over
     // {@link MAX_RESUME_TOKEN_CHARS} is one this face would refuse on replay, so
     // it is not named ({@link withinResumeTokenCeiling}, issue #76). Judged only
     // on the arm that NAMES it — a complete walk has nothing to name, so it must
     // not pay for the encoding.
     const token =
-      !page.truncated || position === undefined || mangledRemainder(position)
+      !page.truncated || position === undefined
         ? undefined
         : withinResumeTokenCeiling(encodeListResumeCursor(binding, position))
     return {
@@ -6139,30 +6140,65 @@ export function messageResumeToken(
   returned: number,
   lastReturnedId: string | undefined,
 ): string | undefined {
-  const anchor = optionalString(lastReturnedId)
+  const anchor = nameableRemainder(optionalString(lastReturnedId))
   // TWO forms of "the walk stopped inside what it was given": it returned fewer
   // items than it collected, or the PEER overshot the requested page and items
   // were left in it ({@link CherryPage.pageOverflow}). Either way the page's own
   // position sits past messages this walk never returned, so only the anchor is
   // exact.
   if (returned < page.items.length || page.pageOverflow === true) {
-    // An anchor the parser would REFUSE names nothing: a padded message id is
-    // an `opaqueId`, so it can reach here, and `after: m-1 ` would be a token
-    // the same face rejects on the way back (issue #80).
-    return anchor === undefined || mangledRemainder(anchor)
-      ? undefined
-      : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`)
+    // The ANCHOR takes the content predicate only — NOT the v1 detector, and
+    // that is not an oversight: `parseMessageResume`'s `after:` branch runs
+    // `mangledRemainder` and nothing else, so an id-shaped `after:` remainder is
+    // a token it ACCEPTS back. Applying the detector here would be the mirror
+    // image of this issue — refusing to name a token the parser takes.
+    return anchor === undefined ? undefined : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`)
   }
-  // An empty OR MANGLED position is not a position: a peer answering
-  // `nextCursor: ''` on a non-terminal page would otherwise make this face emit
-  // a bare `cursor:` (review P3-4), and one answering `nextCursor: ' 4 '`
-  // would make it emit `cursor: 4 ` — both refused by the same face on the way
-  // back (issue #80). `mangledRemainder` IS the parser's predicate, so the two
-  // sides run one rule rather than two dialects.
-  const position = optionalString(page.nextCursor)
-  return position === undefined || mangledRemainder(position)
-    ? undefined
-    : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`)
+  // A POSITION takes both: the content predicate, and the retired-format
+  // detector its own parser applies before anything else (issue #85).
+  const position = nameablePeerPosition(optionalString(page.nextCursor))
+  return position === undefined ? undefined : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`)
+}
+
+/**
+ * The CONTENT dimension of "a remainder this bridge may name", or `undefined`
+ * when it must not name one.
+ *
+ * The parsers run `mangledRemainder` on every remainder they read, so one that
+ * fails it is a remainder this tool would refuse on replay: naming it hands the
+ * caller a stop point that can never be used, and the refusal then surfaces at
+ * the RESUME call instead of at the answer that produced it (issues #70, #80).
+ * What it rejects, exactly: empty, not equal to its own `.trim()` (leading/
+ * trailing whitespace), or a control character ANYWHERE — an interior plain space
+ * is legal and round-trips.
+ *
+ * This is the parser's own predicate, not a copy of it, so the two sides cannot
+ * drift into two dialects. The sibling dimension is the LENGTH ceiling, judged
+ * on the FINAL token ({@link withinResumeTokenCeiling}).
+ */
+function nameableRemainder(value: string | undefined): string | undefined {
+  return value === undefined || mangledRemainder(value) ? undefined : value
+}
+
+/**
+ * A remainder this bridge may name AS A PAGE POSITION: {@link nameableRemainder}
+ * plus the one refusal that applies to positions and NOT to anchors.
+ *
+ * `looksLikeV1ListToken` exists because a v1 list token (0.1.6: base64url of
+ * `{v,m,d,h,p}`) lives under `cursor:` and is indistinguishable from a peer
+ * position, so both parsers NAME and refuse it rather than forwarding it to a
+ * desktop that would silently serve its FIRST page. An emitter that wrapped such
+ * a position would mint `cursor:<v1 shape>` and then have its own parser answer
+ * "issued by an older plugin version" about a token this tool had just printed —
+ * the same broken round trip as #76/#80, one detector further out (issue #85).
+ *
+ * The `after:` arm deliberately does NOT use this: `parseMessageResume`'s
+ * `after:` branch never consults the detector, so an `after:` remainder of that
+ * shape is a token it accepts.
+ */
+function nameablePeerPosition(value: string | undefined): string | undefined {
+  const remainder = nameableRemainder(value)
+  return remainder === undefined || looksLikeV1ListToken(remainder) ? undefined : remainder
 }
 
 /**
@@ -6282,8 +6318,14 @@ function messageIdOf(raw: Record<string, unknown>): string {
  * `undefined`/`null` means "from the newest message", which is the ordinary
  * read. An empty remainder (`'cursor:'`, `'after:'`) is refused like any other
  * foreign token: an empty anchor could never match a message.
+ *
+ * EXPORTED FOR ITS OWN TESTS — specifically for the round-trip property, which
+ * is the invariant this whole file is built around: every token the emitters
+ * NAME must be one this function ACCEPTS. Pinning that with a probe table is
+ * what turns "we mirrored every refusal" from a promise into a check
+ * (`tests/unit/resumeTokenEmit.test.ts`, issue #85).
  */
-function parseMessageResume(value: unknown): MessageResume | undefined {
+export function parseMessageResume(value: unknown): MessageResume | undefined {
   if (value === undefined || value === null) return undefined
   const refuse = (): never => {
     throw new Error(
