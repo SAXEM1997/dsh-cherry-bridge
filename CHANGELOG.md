@@ -7,6 +7,16 @@ surface change.
 
 ## [Unreleased]
 
+### Fixed
+
+- `fix(tools)`: a list page whose `items` is not an array — wrong type, or
+  absent — is refused as a protocol violation instead of being read as an empty
+  page (#46). On a terminal page (`nextCursor: null`) that used to answer
+  `truncated: false` over a hole; mid-walk it skipped a whole page with not even
+  the non-record warning (there was no array to count drops against). The
+  diagnosis names the SHAPE it got (`missing`, `null`, `string`, …), never the
+  payload, and the refusal applies to EVERY page, not only the last one.
+
 ### Added
 
 - `feat(tools)`: `cherry_read` takes an optional `messagesResumeCursor`, the stop

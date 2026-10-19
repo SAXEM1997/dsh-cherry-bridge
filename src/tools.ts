@@ -1751,6 +1751,21 @@ class CherryToolEngine {
    *    the exact diagnosis — same family as the stuck-cursor refusal — rather
    *    than returned as `truncated: false` with a hole in it.
    *
+   * A page whose `items` is not an ARRAY at all — wrong type, or absent — is a
+   * PROTOCOL violation rather than an empty page (`pageOf` types the field
+   * `array`, and a page with nothing to say says `items: []`), and it is
+   * refused on EVERY page, terminal or not (issue #46). The terminal case is
+   * the loud one (a whole last page vanishes into `truncated: false`), but the
+   * mid-walk case was quieter still: `arrayOf` counted no drops — there was no
+   * array to compare against — so the walk skipped a page-shaped hole with no
+   * warning at all and reported a short answer as complete. Neither is
+   * tolerated, because neither can be attributed to the caller's `limit` or to
+   * a legitimate transition, and the diagnosis names the shape it got
+   * (`missing`, `null`, `string`, …) so an operator can tell a broken peer from
+   * a broken proxy. The throw is placed BEFORE the dropped bookkeeping: with no
+   * array there is no drop count to report, and the one diagnostic that
+   * matters must not be preceded by a misleading warning.
+   *
    * An EMPTY page with a non-null `nextCursor` is legal progress while the
    * cursor advances: the desktop's pinned-list walk answers exactly
    * `{items: [], nextCursor: 'entity:'}` when a pin anchor is unpinned or
@@ -1790,7 +1805,9 @@ class CherryToolEngine {
     connection: DeviceConnection,
     method: string,
     params: Record<string, unknown>,
-    extract: (page: Record<string, unknown>) => { items: T[]; nextCursor: unknown; dropped?: number },
+    extract: (
+      page: Record<string, unknown>,
+    ) => { items: T[]; nextCursor: unknown; dropped?: number; notAnArray?: string },
     walk: AggregateWalk<T>,
   ): Promise<CherryPage<T>> {
     const {
@@ -1923,6 +1940,21 @@ class CherryToolEngine {
         throw error
       }
       const extracted = extract(result)
+      // THE PAGE'S OWN SHAPE (issue #46), judged on EVERY page — terminal or
+      // not — and before anything is counted or collected. A missing or
+      // non-array `items` is not "an empty page": the protocol types the field
+      // as an array, so a page with no rows says `items: []`. Reading it as
+      // empty is what let a terminal page vanish into `truncated: false` and a
+      // mid-walk page vanish with no warning at all (there was no array to
+      // count drops against). Peer fault, so it is thrown like a stuck cursor,
+      // naming the SHAPE — never the payload, which is peer-supplied data.
+      if (extracted.notAnArray !== undefined) {
+        throw new Error(
+          `${method}: peer answered a page whose \`items\` is not an array (\`items\` is ` +
+            `${extracted.notAnArray}) for ${JSON.stringify(params)}; refusing a silently short ` +
+            'result — every page of a paged list must carry an items array',
+        )
+      }
       const dropped = extracted.dropped ?? 0
       if (dropped > 0 && droppedTotal === 0) {
         // Once per walk, and the ITEMS themselves never reach the log: a peer
@@ -5823,16 +5855,34 @@ class CherryToolEngine {
 
 /**
  * The array at `value`, or an empty array when the peer sent something else —
- * plus HOW MANY entries were dropped as non-records (v0.1.3 review, P3-6a).
+ * plus HOW MANY entries were dropped as non-records (v0.1.3 review, P3-6a) and,
+ * when `value` is not an array AT ALL, the shape it was instead (issue #46).
  *
  * The count is returned rather than logged here because this helper has no
  * idea which method it is projecting: the CALLER (`#aggregate`) owns the
  * method name and the page's terminality, so it is the only place that can
  * say "agent.sessions.list dropped 2" without guessing, and the only place
  * that can decide what a wholesale drop means.
+ *
+ * `notAnArray` is the same division of labour for a DIFFERENT fault: a missing
+ * or wrong-typed `items` is a page the protocol does not allow (`pageOf` types
+ * it `array(item)`, and a page with nothing to say says `items: []`), so it
+ * must be refused rather than read as an empty page. It is reported, never
+ * thrown here, for the same reason the count is: only the caller knows the
+ * method and the params to name in the diagnosis.
  */
-function arrayOf(value: unknown): { items: Array<Record<string, unknown>>; dropped: number } {
-  if (!Array.isArray(value)) return { items: [], dropped: 0 }
+function arrayOf(value: unknown): {
+  items: Array<Record<string, unknown>>
+  dropped: number
+  notAnArray?: string
+} {
+  if (!Array.isArray(value)) {
+    return {
+      items: [],
+      dropped: 0,
+      notAnArray: value === undefined ? 'missing' : value === null ? 'null' : typeof value,
+    }
+  }
   const items = value.filter(isRecord)
   return { items, dropped: value.length - items.length }
 }
