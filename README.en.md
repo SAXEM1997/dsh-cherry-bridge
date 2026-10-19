@@ -109,7 +109,7 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | `cherry_read` | Read a session's message history snapshot, **newest-first** (`limit` drops the **oldest** messages). Attachment parts come back as `name`/`mediaType`/`byteLength` with an empty `content` — the bytes are never fetched. A truncated walk always says so (`truncated` + `truncationReason`): `limit` means your own ceiling was reached and raising `limit` helps; `aggregate-bytes` means the answer hit its **output size limit** — independent of `limit` (a larger `limit` only costs more round trips and stops at the same budget). **The older messages are reached by the resume token**: pass the `messagesResumeCursor` a truncated answer returned as this tool's own `messagesResumeCursor` argument to continue from that stop point (`limit` then bounds how many messages come back **from there**), walking a long history in successive answers. Two token forms: `cursor:<peer position>` (the peer page position after a whole window was consumed) and `after:<messageId>` (the walk stopped inside its window; the resume scans from the newest end to that message and returns the older ones). A token this tool did not emit is **refused locally** (never forwarded — the desktop silently falls back to the newest page for one), and an `after:` anchor that is no longer in the history is an **error**, not an empty result. |
 | `cherry_events` | Read the session's buffered events newer than `cursor`, acking them after delivery. |
 | `cherry_create` | Create a session in an agent workspace (workspace selection is **required**; identity is read back). |
-| `cherry_send` | Send a message, by default waiting for a terminal state and returning the assistant text; `wait: false` returns the command receipt immediately. `messagesTruncated`/`messagesTruncationReason` report a **message**-level cut (older messages dropped). |
+| `cherry_send` | Send a message, by default waiting for a terminal state and returning the assistant text; `wait: false` returns the command receipt immediately. `messagesTruncated`/`messagesTruncationReason` report a **message**-level cut (older messages dropped); `deadline` means the **answer's own assembly budget** ran out (see below), with the content read so far still returned. |
 | `cherry_wait` | Wait only for the session's in-flight execution to settle (sends nothing). |
 | `cherry_interactions` | List the session's **pending** interaction cards (questions / approvals). |
 | `cherry_respond` | Answer an interaction card: questions must be answered in full; approvals take `decision`. |
@@ -138,11 +138,29 @@ with it).
   **original `commandId`**, and the desktop's command ledger replays the receipt.
 - One externalized content is capped at 32 MiB; a larger part is marked
   `unavailable` rather than returning unverifiable partial content.
-- A truncated history walk always says so (`truncationReason`; `limit` and
-  `aggregate-bytes` mean different things, see above) and, whenever a stop point
-  can be named honestly, carries a `messagesResumeCursor` resume token (absent
-  when the walk reached the peer's last page); a message whose own parts could
-  not be fully read carries `incomplete: true`.
+- A truncated history walk always says so (`truncationReason`; `limit`,
+  `aggregate-bytes` and `deadline` mean different things, see above) and,
+  whenever a stop point can be named honestly, carries a `messagesResumeCursor`
+  resume token (absent when the walk reached the peer's last page); a message
+  whose own parts could not be fully read carries `incomplete: true` (inside a
+  wait answer, a message cut by the deadline carries
+  `partsTruncated: "deadline"`).
+- **A wait answer has an assembly budget of its own.** After the window ends,
+  `cherry_send(wait: true)` / `cherry_wait` still read some history (the message
+  page, one part list per message, one content walk per externalized `{ref}`),
+  and that step is now **time-bounded**: it may run until "your window plus
+  another one, floored at 1 s and capped at 15 s" (a 1 s window → at most one
+  more second; a 20 s window → at most 15 more). A flapping link can no longer
+  turn each request's 5 s reconnect wait into minutes of extra latency; when the
+  budget is spent the walk stops, the content already read is returned with
+  `messagesTruncationReason: "deadline"`, and older history is reached with
+  `cherry_read`. The same budget covers the session snapshot the **terminal and
+  timeout answers** read: when it cannot be read the answer degrades
+  (`aggregateError` + `guidance`) instead of losing the run's verdict and its
+  identifiers. **Exception**: the snapshot `cherry_wait` takes to decide whether
+  anything is in flight is a *precondition* — there is no answer yet to degrade
+  — so it keeps the transport's ordinary bounds (one reconnect wait + one
+  replay) and is not inside the budget (#51).
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is

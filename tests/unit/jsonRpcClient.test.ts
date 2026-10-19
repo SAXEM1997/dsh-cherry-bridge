@@ -11,7 +11,12 @@ import {
   type SecureChannel,
 } from '@cherrystudio/remote-transport'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
-import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
+import {
+  isChannelClosedError,
+  JsonRpcClient,
+  JsonRpcRequestError,
+  RequestTimeoutError,
+} from '../../src/rpc/jsonRpcClient.js'
 
 const PROTOCOL_VERSION = 1
 
@@ -343,6 +348,69 @@ describe('JsonRpcClient', () => {
     // instead of resolving or hanging forever.
     await expect(client.request('echo.never', {}, { timeoutMs: 100 })).rejects.toThrow()
   })
+
+  it('④d (issue #21) a request deadline CLAMPS the per-request timeout and its timeout is a typed error', async () => {
+    // The deadline is a clamp on the SHORTER side: a 60 s per-request timeout
+    // must not outlive a 100 ms budget, and a budget farther away than the
+    // ordinary timeout must not lengthen one. The rejection is typed because
+    // the caller that set the deadline has to tell "my budget ran out" (stop the
+    // walk) apart from "the peer is silent" — and it cannot do that by reading
+    // the message text.
+    const { client } = await openLoopback({ timeoutMs: undefined })
+
+    const started = Date.now()
+    const error = (await client
+      .request('echo.never', {}, { timeoutMs: 60_000, deadline: performance.now() + 100 })
+      .catch((reason: unknown) => reason)) as Error
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(RequestTimeoutError)
+    expect((error as RequestTimeoutError).method).toBe('echo.never')
+    // Derived from the budget, never the requested 60 s: the exact value is
+    // `ceil(remaining)`, so it can only be at or just below the 100 ms budget.
+    expect((error as RequestTimeoutError).timeoutMs).toBeGreaterThan(0)
+    expect((error as RequestTimeoutError).timeoutMs).toBeLessThanOrEqual(100)
+    // The flag the deadline-bounded walk switches on: the timeout was SHORTENED
+    // by the budget, so a caller may read the timeout as "my budget ran out".
+    expect((error as RequestTimeoutError).clampedByDeadline).toBe(true)
+    // The message is unchanged: operators and existing reports quote it.
+    expect(error.message).toContain('timed out after')
+    expect(elapsed).toBeLessThan(2_000)
+  }, 20_000)
+
+  it('④e (issue #21) a QUEUED request derives its deadline-clamped timeout at ADMISSION, not at enqueue', async () => {
+    // Review finding 4: the timeout used to be computed in `request()` and only
+    // START when a queued send was admitted, so a request that waited D ms in
+    // the in-flight queue outlived its deadline by D. The clamp is now derived
+    // inside `send()`, the single admission point.
+    //
+    // Two clocks, far apart on purpose: A holds the only slot for 200 ms, and
+    // B's deadline is 400 ms from enqueue. Re-clamped, B's timer is 200 ms and
+    // it rejects at ~400 ms; computed at enqueue it would be 400 ms and reject
+    // at ~600 ms.
+    // No harness: the peer half is never read, so neither request is answered
+    // and both settle by their own timeouts — which is the clock under test.
+    const { client } = await openLoopback({ maxInFlight: 1 })
+
+    const held = client.request('echo.pending', {}, { timeoutMs: 200 }).catch((reason: unknown) => reason)
+    const started = Date.now()
+    const queued = client
+      .request('echo.pending', {}, { deadline: performance.now() + 400 })
+      .catch((reason: unknown) => reason)
+
+    const error = (await queued) as Error
+    const elapsed = Date.now() - started
+    await held
+
+    expect(error).toBeInstanceOf(RequestTimeoutError)
+    // The timeout itself was derived from what was LEFT of the budget when the
+    // request was admitted, and it is reported as deadline-clipped.
+    expect((error as RequestTimeoutError).clampedByDeadline).toBe(true)
+    expect((error as RequestTimeoutError).timeoutMs).toBeLessThanOrEqual(400)
+    // 400 ms (admission-time clamp) vs 600 ms (enqueue-time clamp): the bound
+    // sits between them with >100 ms of slack on both sides.
+    expect(elapsed).toBeLessThan(520)
+  }, 20_000)
 
   it('④c (v0.1.3 P3-B4) an un-parameterised client waits 60s — the protocol idleMs — for an answer', async () => {
     // The default is a PROTOCOL decision, not a taste one: a client timeout

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { DeviceUnavailableError } from './connection.js'
+import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
 import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
@@ -8,7 +8,7 @@ import {
   LIST_PAGE_CLAMP,
   PARTS_LIST_PAGE_CLAMP,
 } from './defaults.js'
-import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
 import type { PairingErrorKind } from './pairing.js'
@@ -172,8 +172,10 @@ export interface CherryArchiveQuarantined {
  *
  * `CherryReadMessage.partsTruncated` reuses the type for a DIFFERENT scope —
  * one message's own part list — where the walk runs OLDEST-part-first, so a
- * stop (always `'safety-bound'`; parts have no byte budget) drops that
- * message's LATER parts and flags the message incomplete.
+ * stop drops that message's LATER parts and flags the message incomplete.
+ * Parts have no byte budget of their own, so only two reasons appear there:
+ * `'safety-bound'` (the circuit breaker) and `'deadline'` (a wait answer's
+ * budget — see {@link AssemblyDeadline}).
  */
 export type CherryTruncationReason =
   /** The caller's `limit` was reached with more items available. */
@@ -201,6 +203,21 @@ export type CherryTruncationReason =
    * (`CherryReadSnapshot.truncationReason`, issue #29).
    */
   | 'aggregate-bytes'
+  /**
+   * The ANSWER's own time budget ran out (issue #21).
+   *
+   * Emitted ONLY by the wait faces' aggregate (terminal / timeout / idle), which
+   * runs after — or under — the caller's wait window and must not outlive a
+   * bounded tail of it. Nothing was misreported and no bound the caller chose
+   * was reached: the assembly simply ran out of time, which is why resuming with
+   * the stop-point token (or raising `limit`) is the wrong reading of this word
+   * and `cherry_read` is the recovery.
+   *
+   * `cherry_read` itself never emits it — it has no deadline — but its parts
+   * walk may REPORT it on a message the wait faces projected under theirs
+   * ({@link CherryReadMessage.partsTruncated}), because the projection is shared.
+   */
+  | 'deadline'
 
 /** A page-aggregating result: the items plus how completely they were read. */
 export interface CherryPage<T> {
@@ -288,9 +305,11 @@ export interface CherryReadMessage {
   parts: CherryReadPart[]
   /**
    * Present only when this message's parts could NOT all be read: the safety
-   * circuit-breaker stopped the walk (always `'safety-bound'` here — parts
-   * have no byte budget). The walk runs OLDEST-part-first, so what it drops is
-   * this message's LATER parts. Absent means the part list is complete.
+   * circuit-breaker stopped the walk (`'safety-bound'`) or a WAIT ANSWER's own
+   * time budget did (`'deadline'` — see {@link AssemblyDeadline}). Parts have no
+   * byte budget, so those are the only two reasons here. The walk runs
+   * OLDEST-part-first, so what it drops is this message's LATER parts. Absent
+   * means the part list is complete.
    */
   partsTruncated?: CherryTruncationReason
   /**
@@ -612,6 +631,30 @@ type AggregateResume<T> =
   | { kind: 'cursor'; cursor: string }
   | { kind: 'anchor'; messageId: string; idOf: (item: T) => string | undefined }
 
+/**
+ * Everything one page-walk call configures, in ONE bag: the caller's ceiling and
+ * the three optional dimensions a walk can carry (a tighter safety bound, a
+ * different per-page clamp, a resume point) plus the ANSWER's deadline
+ * (issue #21).
+ *
+ * A bag rather than six positional parameters because the optional ones sit at
+ * different ends of the list: an `#aggregate` call that wants only the deadline
+ * would otherwise spell out three `undefined`s between what it sets and what it
+ * means, and the next optional dimension would make that worse.
+ */
+interface AggregateWalk<T> {
+  /** The caller's ceiling on COLLECTED items (`Infinity` for "no caller bound"). */
+  limit: number
+  /** Internal circuit breaker; defaults to {@link MAX_AGGREGATE_LIMIT}. */
+  safetyBound?: number
+  /** Byte-safe page request; defaults to {@link LIST_PAGE_CLAMP}. */
+  maxPerPage?: number
+  /** Where the walk BEGINS (issue #26). */
+  resume?: AggregateResume<T>
+  /** The answer's own time budget (issue #21) — see `AssemblyDeadline`. */
+  deadline?: AssemblyDeadline
+}
+
 /** Token prefix for a peer page position; the one `#aggregate` can send back. */
 const RESUME_CURSOR_PREFIX = 'cursor:'
 /** Token prefix for "strictly older than this message id". */
@@ -775,6 +818,87 @@ const TEXT_MAX_LENGTH = 32_768
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */
 const MIN_WAIT_TIMEOUT_MS = 1
+
+/**
+ * How much EXTRA time a wait ANSWER may spend assembling its content, at most
+ * (issue #21). The effective tail is the caller's own window, CLAMPED to
+ * [{@link WAIT_ANSWER_TAIL_FLOOR_MS}, this]: one more window, never less than 1 s
+ * and never more than 15 s.
+ *
+ * WHY THE ANSWER NEEDS A BUDGET OF ITS OWN. The wait window bounds how long the
+ * RUN may take, not how long reading its history may take. That read (the
+ * bounded message walk: `agent.messages.list`, one `agent.parts.list` per
+ * message, one `agent.content.read` walk per externalized part) happens AFTER
+ * the window elapses, and before #21 it had no time bound at all: since #12 a
+ * read whose link dies waits up to `transportRetryWaitMs` (5 s) for a reconnect
+ * before replaying, so a flapping link let each of the walk's ~30 requests
+ * absorb that wait — the 1 s timeout of the field report could answer ~150 s
+ * later, exactly the shape #3 fixed.
+ *
+ * WHY 15 s. The walk is already bounded to 20 messages and 256 KiB, so a healthy
+ * assembly is a handful of round trips. The worst SINGLE item inside it is one
+ * max-size (32 MiB) `{ref}`, which at the content tier's 24 KiB slices is ~1,365
+ * sequential reads — single-digit seconds on a LAN, and the only way one ref
+ * approaches this bound. 15 s covers that plus the rest of the walk, and stays a
+ * small absolute cost for the shortest useful windows (1 s → ≤2 s total).
+ *
+ * WHY THE WINDOW RATHER THAN THE CONSTANT ALONE. The tail is a fraction of the
+ * patience the caller stated: a caller who asked for 5 s is not served by a
+ * 15 s tail, and one who asked for 120 s is not served by 120 s more. One more
+ * window is the honest reading of "the answer costs about what the wait did".
+ */
+export const WAIT_ANSWER_TAIL_MS = 15_000
+
+/**
+ * The LEAST extra time a wait answer may spend assembling its content (issue
+ * #21) — one second, whatever window the caller chose.
+ *
+ * The window alone is not enough as a budget, because the tool's window has a
+ * floor of 1 ms ({@link MIN_WAIT_TIMEOUT_MS}): `cherry_wait(timeoutMs: 1)` is a
+ * legal "give me a snapshot now", and a 1 ms answer budget would return the stub
+ * receipt for a run whose reply is one round trip away. One second is far more
+ * than a healthy assembly needs (the walk is bounded to 20 messages) and is
+ * small next to any window a caller actually waits on, so the floor never
+ * extends a real answer — it only rescues a degenerate one.
+ */
+export const WAIT_ANSWER_TAIL_FLOOR_MS = 1_000
+
+/**
+ * The ONE instant a wait ANSWER may still be assembling content (issue #21).
+ *
+ * Built from the caller's own window, so every face of the answer — the session
+ * snapshot, the message walk, each message's parts walk, each `{ref}` content
+ * walk, and the transport layer's reconnect waits — is bounded by the same
+ * clock. Passing an absolute instant (rather than a duration) is what makes
+ * that possible: each layer derives its own remaining time when it is about to
+ * wait, so time already spent is charged exactly once and no layer can reset
+ * the budget.
+ *
+ * The clock is `performance.now()` — MONOTONIC, the same one the waiter's own
+ * deadline uses. A wall clock can be stepped by the system, which would either
+ * expire the answer instantly or extend it by the jump.
+ *
+ * WHEN IT EXPIRES, the walk STOPS and reports `'deadline'`; it does not throw.
+ * The content already read is exactly what the answer is for (spec §3.6:
+ * 超时非失败, return the partial content plus a cursor), so a spent budget
+ * degrades the answer to what it has — with a stop-point token — rather than
+ * throwing that away. The one exception is the message snapshot itself: without
+ * it there is no walk to stop, and the caller gets the stub receipt.
+ */
+class AssemblyDeadline {
+  /** The absolute instant, on `performance.now()`'s clock. */
+  readonly instant: number
+
+  constructor(startedAt: number, windowMs: number) {
+    const tail = Math.min(Math.max(windowMs, WAIT_ANSWER_TAIL_FLOOR_MS), WAIT_ANSWER_TAIL_MS)
+    this.instant = startedAt + windowMs + tail
+  }
+
+  /** Whether the budget is spent (a deadline exactly now counts as spent). */
+  expired(): boolean {
+    return performance.now() >= this.instant
+  }
+}
 
 /**
  * POLL CADENCE for the waiter loop.
@@ -1336,8 +1460,9 @@ class CherryToolEngine {
    *
    *  - a row with an EMPTY revision — there is no fence to trust, so the entry
    *    could never be validated against anything;
-   *  - a TRUNCATED page — the circuit breaker stopped the walk, so the list is
-   *    short. Remembering it would make a transient short walk permanent;
+   *  - a TRUNCATED page — the walk stopped early (the circuit breaker, or a
+   *    wait answer's deadline), so the list is short. Remembering it would make
+   *    a transient short walk permanent; the refusal is reason-blind;
    *  - a page above {@link MESSAGE_CACHE_ENTRY_BYTES} — walked fresh every time
    *    rather than allowed to crowd out every other message.
    *
@@ -1616,17 +1741,31 @@ class CherryToolEngine {
    * anchor still unfound (it is gone), and {@link MAX_ANCHOR_SCAN_PAGES} pages
    * spent without finding it. The ceiling counts COLLECTED items, so a scan's
    * discarded pages do not spend the caller's `limit`.
+   *
+   * `deadline` (issue #21) is the ANSWER's own budget, and it is the one bound
+   * that stops the walk GRACEFULLY: a spent budget returns what was collected
+   * with `'deadline'` as the reason and the page position it was about to ask
+   * for as the stop point. Every other bound here either throws (a peer fault)
+   * or returns a caller-attributed truncation; this one returns a TIME
+   * attribution, because neither the caller nor the peer did anything wrong.
+   * The budget is re-judged BEFORE each request (so a spent one is not spent on
+   * the wire) and is handed to the request itself, where the transport clamps
+   * the request's own timeout to it and refuses to wait past it for a reconnect.
    */
   async #aggregate<T>(
     connection: DeviceConnection,
     method: string,
     params: Record<string, unknown>,
     extract: (page: Record<string, unknown>) => { items: T[]; nextCursor: unknown; dropped?: number },
-    limit: number,
-    safetyBound: number = MAX_AGGREGATE_LIMIT,
-    maxPerPage: number = LIST_PAGE_CLAMP,
-    resume?: AggregateResume<T>,
+    walk: AggregateWalk<T>,
   ): Promise<CherryPage<T>> {
+    const {
+      limit,
+      safetyBound = MAX_AGGREGATE_LIMIT,
+      maxPerPage = LIST_PAGE_CLAMP,
+      resume,
+      deadline,
+    } = walk
     const negotiated = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK))
     // The byte-safe clamp intersects the negotiated one: a peer that already
     // pages smaller keeps its size, and no page request ever exceeds either.
@@ -1668,6 +1807,20 @@ class CherryToolEngine {
     const seen = new Set<string>()
 
     for (let pages = 0; ; pages += 1) {
+      // THE ANSWER'S OWN BUDGET, judged BEFORE the request rather than instead
+      // of one: a spent deadline must not spend an admission, a round trip and
+      // a reconnect wait on a request whose answer could not be used. Re-judged
+      // here on every page for the same reason the transport re-judges it after
+      // its pacing admission — every wait in between is charged to the budget.
+      //
+      // ORDERED BEFORE THE CEILING CHECK on purpose: when the budget and the
+      // caller's `limit` bind at the same item, `'deadline'` is reported. Both
+      // are true, but the deadline is the one that would stop the NEXT answer
+      // too, and `'limit'` would send the caller to raise a bound that cannot
+      // help. (Neither is wrong to re-ask: the stop point is emitted either way.)
+      if (deadline !== undefined && deadline.expired()) {
+        return this.#truncated(items, 'deadline', cursor)
+      }
       if (items.length >= ceiling) {
         // Which ceiling stopped it decides how the caller reads the result.
         //
@@ -1710,7 +1863,31 @@ class CherryToolEngine {
         limit: pendingAnchor === undefined ? Math.min(ceiling - items.length, pageItems) : pageItems,
       }
       if (cursor !== undefined) request['cursor'] = cursor
-      const result = (await connection.rpc.request(method, request)) as Record<string, unknown>
+      let result: Record<string, unknown>
+      try {
+        result = (await connection.rpc.request(
+          method,
+          request,
+          deadline === undefined ? undefined : { deadline: deadline.instant },
+        )) as Record<string, unknown>
+      } catch (error) {
+        // A request that died OF THE BUDGET is a STOP, not a failure: the
+        // transport reports the spent deadline as one of these two classes
+        // (its own request timeout, or a refused replay), and both mean "no
+        // further attempt was possible", not "the peer or the link misbehaved".
+        // Converting them is what keeps the content already collected — a
+        // timeout answer exists to hand back partial content, so turning it
+        // into the stub receipt would throw away the very thing it promises.
+        //
+        // NOTHING ELSE is converted, deliberately: a peer refusal, an offline
+        // device or an integrity failure after the deadline is still a real
+        // verdict about something else, and reporting it as `'deadline'` would
+        // send the caller looking at their own clock.
+        if (deadline !== undefined && deadlineExhaustion(error)) {
+          return this.#truncated(items, 'deadline', cursor)
+        }
+        throw error
+      }
       const extracted = extract(result)
       const dropped = extracted.dropped ?? 0
       if (dropped > 0 && droppedTotal === 0) {
@@ -1960,7 +2137,7 @@ class CherryToolEngine {
           'agent.agents.list',
           {},
           (page) => ({ ...arrayOf(page['items']), nextCursor: page['nextCursor'] }),
-          aggregateLimit(args['limit']),
+          { limit: aggregateLimit(args['limit']) },
         )
       },
     })
@@ -2004,7 +2181,7 @@ class CherryToolEngine {
             if (typeof result['systemWorkspace'] === 'boolean') systemWorkspace = result['systemWorkspace']
             return { ...arrayOf(result['items']), nextCursor: result['nextCursor'] }
           },
-          aggregateLimit(args['limit']),
+          { limit: aggregateLimit(args['limit']) },
         )
         return {
           items: page.items,
@@ -2055,7 +2232,7 @@ class CherryToolEngine {
             ...(workspaceId === undefined ? {} : { workspaceId }),
           },
           (page) => ({ ...arrayOf(page['items']), nextCursor: page['nextCursor'] }),
-          aggregateLimit(args['limit']),
+          { limit: aggregateLimit(args['limit']) },
         )
       },
     })
@@ -2229,25 +2406,28 @@ class CherryToolEngine {
       'agent.messages.list',
       { sessionId, historyRevision },
       (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-      limit,
-      MAX_AGGREGATE_LIMIT,
-      LIST_PAGE_CLAMP,
-      resume === undefined
-        ? undefined
-        : resume.kind === 'cursor'
-          ? { kind: 'cursor', cursor: resume.cursor }
-          : {
-              kind: 'anchor',
-              messageId: resume.messageId,
-              // `messageIdOf` — the SAME reading `#projectMessage` prints, so
-              // this bridge can never emit an `after:` anchor its own scan
-              // cannot match. An item with no id reads as `''` and can never BE
-              // the anchor.
-              idOf: (raw) => {
-                const id = messageIdOf(raw)
-                return id === '' ? undefined : id
-              },
-            },
+      {
+        limit,
+        safetyBound: MAX_AGGREGATE_LIMIT,
+        maxPerPage: LIST_PAGE_CLAMP,
+        resume:
+          resume === undefined
+            ? undefined
+            : resume.kind === 'cursor'
+              ? { kind: 'cursor', cursor: resume.cursor }
+              : {
+                  kind: 'anchor',
+                  messageId: resume.messageId,
+                  // `messageIdOf` — the SAME reading `#projectMessage` prints, so
+                  // this bridge can never emit an `after:` anchor its own scan
+                  // cannot match. An item with no id reads as `''` and can never
+                  // BE the anchor.
+                  idOf: (raw) => {
+                    const id = messageIdOf(raw)
+                    return id === '' ? undefined : id
+                  },
+                },
+      },
     )
 
     const messages: CherryReadMessage[] = []
@@ -2326,6 +2506,7 @@ class CherryToolEngine {
     connection: DeviceConnection,
     sessionId: string,
     raw: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<CherryReadMessage> {
     const messageId = messageIdOf(raw)
     const revision = String(raw['revision'] ?? '')
@@ -2347,11 +2528,19 @@ class CherryToolEngine {
         'agent.parts.list',
         { sessionId, messageId, messageRevision: revision },
         (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-        Number.POSITIVE_INFINITY,
-        this.#partsSafetyBound,
-        // Parts records are the fattest per item (inline text), so they ride the
-        // tightest derived clamp.
-        PARTS_LIST_PAGE_CLAMP,
+        {
+          limit: Number.POSITIVE_INFINITY,
+          safetyBound: this.#partsSafetyBound,
+          // Parts records are the fattest per item (inline text), so they ride
+          // the tightest derived clamp.
+          maxPerPage: PARTS_LIST_PAGE_CLAMP,
+          // A wait answer's budget reaches the parts walk too (issue #21): a
+          // message's parts are read to COMPLETION, so without this a single fat
+          // message could outlive the whole answer. A deadline stop returns the
+          // parts read so far and marks the message `incomplete`
+          // (`partsTruncated: 'deadline'`), never a silently short list.
+          deadline,
+        },
       )
       // The REFUSAL list lives in the store (`#rememberPartsPage`), the one
       // place it can be enforced for every current and future caller. The walk's
@@ -2362,7 +2551,7 @@ class CherryToolEngine {
 
     const parts: CherryReadPart[] = []
     for (const part of page.items) {
-      parts.push(await this.#projectPart(connection, sessionId, part))
+      parts.push(await this.#projectPart(connection, sessionId, part, deadline))
     }
     const partsTruncated = page.truncated ? (page.truncationReason ?? 'safety-bound') : undefined
     // The message-level completeness verdict is set HERE, the one projection
@@ -2407,6 +2596,7 @@ class CherryToolEngine {
     connection: DeviceConnection,
     sessionId: string,
     raw: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<CherryReadPart> {
     const partId = String(raw['partId'] ?? '')
     const revision = String(raw['revision'] ?? '')
@@ -2448,7 +2638,7 @@ class CherryToolEngine {
       // unreachable. The part stays in the result with `unavailable` naming the
       // fault, so the loss is VISIBLE rather than silent.
       try {
-        text = await this.#readExternalized(connection, sessionId, content['ref'])
+        text = await this.#readExternalized(connection, sessionId, content['ref'], deadline)
       } catch (error) {
         // An INTEGRITY failure is not degradable: see `#degradableReadFailure`.
         if (!this.#degradableReadFailure(error)) throw error
@@ -2570,6 +2760,7 @@ class CherryToolEngine {
     connection: DeviceConnection,
     sessionId: string,
     ref: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<string> {
     const contentId = String(ref['contentId'] ?? '')
     const revision = String(ref['revision'] ?? '')
@@ -2605,13 +2796,23 @@ class CherryToolEngine {
     const chunks: Buffer[] = []
     const hash = createHash('sha256')
     for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
-      const slice = (await connection.rpc.request('agent.content.read', {
-        sessionId,
-        contentId,
-        revision,
-        offset,
-        maxBytes: CONTENT_READ_MAX_BYTES,
-      })) as Record<string, unknown>
+      // The slice walk is bounded by the answer's budget like every other
+      // request it makes (issue #21). A slice that cannot be read in time makes
+      // this ONE part `unavailable` — the degradable class — because the
+      // reassembled bytes could not be verified; the rest of the snapshot is
+      // still exactly what the peer said, and the message is flagged
+      // `incomplete` by the ordinary projection.
+      const slice = (await connection.rpc.request(
+        'agent.content.read',
+        {
+          sessionId,
+          contentId,
+          revision,
+          offset,
+          maxBytes: CONTENT_READ_MAX_BYTES,
+        },
+        deadline === undefined ? undefined : { deadline: deadline.instant },
+      )) as Record<string, unknown>
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
       // The cap is checked on the base64 LENGTH first, before the decode: a
       // slice may carry any size a hostile peer puts in one frame, and decoding
@@ -2977,7 +3178,9 @@ class CherryToolEngine {
         'the older messages (re-waiting re-reads the newest window). When content is cut, ' +
         '`messagesTruncated`/`messagesTruncationReason` ' +
         'report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a ' +
-        'returned message missing its own parts carries `incomplete`.',
+        'returned message missing its own parts carries `incomplete`. The reason `deadline` means the ' +
+        'ANSWER\'s own assembly budget ran out (your window plus a bounded tail): the content read so ' +
+        'far is still returned, and `cherry_read` continues past the stop-point token.',
       parameters: {
         type: 'object',
         properties: {
@@ -3221,7 +3424,8 @@ class CherryToolEngine {
         'execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, ' +
         'never a park. Use it to resume after answering an interaction. Its message walk is bounded ' +
         'like `cherry_send`\'s, with the same verdict wording: a cut drops the OLDER messages, and a ' +
-        'returned message missing its own parts carries `incomplete`.',
+        'returned message missing its own parts carries `incomplete`. A cut whose reason is `deadline` ' +
+        'means the ANSWER\'s own assembly budget ran out — the content read so far is still returned.',
       parameters: {
         type: 'object',
         properties: {
@@ -3282,11 +3486,25 @@ class CherryToolEngine {
           // A failed assembly degrades the same way the terminal and timeout
           // answers do (issue #3): `idle` is still true, and the failure to
           // read the history behind it is reported beside the verdict.
-          const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
-            status: 'idle' satisfies CherryRunStatus,
+          // The answer's own budget (issue #21) starts HERE, for an idle
+          // answer: nothing was waited for, so the caller's window is what its
+          // history read may spend (plus the bounded tail — see
+          // `AssemblyDeadline`). Anchoring it at the assembly rather than at the
+          // tool entry is deliberate: the window is the WAIT's, and there was
+          // no wait; the snapshot above is the §6 precondition, not part of the
+          // answer's content.
+          const answerDeadline = new AssemblyDeadline(performance.now(), waitTimeout(args['timeoutMs']))
+          const assembled = await this.#assembledTerminalMessages(
+            connection,
             sessionId,
-            cursor: this.#cursorOf(subscriptions, sessionId),
-          })
+            session,
+            {
+              status: 'idle' satisfies CherryRunStatus,
+              sessionId,
+              cursor: this.#cursorOf(subscriptions, sessionId),
+            },
+            answerDeadline,
+          )
           if (assembled.failed !== undefined) {
             return { ...assembled.failed, session, executionId: null }
           }
@@ -3361,11 +3579,13 @@ class CherryToolEngine {
           'agent.interactions.list',
           { sessionId },
           (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-          aggregateLimit(args['limit']),
-          MAX_AGGREGATE_LIMIT,
-          // An interaction record carries an inline input AND an inline
-          // summary, the fattest item of the plain lists.
-          INTERACTIONS_LIST_PAGE_CLAMP,
+          {
+            limit: aggregateLimit(args['limit']),
+            safetyBound: MAX_AGGREGATE_LIMIT,
+            // An interaction record carries an inline input AND an inline
+            // summary, the fattest item of the plain lists.
+            maxPerPage: INTERACTIONS_LIST_PAGE_CLAMP,
+          },
         )
 
         const includeAnswered = args['includeAnswered'] === true
@@ -3902,9 +4122,13 @@ class CherryToolEngine {
    * something the lookup would never serve correctly:
    *
    *  - `revision === ''` — nothing to fence;
-   *  - `page.truncated` — the parts walk was cut by the circuit breaker, so the
-   *    list is SHORT. A short walk is a transient fault and must be retried,
-   *    never remembered;
+   *  - `page.truncated` — the parts walk stopped early, so the list is SHORT.
+   *    REASON-BLIND on purpose: the circuit breaker (`'safety-bound'`) and a
+   *    wait answer's spent budget (`'deadline'`) are both transient from the
+   *    cache's point of view — the next read may well complete — and the ONE
+   *    thing that must not happen is remembering a short list as if it were the
+   *    peer's complete answer. Matching on the reason would leave the next
+   *    reason word free to reintroduce that bug;
    *  - `bytes > messageCacheEntryBytes` — walked fresh every time instead.
    *
    * NOT a refusal: a message whose parts then FAILED to resolve. That
@@ -4357,9 +4581,11 @@ class CherryToolEngine {
       'agent.interactions.list',
       { sessionId },
       (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-      MAX_AGGREGATE_LIMIT,
-      MAX_AGGREGATE_LIMIT,
-      INTERACTIONS_LIST_PAGE_CLAMP,
+      {
+        limit: MAX_AGGREGATE_LIMIT,
+        safetyBound: MAX_AGGREGATE_LIMIT,
+        maxPerPage: INTERACTIONS_LIST_PAGE_CLAMP,
+      },
     )
     for (const item of page.items) this.#rememberInteraction(deviceId, sessionId, item)
 
@@ -4526,6 +4752,14 @@ class CherryToolEngine {
     // system, and a wait whose deadline raced a time jump would either expire
     // instantly or park for far longer than the caller asked.
     const deadline = options.startedAt + options.timeoutMs
+    // THE ANSWER'S OWN BUDGET (issue #21), built from the same clock and the
+    // same window as `deadline` above. Passing it to both answer faces (the
+    // terminal one and the timeout one) is what keeps a settled run's history
+    // read — and a timed-out run's — from outliving the caller's patience: the
+    // aggregate may spend only the bounded TAIL past the window (see
+    // `AssemblyDeadline`), and every request it issues is clamped to that
+    // instant.
+    const answerDeadline = new AssemblyDeadline(options.startedAt, options.timeoutMs)
     let latestExecutionId = options.executionId
     // THE BASELINE: the newest seq already in the buffer when this wait began.
     // The fold below sees only events strictly after it, so a prior run's
@@ -4630,13 +4864,20 @@ class CherryToolEngine {
 
       // HARD TERMINAL: one of the four execution states, FOR THIS EXECUTION.
       if (observed.terminalStatus !== undefined) {
-        return await this.#terminalResult(connection, subscriptions, sessionId, observed.terminalStatus, {
-          ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
-          ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
-          // The run-scoped cut for the terminal aggregate: the message THIS run
-          // persisted, when the peer named one.
-          ...(observed.terminalMessageId === undefined ? {} : { terminalMessageId: observed.terminalMessageId }),
-        })
+        return await this.#terminalResult(
+          connection,
+          subscriptions,
+          sessionId,
+          observed.terminalStatus,
+          {
+            ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
+            ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
+            // The run-scoped cut for the terminal aggregate: the message THIS run
+            // persisted, when the peer named one.
+            ...(observed.terminalMessageId === undefined ? {} : { terminalMessageId: observed.terminalMessageId }),
+          },
+          answerDeadline,
+        )
       }
 
       // The window is judged on the monotonic clock, like `deadline` itself.
@@ -4644,11 +4885,17 @@ class CherryToolEngine {
       if (now >= deadline) {
         // TIMEOUT IS NOT A FAILURE (spec §6): hand back what arrived, plus the
         // cursor, so the caller can continue from exactly here.
-        return await this.#timeoutResult(connection, subscriptions, sessionId, {
-          timeoutMs: options.timeoutMs,
-          ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
-          ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
-        })
+        return await this.#timeoutResult(
+          connection,
+          subscriptions,
+          sessionId,
+          {
+            timeoutMs: options.timeoutMs,
+            ...(latestExecutionId === undefined ? {} : { executionId: latestExecutionId }),
+            ...(options.commandId === undefined ? {} : { commandId: options.commandId }),
+          },
+          answerDeadline,
+        )
       }
 
       // Park on the session buffer: `waitFor` settles when the buffer advances
@@ -5029,13 +5276,22 @@ class CherryToolEngine {
     sessionId: string,
     status: string,
     extra: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<Record<string, unknown>> {
     const { terminalMessageId, ...rest } = extra
-    const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
-      string,
-      unknown
-    >
-    const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
+    const cursor = this.#cursorOf(subscriptions, sessionId)
+    // THE SNAPSHOT IS INSIDE THE DEGRADE ARM TOO (issue #21, and the #3
+    // invariant it extends): without it there is no `historyRevision` and so no
+    // history to assemble, but the RUN's verdict is already known and must
+    // survive. A dead link here used to make `cherry_send` REJECT — taking the
+    // status and the run's identifiers down with the content, which is exactly
+    // what #3 removed for every other assembly failure.
+    let session: Record<string, unknown>
+    try {
+      session = await this.#sessionSnapshot(connection, sessionId, deadline)
+    } catch (error) {
+      return this.#assemblyFailed({ status, sessionId, ...rest, cursor }, error)
+    }
     // The cache is refreshed from the terminal snapshot so a follow-up send
     // does not have to re-read the session. Done BEFORE the aggregate: it does
     // not depend on the content read, so a failed assembly must not cost it.
@@ -5048,14 +5304,13 @@ class CherryToolEngine {
         idle,
       )
     }
-    const cursor = this.#cursorOf(subscriptions, sessionId)
-
-    const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
-      status,
+    const assembled = await this.#assembledTerminalMessages(
+      connection,
       sessionId,
-      ...rest,
-      cursor,
-    })
+      session,
+      { status, sessionId, ...rest, cursor },
+      deadline,
+    )
     if (assembled.failed !== undefined) return assembled.failed
 
     return {
@@ -5120,22 +5375,36 @@ class CherryToolEngine {
     subscriptions: SessionSubscriptions,
     sessionId: string,
     extra: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<Record<string, unknown>> {
-    const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
-      string,
-      unknown
-    >
-    const session = isRecord(sessionResult['session']) ? sessionResult['session'] : {}
     const cursor = this.#cursorOf(subscriptions, sessionId)
     const progress = this.#timeoutProgress(subscriptions, sessionId)
-
-    const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
+    const identity = {
       status: 'timeout' satisfies CherryRunStatus,
       sessionId,
       ...extra,
       cursor,
       ...(progress === undefined ? {} : { progress }),
-    })
+    }
+    // The snapshot is the FIRST request of the answer and rides the same
+    // deadline (issue #21); its failure is an ASSEMBLY failure, not a run
+    // verdict, so it degrades to the stub receipt instead of rejecting the
+    // call. Before this, a dead link here made `cherry_send` throw and the
+    // caller lost even the `commandId` of the run it had just issued.
+    let session: Record<string, unknown>
+    try {
+      session = await this.#sessionSnapshot(connection, sessionId, deadline)
+    } catch (error) {
+      return this.#assemblyFailed(identity, error)
+    }
+
+    const assembled = await this.#assembledTerminalMessages(
+      connection,
+      sessionId,
+      session,
+      identity,
+      deadline,
+    )
     if (assembled.failed !== undefined) return assembled.failed
 
     return {
@@ -5228,29 +5497,73 @@ class CherryToolEngine {
     sessionId: string,
     session: Record<string, unknown>,
     identity: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<
     | { failed?: undefined; messages: CherryReadMessage[]; walk: CherryMessageWalkVerdict }
     | { failed: Record<string, unknown>; messages?: undefined; walk?: undefined }
   > {
     try {
-      const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session)
+      const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session, deadline)
       return { messages, walk }
     } catch (error) {
-      // Bounded like every other peer-echoed string in a result: the reason is
-      // actionable, the full text belongs in the log.
-      const message = error instanceof Error ? error.message : String(error)
-      console.warn(
-        `[cherry-remote] the ${String(identity['status'])} answer for session ${sessionId} could not ` +
-          `assemble its content (${message}); returning the verdict with the assembly failure reported`,
-      )
-      return {
-        failed: {
-          ...identity,
-          aggregateError: message.slice(0, 200),
-          guidance: AGGREGATE_FAILED_GUIDANCE,
-        },
-      }
+      return { failed: this.#assemblyFailed(identity, error) }
     }
+  }
+
+  /**
+   * The STUB RECEIPT: the run's verdict and identifiers, the assembly failure,
+   * and the route that rebuilds the content (issue #3).
+   *
+   * One builder for both failure points of all three wait faces — the session
+   * snapshot and the message walk — so the shape cannot drift between paths
+   * that mean the same thing. It is deliberately built from the CALLER's
+   * identity object: the verdict is already known and true, and only the
+   * content behind it failed.
+   *
+   * `aggregateError` is BOUNDED like every other peer-echoed string in a result
+   * (the full text goes to the log): the reason is actionable at 200 characters
+   * and the log is where the operator reads the rest.
+   */
+  #assemblyFailed(identity: Record<string, unknown>, error: unknown): Record<string, unknown> {
+    const message = error instanceof Error ? error.message : String(error)
+    console.warn(
+      `[cherry-remote] the ${String(identity['status'])} answer for session ${String(identity['sessionId'])} ` +
+        `could not assemble its content (${message}); returning the verdict with the assembly failure reported`,
+    )
+    return {
+      ...identity,
+      aggregateError: message.slice(0, 200),
+      guidance: AGGREGATE_FAILED_GUIDANCE,
+    }
+  }
+
+  /**
+   * One session snapshot, inside the answer's budget when it has one (issue
+   * #21).
+   *
+   * The snapshot is the FIRST request every wait answer makes (it carries the
+   * `historyRevision` the history walk needs), so it sits inside the same
+   * deadline as the walk: a link that would make the caller wait
+   * `transportRetryWaitMs` for a replay must not do so after the answer's
+   * budget is spent.
+   *
+   * A reply whose `session` is not a record yields `{}` — the same tolerance
+   * every reader here applies — and the walk then finds no `historyRevision`
+   * and answers with an empty message list. That is the pre-existing behaviour
+   * and deliberately not an error: a peer that sends no session has no history
+   * to read, which is different from one that refused the read.
+   */
+  async #sessionSnapshot(
+    connection: DeviceConnection,
+    sessionId: string,
+    deadline?: AssemblyDeadline,
+  ): Promise<Record<string, unknown>> {
+    const result = (await connection.rpc.request(
+      'agent.sessions.get',
+      { sessionId },
+      deadline === undefined ? undefined : { deadline: deadline.instant },
+    )) as Record<string, unknown>
+    return isRecord(result['session']) ? result['session'] : {}
   }
 
   /**
@@ -5305,6 +5618,7 @@ class CherryToolEngine {
     connection: DeviceConnection,
     sessionId: string,
     session: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
   ): Promise<{ messages: CherryReadMessage[] } & CherryMessageWalkVerdict> {
     const historyRevision = optionalString(session['historyRevision'])
     if (historyRevision === undefined) return { messages: [] }
@@ -5314,38 +5628,49 @@ class CherryToolEngine {
       'agent.messages.list',
       { sessionId, historyRevision },
       (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-      TERMINAL_AGGREGATE_MESSAGES,
+      { limit: TERMINAL_AGGREGATE_MESSAGES, deadline },
     )
 
     const messages: CherryReadMessage[] = []
     let projectedBytes = 0
-    let outOfBudget = false
+    // WHY the loop stopped, when it did — the two budgets are independent and
+    // each has its own word, so the first stop wins and is reported as itself.
+    let stop: CherryTruncationReason | undefined
     for (const raw of page.items) {
-      const message = await this.#projectMessage(connection, sessionId, raw)
+      // The ANSWER's budget, judged BEFORE every message: one message's parts
+      // walk is a whole sub-walk (one `agent.parts.list` page set plus one
+      // `agent.content.read` walk per externalized part), so the check has to
+      // sit here as well as inside `#aggregate` — that is where a hard-bounded
+      // answer actually spends its last round trip.
+      if (deadline !== undefined && deadline.expired()) {
+        stop = 'deadline'
+        break
+      }
+      const message = await this.#projectMessage(connection, sessionId, raw, deadline)
       messages.push(message)
       projectedBytes += JSON.stringify(message).length
       // Checked AFTER the message is complete: the budget trims what comes
       // NEXT, never what has already been taken, so message 0 is always whole.
       if (projectedBytes >= AGGREGATE_BYTES) {
-        outOfBudget = true
+        stop = 'aggregate-bytes'
         break
       }
     }
-    // The BYTE stop only counts as truncation when items were LEFT BEHIND:
-    // spending the budget exactly on the peer's last message is a complete
-    // walk, and flagging it would be a false alarm (the same honesty the
-    // aggregate's own boundary case records).
-    const exhausted = outOfBudget && (messages.length < page.items.length || page.truncated)
-    if (exhausted) {
+    // A STOP only counts as truncation when items were LEFT BEHIND: spending the
+    // budget exactly on the peer's last message is a complete walk, and flagging
+    // it would be a false alarm (the same honesty the aggregate's own boundary
+    // case records).
+    const leftBehind = messages.length < page.items.length || page.truncated
+    if (stop !== undefined && leftBehind) {
       // The token comes from the SAME helper `cherry_read` uses, so this face's
-      // mid-window byte stop now emits `after:<last returned id>` instead of
-      // nothing — and that token is a `cherry_read` input. The EXHAUSTED
-      // VERDICT is unchanged: both stops are truncation.
+      // mid-window stop emits `after:<last returned id>` instead of nothing —
+      // and that token is a `cherry_read` input. The truncation VERDICT is
+      // unchanged; only the word differs (a byte budget vs. a time budget).
       const resumeToken = messageResumeToken(page, messages.length, messages[messages.length - 1]?.messageId)
       return {
         messages,
         messagesTruncated: true,
-        messagesTruncationReason: 'aggregate-bytes',
+        messagesTruncationReason: stop,
         ...(resumeToken === undefined ? {} : { messagesResumeCursor: resumeToken }),
       }
     }
@@ -5606,6 +5931,32 @@ function messageWalkVerdict(
  */
 function mangledRemainder(remainder: string): boolean {
   return remainder === '' || remainder !== remainder.trim() || /[\u0000-\u001f\u007f]/.test(remainder)
+}
+
+/**
+ * Whether a request's rejection means the ANSWER's budget ran out (issue #21).
+ *
+ * Two classes, one meaning, from the two layers that wait:
+ *
+ *  - {@link RpcDeadlineExceededError} — the connection refused to wait longer
+ *    for a reconnect, or refused the replay, because the deadline had passed.
+ *    It is raised only in that case, so no extra test is needed.
+ *  - {@link RequestTimeoutError} — the rpc layer's per-request timeout, but ONLY
+ *    when that timeout was DERIVED from the deadline (`clampedByDeadline`). The
+ *    same class is raised by the ordinary 60 s default on a walk whose deadline
+ *    is farther away, and a peer that goes silent for a minute is not the
+ *    caller's budget running out: converting that one would report `'deadline'`
+ *    for a different failure, and the caller would stop looking for a peer that
+ *    stopped answering. The flag exists instead of a clock comparison because a
+ *    timer may fire a millisecond early — "the budget shortened my timeout" is a
+ *    fact, "the deadline has passed by now" is a race.
+ *
+ * Everything else is a verdict about something else (the peer, the link, the
+ * content) and keeps its own error.
+ */
+function deadlineExhaustion(error: unknown): boolean {
+  if (error instanceof RpcDeadlineExceededError) return true
+  return error instanceof RequestTimeoutError && error.clampedByDeadline
 }
 
 /**

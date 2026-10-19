@@ -11,7 +11,12 @@ import {
 import { JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 import type { DeviceRecord } from '../../src/deviceStore.js'
-import { CHANNEL_SEAM, DeviceConnection, TransportLostError } from '../../src/connection.js'
+import {
+  CHANNEL_SEAM,
+  DeviceConnection,
+  RpcDeadlineExceededError,
+  TransportLostError,
+} from '../../src/connection.js'
 import type { DeviceState, EffectiveLimits } from '../../src/connection.js'
 import { FakeCherry, maxRequestsInAnyOneSecondWindow } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
@@ -1751,6 +1756,120 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(failedWrites).toBe(2)
     await waitForState(connection, 'connected', 5_000)
     expect(fakeInfo.fake.methodCount('agent.messages.send')).toBe(0)
+  }, 20_000)
+
+  // -------------------------------------------------------------------------
+  // Issue #21: a caller-supplied deadline bounds the recovery waits
+  // -------------------------------------------------------------------------
+
+  it('⑯ (issue #21) a read whose deadline is spent stops at it instead of waiting out transportRetryWaitMs', async () => {
+    // The field shape: a flapping link, a read that dies in flight, and a
+    // reconnect that cannot land inside the caller's remaining budget. The
+    // deadline is the bound that matters — the connection's own 5 s allowance
+    // is an ALLOWANCE, not a duty, once the caller has said how long it can
+    // still use the answer.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeLinkKillingFake('agent.agents.list', {
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      // A backoff longer than the deadline, so the reconnect cannot land inside
+      // it: this is the "the desktop is not coming back in time" case.
+      backoffInitialMs: 60_000,
+      transportRetryWaitMs: 5_000,
+    })
+    await connection.connect()
+
+    const started = Date.now()
+    const error = await connection.rpc
+      .request('agent.agents.list', {}, { deadline: performance.now() + 200 })
+      .catch((reason: unknown) => reason)
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(RpcDeadlineExceededError)
+    expect((error as RpcDeadlineExceededError).method).toBe('agent.agents.list')
+    expect((error as RpcDeadlineExceededError).device).toBe(recordFor(fakeInfo).deviceId)
+    // Bounded by the DEADLINE (200 ms), not by the 5 s reconnect allowance and
+    // certainly not by the 60 s default of the replay that never happened.
+    expect(elapsed).toBeLessThan(1_500)
+    // Nothing was replayed: the killed arrival is the only one the peer saw.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
+  }, 20_000)
+
+  it('⑯b (issue #21) the replay is refused once the pacing admission has spent the deadline', async () => {
+    // THREE CLOCKS, deliberately far apart: the link is back in ~10 ms
+    // (`backoffInitialMs`), the replay's fresh pacing admission cannot be taken
+    // before ~575 ms (`rateBudgetPerSecond: 2` ⇒ ceil(1150/2) ms gap), and the
+    // caller's deadline is 300 ms. The reconnect succeeds and the pacing wait
+    // is what spends the budget, so the replay must NOT be fired.
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeLinkKillingFake('agent.agents.list', {
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 10,
+      transportRetryWaitMs: 5_000,
+      rateBudgetPerSecond: 2,
+    })
+    await connection.connect()
+
+    const started = Date.now()
+    const error = await connection.rpc
+      .request('agent.agents.list', {}, { deadline: performance.now() + 300 })
+      .catch((reason: unknown) => reason)
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(RpcDeadlineExceededError)
+    // It really waited for the admission (past the 300 ms deadline) rather than
+    // failing early: this is the branch AFTER the pacing acquire.
+    expect(elapsed).toBeGreaterThanOrEqual(250)
+    expect(elapsed).toBeLessThan(2_000)
+    // The replay never reached the wire.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
+  }, 20_000)
+
+  it('⑰ (issue #21) a request whose deadline is ALREADY spent does not buy a pacing admission', async () => {
+    // Review finding 3: the admission (one `#minGapMs` per request) used to be
+    // taken before the post-admission deadline guard, so a walk that kept asking
+    // after its budget was gone paid one queueing gap per remaining part — up to
+    // ~1 s of overshoot on a "absolute" instant. With a 2/s shared budget the
+    // gap is ceil(1150/2) = 575 ms, so the two behaviours are far apart: refuse
+    // before the admission (fast) vs after it (≥575 ms).
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: { heartbeatMs: 60_000 },
+      agent: { agents: [{ agentId: 'agent-1', name: 'Agent One' }] },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 60_000,
+      transportRetryWaitMs: 5_000,
+      rateBudgetPerSecond: 2,
+    })
+    await connection.connect()
+
+    // Spend the tier's only admission so the NEXT request cannot be admitted
+    // for ~575 ms.
+    await connection.rpc.request('connection.ping', { nonce: 'first' })
+
+    const started = Date.now()
+    const error = await connection.rpc
+      .request('agent.agents.list', {}, { deadline: performance.now() - 1 })
+      .catch((reason: unknown) => reason)
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(RpcDeadlineExceededError)
+    // Refused BEFORE the admission: no 575 ms gap was paid, and no request was
+    // put on the wire. (A request admitted just BEFORE expiry can still straddle
+    // it by at most one gap — the limiter, not the deadline, releases a queued
+    // request; that residue is documented in AGENTS.md.)
+    expect(elapsed).toBeLessThan(300)
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(0)
   }, 20_000)
 
   it('⑭d a peer REFUSAL under a live link is neither reclassified nor retried', async () => {

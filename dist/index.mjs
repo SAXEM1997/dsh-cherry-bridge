@@ -536,6 +536,42 @@ function writeLossError(error) {
 	return new Error(CHANNEL_CLOSED_MESSAGE, { cause: detail });
 }
 /**
+* A request that was NOT answered before its own client-side timeout, as its own
+* type rather than a message (issue #21).
+*
+* The distinction is only observable to a caller that chose the timeout: a
+* deadline-bounded walk derives every per-request timeout from its remaining
+* budget ({@link JsonRpcClient.request}'s `deadline`), so a timeout there means
+* "my budget ran out, stop the walk" — which is a STOP, not a failure of the
+* peer or of the request. Matching the message text would make that decision
+* depend on wording; the class makes it depend on the event.
+*
+* The message is unchanged, byte for byte, because it is what every existing
+* operator-facing report and test quotes.
+*/
+var RequestTimeoutError = class extends Error {
+	method;
+	timeoutMs;
+	/**
+	* Whether {@link timeoutMs} was DERIVED from the caller's deadline (it was
+	* shorter than the requested timeout), i.e. whether the budget is what ran out.
+	*
+	* This is a positive flag rather than a clock comparison on purpose: a timer
+	* may fire a millisecond EARLY, so "has the deadline passed by the time I
+	* handle the rejection" is a race, while "my timeout was clamped by it" is a
+	* fact about how the error was produced.
+	*/
+	clampedByDeadline;
+	constructor(method, timeoutMs, clampedByDeadline = false) {
+		super(`JSON-RPC request "${method}" timed out after ${timeoutMs}ms`);
+		this.name = "RequestTimeoutError";
+		this.method = method;
+		this.timeoutMs = timeoutMs;
+		this.clampedByDeadline = clampedByDeadline;
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+};
+/**
 * The structured error a peer returns for a request. `code` is the literal
 * 1000 the transport reserves for protocol failures; `data.reason` is the
 * discriminator consumers switch on.
@@ -656,7 +692,22 @@ var JsonRpcClient = class {
 		};
 		const parsed = jsonRpcRequestSchema.safeParse(envelope);
 		if (!parsed.success) return Promise.reject(/* @__PURE__ */ new Error(`Invalid JSON-RPC request for method "${method}"`));
-		const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
+		const requestedTimeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
+		const timeoutFor = () => {
+			const remainingMs = opts?.deadline === void 0 ? void 0 : opts.deadline - performance.now();
+			if (remainingMs === void 0) return {
+				timeoutMs: requestedTimeoutMs,
+				clipped: false
+			};
+			const clampedMs = Math.max(1, Math.ceil(remainingMs));
+			return clampedMs < requestedTimeoutMs ? {
+				timeoutMs: clampedMs,
+				clipped: true
+			} : {
+				timeoutMs: requestedTimeoutMs,
+				clipped: false
+			};
+		};
 		return new Promise((resolve, reject) => {
 			const send = (abortError) => {
 				if (this.disposed || abortError !== void 0) {
@@ -668,8 +719,9 @@ var JsonRpcClient = class {
 					for (const send of this.queue.splice(0, this.queue.length)) send();
 					return;
 				}
+				const { timeoutMs, clipped } = timeoutFor();
 				const timer = setTimeout(() => {
-					this.finish(id, `JSON-RPC request "${method}" timed out after ${timeoutMs}ms`);
+					this.finish(id, new RequestTimeoutError(method, timeoutMs, clipped));
 				}, timeoutMs);
 				this.pending.set(id, {
 					resolve,
@@ -770,11 +822,11 @@ var JsonRpcClient = class {
 		for (const send of queued) send(error);
 	}
 	/** Settles one pending request and releases its in-flight slot. */
-	finish(id, message) {
+	finish(id, error) {
 		const pending = this.pending.get(id);
 		if (pending === void 0) return;
 		this.release(id);
-		pending.reject(new Error(message));
+		pending.reject(error);
 	}
 	resolve(id, value) {
 		const pending = this.pending.get(id);
@@ -2272,6 +2324,30 @@ var TransportLostError = class extends Error {
 	}
 };
 /**
+* The caller's DEADLINE ran out while a read was being recovered (issue #21).
+*
+* Distinct from {@link TransportLostError}, which says "the link died and I ran
+* out of patience for a reconnect". This one says something the caller already
+* knows but must be able to act on: the answer's own time budget is spent, so
+* no further attempt is worth making. A deadline-bounded walk treats it as a
+* STOP (return what has been read), while a mere link loss is a failure — and
+* the two must not be confused, because only one of them has content behind it.
+*
+* It is NOT `DeviceUnavailableError` either: the device may be perfectly well
+* and the budget may have expired in pacing or in a slow peer.
+*/
+var RpcDeadlineExceededError = class extends Error {
+	device;
+	method;
+	constructor(device, method) {
+		super(`device ${device}: the request deadline passed before "${method}" could be attempted again`);
+		this.name = "RpcDeadlineExceededError";
+		this.device = device;
+		this.method = method;
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+};
+/**
 * CEILING for the business-request window — not the window itself. The window
 * is owned by the rpc layer and is sized from the peer's hello-reported
 * `inFlightRequests` (spec §3.4「取回报一半」): see
@@ -2393,6 +2469,33 @@ var SecondWindowRateLimiter = class {
 */
 function classifyRateTier(method) {
 	return method === "agent.content.read" ? "content" : "shared";
+}
+/**
+* The reconnect wait one read is granted, and whether the CALLER's deadline is
+* what shortens it (issue #21).
+*
+* Returned together, from the RAW remaining time, because the two answers must
+* not be re-derived from the timer value: the wait is CEILED for `setTimeout`
+* (which truncates a fractional delay, and a budget-capped wait firing a
+* millisecond early would report the deadline as expired sub-ms before it is).
+* A raw remaining of 4,999.4 ms against a 5,000 ms allowance therefore yields a
+* 5,000 ms wait — EQUAL to the allowance, yet the deadline was the shorter
+* bound. Deciding `deadlineCapped` from the ceiled wait would report a spent
+* budget as a plain transport loss, and a wait answer converts only the
+* deadline class into the graceful stop that keeps its partial content.
+*
+* A wait is never zero: the caller refuses a spent deadline before this, and
+* `setTimeout` treats anything below 1 ms as "as soon as possible".
+*/
+function reconnectWait(remainingMs, allowanceMs) {
+	if (remainingMs === void 0 || remainingMs >= allowanceMs) return {
+		waitMs: allowanceMs,
+		deadlineCapped: false
+	};
+	return {
+		waitMs: Math.min(allowanceMs, Math.max(1, Math.ceil(remainingMs))),
+		deadlineCapped: true
+	};
 }
 /**
 * The connection's two pacing tiers: an admission is taken from the tier its
@@ -2718,7 +2821,7 @@ var DeviceConnection = class {
 	async close() {
 		this.#running = false;
 		this.#epoch += 1;
-		for (const abort of [...this.#replayWaiters]) abort(void 0);
+		for (const abort of [...this.#replayWaiters]) abort({ kind: "abandoned" });
 		this.#clearAllTimers();
 		this.#teardownLink();
 		this.#setState("offline");
@@ -3047,30 +3150,72 @@ var DeviceConnection = class {
 	#houseCall(link, method, params, timeoutMs) {
 		return link.client.request(method, params, timeoutMs === void 0 ? void 0 : { timeoutMs });
 	}
-	/** Business request: offline fail-fast, then rate smoothing, then the rpc window. */
+	/**
+	* The remaining time this request may still spend, or undefined when it has no
+	* deadline (issue #21). Recomputed at each point that waits, so pacing and a
+	* reconnect are both charged to the same budget.
+	*/
+	#remainingMs(opts) {
+		return opts?.deadline === void 0 ? void 0 : opts.deadline - performance.now();
+	}
+	/** Whether the caller's deadline has already passed (false without one). */
+	#deadlinePassed(opts) {
+		const remaining = this.#remainingMs(opts);
+		return remaining !== void 0 && remaining <= 0;
+	}
+	/**
+	* Business request: offline fail-fast, then rate smoothing, then the rpc window.
+	*
+	* A caller-supplied `deadline` ({@link JsonRpcRequestOptions}) bounds EVERY
+	* wait this layer owns: the pacing admission, the reconnect wait before a
+	* replay, and the replay itself — while the rpc layer bounds the request's own
+	* timeout with it. That is the whole point of the option: without it, a
+	* flapping link lets every read absorb another `transportRetryWaitMs`, so an
+	* answer whose deadline already passed can still take minutes (issue #21).
+	*
+	* The pacing admission is judged BEFORE it is taken (so a spent budget never
+	* spends a slot, which would otherwise make a walk over many `{ref}` parts
+	* pay one queueing gap per part after the budget is gone) and AGAIN after it
+	* (the admission itself can consume a whole gap). One gap of overshoot
+	* remains, unavoidably: a request already queued for its slot is released by
+	* the limiter, not by the deadline, so it may be refused one gap late — that
+	* bound is the limiter's `#minGapMs`, and refusing it earlier would mean
+	* deadline-aware pacing, which is a different piece of work.
+	*/
 	async #businessRequest(method, params, opts) {
 		if (this.#state !== "connected") {
 			console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`);
 			throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		}
+		if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 		await this.#limiter.acquire(method);
 		const link = this.#link;
 		if (this.#state !== "connected" || link === void 0) {
 			console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`);
 			throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		}
+		if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 		try {
 			return await link.client.request(method, params, opts);
 		} catch (error) {
 			if (!this.#isTransportLoss(error)) throw error;
 			const lost = new TransportLostError(this.record.deviceId, "connected", method, { cause: error });
 			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
-			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`);
-			const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client);
-			if (reconnected === void 0) throw lost;
+			const remaining = this.#remainingMs(opts);
+			if (remaining !== void 0 && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+			const { waitMs, deadlineCapped } = reconnectWait(remaining, this.#transportRetryWaitMs);
+			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${Math.round(waitMs)}ms for a reconnect to replay it`);
+			const waited = await this.#awaitReconnect(waitMs, link.client);
+			if (waited.kind === "abandoned") throw lost;
+			if (waited.kind === "expired") {
+				if (deadlineCapped) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+				throw lost;
+			}
+			const reconnected = waited;
 			if (reconnected.epoch !== this.#epoch) throw lost;
 			await this.#limiter.acquire(method);
 			if (!this.#running || this.#state !== "connected") throw lost;
+			if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 			try {
 				return await reconnected.client.request(method, params, opts);
 			} catch (error) {
@@ -3084,21 +3229,24 @@ var DeviceConnection = class {
 		return error instanceof Error && !(error instanceof JsonRpcRequestError) && isChannelClosedError(error);
 	}
 	/**
-	* Resolves with the next AUTHENTICATED link (+epoch) within `waitMs`, or
-	* undefined once the bound, a shutdown, or a cycle the supervisor abandoned
-	* makes a replay pointless.
+	* Waits up to `waitMs` for the next AUTHENTICATED link, and says WHY the wait
+	* ended ({@link ReplayWait}) instead of resolving `undefined` for all three
+	* outcomes — the caller has to tell "my deadline ran out" from "the peer never
+	* came back" and from "the lifecycle moved on", and only a reported cause can
+	* be trusted (a clock comparison after the fact races an early timer).
 	*
 	* `connected` is the right condition rather than "a link exists": `#establish`
 	* commits `#link` before its hello/authenticate pair completes, and a replay
 	* into that window would ride an unauthenticated client.
 	*/
 	#awaitReconnect(waitMs, deadClient) {
-		if (!this.#running) return Promise.resolve(void 0);
+		if (!this.#running) return Promise.resolve({ kind: "abandoned" });
 		const established = () => {
 			const link = this.#link;
 			if (this.#state !== "connected" || link === void 0) return void 0;
 			if (link.client === deadClient) return void 0;
 			return {
+				kind: "connected",
 				client: link.client,
 				epoch: link.epoch
 			};
@@ -3106,26 +3254,27 @@ var DeviceConnection = class {
 		const ready = established();
 		if (ready !== void 0) return Promise.resolve(ready);
 		return new Promise((resolve) => {
-			const finish = (value) => {
+			const finish = (outcome) => {
 				clearTimeout(timer);
 				this.#stateListeners.delete(listener);
 				this.#replayWaiters.delete(finish);
-				resolve(value);
+				resolve(outcome);
 			};
 			const listener = (state) => {
 				if (!this.#running || state === "disabled" || state === "identity-mismatch") {
-					finish(void 0);
+					finish({ kind: "abandoned" });
 					return;
 				}
 				if (state !== "connected") return;
 				const link = this.#link;
 				if (link === void 0 || link.client === deadClient) return;
 				finish({
+					kind: "connected",
 					client: link.client,
 					epoch: link.epoch
 				});
 			};
-			const timer = setTimeout(() => finish(void 0), waitMs);
+			const timer = setTimeout(() => finish({ kind: "expired" }), waitMs);
 			this.#replayWaiters.add(finish);
 			this.#stateListeners.add(listener);
 		});
@@ -4421,6 +4570,82 @@ const DEFAULT_WAIT_TIMEOUT_MS = 12e4;
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */
 const MIN_WAIT_TIMEOUT_MS = 1;
 /**
+* How much EXTRA time a wait ANSWER may spend assembling its content, at most
+* (issue #21). The effective tail is the caller's own window, CLAMPED to
+* [{@link WAIT_ANSWER_TAIL_FLOOR_MS}, this]: one more window, never less than 1 s
+* and never more than 15 s.
+*
+* WHY THE ANSWER NEEDS A BUDGET OF ITS OWN. The wait window bounds how long the
+* RUN may take, not how long reading its history may take. That read (the
+* bounded message walk: `agent.messages.list`, one `agent.parts.list` per
+* message, one `agent.content.read` walk per externalized part) happens AFTER
+* the window elapses, and before #21 it had no time bound at all: since #12 a
+* read whose link dies waits up to `transportRetryWaitMs` (5 s) for a reconnect
+* before replaying, so a flapping link let each of the walk's ~30 requests
+* absorb that wait — the 1 s timeout of the field report could answer ~150 s
+* later, exactly the shape #3 fixed.
+*
+* WHY 15 s. The walk is already bounded to 20 messages and 256 KiB, so a healthy
+* assembly is a handful of round trips. The worst SINGLE item inside it is one
+* max-size (32 MiB) `{ref}`, which at the content tier's 24 KiB slices is ~1,365
+* sequential reads — single-digit seconds on a LAN, and the only way one ref
+* approaches this bound. 15 s covers that plus the rest of the walk, and stays a
+* small absolute cost for the shortest useful windows (1 s → ≤2 s total).
+*
+* WHY THE WINDOW RATHER THAN THE CONSTANT ALONE. The tail is a fraction of the
+* patience the caller stated: a caller who asked for 5 s is not served by a
+* 15 s tail, and one who asked for 120 s is not served by 120 s more. One more
+* window is the honest reading of "the answer costs about what the wait did".
+*/
+const WAIT_ANSWER_TAIL_MS = 15e3;
+/**
+* The LEAST extra time a wait answer may spend assembling its content (issue
+* #21) — one second, whatever window the caller chose.
+*
+* The window alone is not enough as a budget, because the tool's window has a
+* floor of 1 ms ({@link MIN_WAIT_TIMEOUT_MS}): `cherry_wait(timeoutMs: 1)` is a
+* legal "give me a snapshot now", and a 1 ms answer budget would return the stub
+* receipt for a run whose reply is one round trip away. One second is far more
+* than a healthy assembly needs (the walk is bounded to 20 messages) and is
+* small next to any window a caller actually waits on, so the floor never
+* extends a real answer — it only rescues a degenerate one.
+*/
+const WAIT_ANSWER_TAIL_FLOOR_MS = 1e3;
+/**
+* The ONE instant a wait ANSWER may still be assembling content (issue #21).
+*
+* Built from the caller's own window, so every face of the answer — the session
+* snapshot, the message walk, each message's parts walk, each `{ref}` content
+* walk, and the transport layer's reconnect waits — is bounded by the same
+* clock. Passing an absolute instant (rather than a duration) is what makes
+* that possible: each layer derives its own remaining time when it is about to
+* wait, so time already spent is charged exactly once and no layer can reset
+* the budget.
+*
+* The clock is `performance.now()` — MONOTONIC, the same one the waiter's own
+* deadline uses. A wall clock can be stepped by the system, which would either
+* expire the answer instantly or extend it by the jump.
+*
+* WHEN IT EXPIRES, the walk STOPS and reports `'deadline'`; it does not throw.
+* The content already read is exactly what the answer is for (spec §3.6:
+* 超时非失败, return the partial content plus a cursor), so a spent budget
+* degrades the answer to what it has — with a stop-point token — rather than
+* throwing that away. The one exception is the message snapshot itself: without
+* it there is no walk to stop, and the caller gets the stub receipt.
+*/
+var AssemblyDeadline = class {
+	/** The absolute instant, on `performance.now()`'s clock. */
+	instant;
+	constructor(startedAt, windowMs) {
+		const tail = Math.min(Math.max(windowMs, WAIT_ANSWER_TAIL_FLOOR_MS), WAIT_ANSWER_TAIL_MS);
+		this.instant = startedAt + windowMs + tail;
+	}
+	/** Whether the budget is spent (a deadline exactly now counts as spent). */
+	expired() {
+		return performance.now() >= this.instant;
+	}
+};
+/**
 * POLL CADENCE for the waiter loop.
 *
 * The waiter rides the subscriptions layer's event buffer, which exposes a
@@ -4723,8 +4948,9 @@ var CherryToolEngine = class {
 	*
 	*  - a row with an EMPTY revision — there is no fence to trust, so the entry
 	*    could never be validated against anything;
-	*  - a TRUNCATED page — the circuit breaker stopped the walk, so the list is
-	*    short. Remembering it would make a transient short walk permanent;
+	*  - a TRUNCATED page — the walk stopped early (the circuit breaker, or a
+	*    wait answer's deadline), so the list is short. Remembering it would make
+	*    a transient short walk permanent; the refusal is reason-blind;
 	*  - a page above {@link MESSAGE_CACHE_ENTRY_BYTES} — walked fresh every time
 	*    rather than allowed to crowd out every other message.
 	*
@@ -4955,8 +5181,19 @@ var CherryToolEngine = class {
 	* anchor still unfound (it is gone), and {@link MAX_ANCHOR_SCAN_PAGES} pages
 	* spent without finding it. The ceiling counts COLLECTED items, so a scan's
 	* discarded pages do not spend the caller's `limit`.
+	*
+	* `deadline` (issue #21) is the ANSWER's own budget, and it is the one bound
+	* that stops the walk GRACEFULLY: a spent budget returns what was collected
+	* with `'deadline'` as the reason and the page position it was about to ask
+	* for as the stop point. Every other bound here either throws (a peer fault)
+	* or returns a caller-attributed truncation; this one returns a TIME
+	* attribution, because neither the caller nor the peer did anything wrong.
+	* The budget is re-judged BEFORE each request (so a spent one is not spent on
+	* the wire) and is handed to the request itself, where the transport clamps
+	* the request's own timeout to it and refuses to wait past it for a reconnect.
 	*/
-	async #aggregate(connection, method, params, extract, limit, safetyBound = MAX_AGGREGATE_LIMIT, maxPerPage = 16, resume) {
+	async #aggregate(connection, method, params, extract, walk) {
+		const { limit, safetyBound = MAX_AGGREGATE_LIMIT, maxPerPage = 16, resume, deadline } = walk;
 		const negotiated = Math.max(1, Math.floor(connection.limits.pageItems || PAGE_ITEMS_FALLBACK));
 		const pageItems = Math.min(negotiated, Math.max(1, Math.floor(maxPerPage)));
 		const aggregate = Math.max(1, Math.floor(limit));
@@ -4971,6 +5208,7 @@ var CherryToolEngine = class {
 		let droppedTotal = 0;
 		const seen = /* @__PURE__ */ new Set();
 		for (let pages = 0;; pages += 1) {
+			if (deadline !== void 0 && deadline.expired()) return this.#truncated(items, "deadline", cursor);
 			if (items.length >= ceiling) return this.#truncated(items, bindsCallerLimit ? "limit" : "safety-bound", cursor);
 			if (pages >= MAX_AGGREGATE_PAGES) throw new Error(`${method} did not terminate within ${MAX_AGGREGATE_PAGES} page(s) for ${JSON.stringify(params)}`);
 			if (pendingAnchor !== void 0 && scannedPages >= MAX_ANCHOR_SCAN_PAGES) throw new Error(`${method}: could not find resume anchor message ${JSON.stringify(pendingAnchor)} within ${MAX_ANCHOR_SCAN_PAGES} page(s) for ${JSON.stringify(params)}`);
@@ -4979,7 +5217,14 @@ var CherryToolEngine = class {
 				limit: pendingAnchor === void 0 ? Math.min(ceiling - items.length, pageItems) : pageItems
 			};
 			if (cursor !== void 0) request["cursor"] = cursor;
-			const extracted = extract(await connection.rpc.request(method, request));
+			let result;
+			try {
+				result = await connection.rpc.request(method, request, deadline === void 0 ? void 0 : { deadline: deadline.instant });
+			} catch (error) {
+				if (deadline !== void 0 && deadlineExhaustion(error)) return this.#truncated(items, "deadline", cursor);
+				throw error;
+			}
+			const extracted = extract(result);
 			const dropped = extracted.dropped ?? 0;
 			if (dropped > 0 && droppedTotal === 0) console.warn(`[cherry-remote] ${method} dropped ${dropped} non-record items from a page for ${JSON.stringify(params)}; they cannot be projected as entries`);
 			droppedTotal += dropped;
@@ -5127,7 +5372,7 @@ var CherryToolEngine = class {
 				return this.#aggregate(connection, "agent.agents.list", {}, (page) => ({
 					...arrayOf(page["items"]),
 					nextCursor: page["nextCursor"]
-				}), aggregateLimit(args["limit"]));
+				}), { limit: aggregateLimit(args["limit"]) });
 			}
 		});
 	}
@@ -5168,7 +5413,7 @@ var CherryToolEngine = class {
 						...arrayOf(result["items"]),
 						nextCursor: result["nextCursor"]
 					};
-				}, aggregateLimit(args["limit"]));
+				}, { limit: aggregateLimit(args["limit"]) });
 				return {
 					items: page.items,
 					systemWorkspace,
@@ -5219,7 +5464,7 @@ var CherryToolEngine = class {
 				}, (page) => ({
 					...arrayOf(page["items"]),
 					nextCursor: page["nextCursor"]
-				}), aggregateLimit(args["limit"]));
+				}), { limit: aggregateLimit(args["limit"]) });
 			}
 		});
 	}
@@ -5329,15 +5574,20 @@ var CherryToolEngine = class {
 		}, (result) => ({
 			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), limit, MAX_AGGREGATE_LIMIT, 16, resume === void 0 ? void 0 : resume.kind === "cursor" ? {
-			kind: "cursor",
-			cursor: resume.cursor
-		} : {
-			kind: "anchor",
-			messageId: resume.messageId,
-			idOf: (raw) => {
-				const id = messageIdOf(raw);
-				return id === "" ? void 0 : id;
+		}), {
+			limit,
+			safetyBound: MAX_AGGREGATE_LIMIT,
+			maxPerPage: 16,
+			resume: resume === void 0 ? void 0 : resume.kind === "cursor" ? {
+				kind: "cursor",
+				cursor: resume.cursor
+			} : {
+				kind: "anchor",
+				messageId: resume.messageId,
+				idOf: (raw) => {
+					const id = messageIdOf(raw);
+					return id === "" ? void 0 : id;
+				}
 			}
 		});
 		const messages = [];
@@ -5393,7 +5643,7 @@ var CherryToolEngine = class {
 	*     `agent.parts.list`; a hit costs zero of those and still pays every
 	*     content read it owes.
 	*/
-	async #projectMessage(connection, sessionId, raw) {
+	async #projectMessage(connection, sessionId, raw, deadline) {
 		const messageId = messageIdOf(raw);
 		const revision = String(raw["revision"] ?? "");
 		let page = this.#cachedPartsPage(connection.record.deviceId, messageId, revision);
@@ -5405,11 +5655,16 @@ var CherryToolEngine = class {
 			}, (result) => ({
 				...arrayOf(result["items"]),
 				nextCursor: result["nextCursor"]
-			}), Number.POSITIVE_INFINITY, this.#partsSafetyBound, PARTS_LIST_PAGE_CLAMP);
+			}), {
+				limit: Number.POSITIVE_INFINITY,
+				safetyBound: this.#partsSafetyBound,
+				maxPerPage: PARTS_LIST_PAGE_CLAMP,
+				deadline
+			});
 			this.#rememberPartsPage(connection.record.deviceId, messageId, revision, page);
 		}
 		const parts = [];
-		for (const part of page.items) parts.push(await this.#projectPart(connection, sessionId, part));
+		for (const part of page.items) parts.push(await this.#projectPart(connection, sessionId, part, deadline));
 		const partsTruncated = page.truncated ? page.truncationReason ?? "safety-bound" : void 0;
 		const unavailableParts = parts.filter((part) => part.unavailable !== void 0).length;
 		const incomplete = unavailableParts > 0 || partsTruncated !== void 0;
@@ -5434,7 +5689,7 @@ var CherryToolEngine = class {
 	* (what the ref advertises, and what the peer returns on every slice) is
 	* verified against the reassembled bytes before any text is handed back.
 	*/
-	async #projectPart(connection, sessionId, raw) {
+	async #projectPart(connection, sessionId, raw, deadline) {
 		const partId = String(raw["partId"] ?? "");
 		const revision = String(raw["revision"] ?? "");
 		const kind = String(raw["kind"] ?? "");
@@ -5452,7 +5707,7 @@ var CherryToolEngine = class {
 		let text;
 		if (typeof content["text"] === "string") text = content["text"];
 		else if (isRecord(content["ref"])) try {
-			text = await this.#readExternalized(connection, sessionId, content["ref"]);
+			text = await this.#readExternalized(connection, sessionId, content["ref"], deadline);
 		} catch (error) {
 			if (!this.#degradableReadFailure(error)) throw error;
 			return {
@@ -5550,7 +5805,7 @@ var CherryToolEngine = class {
 	* in flight together multiply the peak by their count. A global gate or
 	* budget is a separate concern, deliberately outside this walk.
 	*/
-	async #readExternalized(connection, sessionId, ref) {
+	async #readExternalized(connection, sessionId, ref, deadline) {
 		const contentId = String(ref["contentId"] ?? "");
 		const revision = String(ref["revision"] ?? "");
 		const declaredSha = typeof ref["sha256"] === "string" ? ref["sha256"] : void 0;
@@ -5570,7 +5825,7 @@ var CherryToolEngine = class {
 				revision,
 				offset,
 				maxBytes: CONTENT_READ_MAX_BYTES
-			});
+			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
 			const cap = this.#externalizedByteCap;
 			if (read + Math.ceil(data.length / 4) * 3 > cap + 2) throw new Error(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for externalized content; not read`);
@@ -5746,7 +6001,7 @@ var CherryToolEngine = class {
 	#sendTool() {
 		return defineCherryTool({
 			name: "cherry_send",
-			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and, whenever a stop point can be named honestly, a `messagesResumeCursor` token marking where the unread history begins: hand it to `cherry_read` as `messagesResumeCursor` to read the older messages (re-waiting re-reads the newest window). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`.",
+			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and, whenever a stop point can be named honestly, a `messagesResumeCursor` token marking where the unread history begins: hand it to `cherry_read` as `messagesResumeCursor` to read the older messages (re-waiting re-reads the newest window). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`. The reason `deadline` means the ANSWER's own assembly budget ran out (your window plus a bounded tail): the content read so far is still returned, and `cherry_read` continues past the stop-point token.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5887,7 +6142,7 @@ var CherryToolEngine = class {
 	#waitTool() {
 		return defineCherryTool({
 			name: "cherry_wait",
-			description: "Wait for a session's in-flight execution to reach a terminal state, without sending anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, never a park. Use it to resume after answering an interaction. Its message walk is bounded like `cherry_send`'s, with the same verdict wording: a cut drops the OLDER messages, and a returned message missing its own parts carries `incomplete`.",
+			description: "Wait for a session's in-flight execution to reach a terminal state, without sending anything. Returns the same shape as `cherry_send(wait: true)`. A session with no in-flight execution answers IMMEDIATELY with its current snapshot (status `idle`) — never an error, never a park. Use it to resume after answering an interaction. Its message walk is bounded like `cherry_send`'s, with the same verdict wording: a cut drops the OLDER messages, and a returned message missing its own parts carries `incomplete`. A cut whose reason is `deadline` means the ANSWER's own assembly budget ran out — the content read so far is still returned.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5921,11 +6176,12 @@ var CherryToolEngine = class {
 				if (activeExecutionId === void 0) {
 					const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 					if (idle !== void 0) this.#remember(this.#revisionCache, record.deviceId, this.#cacheKey(record.deviceId, sessionId), idle);
+					const answerDeadline = new AssemblyDeadline(performance.now(), waitTimeout(args["timeoutMs"]));
 					const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
 						status: "idle",
 						sessionId,
 						cursor: this.#cursorOf(subscriptions, sessionId)
-					});
+					}, answerDeadline);
 					if (assembled.failed !== void 0) return {
 						...assembled.failed,
 						session,
@@ -5987,7 +6243,11 @@ var CherryToolEngine = class {
 				const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
 					...arrayOf(result["items"]),
 					nextCursor: result["nextCursor"]
-				}), aggregateLimit(args["limit"]), MAX_AGGREGATE_LIMIT, INTERACTIONS_LIST_PAGE_CLAMP);
+				}), {
+					limit: aggregateLimit(args["limit"]),
+					safetyBound: MAX_AGGREGATE_LIMIT,
+					maxPerPage: INTERACTIONS_LIST_PAGE_CLAMP
+				});
 				const includeAnswered = args["includeAnswered"] === true;
 				const items = page.items.filter((item) => includeAnswered || item["status"] === "pending").map((item) => this.#interactionView(item));
 				for (const item of page.items) this.#rememberInteraction(record.deviceId, sessionId, item);
@@ -6371,9 +6631,13 @@ var CherryToolEngine = class {
 	* something the lookup would never serve correctly:
 	*
 	*  - `revision === ''` — nothing to fence;
-	*  - `page.truncated` — the parts walk was cut by the circuit breaker, so the
-	*    list is SHORT. A short walk is a transient fault and must be retried,
-	*    never remembered;
+	*  - `page.truncated` — the parts walk stopped early, so the list is SHORT.
+	*    REASON-BLIND on purpose: the circuit breaker (`'safety-bound'`) and a
+	*    wait answer's spent budget (`'deadline'`) are both transient from the
+	*    cache's point of view — the next read may well complete — and the ONE
+	*    thing that must not happen is remembering a short list as if it were the
+	*    peer's complete answer. Matching on the reason would leave the next
+	*    reason word free to reintroduce that bug;
 	*  - `bytes > messageCacheEntryBytes` — walked fresh every time instead.
 	*
 	* NOT a refusal: a message whose parts then FAILED to resolve. That
@@ -6680,7 +6944,11 @@ var CherryToolEngine = class {
 		const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
 			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), MAX_AGGREGATE_LIMIT, MAX_AGGREGATE_LIMIT, INTERACTIONS_LIST_PAGE_CLAMP);
+		}), {
+			limit: MAX_AGGREGATE_LIMIT,
+			safetyBound: MAX_AGGREGATE_LIMIT,
+			maxPerPage: INTERACTIONS_LIST_PAGE_CLAMP
+		});
 		for (const item of page.items) this.#rememberInteraction(deviceId, sessionId, item);
 		return this.#interactionCache.get(this.#interactionKey(deviceId, sessionId, interactionId));
 	}
@@ -6792,6 +7060,7 @@ var CherryToolEngine = class {
 	*/
 	async #awaitRun(connection, subscriptions, sessionId, options) {
 		const deadline = options.startedAt + options.timeoutMs;
+		const answerDeadline = new AssemblyDeadline(options.startedAt, options.timeoutMs);
 		let latestExecutionId = options.executionId;
 		const baselineSeq = options.baselineSeq ?? this.#newestSeq(subscriptions, sessionId);
 		const observation = {};
@@ -6834,13 +7103,13 @@ var CherryToolEngine = class {
 				...latestExecutionId === void 0 ? {} : { executionId: latestExecutionId },
 				...options.commandId === void 0 ? {} : { commandId: options.commandId },
 				...observed.terminalMessageId === void 0 ? {} : { terminalMessageId: observed.terminalMessageId }
-			});
+			}, answerDeadline);
 			const now = performance.now();
 			if (now >= deadline) return await this.#timeoutResult(connection, subscriptions, sessionId, {
 				timeoutMs: options.timeoutMs,
 				...latestExecutionId === void 0 ? {} : { executionId: latestExecutionId },
 				...options.commandId === void 0 ? {} : { commandId: options.commandId }
-			});
+			}, answerDeadline);
 			const cursor = this.#cursorOf(subscriptions, sessionId);
 			if (cursor !== void 0) carriedCursor = cursor;
 			const pollMs = Math.min(this.#waitPollMs, Math.max(1, deadline - now));
@@ -7078,19 +7347,28 @@ var CherryToolEngine = class {
 	* `aggregateError` and `guidance`, and NO `messages`/`text` (half an
 	* assembly must never be presented as the run's output).
 	*/
-	async #terminalResult(connection, subscriptions, sessionId, status, extra) {
+	async #terminalResult(connection, subscriptions, sessionId, status, extra, deadline) {
 		const { terminalMessageId, ...rest } = extra;
-		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const cursor = this.#cursorOf(subscriptions, sessionId);
+		let session;
+		try {
+			session = await this.#sessionSnapshot(connection, sessionId, deadline);
+		} catch (error) {
+			return this.#assemblyFailed({
+				status,
+				sessionId,
+				...rest,
+				cursor
+			}, error);
+		}
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle !== void 0) this.#remember(this.#revisionCache, connection.record.deviceId, this.#cacheKey(connection.record.deviceId, sessionId), idle);
-		const cursor = this.#cursorOf(subscriptions, sessionId);
 		const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
 			status,
 			sessionId,
 			...rest,
 			cursor
-		});
+		}, deadline);
 		if (assembled.failed !== void 0) return assembled.failed;
 		return {
 			status,
@@ -7142,18 +7420,23 @@ var CherryToolEngine = class {
 	* without a second call. Its limits are stated where it is built
 	* ({@link CherryToolEngine.#timeoutProgress}).
 	*/
-	async #timeoutResult(connection, subscriptions, sessionId, extra) {
-		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+	async #timeoutResult(connection, subscriptions, sessionId, extra, deadline) {
 		const cursor = this.#cursorOf(subscriptions, sessionId);
 		const progress = this.#timeoutProgress(subscriptions, sessionId);
-		const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, {
+		const identity = {
 			status: "timeout",
 			sessionId,
 			...extra,
 			cursor,
 			...progress === void 0 ? {} : { progress }
-		});
+		};
+		let session;
+		try {
+			session = await this.#sessionSnapshot(connection, sessionId, deadline);
+		} catch (error) {
+			return this.#assemblyFailed(identity, error);
+		}
+		const assembled = await this.#assembledTerminalMessages(connection, sessionId, session, identity, deadline);
 		if (assembled.failed !== void 0) return assembled.failed;
 		return {
 			status: "timeout",
@@ -7231,22 +7514,59 @@ var CherryToolEngine = class {
 	* same failure degrades the CONTENT (`messages`/`text` absent) while the
 	* verdict stands. Nothing unverified is handed back either way.
 	*/
-	async #assembledTerminalMessages(connection, sessionId, session, identity) {
+	async #assembledTerminalMessages(connection, sessionId, session, identity, deadline) {
 		try {
-			const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session);
+			const { messages, ...walk } = await this.#readTerminalMessages(connection, sessionId, session, deadline);
 			return {
 				messages,
 				walk
 			};
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			console.warn(`[cherry-remote] the ${String(identity["status"])} answer for session ${sessionId} could not assemble its content (${message}); returning the verdict with the assembly failure reported`);
-			return { failed: {
-				...identity,
-				aggregateError: message.slice(0, 200),
-				guidance: AGGREGATE_FAILED_GUIDANCE
-			} };
+			return { failed: this.#assemblyFailed(identity, error) };
 		}
+	}
+	/**
+	* The STUB RECEIPT: the run's verdict and identifiers, the assembly failure,
+	* and the route that rebuilds the content (issue #3).
+	*
+	* One builder for both failure points of all three wait faces — the session
+	* snapshot and the message walk — so the shape cannot drift between paths
+	* that mean the same thing. It is deliberately built from the CALLER's
+	* identity object: the verdict is already known and true, and only the
+	* content behind it failed.
+	*
+	* `aggregateError` is BOUNDED like every other peer-echoed string in a result
+	* (the full text goes to the log): the reason is actionable at 200 characters
+	* and the log is where the operator reads the rest.
+	*/
+	#assemblyFailed(identity, error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.warn(`[cherry-remote] the ${String(identity["status"])} answer for session ${String(identity["sessionId"])} could not assemble its content (${message}); returning the verdict with the assembly failure reported`);
+		return {
+			...identity,
+			aggregateError: message.slice(0, 200),
+			guidance: AGGREGATE_FAILED_GUIDANCE
+		};
+	}
+	/**
+	* One session snapshot, inside the answer's budget when it has one (issue
+	* #21).
+	*
+	* The snapshot is the FIRST request every wait answer makes (it carries the
+	* `historyRevision` the history walk needs), so it sits inside the same
+	* deadline as the walk: a link that would make the caller wait
+	* `transportRetryWaitMs` for a replay must not do so after the answer's
+	* budget is spent.
+	*
+	* A reply whose `session` is not a record yields `{}` — the same tolerance
+	* every reader here applies — and the walk then finds no `historyRevision`
+	* and answers with an empty message list. That is the pre-existing behaviour
+	* and deliberately not an error: a peer that sends no session has no history
+	* to read, which is different from one that refused the read.
+	*/
+	async #sessionSnapshot(connection, sessionId, deadline) {
+		const result = await connection.rpc.request("agent.sessions.get", { sessionId }, deadline === void 0 ? void 0 : { deadline: deadline.instant });
+		return isRecord(result["session"]) ? result["session"] : {};
 	}
 	/**
 	* The session's recent messages, projected with `{ref}` parts aggregated
@@ -7296,7 +7616,7 @@ var CherryToolEngine = class {
 	* reached the peer's last page having returned everything it collected).
 	* See {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*/
-	async #readTerminalMessages(connection, sessionId, session) {
+	async #readTerminalMessages(connection, sessionId, session, deadline) {
 		const historyRevision = optionalString(session["historyRevision"]);
 		if (historyRevision === void 0) return { messages: [] };
 		const page = await this.#aggregate(connection, "agent.messages.list", {
@@ -7305,25 +7625,33 @@ var CherryToolEngine = class {
 		}, (result) => ({
 			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
-		}), TERMINAL_AGGREGATE_MESSAGES);
+		}), {
+			limit: TERMINAL_AGGREGATE_MESSAGES,
+			deadline
+		});
 		const messages = [];
 		let projectedBytes = 0;
-		let outOfBudget = false;
+		let stop;
 		for (const raw of page.items) {
-			const message = await this.#projectMessage(connection, sessionId, raw);
+			if (deadline !== void 0 && deadline.expired()) {
+				stop = "deadline";
+				break;
+			}
+			const message = await this.#projectMessage(connection, sessionId, raw, deadline);
 			messages.push(message);
 			projectedBytes += JSON.stringify(message).length;
 			if (projectedBytes >= AGGREGATE_BYTES) {
-				outOfBudget = true;
+				stop = "aggregate-bytes";
 				break;
 			}
 		}
-		if (outOfBudget && (messages.length < page.items.length || page.truncated)) {
+		const leftBehind = messages.length < page.items.length || page.truncated;
+		if (stop !== void 0 && leftBehind) {
 			const resumeToken = messageResumeToken(page, messages.length, messages[messages.length - 1]?.messageId);
 			return {
 				messages,
 				messagesTruncated: true,
-				messagesTruncationReason: "aggregate-bytes",
+				messagesTruncationReason: stop,
 				...resumeToken === void 0 ? {} : { messagesResumeCursor: resumeToken }
 			};
 		}
@@ -7554,6 +7882,31 @@ function messageWalkVerdict(page, returned, lastReturnedId) {
 */
 function mangledRemainder(remainder) {
 	return remainder === "" || remainder !== remainder.trim() || /[\u0000-\u001f\u007f]/.test(remainder);
+}
+/**
+* Whether a request's rejection means the ANSWER's budget ran out (issue #21).
+*
+* Two classes, one meaning, from the two layers that wait:
+*
+*  - {@link RpcDeadlineExceededError} — the connection refused to wait longer
+*    for a reconnect, or refused the replay, because the deadline had passed.
+*    It is raised only in that case, so no extra test is needed.
+*  - {@link RequestTimeoutError} — the rpc layer's per-request timeout, but ONLY
+*    when that timeout was DERIVED from the deadline (`clampedByDeadline`). The
+*    same class is raised by the ordinary 60 s default on a walk whose deadline
+*    is farther away, and a peer that goes silent for a minute is not the
+*    caller's budget running out: converting that one would report `'deadline'`
+*    for a different failure, and the caller would stop looking for a peer that
+*    stopped answering. The flag exists instead of a clock comparison because a
+*    timer may fire a millisecond early — "the budget shortened my timeout" is a
+*    fact, "the deadline has passed by now" is a race.
+*
+* Everything else is a verdict about something else (the peer, the link, the
+* content) and keeps its own error.
+*/
+function deadlineExhaustion(error) {
+	if (error instanceof RpcDeadlineExceededError) return true;
+	return error instanceof RequestTimeoutError && error.clampedByDeadline;
 }
 /**
 * The message id a projection uses, read from a raw `agent.messages.list` item.

@@ -100,7 +100,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算。**被挡下的更旧消息用 `messagesResumeCursor` 续读**：把本次返回的 `messagesResumeCursor` 原样传给下一次调用的 `messagesResumeCursor` 参数即可从停点继续（`limit` 此时约束的是**从停点起**本次最多返回多少条），长历史分几次回答读完。两种令牌：`cursor:<peer position>`（整窗读完后的 peer 分页位置）与 `after:<messageId>`（停在窗内，续读从最新端扫到该消息、返回它更旧的那些）。不是本工具发出的令牌会被**本地拒绝**（不转发给桌面端——桌面端会静默回退到最新页）；`after:` 锚点在历史里找不到则**报错**，不会返回空结果。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后回读身份）。 |
-| `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的）。 |
+| `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的）；`deadline` 表示**回答自身的装配时限**到了（见下），已读到的内容照常返回。 |
 | `cherry_wait` | 只等待该会话在途执行收敛（不发送新消息）。 |
 | `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。 |
 | `cherry_respond` | 应答交互卡：提问必须全量作答，审批走 `decision`。 |
@@ -122,9 +122,19 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 - 读方法在重连后**单次**重放；**命令永不重放**——写操作丢失应答时，携**原 `commandId`**
   重试即可，桌面端的命令账本会回放原回执。
 - 单个外置内容上限 32 MiB，超过的 part 标 `unavailable`，不回无法校验的部分内容。
-- 历史走查被截断时一定说明（`truncationReason`，`limit` 与 `aggregate-bytes` 两种含义不同，见上），
+- 历史走查被截断时一定说明（`truncationReason`，`limit` / `aggregate-bytes` / `deadline` 三种含义不同，见上），
   并在能诚实标出停点时给出 `messagesResumeCursor` 续读令牌（走到对端末页时没有可标的位置，就不给）；
-  某条消息自身 parts 没读全时带 `incomplete: true`。
+  某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带
+  `partsTruncated: "deadline"`）。
+- **等待类回答有自己的装配时限**：`cherry_send(wait: true)` / `cherry_wait` 在窗口结束后仍要读一段历史
+  （消息页 + 每条消息的 parts + 每个外置 `{ref}` 内容），这一步现在是**有时限的**——截至「你的窗口 +
+  同样长度的时间」，下限 1 秒、上限 15 秒（即窗口 1 秒 → 最多再等 1 秒；窗口 20 秒 → 最多再等 15 秒）。
+  链路抖动时不会再有「每个请求各等 5 秒重连」把回答拖到几分钟之后；时限用尽就停走查，
+  已读到的内容照常返回并标 `messagesTruncationReason: "deadline"`，更旧的历史用 `cherry_read` 续读。
+  同一条时限也覆盖 **终态与超时回答**所读的会话快照：快照读不到时
+  回执降级（`aggregateError` + `guidance`），不会把已经确定的运行结局（`status` 与各 id）一起丢掉。
+  **例外**：`cherry_wait` 判断「会话是否还有在途执行」的那次快照是**前置查询**——此时还没有回答可降级，
+  所以它保持传输层原有的边界（一次重连等待 + 一次重放），不在该时限内（#51）。
 - **已知限制**：`cherry_respond` 让 DSH agent 可代替用户批准 Cherry 端审批卡（MVP 不加拦截层，
   信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；仅 `ws://`（Noise 加密），不做 TLS 直连。
 

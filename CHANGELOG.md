@@ -52,6 +52,22 @@ surface change.
 - The terminal/timeout/idle aggregate's mid-window byte stop now carries
   `messagesResumeCursor: "after:<lastReturnedId>"` instead of nothing, from the
   same helper the read face uses.
+- A wait ANSWER is now **deadline-bounded** (#21). The aggregate behind
+  `cherry_send(wait: true)` / `cherry_wait` receives one absolute deadline — the
+  caller's window plus a tail of the same length, floored at 1 s and capped at
+  15 s — and every request it issues is clamped to it: the rpc layer shortens
+  the per-request timeout, the connection caps the reconnect wait by the
+  remaining budget and refuses a replay once it has expired. Before this, each
+  of the walk's ~30 requests could absorb another `transportRetryWaitMs` (5 s)
+  under a flapping link, so a 1 s window could answer ~150 s late — the shape
+  #3 fixed, still present on this path. A spent budget now STOPS the walk and
+  returns the content already read with `messagesTruncationReason: "deadline"`
+  (a message whose own parts were cut carries `partsTruncated: "deadline"`), and
+  a request that hangs is cut at the budget instead of riding the 60 s default.
+  The session snapshot each wait answer needs rides the same budget and now
+  DEGRADES to the stub receipt (`aggregateError` + `guidance`) instead of
+  rejecting the call, so a run's verdict and its identifiers survive a link that
+  dies after the run settled.
 
 ## v0.1.4 (2026-10-18)
 
