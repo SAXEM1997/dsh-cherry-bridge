@@ -589,6 +589,31 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   guard the message face uses, because a token the tool refuses to replay is
   worse than none — `truncated` already says the walk was cut, and a wider
   `limit` is the remedy that works.
+- **The ceiling is enforced on the way OUT too — the same refusal in one more
+  dimension.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
+  over it is one this tool would refuse on replay, and emitting it would hand
+  the caller a stop point that can never be used. Both emitters run the FINAL
+  token string through `withinResumeTokenCeiling` — the message face's
+  `cursor:` and `after:` arms alike, and the list face's encoded token — and
+  name nothing when it is over the bound: `truncated` still says the walk was
+  cut, and a wider `limit` is the remedy that works. The comparison is `<=`, so
+  exactly 4,096 characters is still emitted. The guard measures the string it is
+  about to hand out, never a reconstruction of its length, so a format change
+  cannot leave it behind. This is about what the tool ACCEPTS; a well-behaved
+  peer is far below it (the protocol's own `opaqueId` caps a cursor at 256
+  characters).
+- **The `after:` arm is pinned on the function, not through a tool.** Its anchor
+  is a message ID, and projecting that message sends the same id to
+  `agent.parts.list`, whose `messageId` is an `opaqueId` (256 characters). A peer
+  item carrying an id above the ceiling therefore fails its parts walk and is
+  never RETURNED, so no walk can reach the point of naming it: the state is
+  unreachable through the protocol, not merely untested. The guard stays
+  regardless — the emitter must never mint what the parser refuses, whatever the
+  peer's cap becomes — and `tests/unit/resumeTokenEmit.test.ts` drives
+  `messageResumeToken` directly to pin it (both arms, both sides of the
+  boundary). The `cursor:` arm and the list face keep their end-to-end tests
+  (`toolsReadResume.test.ts` ⑭a/⑭b, `toolsRead.test.ts` ⑦h), which is why that
+  helper is exported.
 
 ### `AGGREGATE_BYTES`: one budget, two faces
 

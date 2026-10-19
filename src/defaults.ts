@@ -151,5 +151,10 @@ export const LIST_PAGE_CLAMP = 16
  * BOUND instead of being split, hashed and carried to the peer, and so both
  * parameters can declare `maxLength` honestly. ONE number for both faces: it
  * bounds caller INPUT, not what a token means.
+ *
+ * The emit side enforces it too (#76): a stop point whose token would exceed
+ * this is not named at all, because a token this tool refuses to replay is
+ * worse than no token — `truncated` still says the walk was cut. One number,
+ * judged in both directions.
  */
 export const MAX_RESUME_TOKEN_CHARS = 4_096

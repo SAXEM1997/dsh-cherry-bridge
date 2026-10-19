@@ -2478,6 +2478,53 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
     }
   })
 
+  it('⑦h a position this face would REFUSE BY LENGTH is not emitted, while the boundary is (issue #76)', async () => {
+    const agents = Array.from({ length: 12 }, (_unused, index) => ({ agentId: `a-${index}`, name: `A${index}` }))
+    const rig = await makeRig({ agent: { agents: agents as never } })
+    const overLong = '9'.repeat(5000)
+    rig.fake.scriptListPages('agent.agents.list', [{ items: agents.slice(0, 2), nextCursor: overLong }])
+    // `parseListResumeCursor` refuses this token by its length, so naming it would
+    // hand the caller a stop point no replay can use. No token; `truncated` still
+    // says the walk was cut and a wider `limit` is the remedy that works.
+    const cut = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
+    expect(cut.truncated).toBe(true)
+    expect(cut.resumeCursor).toBeUndefined()
+
+    // Learn the token's fixed HEAD length from a one-character position instead
+    // of hard-coding the format, so a format change cannot leave this test green
+    // against a boundary that no longer exists.
+    rig.fake.scriptListPages('agent.agents.list', [{ items: agents.slice(0, 2), nextCursor: '2' }])
+    const probe = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
+    const probeToken = probe.resumeCursor as string
+    const boundary = '9'.repeat(4096 - (probeToken.length - 1))
+    rig.fake.scriptListPages('agent.agents.list', [{ items: agents.slice(0, 2), nextCursor: boundary }])
+    // Arrivals, not `readCallsFor`: the fake records the call BEFORE it judges
+    // the params, which is exactly what a peer-schema refusal must leave behind.
+    const arrivalsBefore = rig.fake.methodCount('agent.agents.list')
+    const atCeiling = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
+    expect(atCeiling.truncated).toBe(true)
+    expect(atCeiling.resumeCursor).toBeDefined()
+    // Exactly at the ceiling is still a token this face accepts back, so it is
+    // emitted: `<=` in the guard, never `<`.
+    expect(atCeiling.resumeCursor).toHaveLength(4096)
+
+    // The replay is judged at THIS face's boundary: the minted token must pass
+    // `parseListResumeCursor` (no length refusal, no "not a token this tool
+    // emitted") and leave with the position on it. Where it then stops is the
+    // PEER's own schema — `pageParams.cursor` is an `opaqueId` of at most 256
+    // characters — so the expected verdict is the peer rejecting the params,
+    // which is only reachable if this face let the token through.
+    const replay = await rig
+      .call('cherry_agents', { device: 'dev-A', limit: 2, cursor: atCeiling.resumeCursor })
+      .then(
+        (page) => page as ListPage,
+        (error: unknown) => error as Error,
+      )
+    expect(replay).toBeInstanceOf(Error)
+    expect((replay as Error).message).toMatch(/malformed params for agent\.agents\.list/)
+    expect(rig.fake.methodCount('agent.agents.list')).toBeGreaterThan(arrivalsBefore)
+  })
+
   it('⑦g a MESSAGE-face token is refused by a list tool, naming the face that owns it (issue #72)', async () => {
     const rig = await makeRig({
       agent: { agents: [{ agentId: 'a1', name: 'A' }] as never, sessions: sessions(40) as never },

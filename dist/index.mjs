@@ -2274,6 +2274,11 @@ const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 * BOUND instead of being split, hashed and carried to the peer, and so both
 * parameters can declare `maxLength` honestly. ONE number for both faces: it
 * bounds caller INPUT, not what a token means.
+*
+* The emit side enforces it too (#76): a stop point whose token would exceed
+* this is not named at all, because a token this tool refuses to replay is
+* worse than no token — `truncated` still says the walk was cut. One number,
+* judged in both directions.
 */
 const MAX_RESUME_TOKEN_CHARS = 4096;
 //#endregion
@@ -5478,11 +5483,12 @@ var CherryToolEngine = class {
 	*/
 	#listPage(page, binding) {
 		const position = optionalString(page.nextCursor);
+		const token = !page.truncated || position === void 0 || mangledRemainder(position) ? void 0 : withinResumeTokenCeiling(encodeListResumeCursor(binding, position));
 		return {
 			items: page.items,
 			truncated: page.truncated,
 			...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason },
-			...page.truncated && position !== void 0 && !mangledRemainder(position) ? { resumeCursor: encodeListResumeCursor(binding, position) } : {}
+			...token === void 0 ? {} : { resumeCursor: token }
 		};
 	}
 	#devicesTool() {
@@ -8137,12 +8143,33 @@ function parseQuestionInput(input) {
 * peer's page position is exactly where the unread history begins
 * (`cursor:<pos>`) — unless the peer answered an EMPTY position, which names
 * nothing and is therefore not emitted at all.
+*
+* EXPORTED FOR ITS OWN TESTS. The `after:` arm cannot be driven through a tool:
+* an anchor is a message ID, and projecting that message means asking the peer
+* for `agent.parts.list` with it, whose `messageId` is an `opaqueId` (256
+* characters). A peer item carrying an id above the token ceiling therefore
+* fails its parts walk and is never RETURNED, so no walk reaches the point of
+* naming it. The length guard on that arm is still required — the emitter must
+* never mint what the parser refuses, whatever the peer's cap becomes — and
+* this export is how a unit test pins it (`tests/unit/resumeTokenEmit.test.ts`).
 */
 function messageResumeToken(page, returned, lastReturnedId) {
 	const anchor = optionalString(lastReturnedId);
-	if (returned < page.items.length || page.pageOverflow === true) return anchor === void 0 ? void 0 : `${RESUME_ANCHOR_PREFIX}${anchor}`;
+	if (returned < page.items.length || page.pageOverflow === true) return anchor === void 0 ? void 0 : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`);
 	const position = optionalString(page.nextCursor);
-	return position === void 0 ? void 0 : `${RESUME_CURSOR_PREFIX}${position}`;
+	return position === void 0 ? void 0 : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`);
+}
+/**
+* The token ceiling, enforced on the way OUT as well as in. A token this tool
+* refuses to replay is worse than no token at all: `truncated` already says the
+* walk was cut and a wider `limit` is the remedy that works, so a stop point
+* whose token would push past {@link MAX_RESUME_TOKEN_CHARS} is simply not
+* named. Measured on the FINAL string, never on a reconstruction of its length,
+* so a format change cannot leave the guard behind. Exactly at the ceiling is
+* accepted — it is a length the parser takes back.
+*/
+function withinResumeTokenCeiling(token) {
+	return token.length <= 4096 ? token : void 0;
 }
 /**
 * The message-walk verdict, projected off an aggregate page.

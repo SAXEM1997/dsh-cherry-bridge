@@ -777,3 +777,83 @@ describe('issue #74: the message token has a length ceiling', () => {
     expect(overLimit).not.toMatch(/a LIST `resumeCursor`/)
   })
 })
+
+/**
+ * Issue #76: the ceiling is enforced on the way OUT, not only on the way in.
+ *
+ * #74 bounded the token a message walk ACCEPTS; the emit side had no such guard.
+ * A peer that answers a truncated page with a position longer than the head
+ * allowance would make `messageResumeToken` mint a token of its own over the
+ * ceiling — a token `parseMessageResume` refuses on replay, so the walk handed
+ * the caller a stop point that can never be used. The remedy for the shape is
+ * the existing one: no token at all, `truncated` still saying the walk was cut.
+ */
+describe('issue #76: the emit side never names a token the parser would refuse', () => {
+  it('⑭a an over-long `cursor:` position is not named, and the content is still returned', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1)] },
+    })
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0), wire(1)], nextCursor: '9'.repeat(5000) },
+    ])
+
+    const page = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })) as ReadResult
+    // The walk did not throw and did not drop what it read: a stop point that
+    // cannot be named is not a reason to lose the content before it.
+    expect(ids(page)).toEqual(['m-0', 'm-1'])
+    expect(page.truncated).toBe(true)
+    expect(page.truncationReason).toBe('limit')
+    expect(page.messagesResumeCursor).toBeUndefined()
+  })
+
+  it('⑭b a position EXACTLY at the ceiling is still named, and the parser takes it back', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1)] },
+    })
+    const atCeiling = '9'.repeat(4096 - 'cursor:'.length)
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0), wire(1)], nextCursor: atCeiling },
+    ])
+
+    const first = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })) as ReadResult
+    expect(first.truncated).toBe(true)
+    expect(first.messagesResumeCursor).toBeDefined()
+    // Arrivals, not `readCallsFor`: the fake records the call BEFORE it judges
+    // the params, which is exactly what a peer-schema refusal must leave behind.
+    const arrivalsBefore = rig.fake.methodCount('agent.messages.list')
+    // The off-by-one: exactly 4,096 is a token the parser accepts, so it must be
+    // emitted. `<=` in the guard, never `<`.
+    expect(first.messagesResumeCursor).toHaveLength(4096)
+
+    // The round trip is judged at THIS face's boundary: the minted token must
+    // survive `parseMessageResume` (no length refusal, no "must be a token this
+    // tool emitted") and leave with the position on it. Where it then stops is
+    // the PEER's own schema — `pageParams.cursor` is an `opaqueId` of at most
+    // 256 characters — so the expected verdict is the peer rejecting the params,
+    // which is only reachable if this face let the token through.
+    const replay = await rig
+      .call('cherry_read', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        limit: 2,
+        messagesResumeCursor: first.messagesResumeCursor,
+      })
+      .then(
+        (page) => page as ReadResult,
+        (error: unknown) => error as Error,
+      )
+    expect(replay).toBeInstanceOf(Error)
+    expect((replay as Error).message).toMatch(/malformed params for agent\.messages\.list/)
+    expect(rig.fake.methodCount('agent.messages.list')).toBeGreaterThan(arrivalsBefore)
+  })
+
+  // The `after:` arm of the same guard has no integration fixture, and cannot
+  // have one: an anchor is a message ID, and projecting that message sends it to
+  // `agent.parts.list`, whose `messageId` is an `opaqueId` (256 characters). A
+  // peer item with an id above the token ceiling therefore fails its parts walk
+  // and is never RETURNED — a peer would have to violate its own schema to
+  // produce the state. That arm is pinned by `tests/unit/resumeTokenEmit.test.ts`
+  // instead, which drives `messageResumeToken` directly.
+})
