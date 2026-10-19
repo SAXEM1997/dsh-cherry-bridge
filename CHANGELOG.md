@@ -5,7 +5,11 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
-## [Unreleased]
+## v0.1.5 (2026-10-19)
+
+The 2026-10-19 batch: eight issues merged after the v0.1.4 tag — bounded wait
+answers and list walks, a resumable read and a read cache, plus the field
+follow-ups the surrounding reviews left behind.
 
 ### Added
 
