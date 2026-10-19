@@ -751,8 +751,11 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
   value that is already bracketed is left alone (`[[fe80::2]]` would parse to
   nothing). Without this an IPv6 LAN bind contributed no usable entry and only
   loopback stayed reachable — fail-closed, but an availability gap (issue #9).
-  Zone-scoped literals (`fe80::1%eth0`) still parse to nothing: WHATWG URL wants
-  `%25` and a browser sends no zone id at all.
+  Zone-scoped literals (`fe80::1%eth0`, with or without the `%25` spelling) still
+  parse to nothing — this runtime rejects zone ids in an IPv6 literal outright —
+  and a browser sends no zone id at all. A bind carrying a PORT
+  (`example.com:8080`) is out of contract for `webStartup.host` and is dropped
+  rather than trusted, which is the fail-closed direction.
 
 ## Upstream references
 

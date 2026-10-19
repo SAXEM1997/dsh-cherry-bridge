@@ -825,9 +825,14 @@ export function resolveTrustedHosts(ctx: CherryHttpContext): readonly string[] {
  * alone, so a hand-written `[fe80::2]` cannot become `[[fe80::2]]` and parse to
  * nothing — re-creating the very gap this closes.
  *
- * A zone-scoped literal (`fe80::1%eth0`) still parses to nothing: WHATWG URL
- * wants `%25` there and a browser sends no zone id at all, so it is left to the
- * parser rather than guessed at.
+ * A zone-scoped literal (`fe80::1%eth0`, or the `%25` spelling WHATWG URL uses
+ * for `%`) still parses to nothing: this runtime's URL rejects zone ids in an
+ * IPv6 literal outright, and a browser sends none at all, so it is left to the
+ * parser rather than guessed at. A value carrying a PORT (`example.com:8080`)
+ * is out of contract — `WebRuntimeLike.host` is a bare hostname — and is
+ * bracketed like any other colon-bearing value, which parses to nothing: the
+ * entry is dropped rather than trusted, which is the fail-closed direction for
+ * a shape the host promises not to produce.
  */
 function asTrustedEntry(host: string): string {
   if (host.startsWith('[') || !host.includes(':')) return host
