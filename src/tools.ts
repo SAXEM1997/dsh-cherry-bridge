@@ -6103,17 +6103,31 @@ function parseQuestionInput(input: unknown): string[] | undefined {
  * invented: a wrong anchor is worse than no anchor, and `truncated` still says
  * the walk was cut. Otherwise the whole collected window was consumed, and the
  * peer's page position is exactly where the unread history begins
- * (`cursor:<pos>`) — unless the peer answered an EMPTY position, which names
- * nothing and is therefore not emitted at all.
+ * (`cursor:<pos>`).
  *
- * EXPORTED FOR ITS OWN TESTS. The `after:` arm cannot be driven through a tool:
- * an anchor is a message ID, and projecting that message means asking the peer
- * for `agent.parts.list` with it, whose `messageId` is an `opaqueId` (256
- * characters). A peer item carrying an id above the token ceiling therefore
- * fails its parts walk and is never RETURNED, so no walk reaches the point of
- * naming it. The length guard on that arm is still required — the emitter must
- * never mint what the parser refuses, whatever the peer's cap becomes — and
- * this export is how a unit test pins it (`tests/unit/resumeTokenEmit.test.ts`).
+ * BOTH arms name a remainder only when the PARSER would accept it
+ * ({@link mangledRemainder}): empty, not equal to its own `.trim()` (which is
+ * leading/trailing whitespace), or carrying a control character anywhere is
+ * refused HERE exactly as `parseMessageResume` refuses it on replay. The
+ * emitter must never mint what the parser refuses — a token this tool will not
+ * take back is worse than none, because the refusal then surfaces at the RESUME
+ * call instead of at the answer that produced it. This is the CONTENT
+ * dimension; {@link withinResumeTokenCeiling} is the sibling LENGTH one. The
+ * `after:` anchor is covered by the same rule, not just the `cursor:` position:
+ * a message id is an `opaqueId` too, and padding is schema-valid, so a padded
+ * id really can reach the anchor.
+ *
+ * EXPORTED FOR ITS OWN TESTS. The LENGTH guard on the `after:` arm cannot be
+ * driven through a tool: an anchor is a message ID, and projecting that message
+ * means asking the peer for `agent.parts.list` with it, whose `messageId` is an
+ * `opaqueId` (256 characters). A peer item carrying an id above the token
+ * ceiling therefore fails its parts walk and is never RETURNED, so no walk
+ * reaches the point of naming it. The length guard on that arm is still
+ * required — the emitter must never mint what the parser refuses, whatever the
+ * peer's cap becomes — and this export is how a unit test pins it
+ * (`tests/unit/resumeTokenEmit.test.ts`). The CONTENT guard on both arms IS
+ * reachable, because `opaqueId` allows padding: `tests/integration/
+ * toolsReadResume.test.ts` ⑭d/⑭e drive it through the tools.
  */
 export function messageResumeToken(
   page: CherryPage<unknown>,
@@ -6127,13 +6141,23 @@ export function messageResumeToken(
   // position sits past messages this walk never returned, so only the anchor is
   // exact.
   if (returned < page.items.length || page.pageOverflow === true) {
-    return anchor === undefined ? undefined : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`)
+    // An anchor the parser would REFUSE names nothing: a padded message id is
+    // an `opaqueId`, so it can reach here, and `after: m-1 ` would be a token
+    // the same face rejects on the way back (issue #80).
+    return anchor === undefined || mangledRemainder(anchor)
+      ? undefined
+      : withinResumeTokenCeiling(`${RESUME_ANCHOR_PREFIX}${anchor}`)
   }
-  // An empty position is not a position: a peer answering `nextCursor: ''` on a
-  // non-terminal page would otherwise make this face emit a bare `cursor:`,
-  // which the same face REFUSES on the way back (review P3-4).
+  // An empty OR MANGLED position is not a position: a peer answering
+  // `nextCursor: ''` on a non-terminal page would otherwise make this face emit
+  // a bare `cursor:` (review P3-4), and one answering `nextCursor: ' 4 '`
+  // would make it emit `cursor: 4 ` — both refused by the same face on the way
+  // back (issue #80). `mangledRemainder` IS the parser's predicate, so the two
+  // sides run one rule rather than two dialects.
   const position = optionalString(page.nextCursor)
-  return position === undefined ? undefined : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`)
+  return position === undefined || mangledRemainder(position)
+    ? undefined
+    : withinResumeTokenCeiling(`${RESUME_CURSOR_PREFIX}${position}`)
 }
 
 /**

@@ -19,6 +19,19 @@ surface change.
   stop point is simply not named: `truncated` still says the walk was cut, and
   a wider `limit` is the remedy that works. A token of exactly 4,096
   characters is still emitted.
+- **A resume token is never minted from a remainder the same tool refuses**
+  (#80). Both parsers reject a remainder `mangledRemainder` calls mangled —
+  empty, not equal to its own `.trim()` (leading/trailing whitespace), or
+  carrying a control character anywhere — while the message face's emitter
+  only filtered `''`. A peer page whose `nextCursor` was `' 4 '` (schema-valid:
+  `opaqueId` forbids only lone surrogates) therefore minted `cursor: 4 `, and
+  the `after:` anchor had the same hole (`after: m-0 `, from a padded message
+  id that the parts walk accepts): a token the tool then refused on replay, so
+  the refusal surfaced at the resume call instead of at the answer that
+  produced it. The message face now applies the parser's own predicate to BOTH
+  the `cursor:` position and the `after:` anchor, so a mangled remainder yields
+  no token at all — `truncated` still says the walk was cut, and a wider
+  `limit` is the remedy that works. The list face already ran that guard.
 
 ## v0.1.7 (2026-10-19)
 
