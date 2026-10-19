@@ -1259,6 +1259,11 @@ describe('DeviceConnection over a real loopback channel', () => {
       (reason: unknown) => reason,
     )
     expect(error).toBeInstanceOf(Error)
+    // The CLASSIFIED verdict, not merely "some error" (review P3): the socket
+    // died mid-handshake with no candidate left, which is the all-hosts face
+    // the tool layer already reports. An `instanceof` alone would also pass for
+    // a rejection whose text tells an operator nothing.
+    expect((error as Error).message).toMatch(/all candidate hosts unreachable/i)
     expect((error as Error).message).not.toMatch(/disposed/i)
   }, 15_000)
 
