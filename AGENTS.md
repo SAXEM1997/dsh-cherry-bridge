@@ -229,57 +229,75 @@ These are load-bearing; the code comments are the long version.
   their number in flight (still no total bound). A global budget is a separate
   concern and deliberately not in the walk.
 
-### Read cache: one projection, fenced by the peer's own revision
+### Read cache: the parts-list RESULT, fenced by the peer's own revision
 
 `cherry_read` and the terminal/timeout/idle aggregates share ONE projection
-(`#projectMessage`), and the projected-message cache lives inside it — the
-lookup at its top, the store at its end. One entry saves one message's
-`agent.parts.list` walk plus one `agent.content.read` walk per externalized
-part, so an agent doing send → wait → read stops paying for the same unchanged
-history on every round.
+(`#projectMessage`), and that method runs in two steps: obtain the message's
+parts RECORDS (one `agent.parts.list` walk), then project them (one
+`agent.content.read` walk per externalized `{ref}`, digest-verified). The cache
+sits BETWEEN the steps — lookup before the list, store after it — and holds the
+LIST, not the projection. An agent doing send → wait → read therefore stops
+paying for the same unchanged part list on every round, while every read still
+verifies every byte it hands back.
 
+- **What an entry holds**: the `agent.parts.list` result —
+  `{revision, page: CherryPage<Record<string, unknown>>}` — i.e. the raw part
+  records plus the walk's own verdict. On a hit the RPC is skipped and the
+  ordinary projection loop runs again over those records, re-resolving and
+  re-verifying every `{ref}`.
 - **Key**: `<deviceId>\0<messageId>`. Device-scoped for the same reason every
   engine cache is: a message id is the peer's, and two desktops can issue the
-  same one.
-- **Fence**: a hit requires the stored `revision` to EQUAL the revision the
-  current `agent.messages.list` row carries. The peer refuses `agent.parts.list`
-  with `REVISION_EXPIRED` for a stale `messageRevision`, so a projection keyed
-  by the same revision is exactly what a fresh parts walk would have returned.
-  The cache inherits **that** staleness class; it adds none of its own.
-- **The fence does NOT cover a `{ref}`'s content store.** A message revision
-  describes the message's parts RECORDS, not the bytes behind a `{ref}`: content
-  corrupted there while the revision stays put would be re-verified by a fresh
-  walk and skipped by a cache hit, turning a `ContentIntegrityError` into a
-  confident answer. So a message holding ANY ref-resolved part is **never
-  cached** — `CherryReadPart.fromRef` records the fact internally and
-  `#publicMessage` strips it before the projection reaches a caller. The read
-  still verifies every ref's sha256 on every read; what the cache gives up is
-  the round trips for ref-bearing messages (the 2.1.6 common case), which is
-  the price of keeping the integrity guarantee absolute.
-- **Never cached**: an `incomplete` projection (a failed part, or a
-  circuit-broken parts walk — a transient failure must never become permanent),
-  a projection containing a ref-resolved part (above), a row whose revision is
-  EMPTY (no fence to trust), and a projection above
-  `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB; served fresh every time rather than
-  allowed to crowd out every other message).
-- **Two bounds, both per device**: `MESSAGE_CACHE_ENTRY_BYTES` = 1 MiB and
-  `MESSAGE_CACHE_BYTES_PER_DEVICE` = 32 MiB (the size of one `{ref}`, i.e. the
-  largest piece of content the read path will assemble). Eviction is **FIFO**,
-  oldest insertion first — `Map` order IS the policy, the same deliberate choice
-  `#remember` documents for the session caches. Room is made BEFORE an insert,
-  so a device never passes its budget. `#dropCachedMessage` is the ONE delete
-  path, so the per-device byte total cannot drift from the map. Eviction warns
-  once per insert that dropped anything: device and count only, never a message
-  id.
-- **A hit is served BY REFERENCE.** Every face treats a projection as immutable
-  (it serializes it or reads its text), so a hit is not deep-copied — a copy per
-  hit would spend the CPU the cache exists to save. A future face that mutates a
-  projection must copy first.
+  same one. The revision is the FENCE, not part of the key.
+- **The fence covers parts RECORDS, and that is now the whole story.** A
+  message revision describes the parts a `messageRevision`-fenced
+  `agent.parts.list` returns; the peer itself raises `REVISION_EXPIRED` for a
+  stale one. So a hit is exactly the list a fresh walk would have returned, and
+  the cache inherits **that** staleness class with none of its own.
+- **The fence never had to cover a `{ref}`'s content store**, because the cache
+  does not hold the content: a `{ref}` is re-fetched through
+  `agent.content.read` and its sha256 re-verified on EVERY read, hit or miss.
+  Bytes corrupted behind an unchanged revision still fail the read with
+  `ContentIntegrityError` — the four integrity tests (`toolsRead.test.ts`
+  ④b/④j, `toolsAggregateBudget.test.ts` T3/T3b) pass unmodified against this
+  design, and `toolsReadCache.test.ts` T1b pins it next to the cache. The
+  earlier attempt cached the PROJECTION and had to refuse every ref-bearing
+  message to keep that promise; that refusal (and the `CherryReadPart.fromRef`
+  marker and `#publicMessage` that existed only to support it) is gone.
+- **Never cached**: a row whose revision is EMPTY (no fence to trust —
+  defensive only: the protocol's `messageRevision` is a strict decimal, so no
+  test can drive it), a TRUNCATED parts page (the circuit breaker stopped the
+  walk, so the list is short — a transient fault must be retried, never
+  remembered), and a page above `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB; walked fresh
+  every time rather than allowed to crowd out every other message).
+- **A failed part is NOT a reason to forget the list.** Degradation happens in
+  the projection step; the held records are still the peer's complete answer and
+  the next read re-attempts every part. (The projection-cached design had to
+  refuse an `incomplete` message, because there the projection WAS the entry
+  and a degraded one would have stayed degraded for the life of the revision.)
+- **What it costs**: an unchanged message's part LIST costs no
+  `agent.parts.list` RPC; its externalized content is STILL fetched and verified
+  on every read. That is the honest claim — the cache is not a zero-RPC hit
+  for the 2.1.6 common case (every part above 4,096 characters is a `{ref}`).
+- **Memory holds descriptors, not text.** An entry is sized with
+  `JSON.stringify(page.items).length` (the same wire-cost proxy
+  `AGGREGATE_BYTES` uses) and no resolved content is ever retained, so
+  `MESSAGE_CACHE_ENTRY_BYTES` rarely binds; it stays as the guard against an
+  entry that would evict everything else. `MESSAGE_CACHE_BYTES_PER_DEVICE` =
+  32 MiB — deliberately far more headroom than descriptor entries need.
+- **Two bounds, both per device.** Eviction is **FIFO**, oldest insertion
+  first — `Map` order IS the policy, the same deliberate choice `#remember`
+  documents for the session caches. Room is made BEFORE an insert, so a device
+  never passes its budget. `#dropCachedMessage` is the ONE delete path, so the
+  per-device byte total cannot drift from the map. Eviction warns once per
+  insert that dropped anything: device and count only, never a message id.
+- **A hit hands the PAGE out BY REFERENCE**, which is safe because it is a list
+  of records: the projection loop only reads it and builds new part objects
+  from it. A future reader that mutates a cached page must copy first.
 - **Invalidation** rides the existing seam: `#forgetDevice` drops the device's
-  message entries with its three session caches, and `#watchConnection` already
-  routes `offline` / `identity-mismatch` there. Note what that seam covers: an
-  ordinary link loss also publishes `offline`, so a reconnect drops the cache
-  too — one re-read per session, the documented cost of the seam.
+  entries with its three session caches, and `#watchConnection` already routes
+  `offline` / `identity-mismatch` there. Note what that seam covers: an ordinary
+  link loss also publishes `offline`, so a reconnect drops the cache too — one
+  re-walk per session, the documented cost of the seam.
 
 ### Walks: what is tolerated, what is refused
 
