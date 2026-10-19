@@ -167,6 +167,25 @@ export class RpcDeadlineExceededError extends Error {
   }
 }
 
+/**
+ * WHY a parked replay wait ended (issue #21).
+ *
+ * Its own type because the caller must not have to INFER the cause: before this
+ * the wait resolved `undefined` for all three outcomes and `#businessRequest`
+ * told "the caller's deadline" apart from "the reconnect allowance" by comparing
+ * `performance.now()` with the deadline afterwards — a race, because a timer may
+ * fire a millisecond EARLY, and a full-suite run duly produced a
+ * `TransportLostError` where the deadline had actually ended the wait. The
+ * discriminator is now a FACT the wait reports, on the same principle as
+ * `RequestTimeoutError.clampedByDeadline`.
+ */
+type ReplayWait =
+  | { kind: 'connected'; client: JsonRpcClient; epoch: number }
+  /** The wait's own bound elapsed (the deadline-capped `waitMs`). */
+  | { kind: 'expired' }
+  /** The lifecycle moved on — a shutdown, a disabled or identity-mismatched device. */
+  | { kind: 'abandoned' }
+
 // ---------------------------------------------------------------------------
 // Defaults (spec §3.4 and controller rulings; values are contractual).
 // ---------------------------------------------------------------------------
@@ -589,7 +608,7 @@ export class DeviceConnection {
    * the state is already 'offline' is a no-op), so the listeners alone cannot
    * be relied on to notice.
    */
-  readonly #replayWaiters = new Set<(value?: undefined) => void>()
+  readonly #replayWaiters = new Set<(outcome: ReplayWait) => void>()
   /** Notification handlers, re-attached to every new client after a reconnect. */
   readonly #notificationHandlers = new Set<(method: string, params: unknown) => void>()
   /**
@@ -763,7 +782,7 @@ export class DeviceConnection {
     this.#epoch += 1
     // Abort every parked replay wait first: this is the only reliable signal
     // they get — see #replayWaiters.
-    for (const abort of [...this.#replayWaiters]) abort(undefined)
+    for (const abort of [...this.#replayWaiters]) abort({ kind: 'abandoned' })
     this.#clearAllTimers()
     this.#teardownLink()
     this.#setState('offline')
@@ -1383,11 +1402,18 @@ export class DeviceConnection {
         `[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); ` +
           `waiting up to ${Math.round(waitMs)}ms for a reconnect to replay it`,
       )
-      const reconnected = await this.#awaitReconnect(waitMs, link.client)
-      if (reconnected === undefined) {
-        if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+      const waited = await this.#awaitReconnect(waitMs, link.client)
+      if (waited.kind === 'abandoned') throw lost
+      if (waited.kind === 'expired') {
+        // WHICH bound expired is decided by the bound the caller was given, not
+        // by a clock read: `waitMs` is the smaller of the reconnect allowance
+        // and the remaining budget, so a strictly smaller `waitMs` CAN only be
+        // the deadline. (A clock comparison here was the bug: a timer firing a
+        // millisecond early made a deadline-capped wait read as a plain loss.)
+        if (waitMs < this.#transportRetryWaitMs) throw new RpcDeadlineExceededError(this.record.deviceId, method)
         throw lost
       }
+      const reconnected = waited
       // The link GENERATION the wait resolved on, re-checked before the replay
       // is spent. This is why `#awaitReconnect` returns the epoch at all: a
       // link loss is not a teardown, so a wait parked across one is not
@@ -1446,50 +1472,52 @@ export class DeviceConnection {
   }
 
   /**
-   * Resolves with the next AUTHENTICATED link (+epoch) within `waitMs`, or
-   * undefined once the bound, a shutdown, or a cycle the supervisor abandoned
-   * makes a replay pointless.
+   * Waits up to `waitMs` for the next AUTHENTICATED link, and says WHY the wait
+   * ended ({@link ReplayWait}) instead of resolving `undefined` for all three
+   * outcomes — the caller has to tell "my deadline ran out" from "the peer never
+   * came back" and from "the lifecycle moved on", and only a reported cause can
+   * be trusted (a clock comparison after the fact races an early timer).
    *
    * `connected` is the right condition rather than "a link exists": `#establish`
    * commits `#link` before its hello/authenticate pair completes, and a replay
    * into that window would ride an unauthenticated client.
    */
-  #awaitReconnect(
-    waitMs: number,
-    deadClient: JsonRpcClient,
-  ): Promise<{ client: JsonRpcClient; epoch: number } | undefined> {
-    if (!this.#running) return Promise.resolve(undefined)
+  #awaitReconnect(waitMs: number, deadClient: JsonRpcClient): Promise<ReplayWait> {
+    if (!this.#running) return Promise.resolve({ kind: 'abandoned' })
     // The link whose channel just died must not be handed back: the supervisor
     // may not have observed the loss yet, and replaying into the SAME dead
     // client burns the one retry on an immediate rejection.
-    const established = (): { client: JsonRpcClient; epoch: number } | undefined => {
+    const established = (): ReplayWait | undefined => {
       const link = this.#link
       if (this.#state !== 'connected' || link === undefined) return undefined
       if (link.client === deadClient) return undefined
-      return { client: link.client, epoch: link.epoch }
+      return { kind: 'connected', client: link.client, epoch: link.epoch }
     }
     const ready = established()
     if (ready !== undefined) return Promise.resolve(ready)
     // Rides the state listeners rather than a polling loop, so every wait costs
     // one timer (its own bound) that is cleared whichever way it settles.
     return new Promise((resolve) => {
-      const finish = (value: { client: JsonRpcClient; epoch: number } | undefined): void => {
+      const finish = (outcome: ReplayWait): void => {
         clearTimeout(timer)
         this.#stateListeners.delete(listener)
         this.#replayWaiters.delete(finish)
-        resolve(value)
+        resolve(outcome)
       }
       const listener = (state: DeviceState): void => {
         if (!this.#running || state === 'disabled' || state === 'identity-mismatch') {
-          finish(undefined)
+          finish({ kind: 'abandoned' })
           return
         }
         if (state !== 'connected') return
         const link = this.#link
         if (link === undefined || link.client === deadClient) return
-        finish({ client: link.client, epoch: link.epoch })
+        finish({ kind: 'connected', client: link.client, epoch: link.epoch })
       }
-      const timer = setTimeout(() => finish(undefined), waitMs)
+      // The ONLY thing this timer means is "the bound elapsed". Whether that
+      // bound was the deadline or the reconnect allowance is decided by the
+      // caller from `waitMs`, which it chose.
+      const timer = setTimeout(() => finish({ kind: 'expired' }), waitMs)
       this.#replayWaiters.add(finish)
       this.#stateListeners.add(listener)
     })

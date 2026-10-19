@@ -2782,7 +2782,7 @@ var DeviceConnection = class {
 	async close() {
 		this.#running = false;
 		this.#epoch += 1;
-		for (const abort of [...this.#replayWaiters]) abort(void 0);
+		for (const abort of [...this.#replayWaiters]) abort({ kind: "abandoned" });
 		this.#clearAllTimers();
 		this.#teardownLink();
 		this.#setState("offline");
@@ -3156,11 +3156,13 @@ var DeviceConnection = class {
 			if (remaining !== void 0 && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 			const waitMs = remaining === void 0 ? this.#transportRetryWaitMs : Math.min(this.#transportRetryWaitMs, remaining);
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${Math.round(waitMs)}ms for a reconnect to replay it`);
-			const reconnected = await this.#awaitReconnect(waitMs, link.client);
-			if (reconnected === void 0) {
-				if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+			const waited = await this.#awaitReconnect(waitMs, link.client);
+			if (waited.kind === "abandoned") throw lost;
+			if (waited.kind === "expired") {
+				if (waitMs < this.#transportRetryWaitMs) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 				throw lost;
 			}
+			const reconnected = waited;
 			if (reconnected.epoch !== this.#epoch) throw lost;
 			await this.#limiter.acquire(method);
 			if (!this.#running || this.#state !== "connected") throw lost;
@@ -3178,21 +3180,24 @@ var DeviceConnection = class {
 		return error instanceof Error && !(error instanceof JsonRpcRequestError) && isChannelClosedError(error);
 	}
 	/**
-	* Resolves with the next AUTHENTICATED link (+epoch) within `waitMs`, or
-	* undefined once the bound, a shutdown, or a cycle the supervisor abandoned
-	* makes a replay pointless.
+	* Waits up to `waitMs` for the next AUTHENTICATED link, and says WHY the wait
+	* ended ({@link ReplayWait}) instead of resolving `undefined` for all three
+	* outcomes — the caller has to tell "my deadline ran out" from "the peer never
+	* came back" and from "the lifecycle moved on", and only a reported cause can
+	* be trusted (a clock comparison after the fact races an early timer).
 	*
 	* `connected` is the right condition rather than "a link exists": `#establish`
 	* commits `#link` before its hello/authenticate pair completes, and a replay
 	* into that window would ride an unauthenticated client.
 	*/
 	#awaitReconnect(waitMs, deadClient) {
-		if (!this.#running) return Promise.resolve(void 0);
+		if (!this.#running) return Promise.resolve({ kind: "abandoned" });
 		const established = () => {
 			const link = this.#link;
 			if (this.#state !== "connected" || link === void 0) return void 0;
 			if (link.client === deadClient) return void 0;
 			return {
+				kind: "connected",
 				client: link.client,
 				epoch: link.epoch
 			};
@@ -3200,26 +3205,27 @@ var DeviceConnection = class {
 		const ready = established();
 		if (ready !== void 0) return Promise.resolve(ready);
 		return new Promise((resolve) => {
-			const finish = (value) => {
+			const finish = (outcome) => {
 				clearTimeout(timer);
 				this.#stateListeners.delete(listener);
 				this.#replayWaiters.delete(finish);
-				resolve(value);
+				resolve(outcome);
 			};
 			const listener = (state) => {
 				if (!this.#running || state === "disabled" || state === "identity-mismatch") {
-					finish(void 0);
+					finish({ kind: "abandoned" });
 					return;
 				}
 				if (state !== "connected") return;
 				const link = this.#link;
 				if (link === void 0 || link.client === deadClient) return;
 				finish({
+					kind: "connected",
 					client: link.client,
 					epoch: link.epoch
 				});
 			};
-			const timer = setTimeout(() => finish(void 0), waitMs);
+			const timer = setTimeout(() => finish({ kind: "expired" }), waitMs);
 			this.#replayWaiters.add(finish);
 			this.#stateListeners.add(listener);
 		});
