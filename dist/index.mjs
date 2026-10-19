@@ -5521,7 +5521,7 @@ var CherryToolEngine = class {
 	#agentsTool() {
 		return defineCherryTool({
 			name: "cherry_agents",
-			description: "List the Cherry Studio agents available on a device. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally.",
+			description: "List the Cherry Studio agents available on a device. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one); its `nextCursor`, when present, is the peer's internal page position — not a resume input.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5553,7 +5553,7 @@ var CherryToolEngine = class {
 	#workspacesTool() {
 		return defineCherryTool({
 			name: "cherry_workspaces",
-			description: "List an agent's REGISTERED workspaces, plus whether a system workspace exists. The system workspace has no enumerable id: it is not in `items`, and its identity is only observable by creating a session in it and reading it back.",
+			description: "List an agent's REGISTERED workspaces, plus whether a system workspace exists. The system workspace has no enumerable id: it is not in `items`, and its identity is only observable by creating a session in it and reading it back. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5600,7 +5600,7 @@ var CherryToolEngine = class {
 	#sessionsTool() {
 		return defineCherryTool({
 			name: "cherry_sessions",
-			description: "List an agent's sessions, optionally filtered by workspace. The `agentId` and `workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally.",
+			description: "List an agent's sessions, optionally filtered by workspace. The `agentId` and `workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one); its `nextCursor`, when present, is the peer's internal page position — not a resume input.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6061,7 +6061,7 @@ var CherryToolEngine = class {
 	#eventsTool() {
 		return defineCherryTool({
 			name: "cherry_events",
-			description: "Read the session's buffered events newer than `cursor`, delivering them and then acknowledging the advanced cursor to the peer. While the window has dropped no events, every cursor this plugin handed out is servable, including the baseline `cherry_send`/`cherry_wait` report on an empty window. Once the window DISCARDS events, the boundary it reports is not: that boundary and everything below it answer a structured `cursor-out-of-window` verdict, and only positions strictly past it are served — rebuild the baseline with `cherry_read` and resume from that instead.",
+			description: "Read the session's buffered events newer than `cursor`, delivering them and then acknowledging the advanced cursor to the peer. While the window has dropped no events, every cursor this plugin handed out is servable, including the baseline `cherry_send`/`cherry_wait` report on an empty window. Once the window DISCARDS events, the boundary it reports is not: that boundary and everything below it answer a structured `cursor-out-of-window` verdict, and only positions strictly past it are served — rebuild the baseline with `cherry_read` and resume from that instead. The answer is `{events, nextCursor}`; pass that `nextCursor` back as `cursor` on the next call to continue from it.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6419,7 +6419,7 @@ var CherryToolEngine = class {
 	#interactionsTool() {
 		return defineCherryTool({
 			name: "cherry_interactions",
-			description: "List the session's PENDING interactions (questions and approval decisions) that need an answer. The peer serves the full four-state set (pending/approved/denied/expired) — the pending filter is applied here. Each entry carries its `kind` (question|decision) and a summary; answer questions with cherry_respond's `response` form and decisions with `decision`.",
+			description: "List the session's PENDING interactions (questions and approval decisions) that need an answer. The peer serves the full four-state set (pending/approved/denied/expired) — the pending filter is applied here. Each entry carries its `kind` (question|decision) and a summary; answer questions with cherry_respond's `response` form and decisions with `decision`. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out.",
 			parameters: {
 				type: "object",
 				properties: {
