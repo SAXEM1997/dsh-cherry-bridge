@@ -6,6 +6,7 @@ import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import {
   INTERACTIONS_LIST_PAGE_CLAMP,
   LIST_PAGE_CLAMP,
+  MAX_LIST_TOKEN_CHARS,
   PARTS_LIST_PAGE_CLAMP,
 } from './defaults.js'
 import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
@@ -2097,12 +2098,20 @@ class CherryToolEngine {
    * #65). What a caller can act on is a token, so that is what is emitted.
    */
   #listPage(page: CherryPage<Record<string, unknown>>, binding: ListResumeBinding): Record<string, unknown> {
+    // A position this face would REFUSE is not a position it may name. The
+    // round-trip symmetry (a token a tool emits is a token that tool accepts) is
+    // the whole point of the token, so a peer answering `nextCursor: ''` — or a
+    // position carrying whitespace/control characters, which `mangledRemainder`
+    // rejects on the way back — gets NO token; `truncated` still says the walk
+    // was cut and a wider `limit` is the remedy. `messageResumeToken` guards the
+    // same hole for the message face.
+    const position = optionalString(page.nextCursor)
     return {
       items: page.items,
       truncated: page.truncated,
       ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
-      ...(page.truncated && page.nextCursor !== undefined
-        ? { resumeCursor: encodeListResumeCursor(binding, page.nextCursor) }
+      ...(page.truncated && position !== undefined && !mangledRemainder(position)
+        ? { resumeCursor: encodeListResumeCursor(binding, position) }
         : {}),
     }
   }
@@ -6247,16 +6256,68 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
  * another query is a perfectly valid number that reads the WRONG slice with no
  * error anywhere. So this token carries a fingerprint of the binding and a
  * mismatched replay is refused HERE — before any RPC.
+ *
+ * Wire format (issue #70):
+ * `cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>` — the
+ * position verbatim and LAST. It replaced a base64 JSON blob (`{v,m,d,h,p}`)
+ * that was ~2.3x longer and had no integrity check: measured over 20,000 random
+ * single-character corruptions, 28.7% of the old tokens were ACCEPTED with a
+ * different position, because the position is the one field a structural check
+ * cannot validate. The compact form plus the checksum makes that class empty.
  */
 const LIST_RESUME_PREFIX = 'cursor:'
 
-/** The `cursor` parameter every list tool shares (issue #65). */
+/**
+ * The token's format marker (issue #70). It is a FIELD, not part of the prefix,
+ * so a token from the PREVIOUS format is recognised and refused by name
+ * ({@link looksLikeV1ListToken}) instead of getting the generic shape error: a
+ * resume token outlives a plugin upgrade (the caller is holding it), and "start
+ * the walk over" is actionable where "not a token this tool emitted" invites
+ * one more attempt with the same string.
+ *
+ * A format NEWER than this one has no detector and falls through to the
+ * generic refusal, which is the honest verdict: this release cannot know that a
+ * future format is a resume token at all.
+ */
+const LIST_TOKEN_VERSION = 'v2'
+
+/**
+ * One character per list tool, replacing the full method name (19 characters of
+ * a 225-character token). Every method a list tool can issue MUST appear here:
+ * {@link encodeListResumeCursor} throws on an unknown one rather than emit a
+ * token the matching parser could never accept.
+ */
+const LIST_TOOL_CODES: Readonly<Record<string, string>> = {
+  'agent.agents.list': 'a',
+  'agent.workspaces.list': 'w',
+  'agent.sessions.list': 's',
+  'agent.interactions.list': 'i',
+}
+
+/** The inverse of {@link LIST_TOOL_CODES}, for {@link parseListResumeCursor}. */
+const LIST_CODE_METHODS: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.entries(LIST_TOOL_CODES).map(([method, code]) => [code, method]),
+)
+
+/**
+ * The fields after the version marker, BEFORE the peer position: tool code,
+ * device digest, filter fingerprint and checksum. The position is the rest of
+ * the token — it is peer-supplied and may contain the delimiter itself (the
+ * desktop's session cursor is `entity:<orderKey>:<uuid>`), so the split stops
+ * at a fixed count and never consumes it.
+ */
+const LIST_TOKEN_FIELDS = 4
+
+/** The `cursor` parameter every list tool shares (issues #65 and #70). */
 const LIST_CURSOR_PARAMETER = {
   type: 'string',
+  maxLength: MAX_LIST_TOKEN_CHARS,
   description:
     'A `resumeCursor` a previous TRUNCATED answer of this tool returned: replay it with the SAME ' +
     'device and filters to continue from that stop point (`limit` then bounds this answer). A token ' +
-    'from another tool, device or filter set is refused locally.',
+    'from another tool, device or filter set is refused locally, and so is a token this account ' +
+    `cannot have received intact (the token carries a checksum; ${MAX_LIST_TOKEN_CHARS} characters ` +
+    'is the ceiling).',
 } as const
 
 /** What a list token is valid for. `params` are the CALLER's filters, not the wire page params. */
@@ -6272,18 +6333,58 @@ function listParamsFingerprint(params: Record<string, unknown>): string {
     .sort()
     .filter((key) => params[key] !== undefined)
     .map((key) => [key, params[key]] as const)
-  return createHash('sha256').update(JSON.stringify(entries)).digest('hex').slice(0, 16)
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex').slice(0, 8)
+}
+
+/**
+ * The device half of the binding, as a digest rather than the id itself: a
+ * `deviceId` is a 36-character UUID, and the token only ever has to answer "was
+ * this issued for the device I just resolved?", never "which device was it?".
+ * 12 hex characters (48 bits) make an accidental collision between two paired
+ * desktops a non-event, where the old field was a third of the token.
+ */
+function listDeviceFingerprint(deviceId: string): string {
+  return createHash('sha256').update(deviceId).digest('hex').slice(0, 12)
+}
+
+/**
+ * The token's integrity check (issue #70). It covers the peer position, which
+ * is the ONE field no structural check can validate: a substitution there used
+ * to decode as a perfectly well-formed token and was forwarded, and the desktop
+ * silently falls back to its FIRST page for a position it cannot parse — so the
+ * caller's "continue from here" came back as the newest page presented as older
+ * history. 8 hex characters (32 bits) turn every single-character corruption
+ * into a local refusal; the token is not a security boundary, so a MAC would
+ * only make it longer.
+ */
+function listTokenChecksum(body: string, peerPosition: string): string {
+  return createHash('sha256')
+    .update(`${body}\u0000${peerPosition}`)
+    .digest('hex')
+    .slice(0, 8)
 }
 
 function encodeListResumeCursor(binding: ListResumeBinding, peerPosition: string): string {
-  const payload = {
-    v: 1,
-    m: binding.method,
-    d: binding.deviceId,
-    h: listParamsFingerprint(binding.params),
-    p: peerPosition,
+  const code = LIST_TOOL_CODES[binding.method]
+  if (code === undefined) throw new Error(`${binding.method}: no list resume token code`)
+  const body = `${LIST_TOKEN_VERSION}:${code}:${listDeviceFingerprint(binding.deviceId)}:${listParamsFingerprint(
+    binding.params,
+  )}`
+  return `${LIST_RESUME_PREFIX}${body}:${listTokenChecksum(body, peerPosition)}:${peerPosition}`
+}
+
+/**
+ * Whether a `cursor:` remainder is a token from the base64-JSON era (issue #65,
+ * `v: 1`). Only used to explain a refusal: the payload is never replayed.
+ */
+function looksLikeV1ListToken(raw: string): boolean {
+  if (raw === '' || raw.includes(':')) return false
+  try {
+    const decoded: unknown = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
+    return typeof decoded === 'object' && decoded !== null && (decoded as Record<string, unknown>)['v'] === 1
+  } catch {
+    return false
   }
-  return LIST_RESUME_PREFIX + Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url')
 }
 
 /**
@@ -6305,28 +6406,48 @@ function parseListResumeCursor(value: unknown, binding: ListResumeBinding): stri
   if (typeof value !== 'string' || !value.startsWith(LIST_RESUME_PREFIX)) {
     refuse('must be a `cursor:` token this tool emitted')
   }
-  const raw = (value as string).slice(LIST_RESUME_PREFIX.length)
-  let decoded: unknown
-  try {
-    decoded = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'))
-  } catch {
+  const token = value as string
+  if (token.length > MAX_LIST_TOKEN_CHARS) {
+    throw new Error(
+      `cursor is ${token.length} characters long, over the ${MAX_LIST_TOKEN_CHARS}-character ceiling for a ` +
+        'resume token; omit `cursor` to read from the start.',
+    )
+  }
+  const raw = token.slice(LIST_RESUME_PREFIX.length)
+  if (!raw.startsWith(`${LIST_TOKEN_VERSION}:`)) {
+    if (looksLikeV1ListToken(raw)) {
+      // A v1 token cannot be replayed at ALL: the format changed, so "the same
+      // tool, device and filters" would fail again. The generic tail would
+      // therefore tell the caller to do something that can never work — the one
+      // thing this version marker exists to avoid.
+      throw new Error(
+        'cursor was issued by an older plugin version (a v1 token, from before list tokens were compact ' +
+          'and checksummed), so it can no longer be verified; start this walk over with `cursor` omitted.',
+      )
+    }
     refuse('is not a token this tool emitted')
   }
-  if (typeof decoded !== 'object' || decoded === null) refuse('is not a token this tool emitted')
-  const payload = decoded as Record<string, unknown>
-  if (
-    payload['v'] !== 1 ||
-    typeof payload['m'] !== 'string' ||
-    typeof payload['d'] !== 'string' ||
-    typeof payload['h'] !== 'string' ||
-    typeof payload['p'] !== 'string'
-  ) {
-    refuse('is not a token this tool emitted')
+  let rest = raw.slice(LIST_TOKEN_VERSION.length + 1)
+  const fields: string[] = []
+  for (let index = 0; index < LIST_TOKEN_FIELDS; index += 1) {
+    const separator = rest.indexOf(':')
+    if (separator < 0) refuse('is not a token this tool emitted')
+    fields.push(rest.slice(0, separator))
+    rest = rest.slice(separator + 1)
   }
-  if (payload['m'] !== binding.method) refuse('was issued for a different tool')
-  if (payload['d'] !== binding.deviceId) refuse('was issued for a different device')
-  if (payload['h'] !== listParamsFingerprint(binding.params)) refuse('was issued for a different filter set')
-  const peerPosition = payload['p'] as string
+  // What is left is the peer position, verbatim — colons and all.
+  const [code, device, filters, checksum] = fields as [string, string, string, string]
+  const peerPosition = rest
+  const body = `${LIST_TOKEN_VERSION}:${code}:${device}:${filters}`
+  // The checksum is judged BEFORE the binding: a corrupted token is not a
+  // statement about the caller's filters, and reporting it as one would send
+  // the caller looking for a filter they never changed.
+  if (checksum !== listTokenChecksum(body, peerPosition)) {
+    refuse('is not a token this tool emitted (its checksum does not match, so it was altered in transit)')
+  }
+  if (LIST_CODE_METHODS[code] !== binding.method) refuse('was issued for a different tool')
+  if (device !== listDeviceFingerprint(binding.deviceId)) refuse('was issued for a different device')
+  if (filters !== listParamsFingerprint(binding.params)) refuse('was issued for a different filter set')
   if (mangledRemainder(peerPosition)) refuse('is not a token this tool emitted')
   return peerPosition
 }

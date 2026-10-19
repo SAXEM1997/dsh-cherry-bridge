@@ -543,6 +543,38 @@ peer position). From a resume point `limit` bounds THAT answer; a page the peer
 overshoots is re-read from the position the walk sent (duplicates, never a gap),
 and `cherry_interactions` counts pre-filter rows against `limit`.
 
+**The token itself is compact and checksummed (issue #70):**
+
+    cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>
+
+- One character per tool (`a`/`w`/`s`/`i`) instead of the method name, a 12-hex
+  **digest** of the deviceId instead of the 36-character UUID, an 8-hex filter
+  fingerprint, and an 8-hex checksum. The peer position goes **last and
+  verbatim** (it may contain the delimiter — the desktop's session cursor is
+  `entity:<orderKey>:<uuid>`), so the split stops at a fixed field count. The
+  three binding verdicts keep their own wording; `MAX_LIST_TOKEN_CHARS` (4,096)
+  is enforced by the parser and declared as the parameter's `maxLength`.
+- **The checksum is the load-bearing half of that change, not the length.** The
+  position is the one field no structural check can validate: measured over
+  20,000 random single-character corruptions of the old base64-JSON token,
+  **28.7% were accepted with a different position** — and the desktop's cursor
+  decoders (`decodePinnedListCursor`, `decodeListCursor`) warn and fall back to
+  the FIRST page for a position they cannot parse, so "continue from here"
+  silently became the newest page presented as older history. Every
+  single-character corruption is now refused locally (a test walks every
+  position of a real token), and the token is 225 → ~100 characters on the
+  sessions worst case, ~150 → ~44 on the numeric faces.
+- A v1 token (base64 JSON, `{v,m,d,h,p}`) is refused by name — a plugin upgrade
+  invalidates a held token, and "start the walk over" is the actionable answer,
+  so that refusal does NOT reuse the generic "…or replay the token" tail: a v1
+  token can never be replayed, whoever holds it.
+- **Only a position this face would accept is ever named.** An empty peer
+  position (or one carrying whitespace/control characters, which the parser
+  rejects) yields no token at all: `#listPage` runs the same `optionalString`
+  guard the message face uses, because a token the tool refuses to replay is
+  worse than none — `truncated` already says the walk was cut, and a wider
+  `limit` is the remedy that works.
+
 ### `AGGREGATE_BYTES`: one budget, two faces
 
 `AGGREGATE_BYTES` = 256 KiB bounds a **projected message aggregate** (measured

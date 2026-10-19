@@ -2159,7 +2159,7 @@ describe('issue #65: list walks are resumable', () => {
 
     await expect(
       rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a2', limit: 16, cursor: first.resumeCursor }),
-    ).rejects.toThrow(/cursor/i)
+    ).rejects.toThrow(/different filter set/i)
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
   })
 
@@ -2169,13 +2169,16 @@ describe('issue #65: list walks are resumable', () => {
 
     await expect(
       rig.call('cherry_agents', { device: 'dev-A', limit: 2, cursor: first.resumeCursor }),
-    ).rejects.toThrow(/cursor/i)
+    ).rejects.toThrow(/different tool/i)
+    // A bare peer position and the message face's anchor form are both refused
+    // by the PREFIX: neither can be a token this tool emitted (issue #70 kept
+    // the two faces on one prefix so this stays true).
     await expect(rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: '16' })).rejects.toThrow(
-      /cursor/i,
+      /must be a `cursor:` token/i,
     )
     await expect(
       rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: 'after:msg-1' }),
-    ).rejects.toThrow(/cursor/i)
+    ).rejects.toThrow(/must be a `cursor:` token/i)
   })
 
   it('⑰e a token issued by one device is refused on another', async () => {
@@ -2189,7 +2192,7 @@ describe('issue #65: list walks are resumable', () => {
 
     await expect(
       rig.call('cherry_sessions', { device: 'dev-B', agentId: 'a1', limit: 2, cursor: first.resumeCursor }),
-    ).rejects.toThrow(/cursor/i)
+    ).rejects.toThrow(/different device/i)
   })
 
   it('⑰f interactions keep the pending filter across answers, and the token covers the raw stream', async () => {
@@ -2303,5 +2306,210 @@ describe('issue #65: list walks are resumable', () => {
     const page = (await rig.call('cherry_sessions', { device: 'dev-A', limit: 100 })) as ListPage
     expect(page.nextCursor).toBeUndefined()
     expect(Object.keys(page)).not.toContain('nextCursor')
+  })
+})
+
+/**
+ * Issue #70: the LIST token is a compact delimiter form, not a base64 JSON blob,
+ * and it carries a checksum over its whole body — INCLUDING the peer position,
+ * the one field a structural check cannot validate. The property is closed:
+ * EVERY single-character corruption of a token this tool emitted is refused
+ * locally, without a dial.
+ *
+ * Shape: `cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<position>` — a
+ * one-char tool code, a digest instead of the 36-char deviceId, an 8-hex filter
+ * fingerprint, an 8-hex checksum, and the peer position VERBATIM and last. It
+ * has to be last: the real desktop's session cursor is
+ * `entity:<orderKey>:<uuid>`, i.e. it contains the token's own delimiter, so
+ * the split stops at a fixed field count rather than consuming the rest.
+ */
+describe('issue #70: list resume tokens are compact and integrity-checked', () => {
+  interface ListPage {
+    items: Array<Record<string, unknown>>
+    truncated?: boolean
+    truncationReason?: string
+    resumeCursor?: string
+    nextCursor?: string
+  }
+
+  /** The real desktop's session cursor: a section tag, an order key, an id. */
+  const KEYSET = 'entity:1757923200000:9c1f0a2e-6b3d-4a71-8f55-2d6e0b1c7a44'
+
+  const sessions = (count: number): Array<Record<string, unknown>> =>
+    Array.from({ length: count }, (_unused, index) => ({
+      sessionId: `s-${String(index).padStart(3, '0')}`,
+      agentId: 'a1',
+      workspaceId: 'w1',
+      title: `Session ${index}`,
+      historyRevision: '1',
+    }))
+
+  /**
+   * A `cherry_sessions` answer truncated at a KEYSET position — the desktop's
+   * own shape, i.e. one that contains the token's delimiter. The second
+   * scripted page records the cursor it was handed, so the round trip can be
+   * asserted on the WIRE (verbatim) rather than through the token's own words.
+   */
+  const keysetRig = async (): Promise<{ rig: Rig; wire: string[] }> => {
+    const wire: string[] = []
+    const rig = await makeRig({
+      agent: { agents: [{ agentId: 'a1', name: 'A' }] as never, sessions: sessions(3) as never },
+    })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      { items: sessions(2), nextCursor: KEYSET },
+      (params) => {
+        wire.push(String(params['cursor']))
+        return { items: sessions(3).slice(2), nextCursor: null }
+      },
+    ])
+    return { rig, wire }
+  }
+
+  it('⑦a the token is the compact form and the peer position rides back VERBATIM', async () => {
+    const { rig, wire } = await keysetRig()
+    const first = (await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2 })) as ListPage
+    expect(first.truncated).toBe(true)
+    expect(first.truncationReason).toBe('limit')
+    // tool code `s`, 12-hex device digest, 8-hex filter hash, 8-hex checksum,
+    // then the position with its own colons.
+    expect(first.resumeCursor).toMatch(/^cursor:v2:s:[0-9a-f]{12}:[0-9a-f]{8}:[0-9a-f]{8}:entity:1757923200000:/)
+    expect(first.resumeCursor).toMatch(new RegExp(`:${KEYSET}$`))
+    expect((first.resumeCursor as string).length).toBeLessThan(120)
+
+    const second = (await rig.call('cherry_sessions', {
+      device: 'dev-A',
+      agentId: 'a1',
+      limit: 2,
+      cursor: first.resumeCursor,
+    })) as ListPage
+    expect(wire).toEqual([KEYSET])
+    expect(second.items.map((item) => item['sessionId'])).toEqual(['s-002'])
+    expect(second.truncated).toBe(false)
+    expect(second.resumeCursor).toBeUndefined()
+  })
+
+  it('⑦b every single-character corruption is refused LOCALLY — the checksum covers the position', async () => {
+    const { rig } = await keysetRig()
+    const token = ((await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2 })) as ListPage)
+      .resumeCursor as string
+    const before = rig.fake.readCallsFor('agent.sessions.list').length
+    let tried = 0
+    for (let at = 0; at < token.length; at += 1) {
+      for (const ch of ['0', 'a', ':']) {
+        if (ch === token[at]) continue
+        const mutated = token.slice(0, at) + ch + token.slice(at + 1)
+        await expect(
+          rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: mutated }),
+        ).rejects.toThrow(/cursor/i)
+        tried += 1
+      }
+    }
+    // A "single-character corruption" includes LOSING one and GAINING one: a
+    // model can truncate the string or paste a character twice. Both move the
+    // response the peer is asked for, so both are the checksum's job.
+    for (let at = 0; at < token.length; at += 1) {
+      const deleted = token.slice(0, at) + token.slice(at + 1)
+      await expect(
+        rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: deleted }),
+      ).rejects.toThrow(/cursor/i)
+      const inserted = token.slice(0, at) + 'a' + token.slice(at)
+      await expect(
+        rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: inserted }),
+      ).rejects.toThrow(/cursor/i)
+      tried += 2
+    }
+    // ~281 substitutions + one deletion and one insertion per position.
+    expect(tried).toBeGreaterThan(450)
+    // Not one dial: a corrupted token never reaches the peer.
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
+  })
+
+  it('⑦c a v1 token is refused as an older format, before any RPC', async () => {
+    const { rig } = await keysetRig()
+    const v1 =
+      'cursor:' +
+      Buffer.from(
+        JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+        'utf8',
+      ).toString('base64url')
+    const before = rig.fake.readCallsFor('agent.sessions.list').length
+    const refusal = await rig
+      .call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: v1 })
+      .then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      )
+    expect(refusal).toBeInstanceOf(Error)
+    expect(refusal?.message).toMatch(/older plugin version/i)
+    // The remedy has to be the one that CAN work: a v1 token cannot be replayed
+    // at all, so the generic "replay the token with the same …" tail would send
+    // the caller to do something that fails every time.
+    expect(refusal?.message).toMatch(/start this walk over/i)
+    expect(refusal?.message).not.toMatch(/replay the token/i)
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
+  })
+
+  it('⑦d an over-long cursor is refused by its LENGTH, not by a decode failure', async () => {
+    const { rig } = await keysetRig()
+    const before = rig.fake.readCallsFor('agent.sessions.list').length
+    const huge = `cursor:v2:s:${'0'.repeat(12)}:${'0'.repeat(8)}:${'0'.repeat(8)}:${'9'.repeat(5000)}`
+    await expect(rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: huge })).rejects.toThrow(
+      /4096/,
+    )
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
+  })
+
+  it('⑦f a position this face would REFUSE is never emitted (round-trip symmetry)', async () => {
+    const agents = Array.from({ length: 12 }, (_unused, index) => ({ agentId: `a-${index}`, name: `A${index}` }))
+    const rig = await makeRig({ agent: { agents: agents as never } })
+    // A peer that claims more on an EMPTY position, and one whose position
+    // carries whitespace. `parseListResumeCursor` rejects both, so emitting a
+    // token would break "a token this tool emits is a token it accepts" — and
+    // the caller would hold a token that can never be replayed. No token, and
+    // `truncated` still says the walk was cut.
+    rig.fake.scriptListPages('agent.agents.list', [
+      { items: agents.slice(0, 2), nextCursor: '' },
+      { items: agents.slice(0, 2), nextCursor: ' 4 ' },
+    ])
+    for (let call = 0; call < 2; call += 1) {
+      const page = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
+      expect(page.truncated).toBe(true)
+      expect(page.resumeCursor).toBeUndefined()
+    }
+  })
+
+  it('⑦e each list tool stamps its own one-character code, and a numeric position stays short', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: Array.from({ length: 20 }, (_unused, index) => ({ agentId: `a-${index}`, name: `A${index}` })) as never,
+        workspaces: Array.from({ length: 20 }, (_unused, index) => ({
+          workspaceId: `w-${index}`,
+          name: `W${index}`,
+        })) as never,
+        sessions: sessions(20) as never,
+        interactions: Array.from({ length: 6 }, (_unused, index) => ({
+          interactionId: `i-${index}`,
+          revision: '1',
+          executionId: 'e-1',
+          toolCallId: `t-${index}`,
+          status: 'pending' as const,
+          summary: `S${index}`,
+        })) as never,
+      },
+    })
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['cherry_agents', { device: 'dev-A' }, 'a'],
+      ['cherry_workspaces', { device: 'dev-A', agentId: 'a-0' }, 'w'],
+      ['cherry_sessions', { device: 'dev-A', agentId: 'a1' }, 's'],
+      ['cherry_interactions', { device: 'dev-A', sessionId: 's-000' }, 'i'],
+    ]
+    for (const [tool, args, code] of cases) {
+      const page = (await rig.call(tool, { ...args, limit: 2 })) as ListPage
+      expect(page.truncated).toBe(true)
+      expect(page.resumeCursor).toMatch(new RegExp(`^cursor:v2:${code}:[0-9a-f]{12}:[0-9a-f]{8}:[0-9a-f]{8}:`))
+      // A numeric peer position is a handful of digits: the whole token stays
+      // under 60 characters where the old base64 form needed ~150.
+      expect((page.resumeCursor as string).length).toBeLessThan(60)
+    }
   })
 })
