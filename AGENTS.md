@@ -86,9 +86,10 @@ their keys (there is a contract assertion for exactly that).
   and compares **byte for byte** against the committed files. A missing rebuild
   is a red test, not a style nit.
 - **`prepublishOnly` vs `artifactFreshness` — two different gates.**
-  - `prepublishOnly` = `typecheck && test && build && build:client`: runs the
-    whole chain (both type projects, the full suite, both builds) on the
-    publish path. It proves the tree *is* buildable.
+  - `prepublishOnly` =
+    `typecheck && test && build && build:client && npm pack --dry-run`: runs
+    the whole chain (both type projects, the full suite, both builds, and the
+    pack check) on the publish path. It proves the tree *is* buildable.
   - `artifactFreshness` = rebuild from current source and byte-compare against
     **what is committed**. It proves the committed artifacts were built from
     this exact source — the gate that catches "changed source, forgot to
@@ -815,7 +816,8 @@ profile saw **zero changes** in that window. Notable faces:
 
 ## Release
 
-`npm run prepublishOnly` is the gate (typecheck + full suite + both builds).
+`npm run prepublishOnly` is the gate (typecheck, the full suite, both builds,
+and `npm pack --dry-run`).
 Then walk [`docs/e2e-checklist.md`](docs/e2e-checklist.md): Electron-side
 approvals cannot be CI'd, so pairing / send / interaction answers / disconnect
 recovery / multi-device coexistence must be exercised by hand on a real desktop.

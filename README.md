@@ -176,7 +176,7 @@ npm run typecheck      # 服务端 + UI 两侧
 npm run build          # tsdown → dist/index.mjs + dist/index.d.mts
 npm run build:client   # vite → lib/client.js
 npm run dev:ui         # 设置页 dev server（需宿主在 127.0.0.1:23023 运行）
-npm run prepublishOnly # 发布前闸门：typecheck + test + build + build:client
+npm run prepublishOnly # 发布前闸门：typecheck + test + build + build:client + npm pack --dry-run
 ```
 
 `dist/` 与 `lib/` 是**随仓库提交**的产物：改完 `src/` 或 `ui/` 必须重跑
