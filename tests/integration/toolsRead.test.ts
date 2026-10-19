@@ -2404,7 +2404,22 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
         tried += 1
       }
     }
-    expect(tried).toBeGreaterThan(250)
+    // A "single-character corruption" includes LOSING one and GAINING one: a
+    // model can truncate the string or paste a character twice. Both move the
+    // response the peer is asked for, so both are the checksum's job.
+    for (let at = 0; at < token.length; at += 1) {
+      const deleted = token.slice(0, at) + token.slice(at + 1)
+      await expect(
+        rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: deleted }),
+      ).rejects.toThrow(/cursor/i)
+      const inserted = token.slice(0, at) + 'a' + token.slice(at)
+      await expect(
+        rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: inserted }),
+      ).rejects.toThrow(/cursor/i)
+      tried += 2
+    }
+    // ~281 substitutions + one deletion and one insertion per position.
+    expect(tried).toBeGreaterThan(450)
     // Not one dial: a corrupted token never reaches the peer.
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
   })
@@ -2418,9 +2433,19 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
         'utf8',
       ).toString('base64url')
     const before = rig.fake.readCallsFor('agent.sessions.list').length
-    await expect(rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: v1 })).rejects.toThrow(
-      /older plugin version/i,
-    )
+    const refusal = await rig
+      .call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: v1 })
+      .then(
+        () => undefined,
+        (error: unknown) => error as Error,
+      )
+    expect(refusal).toBeInstanceOf(Error)
+    expect(refusal?.message).toMatch(/older plugin version/i)
+    // The remedy has to be the one that CAN work: a v1 token cannot be replayed
+    // at all, so the generic "replay the token with the same …" tail would send
+    // the caller to do something that fails every time.
+    expect(refusal?.message).toMatch(/start this walk over/i)
+    expect(refusal?.message).not.toMatch(/replay the token/i)
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
   })
 
@@ -2432,6 +2457,25 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
       /4096/,
     )
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
+  })
+
+  it('⑦f a position this face would REFUSE is never emitted (round-trip symmetry)', async () => {
+    const agents = Array.from({ length: 12 }, (_unused, index) => ({ agentId: `a-${index}`, name: `A${index}` }))
+    const rig = await makeRig({ agent: { agents: agents as never } })
+    // A peer that claims more on an EMPTY position, and one whose position
+    // carries whitespace. `parseListResumeCursor` rejects both, so emitting a
+    // token would break "a token this tool emits is a token it accepts" — and
+    // the caller would hold a token that can never be replayed. No token, and
+    // `truncated` still says the walk was cut.
+    rig.fake.scriptListPages('agent.agents.list', [
+      { items: agents.slice(0, 2), nextCursor: '' },
+      { items: agents.slice(0, 2), nextCursor: ' 4 ' },
+    ])
+    for (let call = 0; call < 2; call += 1) {
+      const page = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
+      expect(page.truncated).toBe(true)
+      expect(page.resumeCursor).toBeUndefined()
+    }
   })
 
   it('⑦e each list tool stamps its own one-character code, and a numeric position stays short', async () => {

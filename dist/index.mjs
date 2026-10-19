@@ -5475,11 +5475,12 @@ var CherryToolEngine = class {
 	* #65). What a caller can act on is a token, so that is what is emitted.
 	*/
 	#listPage(page, binding) {
+		const position = optionalString(page.nextCursor);
 		return {
 			items: page.items,
 			truncated: page.truncated,
 			...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason },
-			...page.truncated && page.nextCursor !== void 0 ? { resumeCursor: encodeListResumeCursor(binding, page.nextCursor) } : {}
+			...page.truncated && position !== void 0 && !mangledRemainder(position) ? { resumeCursor: encodeListResumeCursor(binding, position) } : {}
 		};
 	}
 	#devicesTool() {
@@ -8284,10 +8285,15 @@ function parseMessageResume(value) {
 const LIST_RESUME_PREFIX = "cursor:";
 /**
 * The token's format marker (issue #70). It is a FIELD, not part of the prefix,
-* so a token from an older or newer release is refused with an explanation
-* instead of the generic shape error: a resume token outlives a plugin upgrade
-* (the caller is holding it), and "restart the walk" is actionable where
-* "not a token this tool emitted" invites one more attempt with the same token.
+* so a token from the PREVIOUS format is recognised and refused by name
+* ({@link looksLikeV1ListToken}) instead of getting the generic shape error: a
+* resume token outlives a plugin upgrade (the caller is holding it), and "start
+* the walk over" is actionable where "not a token this tool emitted" invites
+* one more attempt with the same string.
+*
+* A format NEWER than this one has no detector and falls through to the
+* generic refusal, which is the honest verdict: this release cannot know that a
+* future format is a resume token at all.
 */
 const LIST_TOKEN_VERSION = "v2";
 /**
@@ -8383,7 +8389,7 @@ function parseListResumeCursor(value, binding) {
 	if (token.length > 4096) throw new Error(`cursor is ${token.length} characters long, over the ${MAX_LIST_TOKEN_CHARS}-character ceiling for a resume token; omit \`cursor\` to read from the start.`);
 	const raw = token.slice(7);
 	if (!raw.startsWith(`${LIST_TOKEN_VERSION}:`)) {
-		if (looksLikeV1ListToken(raw)) refuse("was issued by an older plugin version (a v1 token, from before list tokens were compact and checksummed), so it can no longer be verified");
+		if (looksLikeV1ListToken(raw)) throw new Error("cursor was issued by an older plugin version (a v1 token, from before list tokens were compact and checksummed), so it can no longer be verified; start this walk over with `cursor` omitted.");
 		refuse("is not a token this tool emitted");
 	}
 	let rest = raw.slice(3);

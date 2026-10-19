@@ -2098,12 +2098,20 @@ class CherryToolEngine {
    * #65). What a caller can act on is a token, so that is what is emitted.
    */
   #listPage(page: CherryPage<Record<string, unknown>>, binding: ListResumeBinding): Record<string, unknown> {
+    // A position this face would REFUSE is not a position it may name. The
+    // round-trip symmetry (a token a tool emits is a token that tool accepts) is
+    // the whole point of the token, so a peer answering `nextCursor: ''` — or a
+    // position carrying whitespace/control characters, which `mangledRemainder`
+    // rejects on the way back — gets NO token; `truncated` still says the walk
+    // was cut and a wider `limit` is the remedy. `messageResumeToken` guards the
+    // same hole for the message face.
+    const position = optionalString(page.nextCursor)
     return {
       items: page.items,
       truncated: page.truncated,
       ...(page.truncationReason === undefined ? {} : { truncationReason: page.truncationReason }),
-      ...(page.truncated && page.nextCursor !== undefined
-        ? { resumeCursor: encodeListResumeCursor(binding, page.nextCursor) }
+      ...(page.truncated && position !== undefined && !mangledRemainder(position)
+        ? { resumeCursor: encodeListResumeCursor(binding, position) }
         : {}),
     }
   }
@@ -6261,10 +6269,15 @@ const LIST_RESUME_PREFIX = 'cursor:'
 
 /**
  * The token's format marker (issue #70). It is a FIELD, not part of the prefix,
- * so a token from an older or newer release is refused with an explanation
- * instead of the generic shape error: a resume token outlives a plugin upgrade
- * (the caller is holding it), and "restart the walk" is actionable where
- * "not a token this tool emitted" invites one more attempt with the same token.
+ * so a token from the PREVIOUS format is recognised and refused by name
+ * ({@link looksLikeV1ListToken}) instead of getting the generic shape error: a
+ * resume token outlives a plugin upgrade (the caller is holding it), and "start
+ * the walk over" is actionable where "not a token this tool emitted" invites
+ * one more attempt with the same string.
+ *
+ * A format NEWER than this one has no detector and falls through to the
+ * generic refusal, which is the honest verdict: this release cannot know that a
+ * future format is a resume token at all.
  */
 const LIST_TOKEN_VERSION = 'v2'
 
@@ -6403,9 +6416,13 @@ function parseListResumeCursor(value: unknown, binding: ListResumeBinding): stri
   const raw = token.slice(LIST_RESUME_PREFIX.length)
   if (!raw.startsWith(`${LIST_TOKEN_VERSION}:`)) {
     if (looksLikeV1ListToken(raw)) {
-      refuse(
-        'was issued by an older plugin version (a v1 token, from before list tokens were compact and ' +
-          'checksummed), so it can no longer be verified',
+      // A v1 token cannot be replayed at ALL: the format changed, so "the same
+      // tool, device and filters" would fail again. The generic tail would
+      // therefore tell the caller to do something that can never work — the one
+      // thing this version marker exists to avoid.
+      throw new Error(
+        'cursor was issued by an older plugin version (a v1 token, from before list tokens were compact ' +
+          'and checksummed), so it can no longer be verified; start this walk over with `cursor` omitted.',
       )
     }
     refuse('is not a token this tool emitted')
