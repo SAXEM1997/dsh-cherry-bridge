@@ -4310,6 +4310,141 @@ var SessionSubscriptions = class {
 	}
 };
 //#endregion
+//#region src/contentGate.ts
+/**
+* One process-wide gate over externalized-content ASSEMBLY (issue #39).
+*
+* WHY THIS EXISTS. `MAX_EXTERNALIZED_BYTES` caps ONE `{ref}` at 32 MiB, and a
+* walk holds its content at roughly 3× its size while it assembles it (decoded
+* slices, their concatenation, the decoded string). That product is per ref, so
+* before this gate the process peak was `3 × 32 MiB × (refs being assembled at
+* once)` — and nothing in the engine bounded how many independent tool calls
+* could be assembling one. Four concurrent `cherry_read`s over fat sessions
+* could put ~384 MiB of transient buffers in flight with no number anywhere
+* saying so.
+*
+* The gate makes that number explicit: at most `limit` refs are being assembled
+* at any instant, so the peak is `limit × 3 × 32 MiB` worst case (4 → 384 MiB),
+* and in ordinary traffic `limit × 3 × (declared size)` — usually a few MiB.
+* It bounds the COUNT, not the bytes: a byte budget would be tighter, but it
+* would have to reserve each ref's DECLARED size (optimistic: a peer may serve
+* more) or its cap when the size is unusable (serializing everything behind one
+* slot). The count is what the official client gates on
+* (`REMOTE_READ_CACHE_POLICY.concurrency = 4`), and it is honest about what it
+* does not bound.
+*
+* FIFO: a waiter is admitted in arrival order, so a long walk cannot starve the
+* calls behind it beyond one slot's work. The slot is handed DIRECTLY from the
+* releasing holder to the next waiter (`#active` does not move), so a fresh
+* caller cannot slip in through the fast path between the two.
+*
+* THE DEADLINE BOUNDARY — chosen explicitly, not half-done (the #21 lesson):
+*
+*  - **While QUEUED the caller's budget is honoured**: a wait that has not been
+*    admitted by its instant gives up (`ContentGateTimeoutError`) and is removed
+*    from the queue, so it neither starts a walk it could not finish nor gets
+*    admitted later by a slot nobody can use.
+*  - **After admission the deadline is RE-CHECKED** before the slot is handed
+*    over: a slot that arrives too late is passed on, never spent.
+*  - **Once the walk is RUNNING it is never interrupted here.** Its per-slice
+*    requests are clamped by the transport to the same deadline (issue #21), so
+*    a running walk stops at its next request — the interruption lives where
+*    the I/O is, not here. Doing both would leave "cancelled but still reading"
+*    as a state nobody can reason about.
+*/
+var ContentGateTimeoutError = class extends Error {
+	/** The gate's concurrency limit, for the caller's own report. */
+	limit;
+	constructor(limit) {
+		super(`content-read gate (limit ${String(limit)}): the answer's time budget ran out while waiting for a slot; the externalized content was not read`);
+		this.name = "ContentGateTimeoutError";
+		this.limit = limit;
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+};
+var ContentReadGate = class {
+	/** Maximum refs assembled at once (always ≥ 1). */
+	limit;
+	/** Slots currently held. Exposed for assertions and future diagnostics. */
+	#active = 0;
+	/** Admitted-in-arrival-order waiters; each entry keeps its slot on resolve. */
+	#queue = [];
+	/**
+	* The clock, injectable so the admission re-check's race window — a slot that
+	* frees AFTER the deadline but BEFORE the queued waiter's timer runs — can be
+	* driven deterministically in a unit test. Production never passes one.
+	*/
+	#now;
+	constructor(limit, now = () => performance.now()) {
+		this.limit = Math.max(1, Math.floor(limit));
+		this.#now = now;
+	}
+	/** Slots currently held, for tests and diagnostics. */
+	get active() {
+		return this.#active;
+	}
+	/**
+	* Takes one slot and resolves with its release. The release is IDEMPOTENT: a
+	* caller that releases twice (a `finally` plus a defensive path) must not free
+	* two slots.
+	*
+	* `deadline` is an absolute instant on `performance.now()`'s clock, or
+	* undefined for "wait as long as it takes" (`cherry_read` and the list tools
+	* have no budget of their own; their caller's own timeout applies).
+	*/
+	async acquire(deadline) {
+		if (deadline !== void 0 && this.#now() >= deadline) throw new ContentGateTimeoutError(this.limit);
+		if (this.#active < this.limit) {
+			this.#active += 1;
+			return this.#releaseOnce();
+		}
+		return await new Promise((resolve, reject) => {
+			let settled = false;
+			const grant = () => {
+				if (settled) return;
+				settled = true;
+				if (timer !== void 0) clearTimeout(timer);
+				if (deadline !== void 0 && this.#now() >= deadline) {
+					this.#handOff();
+					reject(new ContentGateTimeoutError(this.limit));
+					return;
+				}
+				resolve(this.#releaseOnce());
+			};
+			const timer = deadline === void 0 ? void 0 : setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				const index = this.#queue.indexOf(grant);
+				if (index >= 0) this.#queue.splice(index, 1);
+				reject(new ContentGateTimeoutError(this.limit));
+			}, Math.max(1, deadline - this.#now()));
+			this.#queue.push(grant);
+		});
+	}
+	/** The idempotent release handed to one admitted caller. */
+	#releaseOnce() {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#handOff();
+		};
+	}
+	/**
+	* Passes this slot to the next waiter, or frees it when the queue is empty.
+	* `#active` moves ONLY in the second case: a transfer is not a release plus an
+	* admission, so nothing can be admitted through the fast path in between.
+	*/
+	#handOff() {
+		const next = this.#queue.shift();
+		if (next === void 0) {
+			this.#active -= 1;
+			return;
+		}
+		next();
+	}
+};
+//#endregion
 //#region src/tools.ts
 /** The four terminal execution statuses the waiter predicate covers. */
 const TERMINAL_EXECUTION_STATUSES = [
@@ -4563,6 +4698,23 @@ const DEFAULT_CONTENT_SLICE_BOUND = 4096;
 * that issued the concurrency are the ones that know its size.
 */
 const MAX_EXTERNALIZED_BYTES = 33554432;
+/**
+* How many `{ref}` contents may be assembled AT ONCE, process-wide (issue #39).
+*
+* {@link MAX_EXTERNALIZED_BYTES} bounds one ref and one ref's assembly peaks at
+* ~3× its size, so without this number the process peak was that product times
+* however many independent tool calls happened to be reading. The gate makes it
+* a product of two stated constants: 4 × 3 × 32 MiB = 384 MiB worst case, and
+* in ordinary traffic 4 × 3 × (the declared size).
+*
+* 4 is the official client's read-concurrency policy
+* (`REMOTE_READ_CACHE_POLICY.concurrency`), not a measurement of this plugin:
+* it keeps a burst of independent reads flowing without letting them multiply
+* the transient buffers without bound. It is injectable, but NOT a config key —
+* like the content-rate tier, a second knob is deferred until a field report
+* needs one.
+*/
+const DEFAULT_CONTENT_READ_CONCURRENCY = 4;
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
 const TEXT_MAX_LENGTH = 32768;
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
@@ -4923,6 +5075,11 @@ var CherryToolEngine = class {
 	#messageCacheEntryBytes;
 	#messageCacheBytesPerDevice;
 	/**
+	* The process-wide gate over `{ref}` assembly (issue #39) — one slot per ref
+	* being read, shared by every tool call and every device this engine serves.
+	*/
+	#contentGate;
+	/**
 	* The parts pages already walked, keyed `<deviceId>\0<messageId>`.
 	*
 	* WHAT IS HELD is the RESULT of `agent.parts.list` — the raw part records plus
@@ -4997,6 +5154,7 @@ var CherryToolEngine = class {
 		this.#cacheEntriesPerDevice = Math.max(1, Math.floor(options.cacheEntriesPerDevice ?? CACHE_ENTRIES_PER_DEVICE));
 		this.#messageCacheEntryBytes = Math.max(1, Math.floor(options.messageCacheEntryBytes ?? MESSAGE_CACHE_ENTRY_BYTES));
 		this.#messageCacheBytesPerDevice = Math.max(1, Math.floor(options.messageCacheBytesPerDevice ?? MESSAGE_CACHE_BYTES_PER_DEVICE));
+		this.#contentGate = new ContentReadGate(options.contentReadConcurrency ?? DEFAULT_CONTENT_READ_CONCURRENCY);
 	}
 	definitions() {
 		return [
@@ -5706,22 +5864,27 @@ var CherryToolEngine = class {
 		};
 		let text;
 		if (typeof content["text"] === "string") text = content["text"];
-		else if (isRecord(content["ref"])) try {
-			text = await this.#readExternalized(connection, sessionId, content["ref"], deadline);
-		} catch (error) {
-			if (!this.#degradableReadFailure(error)) throw error;
-			return {
-				partId,
-				kind,
-				revision,
-				content: "",
-				unavailable: unavailableReason(error),
-				...typeof raw["state"] === "string" ? { state: raw["state"] } : {},
-				...typeof raw["toolName"] === "string" ? { toolName: raw["toolName"] } : {},
-				...typeof raw["toolCallId"] === "string" ? { toolCallId: raw["toolCallId"] } : {}
-			};
-		}
-		else text = "";
+		else if (isRecord(content["ref"])) {
+			let releaseSlot;
+			try {
+				releaseSlot = await this.#contentGate.acquire(deadline?.instant);
+				text = await this.#readExternalized(connection, sessionId, content["ref"], deadline);
+			} catch (error) {
+				if (!this.#degradableReadFailure(error)) throw error;
+				return {
+					partId,
+					kind,
+					revision,
+					content: "",
+					unavailable: unavailableReason(error),
+					...typeof raw["state"] === "string" ? { state: raw["state"] } : {},
+					...typeof raw["toolName"] === "string" ? { toolName: raw["toolName"] } : {},
+					...typeof raw["toolCallId"] === "string" ? { toolCallId: raw["toolCallId"] } : {}
+				};
+			} finally {
+				releaseSlot?.();
+			}
+		} else text = "";
 		return {
 			partId,
 			kind,

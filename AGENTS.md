@@ -214,7 +214,7 @@ These are load-bearing; the code comments are the long version.
   the original receipt. Only the same id with a *different* body is an
   idempotency conflict.
 
-### Memory: 32 MiB per ref, ~3× assembly, concurrency unbounded
+### Memory: 32 MiB per ref, ~3× assembly, 4 refs at once
 
 - `MAX_EXTERNALIZED_BYTES` = 32 MiB caps **one `{ref}`**, the same ceiling the
   official client applies. It is a refusal to start a walk that could never
@@ -224,10 +224,24 @@ These are load-bearing; the code comments are the long version.
   decoded slices, the single concatenation the digest and decoder need, and
   the decoded string. That is the price of never hashing or decoding a buffer a
   caller could mutate.
-- An aggregate reads refs **sequentially**, so its peak is one ref's 3×. There
-  is **no process-wide gate**: concurrent independent calls multiply the peak by
-  their number in flight (still no total bound). A global budget is a separate
-  concern and deliberately not in the walk.
+- An aggregate reads refs **sequentially**, so its own peak is one ref's 3×.
+  Across calls, ONE process-wide gate (`ContentReadGate`, issue #39) bounds how
+  many refs are being assembled at once: `DEFAULT_CONTENT_READ_CONCURRENCY` = 4,
+  the official client's read-concurrency policy. The whole engine — every tool
+  call, every device — shares it, so the process peak is
+  **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
+  `4 × 3 × (the declared size)`. It bounds the COUNT, not the bytes: a byte
+  budget would have to reserve each ref's declared size (optimistic — a peer may
+  serve more) or its cap when the size is unusable (serializing everything
+  behind one slot), so it is deliberately not what landed.
+- **The gate's boundary with the deadline (issue #21).** While a caller is
+  QUEUED it honours its budget: at the deadline it leaves the queue and fails
+  (`ContentGateTimeoutError`, which the projection degrades to one part's
+  `unavailable`). A slot that frees after the deadline but before that timer
+  runs is RE-CHECKED and passed on, never spent. Once a walk is RUNNING the gate
+  does not interrupt it — its per-slice requests carry the deadline to the
+  transport, which is where the I/O stops. Interrupting in both places would
+  make "cancelled but still reading" an unexplainable state.
 
 ### Read cache: the parts-list RESULT, fenced by the peer's own revision
 

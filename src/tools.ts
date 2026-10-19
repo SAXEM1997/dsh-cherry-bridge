@@ -9,6 +9,7 @@ import {
   PARTS_LIST_PAGE_CLAMP,
 } from './defaults.js'
 import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
+import { ContentReadGate } from './contentGate.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
 import type { PairingErrorKind } from './pairing.js'
@@ -811,6 +812,23 @@ const DEFAULT_CONTENT_SLICE_BOUND = 4_096
  * that issued the concurrency are the ones that know its size.
  */
 const MAX_EXTERNALIZED_BYTES = 32 * 1024 * 1024
+/**
+ * How many `{ref}` contents may be assembled AT ONCE, process-wide (issue #39).
+ *
+ * {@link MAX_EXTERNALIZED_BYTES} bounds one ref and one ref's assembly peaks at
+ * ~3× its size, so without this number the process peak was that product times
+ * however many independent tool calls happened to be reading. The gate makes it
+ * a product of two stated constants: 4 × 3 × 32 MiB = 384 MiB worst case, and
+ * in ordinary traffic 4 × 3 × (the declared size).
+ *
+ * 4 is the official client's read-concurrency policy
+ * (`REMOTE_READ_CACHE_POLICY.concurrency`), not a measurement of this plugin:
+ * it keeps a burst of independent reads flowing without letting them multiply
+ * the transient buffers without bound. It is injectable, but NOT a config key —
+ * like the content-rate tier, a second knob is deferred until a field report
+ * needs one.
+ */
+const DEFAULT_CONTENT_READ_CONCURRENCY = 4
 
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
 const TEXT_MAX_LENGTH = 32_768
@@ -1278,6 +1296,16 @@ export interface CherryToolEngineOptions {
    * which no loopback suite should spend its run on.
    */
   messageCacheBytesPerDevice?: number
+  /**
+   * How many `{ref}` contents may be assembled at once across the WHOLE engine
+   * — every tool call, every device. Omitted uses
+   * {@link DEFAULT_CONTENT_READ_CONCURRENCY} (4).
+   *
+   * Injectable so a test can drive it to one and observe serialization: at the
+   * production 4 a proof needs five genuinely concurrent fat reads, and the
+   * property under test ("no more than the limit at once") is the same at 1.
+   */
+  contentReadConcurrency?: number
 }
 
 /**
@@ -1435,6 +1463,11 @@ class CherryToolEngine {
   readonly #messageCacheEntryBytes: number
   readonly #messageCacheBytesPerDevice: number
   /**
+   * The process-wide gate over `{ref}` assembly (issue #39) — one slot per ref
+   * being read, shared by every tool call and every device this engine serves.
+   */
+  readonly #contentGate: ContentReadGate
+  /**
    * The parts pages already walked, keyed `<deviceId>\0<messageId>`.
    *
    * WHAT IS HELD is the RESULT of `agent.parts.list` — the raw part records plus
@@ -1528,6 +1561,7 @@ class CherryToolEngine {
       1,
       Math.floor(options.messageCacheBytesPerDevice ?? MESSAGE_CACHE_BYTES_PER_DEVICE),
     )
+    this.#contentGate = new ContentReadGate(options.contentReadConcurrency ?? DEFAULT_CONTENT_READ_CONCURRENCY)
   }
 
   definitions(): CherryToolDefinition[] {
@@ -2637,7 +2671,20 @@ class CherryToolEngine {
       // fault) would otherwise make every other message in the same page
       // unreachable. The part stays in the result with `unavailable` naming the
       // fault, so the loss is VISIBLE rather than silent.
+      // ONE PROCESS-WIDE SLOT for the WHOLE assembly (issue #39): slices,
+      // digest, decode — the window in which the ~3× transient peak exists. The
+      // slot is released on EVERY path, including a degradable per-part failure
+      // (`finally`), so a peer's refusal cannot leak capacity.
+      //
+      // A wait for the slot is part of the answer's budget: `acquire` abandons
+      // a queued caller at its deadline (`ContentGateTimeoutError`), which the
+      // catch below degrades to this part's `unavailable` — the same class as a
+      // content read the budget cut. Once the walk is RUNNING it is not
+      // interrupted here; its per-slice requests carry the same deadline to the
+      // transport, which is where the I/O actually stops.
+      let releaseSlot: (() => void) | undefined
       try {
+        releaseSlot = await this.#contentGate.acquire(deadline?.instant)
         text = await this.#readExternalized(connection, sessionId, content['ref'], deadline)
       } catch (error) {
         // An INTEGRITY failure is not degradable: see `#degradableReadFailure`.
@@ -2652,6 +2699,8 @@ class CherryToolEngine {
           ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
           ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
         }
+      } finally {
+        releaseSlot?.()
       }
     } else {
       text = ''

@@ -122,6 +122,9 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 - 读方法在重连后**单次**重放；**命令永不重放**——写操作丢失应答时，携**原 `commandId`**
   重试即可，桌面端的命令账本会回放原回执。
 - 单个外置内容上限 32 MiB，超过的 part 标 `unavailable`，不回无法校验的部分内容。
+- **外置内容装配是进程级限流的**：同时最多 4 个 `{ref}` 在装配（官方客户端的读并发策略）。
+  单个 ref 的装配峰值约 3× 它的大小，所以进程峰值上界是 4×3×32 MiB = 384 MiB，日常远低于此
+  （4×3×声明大小）。等待槽位也计入等待类回答的时限：排到时限就放弃并把这一 part 标 `unavailable`。
 - 历史走查被截断时一定说明（`truncationReason`，`limit` / `aggregate-bytes` / `deadline` 三种含义不同，见上），
   并在能诚实标出停点时给出 `messagesResumeCursor` 续读令牌（走到对端末页时没有可标的位置，就不给）；
   某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带
