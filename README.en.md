@@ -103,15 +103,15 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | Tool | What it does |
 | --- | --- |
 | `cherry_devices` | List every paired device and its connection state (`connected`/`connecting`/`offline`/`disabled`/`identity-mismatch`). |
-| `cherry_agents` | List the agents available on a device (paginated). A truncated answer always carries `truncated` + `truncationReason` (`limit` or `safety-bound`, the latter the 1000-item internal ceiling), plus a `resumeCursor`: replay it as `cursor` with the same device and filters to continue from that stop point (`limit` then bounds the next answer). A token from another tool, device or filter set is refused **locally**, never forwarded. |
-| `cherry_workspaces` | List an agent's **registered** workspaces, and whether a system workspace exists. A truncated answer always carries `truncated` + `truncationReason` and a `resumeCursor` — replay it as `cursor` with the same filters to continue. |
-| `cherry_sessions` | List an agent's sessions, optionally filtered by workspace. A truncated answer always carries `truncated` + `truncationReason` (`limit` or `safety-bound`) plus a `resumeCursor`: replay it as `cursor` with the same device and **identical filters** to continue (`limit` then bounds the next answer); a token from another tool, device or filter set is refused **locally**. |
-| `cherry_read` | Read a session's message history snapshot, **newest-first** (`limit` drops the **oldest** messages). Attachment parts come back as `name`/`mediaType`/`byteLength` with an empty `content` — the bytes are never fetched. A truncated walk always says so (`truncated` + `truncationReason`): `limit` means your own ceiling was reached and raising `limit` helps; `aggregate-bytes` means the answer hit its **output size limit** — independent of `limit` (a larger `limit` only costs more round trips and stops at the same budget). **The older messages are reached by the resume token**: pass the `messagesResumeCursor` a truncated answer returned as this tool's own `messagesResumeCursor` argument to continue from that stop point (`limit` then bounds how many messages come back **from there**), walking a long history in successive answers. Two token forms: `cursor:<peer position>` (the peer page position after a whole window was consumed) and `after:<messageId>` (the walk stopped inside its window; the resume scans from the newest end to that message and returns the older ones). A token this tool did not emit is **refused locally** (never forwarded — the desktop silently falls back to the newest page for one), and an `after:` anchor that is no longer in the history is an **error**, not an empty result. |
+| `cherry_agents` | List the agents available on a device (paginated). A truncated answer always carries `truncated` + `truncationReason` (`limit` or `safety-bound`, the latter the 1000-item internal ceiling); when the stop point can be named it also carries a `resumeCursor`: replay it as `cursor` with the same device and filters to continue from that stop point (`limit` then bounds the next answer). A token from another tool, device or filter set is refused **locally**, never forwarded. |
+| `cherry_workspaces` | List an agent's **registered** workspaces, and whether a system workspace exists. A truncated answer always carries `truncated` + `truncationReason`; when the stop point can be named it also carries a `resumeCursor` — replay it as `cursor` with the same filters to continue. |
+| `cherry_sessions` | List an agent's sessions, optionally filtered by workspace. A truncated answer always carries `truncated` + `truncationReason` (`limit` or `safety-bound`); when the stop point can be named it also carries a `resumeCursor`: replay it as `cursor` with the same device and **identical filters** to continue (`limit` then bounds the next answer); a token from another tool, device or filter set is refused **locally**. |
+| `cherry_read` | Read a session's message history snapshot, **newest-first** (`limit` drops the **oldest** messages). Attachment parts come back as `name`/`mediaType`/`byteLength` with an empty `content` — the bytes are never fetched. A truncated walk always says so (`truncated` + `truncationReason`): `limit` means your own ceiling was reached and raising `limit` helps; `aggregate-bytes` means the answer hit its **output size limit** — independent of `limit` (a larger `limit` only costs more round trips and stops at the same budget). **The older messages are reached by the resume token**: pass the `messagesResumeCursor` a truncated answer returned as this tool's own `messagesResumeCursor` argument to continue from that stop point (`limit` then bounds how many messages come back **from there**), walking a long history in successive answers. When the stop point cannot be named the token is **absent** (`truncated` stays `true`, and a wider `limit` is the remedy — see [Errors and limits](#errors-and-limits)). Two token forms: `cursor:<peer position>` (the peer page position after a whole window was consumed) and `after:<messageId>` (the walk stopped inside its window; the resume scans from the newest end to that message and returns the older ones). A token this tool did not emit is **refused locally** (never forwarded — the desktop silently falls back to the newest page for one), and an `after:` anchor that is no longer in the history is an **error**, not an empty result. |
 | `cherry_events` | Read the session's buffered events newer than `cursor`, acking them after delivery. The answer is `{events, nextCursor}`; pass that `nextCursor` back as `cursor` to continue from it. |
 | `cherry_create` | Create a session in an agent workspace (workspace selection is **required**; identity is read back). |
 | `cherry_send` | Send a message, by default waiting for a terminal state and returning the assistant text; `wait: false` returns the command receipt immediately. `messagesTruncated`/`messagesTruncationReason` report a **message**-level cut (older messages dropped); `deadline` means the **answer's own assembly budget** ran out (see below), with the content read so far still returned. |
 | `cherry_wait` | Wait only for the session's in-flight execution to settle (sends nothing). |
-| `cherry_interactions` | List the session's **pending** interaction cards (questions / approvals). A truncated answer always carries `truncated` + `truncationReason` and a `resumeCursor` — replay it as `cursor` to continue (`limit` counts the peer's pre-filter rows). |
+| `cherry_interactions` | List the session's **pending** interaction cards (questions / approvals). A truncated answer always carries `truncated` + `truncationReason`; when the stop point can be named it also carries a `resumeCursor` — replay it as `cursor` from the same `sessionId` to continue (`limit` counts the peer's pre-filter rows). |
 | `cherry_respond` | Answer an interaction card: questions must be answered in full; approvals take `decision`. |
 | `cherry_cancel` | Cancel the session's in-flight execution (`expectedExecutionId` required). |
 | `cherry_pair` | Pair with a desktop using the pairing information shown by the scanned page. |
@@ -124,12 +124,12 @@ The `device` argument accepts an **exact `deviceId`**, or a **prefix of a
 `cherry_send(wait: true)` / `cherry_wait` results carry one of **8 `status`
 values**: the four protocol terminal states
 (`completed`/`failed`/`cancelled`/`interrupted`), plus `awaiting-interaction`
-(a pending card appeared while the run is still alive), `timeout` (the window ran
-out, **not a failure** — partial content plus a stop-point cursor come back),
-`idle` (`cherry_wait` met a session with nothing in flight and returned the
-snapshot immediately), and `subscription-lost` (the subscription was lost and
-could not be rebuilt, so the outcome is **unknowable**; repair guidance ships
-with it).
+(a pending card appeared while the run is still alive), `timeout` (the window
+ran out, **not a failure** — partial content comes back, plus a stop-point
+cursor when one can be named), `idle` (`cherry_wait` met a session with nothing
+in flight and returned the snapshot immediately), and `subscription-lost` (the
+subscription was lost and could not be rebuilt, so the outcome is
+**unknowable**; repair guidance ships with it).
 
 ## Errors and limits
 
@@ -152,9 +152,14 @@ with it).
 - A truncated history walk always says so (`truncationReason`; `limit`,
   `aggregate-bytes` and `deadline` mean different things, see above) and,
   whenever a stop point can be named honestly, carries a `messagesResumeCursor`
-  resume token (absent when the walk reached the peer's last page); a message
-  whose own parts could not be fully read carries `incomplete: true` (inside a
-  wait answer, a message cut by the deadline carries
+  resume token. **When it cannot be named the token is absent**: the peer's
+  position is empty, the token would exceed the 4,096-character ceiling, or there
+  is no message id to anchor on — `truncated` stays `true` and a wider `limit` is
+  the remedy that works (for a wait answer cut by its deadline, the remedy is
+  `cherry_read` instead). The four list tools' `resumeCursor` obeys the same rule
+  and additionally refuses to wrap a position carrying whitespace/control
+  characters. A message whose own parts could not be fully read carries
+  `incomplete: true` (inside a wait answer, a message cut by the deadline carries
   `partsTruncated: "deadline"`).
 - **A wait answer has an assembly budget of its own.** After the window ends,
   `cherry_send(wait: true)` / `cherry_wait` still read some history (the message

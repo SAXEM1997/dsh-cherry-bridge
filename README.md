@@ -94,15 +94,15 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | 工具 | 作用 |
 | --- | --- |
 | `cherry_devices` | 列出已配对设备及连接状态（`connected`/`connecting`/`offline`/`disabled`/`identity-mismatch`）。 |
-| `cherry_agents` | 列出某设备上可用的 agent（分页）。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`，后者是 1000 条内部上限），并给出 `resumeCursor`——用同一 device 与过滤条件把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**，不会转发给对端。 |
-| `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。被截断时必带 `truncated`+`truncationReason`，并给出 `resumeCursor`——用相同过滤条件回传为 `cursor` 即可续读。 |
-| `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`），并给出 `resumeCursor`——用同一 device 与**相同过滤条件**把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**。 |
-| `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算。**被挡下的更旧消息用 `messagesResumeCursor` 续读**：把本次返回的 `messagesResumeCursor` 原样传给下一次调用的 `messagesResumeCursor` 参数即可从停点继续（`limit` 此时约束的是**从停点起**本次最多返回多少条），长历史分几次回答读完。两种令牌：`cursor:<peer position>`（整窗读完后的 peer 分页位置）与 `after:<messageId>`（停在窗内，续读从最新端扫到该消息、返回它更旧的那些）。不是本工具发出的令牌会被**本地拒绝**（不转发给桌面端——桌面端会静默回退到最新页）；`after:` 锚点在历史里找不到则**报错**，不会返回空结果。 |
+| `cherry_agents` | 列出某设备上可用的 agent（分页）。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`，后者是 1000 条内部上限）；停点可命名时还给出 `resumeCursor`——用同一 device 与过滤条件把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**，不会转发给对端。 |
+| `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。被截断时必带 `truncated`+`truncationReason`；停点可命名时还给出 `resumeCursor`——用相同过滤条件回传为 `cursor` 即可续读。 |
+| `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`），停点可命名时还给出 `resumeCursor`——用同一 device 与**相同过滤条件**把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**。 |
+| `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算。**被挡下的更旧消息用 `messagesResumeCursor` 续读**：把本次返回的 `messagesResumeCursor` 原样传给下一次调用的 `messagesResumeCursor` 参数即可从停点继续（`limit` 此时约束的是**从停点起**本次最多返回多少条），长历史分几次回答读完。停点不可命名时**没有**这个令牌（`truncated` 仍为 `true`，此时提高 `limit` 才是可用的补救，详见[错误与限制](#错误与限制)）。两种令牌：`cursor:<peer position>`（整窗读完后的 peer 分页位置）与 `after:<messageId>`（停在窗内，续读从最新端扫到该消息、返回它更旧的那些）。不是本工具发出的令牌会被**本地拒绝**（不转发给桌面端——桌面端会静默回退到最新页）；`after:` 锚点在历史里找不到则**报错**，不会返回空结果。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。返回 `{events, nextCursor}`；把 `nextCursor` 作为下次的 `cursor` 传回即可续读。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的）；`deadline` 表示**回答自身的装配时限**到了（见下），已读到的内容照常返回。 |
 | `cherry_wait` | 只等待该会话在途执行收敛（不发送新消息）。 |
-| `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。被截断时必带 `truncated`+`truncationReason`，并给出 `resumeCursor`——用 `sessionId` 相同的调用回传为 `cursor` 即可续读（`limit` 计的是过滤**前**的对端条目）。 |
+| `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。被截断时必带 `truncated`+`truncationReason`；停点可命名时还给出 `resumeCursor`——用 `sessionId` 相同的调用回传为 `cursor` 即可续读（`limit` 计的是过滤**前**的对端条目）。 |
 | `cherry_respond` | 应答交互卡：提问必须全量作答，审批走 `decision`。 |
 | `cherry_cancel` | 取消会话在途执行（`expectedExecutionId` 必填）。 |
 | `cherry_pair` | 用「扫码后页面显示的配对信息」建立与桌面端的配对。 |
@@ -113,7 +113,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 
 `cherry_send(wait: true)` / `cherry_wait` 的 `status` 有 **8 个取值**：四个协议终态
 （`completed`/`failed`/`cancelled`/`interrupted`），加上 `awaiting-interaction`（出现待答
-交互卡，运行仍活着）、`timeout`（窗口用尽，**不是失败**，随附部分内容与停点游标）、
+交互卡，运行仍活着）、`timeout`（窗口用尽，**不是失败**，随附部分内容，停点可命名时再带游标）、
 `idle`（`cherry_wait` 遇到没有在途执行的会话，立即返回快照）、`subscription-lost`
 （事件订阅丢失且重建失败，运行结局**不可知**，随附修复指引）。
 
@@ -128,9 +128,11 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   不在这个乘积里（每次并发读最多再带一整条消息，因为输出预算只在消息之间检查），parts 缓存另计。
   等待槽位也计入等待类回答的时限：排到时限就放弃并把这一 part 标 `unavailable`。
 - 历史走查被截断时一定说明（`truncationReason`，`limit` / `aggregate-bytes` / `deadline` 三种含义不同，见上），
-  并在能诚实标出停点时给出 `messagesResumeCursor` 续读令牌（走到对端末页时没有可标的位置，就不给）；
-  某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带
-  `partsTruncated: "deadline"`）。
+  并在能诚实标出停点时给出 `messagesResumeCursor` 续读令牌。**停点不可命名时就不给**：对端位置为空、
+  令牌会超过 4096 字符上限、或没有可当锚点的消息 id——此时 `truncated` 仍为 `true`，
+  提高 `limit` 是可用的补救（wait 类回答被时限截断时则是改用 `cherry_read` 续读）。四个列表工具的
+  `resumeCursor` 遵守同一条规则，另外还会拒绝把带空白/控制字符的位置包成令牌。
+  某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带 `partsTruncated: "deadline"`）。
 - **等待类回答有自己的装配时限**：`cherry_send(wait: true)` / `cherry_wait` 在窗口结束后仍要读一段历史
   （消息页 + 每条消息的 parts + 每个外置 `{ref}` 内容），这一步现在是**有时限的**——截至「你的窗口 +
   同样长度的时间」，下限 1 秒、上限 15 秒（即窗口 1 秒 → 最多再等 1 秒；窗口 20 秒 → 最多再等 15 秒）。
