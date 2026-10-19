@@ -43,6 +43,12 @@ are process records, and they stay in `docs/superpowers/**` (not published).
   into a new issue, not into the diff. A doc-only change touches only docs.
 - **The READMEs are a pair.** `README.md` (简体中文) and `README.en.md` (English)
   are expected to say the same thing; an edit to one is an edit to both.
+- **Every promise a test starts settles INSIDE the test.** A request or
+  `connect()` nobody awaits still holds its caller for `DEFAULT_TIMEOUT_MS`
+  when the answer never comes; `void ... .catch(() => {})` hides that, and the
+  next afterEach that awaits the dangling set turns it into a stalled suite.
+  Produce the settlement (usually `close()`) and **assert** the verdict — issue
+  #43 is the two sites that were masked this way.
 - **Commit messages** are English, imperative, `type(scope): summary` —
   `fix(tools):`, `feat(scope):`, `test(connection):`, `docs:`, `chore(release):`.
   The body explains the failure mode that motivated the change and the

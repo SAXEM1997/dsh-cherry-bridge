@@ -1236,7 +1236,7 @@ describe('DeviceConnection over a real loopback channel', () => {
     const fakeInfo = await makeFake({ handshakeDelayMs: 300, hello: { heartbeatMs: 60_000 } })
     const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
 
-    void connection.connect().catch(() => {})
+    const pending = connection.connect()
     await waitForSockets(fakeInfo.fake, 1)
     // Still mid-hold: the peer has accepted the socket but not finished Noise.
     expect(fakeInfo.fake.connectionCount).toBe(0)
@@ -1249,6 +1249,17 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(fakeInfo.fake.helloCount).toBe(0)
     // And the held socket itself is gone, not merely un-served.
     expect(fakeInfo.fake.connectedClients).toBe(0)
+    // The abandoned attempt SETTLES (issue #43): the socket it was holding was
+    // terminated, so `connect()` rejects with a real verdict rather than
+    // parking the caller until some timeout. A `void ... .catch()` used to hide
+    // that settlement; the assertion is what keeps it from regressing into a
+    // silent hang.
+    const error = await pending.then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).not.toMatch(/disposed/i)
   }, 15_000)
 
   it('(L2) a beforeNextCall() hook that THROWS still releases its in-flight slot', async () => {
@@ -1260,10 +1271,13 @@ describe('DeviceConnection over a real loopback channel', () => {
     // design), so a hook that throws makes that promise reject; `#dispatch`
     // converts a throwing hook into "counted, never answered", the same
     // peer-side face as a hook that drops the link, instead of letting the
-    // rejection escape as an unhandled one. The CALLER therefore never settles
-    // — it is deliberately not awaited here, and the test closes the connection
-    // to release it. The subject is the FAKE's bookkeeping, observed on the
-    // peer: `inFlight` must be back to zero.
+    // rejection escape as an unhandled one. The CALLER therefore never gets an
+    // answer — it is settled by `close()` below and ASSERTED, because a
+    // `void ... .catch()` here hid the real shape (issue #43): without the
+    // close the request waits out the 60 s `DEFAULT_TIMEOUT_MS`, so a future
+    // afterEach that awaited the dangling promises would stall the suite. The
+    // subject is the FAKE's bookkeeping, observed on the peer: `inFlight` must
+    // be back to zero.
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
     const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
@@ -1272,13 +1286,25 @@ describe('DeviceConnection over a real loopback channel', () => {
     fakeInfo.fake.beforeNextCall('connection.ping', () => {
       throw new Error('hook exploded')
     })
-    void connection.rpc.request('connection.ping', { nonce: 'boom' }).catch(() => {})
+    const pending = connection.rpc.request('connection.ping', { nonce: 'boom' }).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
     // The frame arrived and was counted: the hook ran (so did the throw), and
     // the slot it took is released on the way out of the finally.
     await waitFor(() => fakeInfo.fake.methodCount('connection.ping') >= 1)
     // Give a leaked slot every chance to show up before asserting zero.
     await sleep(50)
     expect(fakeInfo.fake.inFlight).toBe(0)
+    // The deterministic settlement: close() rejects the in-flight request NOW,
+    // and the verdict is classified rather than a masked rejection.
+    const closing = Date.now()
+    await connection.close()
+    const error = await pending
+    expect(Date.now() - closing).toBeLessThan(1_000)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toMatch(/channel closed|offline|disconnected|transport lost/i)
+    expect((error as Error).message).not.toMatch(/disposed/i)
   }, 15_000)
 
   // -------------------------------------------------------------------------
