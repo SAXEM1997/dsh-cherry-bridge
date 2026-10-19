@@ -224,7 +224,7 @@ npm run typecheck      # server + UI projects
 npm run build          # tsdown → dist/index.mjs + dist/index.d.mts
 npm run build:client   # vite → lib/client.js
 npm run dev:ui         # settings-page dev server (host must run at 127.0.0.1:23023)
-npm run prepublishOnly # pre-publish gate: typecheck + test + build + build:client
+npm run prepublishOnly # pre-publish gate: typecheck + test + build + build:client + npm pack --dry-run
 ```
 
 `dist/` and `lib/` are **committed** artifacts: after changing `src/` or `ui/`
