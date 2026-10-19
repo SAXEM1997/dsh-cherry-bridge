@@ -2599,11 +2599,24 @@ class CherryToolEngine {
       ...(truncationReason === undefined ? {} : { truncationReason }),
       // Only a TRUNCATED walk has unread history, and the token then marks the
       // stop point (OLDER messages remain unread) —
-      // {@link CherryReadSnapshot.messagesResumeCursor}. When the walk's own
-      // verdict names no stop (it reached the peer's last page AND returned
-      // every message it collected) the key is OMITTED rather than emitted
-      // undefined: the absence says "nothing older left", the `truncated` flag
-      // still says whether the walk was cut.
+      // {@link CherryReadSnapshot.messagesResumeCursor}. Whether that stop can
+      // be NAMED is not the walk's verdict: it depends on the peer's payload and
+      // is decided in ONE place ({@link messageResumeToken}, through
+      // {@link nameablePeerPosition}), so the cases are not enumerated again
+      // here.
+      //
+      // The key is OMITTED rather than emitted `undefined`, and its absence only
+      // means something once read together with `truncated`: the two cases have
+      // opposite meanings —
+      //
+      //  - a COMPLETE walk (nothing older left): `truncated: false`, no token —
+      //    the absence really does say "nothing older left";
+      //  - a TRUNCATED walk whose stop point cannot be named — an empty or
+      //    malformed position, a token past the length ceiling, a retired-v1
+      //    shape, no message id to anchor — `truncated: true` plus a
+      //    `truncationReason`, no token: OLDER MESSAGES REMAIN UNREAD, and the
+      //    remedy is a wider `limit`, or `cherry_read` (which has no deadline)
+      //    for a `deadline` stop — never "you reached the end".
       ...(truncated && resumeToken !== undefined ? { messagesResumeCursor: resumeToken } : {}),
     }
   }
