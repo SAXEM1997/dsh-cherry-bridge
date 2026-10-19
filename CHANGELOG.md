@@ -5,6 +5,35 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## v0.1.6 (2026-10-19)
+
+The follow-up to v0.1.5: a list walk's stop point became a resume INPUT, and
+the tool declarations now say what their answers actually carry.
+
+### Added
+
+- `feat(tools)`: a truncated `cherry_agents` / `cherry_sessions` /
+  `cherry_workspaces` / `cherry_interactions` answer now carries `resumeCursor`,
+  and the same tool accepts it back as `cursor` — a history longer than the
+  1000-item ceiling is walked in successive answers (`limit` then bounds one
+  answer), the round trip the message face already had (#65). The token is bound
+  to (method, device, filters): replaying it against another query is refused
+  locally, before any RPC, because the peer's page position is opaque and would
+  otherwise read the wrong slice silently. The raw peer `nextCursor` is no
+  longer exposed; it was never an input.
+
+### Changed
+
+- The tool declarations describe their real answers: `cherry_events` returns
+  `{events, nextCursor}` (that cursor is the ack cursor to pass back), and list
+  answers report `truncated` / `truncationReason` (#64).
+- The install instructions lead with the npm package; the GitHub tag stays as
+  the source channel (#59).
+- The release documentation names the three steps that fail silently — staged
+  publishing, both README pins, and the version-independent release asset
+  (#61) — and the `prepublishOnly` description now names `npm pack --dry-run`
+  (#63).
+
 ## v0.1.5 (2026-10-19)
 
 The 2026-10-19 batch: eight issues merged after the v0.1.4 tag — bounded wait
