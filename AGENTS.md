@@ -565,7 +565,15 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   position of a real token), and the token is 225 → ~100 characters on the
   sessions worst case, ~150 → ~44 on the numeric faces.
 - A v1 token (base64 JSON, `{v,m,d,h,p}`) is refused by name — a plugin upgrade
-  invalidates a held token, and "restart the walk" is the actionable answer.
+  invalidates a held token, and "start the walk over" is the actionable answer,
+  so that refusal does NOT reuse the generic "…or replay the token" tail: a v1
+  token can never be replayed, whoever holds it.
+- **Only a position this face would accept is ever named.** An empty peer
+  position (or one carrying whitespace/control characters, which the parser
+  rejects) yields no token at all: `#listPage` runs the same `optionalString`
+  guard the message face uses, because a token the tool refuses to replay is
+  worse than none — `truncated` already says the walk was cut, and a wider
+  `limit` is the remedy that works.
 
 ### `AGGREGATE_BYTES`: one budget, two faces
 
