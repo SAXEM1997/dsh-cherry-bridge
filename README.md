@@ -36,13 +36,13 @@ flowchart TB
 
 ```bash
 # 从 npm 安装（推荐，钉住版本）
-npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.1.6
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.1.7
 
 # 安装 npm 最新发布版
 npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge
 
 # 从 GitHub 源码安装（与 npm 发布同一提交）
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.6
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.1.7
 ```
 
 本包自带 `cordis.patch.yml`（`package.json` 的 `dsh.bundle.patch` 指向它），

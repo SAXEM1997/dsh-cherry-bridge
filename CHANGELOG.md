@@ -5,6 +5,34 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## v0.1.7 (2026-10-19)
+
+The resume-token batch. **A resume token issued by v0.1.6 cannot be replayed
+after this upgrade** — the list face names it as an older format and the remedy
+is to start the walk over; nothing else changes on the wire, and the peer's own
+cursor is still passed through verbatim.
+
+### Changed
+
+- The list tools' `resumeCursor` is a **new, compact, checked format** (#70):
+  `list:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>`. It is 225
+  → ~100 characters on the desktop's session cursor and ~150 → ~44 on the
+  numeric faces, and its 8-hex checksum covers the peer position — the one field
+  no structural check can validate. Measured over 20,000 random single-character
+  corruptions of the old token, **28.7% were accepted with a different
+  position**, and the desktop answers a position it cannot parse by serving its
+  FIRST page, so "continue from here" silently re-read the newest page. Every
+  single-character corruption (and every insertion/deletion) is now refused
+  locally, before any RPC.
+- **The two token faces have disjoint prefixes** (#72): the message face keeps
+  `cursor:<peer position>` / `after:<messageId>`; the list face owns `list:`.
+  A list `resumeCursor` replayed as `cherry_read`'s `messagesResumeCursor` — and
+  a v1 list token, which v0.1.6 issued under `cursor:` — are refused locally,
+  naming the mistake, instead of being forwarded to the desktop.
+- **Both faces bound the token they accept** (#74): `MAX_RESUME_TOKEN_CHARS`
+  (4,096) is enforced by the parser and declared as `maxLength`, so an over-long
+  string is refused by its length instead of being carried to the peer.
+
 ## v0.1.6 (2026-10-19)
 
 The follow-up to v0.1.5: a list walk's stop point became a resume INPUT, and
