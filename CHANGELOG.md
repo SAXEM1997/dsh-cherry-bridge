@@ -80,6 +80,16 @@ surface change.
   rejecting the call, so a run's verdict and its identifiers survive a link that
   dies after the run settled.
 
+### Fixed
+
+- `fix(tools)`: a list page whose `items` is not an array — wrong type, or
+  absent — is refused as a protocol violation instead of being read as an empty
+  page (#46). On a terminal page (`nextCursor: null`) that used to answer
+  `truncated: false` over a hole; mid-walk it skipped a whole page with not even
+  the non-record warning (there was no array to count drops against). The
+  diagnosis names the SHAPE it got (`missing`, `null`, `string`, …), never the
+  payload, and the refusal applies to EVERY page, not only the last one.
+
 ## v0.1.4 (2026-10-18)
 
 The 2026-10-18 UltraReview batch: eleven fixes and hardening merged after the

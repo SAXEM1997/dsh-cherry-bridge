@@ -498,3 +498,57 @@ describe('v0.1.3 P3 (group B): a page of malformed items is never absorbed silen
     expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(2)
   })
 })
+
+describe('issue #46: a page whose `items` is not an array is a protocol violation', () => {
+  it('#46a REFUSES a terminal page carrying `items: "garbage"` instead of answering truncated:false', async () => {
+    // `arrayOf` used to answer `{items: [], dropped: 0}` for ANY non-array, so
+    // a terminal page (`nextCursor: null`) whose `items` was a string read as
+    // "the peer is done, and everything is here" — `truncated: false` on a
+    // result that silently lost a whole page. That is the same failure B6b
+    // refuses (a contradicting last page) reached through a different door:
+    // there the items were non-records, here there is no item list AT ALL.
+    // The protocol's `pageOf` schema requires `items: array`, so this is a
+    // peer fault, not an empty page — thrown with the exact diagnosis.
+    const fixture = sessions(20)
+    const rig = await makeRig({ agent: { sessions: fixture } })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      pageOf(fixture, 0, LIST_PAGE_CLAMP, String(LIST_PAGE_CLAMP)),
+      { items: 'garbage', nextCursor: null },
+    ])
+
+    const error = await rejectionOf(rig.call('cherry_sessions', { device: 'dev-A' }))
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('agent.sessions.list')
+    expect((error as Error).message).toContain('`items` is not an array')
+    expect((error as Error).message).toContain('string')
+    expect((error as Error).message).toContain('refusing a silently short result')
+    // The payload itself never reaches the message: it is peer-supplied data.
+    expect((error as Error).message).not.toContain('garbage')
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(2)
+  })
+
+  it('#46b REFUSES a malformed MID-walk page instead of skipping it and completing short', async () => {
+    // A mid-walk page is the quieter half of the same defect. The walk used to
+    // read a non-array `items` as an empty page and go on: no throw, and not
+    // even B6a's dropped-count warning (there was no array to count), so the
+    // result came back COMPLETE with a page-shaped hole in it. A missing
+    // `items` is the same violation as a wrong-typed one — the schema requires
+    // the array, so an empty page must say `items: []`, never omit it.
+    const fixture = sessions(20)
+    const rig = await makeRig({ agent: { sessions: fixture } })
+    rig.fake.scriptListPages('agent.sessions.list', [
+      pageOf(fixture, 0, LIST_PAGE_CLAMP, String(LIST_PAGE_CLAMP)),
+      { nextCursor: 'c-after-the-hole' },
+      pageOf(fixture, 2, 4, null),
+    ])
+
+    const error = await rejectionOf(rig.call('cherry_sessions', { device: 'dev-A' }))
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('agent.sessions.list')
+    expect((error as Error).message).toContain('`items` is not an array')
+    expect((error as Error).message).toContain('missing')
+    // The walk stopped AT the malformed page: it never asked for the page that
+    // would have papered over the hole.
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(2)
+  })
+})

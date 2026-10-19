@@ -349,6 +349,13 @@ verifies every byte it hands back.
   `{items: [], nextCursor: 'entity:'}` once per walk (the pin→entity section
   transition). Tolerance is **2 consecutive** advancing empty pages; the **3rd**
   refuses. Any non-empty page resets the count.
+- **A page whose `items` is not an array** (wrong type, or absent) is a
+  PROTOCOL violation, refused on EVERY page, terminal or not: `pageOf` types the
+  field `array(item)`, so a page with no rows says `items: []`. Read as an empty
+  page it loses a whole page silently — on a terminal page even as
+  `truncated: false`. The throw names the shape it got (`missing`, `null`,
+  `string`, …) and never the payload, and it sits **before** the dropped-item
+  bookkeeping, because with no array there is no drop count to report.
 - **Cursors.** A cursor that does not advance is refused, and so is a cursor
   that **loops back** to one already served (a `seen` set per walk) — never spun
   on. `MAX_AGGREGATE_PAGES` (10,000) is the backstop for every other
