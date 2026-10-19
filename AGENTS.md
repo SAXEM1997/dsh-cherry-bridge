@@ -822,6 +822,37 @@ recovery / multi-device coexistence must be exercised by hand on a real desktop.
 Tag `vX.Y.Z`, publish to npm (`publishConfig` pins the public registry), and
 attach the notes to the GitHub release.
 
+**Three release steps fail silently when skipped.**
+
+1. **Publish through staged publishing.** Direct `npm publish` is refused on
+   this account (`E403 … two-factor authentication … required`). The npm bundled
+   with Node 22 (10.x) has no `stage` subcommand, so stage with npm 11:
+   `NPM_CONFIG_CACHE=/workspace/dsh/.superpowers/npm-cache npx npm@11 stage publish --registry=https://registry.npmjs.org/ --access public --tag latest`
+   (add `--ignore-scripts` only when `prepublishOnly` just passed on this exact
+   clean tree), then approve the printed stage id on npmjs.com →
+   **Staged Packages**. `npm stage approve` answered `404 staged version … not
+   found` with every token tried here (stage-only and publish-capable, with and
+   without `--otp`), while the same token's `GET /-/stage/<id>` returned 200 —
+   so the web approval is the one that works. Check the result with
+   `npm view dsh-cherry-bridge dist-tags`: an unapproved stage is silent.
+   A first publish also leaves a public `0.0.0-stage` placeholder in
+   `versions` (0.1.5 did); approving moves `latest` to the real version.
+2. **Bump BOTH README install pins in the same commit, before staging** — the
+   `@X.Y.Z` and `#vX.Y.Z` specs in `README.md` and `README.en.md`. npm serves
+   the README captured in the tarball, so a pin bumped after the publish is
+   stale on the npm page, and the two files are a pair that must never drift.
+3. **Re-attach the version-INDEPENDENT release asset.** The market entry
+   (`awesome-dsh-plugin`, `data/plugins/SAXEM1997__dsh-cherry-bridge.yml`)
+   points at `releases/latest/download/dsh-cherry-bridge.tgz`, so **every**
+   release must attach the tarball under exactly that name (not
+   `dsh-cherry-bridge-X.Y.Z.tgz`). Verify that URL answers 200 and that its sha1
+   equals the npm tarball's: without the asset the download URL 404s for every
+   catalog user (0.1.5 did exactly that).
+
+The catalog needs no PR for a new version: the entry is already merged and the
+index picks the npm package up on its next nightly probe (02:23 UTC) once
+`package.json`'s `repository` points back at this repo.
+
 Notes on documentary labels: `Task N`, `spec §x`, `controller ruling`,
 `UltraReview` in code comments and docs point at this project's internal SDD
 process records under `docs/superpowers/**` — **not published** with the package.
