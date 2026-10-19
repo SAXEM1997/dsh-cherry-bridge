@@ -228,12 +228,17 @@ These are load-bearing; the code comments are the long version.
   Across calls, ONE process-wide gate (`ContentReadGate`, issue #39) bounds how
   many refs are being assembled at once: `DEFAULT_CONTENT_READ_CONCURRENCY` = 4,
   the official client's read-concurrency policy. The whole engine — every tool
-  call, every device — shares it, so the process peak is
+  call, every device — shares it, so the ASSEMBLY peak is
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
   `4 × 3 × (the declared size)`. It bounds the COUNT, not the bytes: a byte
   budget would have to reserve each ref's declared size (optimistic — a peer may
   serve more) or its cap when the size is unusable (serializing everything
   behind one slot), so it is deliberately not what landed.
+  It bounds what is being ASSEMBLED, not everything resident: content an answer
+  has already finished assembling is retained by its caller OUTSIDE this
+  product — up to one whole message per concurrent read, because
+  `AGGREGATE_BYTES` is judged only between messages — and the parts cache adds
+  its own budgeted bytes (32 MiB per device) on top.
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
   (`ContentGateTimeoutError`, which the projection degrades to one part's

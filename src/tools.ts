@@ -2684,6 +2684,14 @@ class CherryToolEngine {
       // transport, which is where the I/O actually stops.
       let releaseSlot: (() => void) | undefined
       try {
+        // A ref that can never be read is refused BEFORE a slot is queued for
+        // (review finding 2): otherwise a zero-I/O refusal spends a queue
+        // position, and under contention with a spent budget it would report
+        // "the budget ran out while waiting for a slot" about a part that was
+        // never readable — sending the caller to their own clock instead of to
+        // the ref's declared size.
+        const refusal = this.#externalizedRefusal(content['ref'])
+        if (refusal !== undefined) throw refusal
         releaseSlot = await this.#contentGate.acquire(deadline?.instant)
         text = await this.#readExternalized(connection, sessionId, content['ref'], deadline)
       } catch (error) {
@@ -2787,6 +2795,29 @@ class CherryToolEngine {
   }
 
   /**
+   * The pre-flight refusal of a `{ref}` whose DECLARED size is above the cap —
+   * one implementation, two callers.
+   *
+   * The projection calls it BEFORE queueing for a content-read slot (issue #39
+   * review, finding 2), so an unreadable ref never waits for capacity it cannot
+   * use and never reports the gate's deadline as its reason; the walk calls it
+   * again so the invariant holds for any caller that reaches it directly.
+   *
+   * A plain Error on purpose: this is the DEGRADABLE class (see
+   * {@link CherryToolEngine.#degradableReadFailure}), so one oversized ref
+   * costs that part's text, not the whole snapshot.
+   */
+  #externalizedRefusal(ref: Record<string, unknown>): Error | undefined {
+    const contentId = String(ref['contentId'] ?? '')
+    const declaredBytes = Number(ref['byteLength'])
+    if (!Number.isFinite(declaredBytes) || declaredBytes <= this.#externalizedByteCap) return undefined
+    return new Error(
+      `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit ` +
+        'for externalized content; not read',
+    )
+  }
+
+  /**
    * Paginate `agent.content.read` over one `{ref}` and verify its sha256.
    *
    * The digest is checked against BOTH its sources (the ref's declaration and
@@ -2822,12 +2853,12 @@ class CherryToolEngine {
     // cap: past it the walk is refused BEFORE any round trip (see
     // MAX_EXTERNALIZED_BYTES). This is the degradable class — a plain Error, so
     // the part is marked unavailable instead of failing the read.
-    if (Number.isFinite(declaredBytes) && declaredBytes > this.#externalizedByteCap) {
-      throw new Error(
-        `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit ` +
-          'for externalized content; not read',
-      )
-    }
+    //
+    // Checked here AND at the caller's pre-flight (one implementation,
+    // `#externalizedRefusal`): the caller needs it before taking a gate slot,
+    // and this keeps the walk safe for any future caller.
+    const refusal = this.#externalizedRefusal(ref)
+    if (refusal !== undefined) throw refusal
     const maxSlices = Number.isSafeInteger(declaredBytes)
       ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES))
       : DEFAULT_CONTENT_SLICE_BOUND

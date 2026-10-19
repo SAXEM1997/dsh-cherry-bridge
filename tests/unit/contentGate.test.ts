@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ContentGateTimeoutError, ContentReadGate } from '../../src/contentGate.js'
 
 /**
@@ -13,6 +13,10 @@ import { ContentGateTimeoutError, ContentReadGate } from '../../src/contentGate.
  */
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+afterEach(() => {
+  vi.useRealTimers()
+})
 
 describe('ContentReadGate: the count', () => {
   it('admits up to the limit without queueing, and reports the held count', async () => {
@@ -143,22 +147,31 @@ describe('ContentReadGate: the deadline boundary', () => {
     // before the queued waiter's own timer callback gets to run (the event loop
     // may delay it). The injected clock makes the ordering exact: release at
     // t=100 against a deadline of 60, with the 60 ms timer still pending.
-    let now = 0
-    const gate = new ContentReadGate(1, () => now)
-    const held = await gate.acquire()
+    //
+    // FAKE TIMERS so the real 60 ms timer cannot win a stalled event loop and
+    // silently switch this test onto the abandonment path (same assertions,
+    // different branch — false comfort). Nothing here advances timers: the
+    // release is what must decide.
+    vi.useFakeTimers()
+    try {
+      let now = 0
+      const gate = new ContentReadGate(1, () => now)
+      const held = await gate.acquire()
 
-    const late = gate.acquire(60)
-    const nextInLine = gate.acquire()
-    const outcome = late.catch((reason: unknown) => reason)
-    await flush()
+      const late = gate.acquire(60)
+      const nextInLine = gate.acquire()
+      const outcome = late.catch((reason: unknown) => reason)
 
-    now = 100
-    held()
-    expect(await outcome).toBeInstanceOf(ContentGateTimeoutError)
-    // The slot was handed ON, not spent: the next waiter is admitted.
-    const release = await nextInLine
-    expect(gate.active).toBe(1)
-    release()
-    expect(gate.active).toBe(0)
+      now = 100
+      held()
+      expect(await outcome).toBeInstanceOf(ContentGateTimeoutError)
+      // The slot was handed ON, not spent: the next waiter is admitted.
+      const release = await nextInLine
+      expect(gate.active).toBe(1)
+      release()
+      expect(gate.active).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

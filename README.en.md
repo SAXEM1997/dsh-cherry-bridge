@@ -140,9 +140,13 @@ with it).
   `unavailable` rather than returning unverifiable partial content.
 - **Externalized-content assembly is gated process-wide**: at most 4 `{ref}`
   contents are assembled at once (the official client's read-concurrency
-  policy). One ref's assembly peaks at ~3× its size, so the process peak is at
-  most 4 × 3 × 32 MiB = 384 MiB worst case, and in ordinary traffic
-  4 × 3 × (declared size). Waiting for a slot is part of a wait answer's time
+  policy). One ref's assembly peaks at ~3× its size, so the **assembly** peak is
+  at most 4 × 3 × 32 MiB = 384 MiB worst case, and in ordinary traffic
+  4 × 3 × (declared size). It bounds what is being ASSEMBLED, not everything
+  resident: content an answer has already assembled is retained by its caller
+  outside this product (up to one whole message per concurrent read, since the
+  output budget is checked only between messages), and the parts cache adds its
+  own budget on top. Waiting for a slot is part of a wait answer's time
   budget: at its deadline the caller gives up and marks that one part
   `unavailable`.
 - A truncated history walk always says so (`truncationReason`; `limit`,

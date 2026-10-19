@@ -5867,6 +5867,8 @@ var CherryToolEngine = class {
 		else if (isRecord(content["ref"])) {
 			let releaseSlot;
 			try {
+				const refusal = this.#externalizedRefusal(content["ref"]);
+				if (refusal !== void 0) throw refusal;
 				releaseSlot = await this.#contentGate.acquire(deadline?.instant);
 				text = await this.#readExternalized(connection, sessionId, content["ref"], deadline);
 			} catch (error) {
@@ -5950,6 +5952,25 @@ var CherryToolEngine = class {
 		return !(error instanceof ContentIntegrityError);
 	}
 	/**
+	* The pre-flight refusal of a `{ref}` whose DECLARED size is above the cap —
+	* one implementation, two callers.
+	*
+	* The projection calls it BEFORE queueing for a content-read slot (issue #39
+	* review, finding 2), so an unreadable ref never waits for capacity it cannot
+	* use and never reports the gate's deadline as its reason; the walk calls it
+	* again so the invariant holds for any caller that reaches it directly.
+	*
+	* A plain Error on purpose: this is the DEGRADABLE class (see
+	* {@link CherryToolEngine.#degradableReadFailure}), so one oversized ref
+	* costs that part's text, not the whole snapshot.
+	*/
+	#externalizedRefusal(ref) {
+		const contentId = String(ref["contentId"] ?? "");
+		const declaredBytes = Number(ref["byteLength"]);
+		if (!Number.isFinite(declaredBytes) || declaredBytes <= this.#externalizedByteCap) return void 0;
+		return /* @__PURE__ */ new Error(`{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit for externalized content; not read`);
+	}
+	/**
 	* Paginate `agent.content.read` over one `{ref}` and verify its sha256.
 	*
 	* The digest is checked against BOTH its sources (the ref's declaration and
@@ -5973,7 +5994,8 @@ var CherryToolEngine = class {
 		const revision = String(ref["revision"] ?? "");
 		const declaredSha = typeof ref["sha256"] === "string" ? ref["sha256"] : void 0;
 		const declaredBytes = Number(ref["byteLength"]);
-		if (Number.isFinite(declaredBytes) && declaredBytes > this.#externalizedByteCap) throw new Error(`{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit for externalized content; not read`);
+		const refusal = this.#externalizedRefusal(ref);
+		if (refusal !== void 0) throw refusal;
 		const maxSlices = Number.isSafeInteger(declaredBytes) ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES)) : DEFAULT_CONTENT_SLICE_BOUND;
 		let offset = "0";
 		let sha;
