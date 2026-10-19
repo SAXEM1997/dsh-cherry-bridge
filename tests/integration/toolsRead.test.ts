@@ -73,6 +73,8 @@ interface Rig {
   tool(name: string): CherryToolDefinition
   /** Invoke one registered tool by name, exactly as the host would. */
   call(name: string, args?: Record<string, unknown>): Promise<unknown>
+  /** Dial a seeded device explicitly (makeRig only dials dev-A by default). */
+  connectDevice(deviceId: string): Promise<void>
   stop(): Promise<void>
 }
 
@@ -199,6 +201,9 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     tmp,
     tool,
     call: (name, args = {}) => tool(name).execute(args),
+    connectDevice: async (deviceId) => {
+      await connect(deviceId).connect()
+    },
     stop: async () => {
       for (const created of subscriptions.values()) await created.dispose()
       for (const connection of connections.values()) await connection.close()
@@ -335,6 +340,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
       items: Array<{ agentId: string }>
       truncated?: boolean
       truncationReason?: string
+      resumeCursor?: string
       nextCursor?: string
     }
 
@@ -342,8 +348,10 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(result.truncated).toBe(true)
     // THE ATTRIBUTION: the equality case belongs to the safety bound.
     expect(result.truncationReason).toBe('safety-bound')
-    // The peer still had data, and the resume point is reported.
-    expect(result.nextCursor).toBeDefined()
+    // The peer still had data, and the resume TOKEN is reported (issue #65:
+    // the raw peer position never leaves the tool).
+    expect(result.resumeCursor).toMatch(/^cursor:/)
+    expect(result.nextCursor).toBeUndefined()
   })
 
   it('②b3 still attributes a stop STRICTLY below the safety bound to the caller limit', async () => {
@@ -2013,5 +2021,287 @@ describe('issue #27 follow-up: the agreement check is PER SLICE, not just on the
     expect(part.content).not.toContain('\uFEFF')
     expect(result.messages[0]).not.toHaveProperty('incomplete')
     expect(result.messages[0]).not.toHaveProperty('unavailableParts')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// issue #65: the LIST face's stop point is a resume INPUT
+// ---------------------------------------------------------------------------
+
+/**
+ * A truncated list walk answers a self-describing `resumeCursor`
+ * (`cursor:<opaque>`), and the same tool accepts it back as `cursor` with the
+ * SAME filters: the round trip the message face already has. The token is bound
+ * to (tool, device, filters), so reuse against a different query is refused
+ * LOCALLY — a peer position from another query would silently read the wrong
+ * slice, which is the failure mode this binding exists to prevent.
+ */
+describe('issue #65: list walks are resumable', () => {
+  interface ListPage {
+    items: Array<Record<string, unknown>>
+    truncated?: boolean
+    truncationReason?: string
+    resumeCursor?: string
+    nextCursor?: string
+  }
+
+  const sessionsFixture = (count: number): Array<Record<string, unknown>> =>
+    Array.from({ length: count }, (_unused, index) => ({
+      sessionId: `s-${String(index).padStart(3, '0')}`,
+      agentId: 'a1',
+      workspaceId: 'w1',
+      title: `Session ${index}`,
+      historyRevision: '1',
+    }))
+
+  const agentsFixture = (count: number): Array<Record<string, unknown>> =>
+    Array.from({ length: count }, (_unused, index) => ({ agentId: `a-${index}`, name: `Agent ${index}` }))
+
+  const ids = (page: ListPage, key: string): string[] => page.items.map((item) => String(item[key]))
+
+  it('⑰a cherry_sessions walks a 40-session list to the end in three exact answers', async () => {
+    const rig = await makeRig({ agent: { agents: [{ agentId: 'a1', name: 'A' }], sessions: sessionsFixture(40) as never } })
+
+    const first = (await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: LIST_PAGE_CLAMP })) as ListPage
+    expect(first.items).toHaveLength(LIST_PAGE_CLAMP)
+    expect(first.truncated).toBe(true)
+    expect(first.truncationReason).toBe('limit')
+    expect(first.resumeCursor).toMatch(/^cursor:/)
+    expect(first.nextCursor).toBeUndefined()
+
+    const second = (await rig.call('cherry_sessions', {
+      device: 'dev-A',
+      agentId: 'a1',
+      limit: LIST_PAGE_CLAMP,
+      cursor: first.resumeCursor,
+    })) as ListPage
+    expect(second.items).toHaveLength(LIST_PAGE_CLAMP)
+    expect(second.truncated).toBe(true)
+
+    const third = (await rig.call('cherry_sessions', {
+      device: 'dev-A',
+      agentId: 'a1',
+      limit: LIST_PAGE_CLAMP,
+      cursor: second.resumeCursor,
+    })) as ListPage
+    expect(third.items).toHaveLength(40 - 2 * LIST_PAGE_CLAMP)
+    expect(third.truncated).toBe(false)
+    expect(third.resumeCursor).toBeUndefined()
+
+    expect([...ids(first, 'sessionId'), ...ids(second, 'sessionId'), ...ids(third, 'sessionId')]).toEqual(
+      sessionsFixture(40).map((session) => session['sessionId']),
+    )
+  })
+
+  it('⑰b each list tool accepts the token it emitted (agents / workspaces / interactions)', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: agentsFixture(20) as never,
+        workspaces: Array.from({ length: 20 }, (_unused, index) => ({ workspaceId: `w-${index}`, name: `W${index}` })) as never,
+        sessions: sessionsFixture(1) as never,
+        interactions: Array.from({ length: 5 }, (_unused, index) => ({
+          interactionId: `i-${index}`,
+          revision: '1',
+          executionId: 'e-1',
+          toolCallId: `t-${index}`,
+          status: 'pending',
+          summary: `Summary ${index}`,
+        })) as never,
+      },
+    })
+
+    const roundTrip = async (
+      tool: string,
+      args: Record<string, unknown>,
+      key: string,
+    ): Promise<string[]> => {
+      const first = (await rig.call(tool, { ...args, limit: 2 })) as ListPage
+      expect(first.truncated).toBe(true)
+      expect(first.resumeCursor).toMatch(/^cursor:/)
+      const second = (await rig.call(tool, { ...args, limit: 2, cursor: first.resumeCursor })) as ListPage
+      expect(second.nextCursor).toBeUndefined()
+      return [...ids(first, key), ...ids(second, key)]
+    }
+
+    // agents: 20 items, 2 per answer → the first two answers are contiguous
+    expect(await roundTrip('cherry_agents', { device: 'dev-A' }, 'agentId')).toEqual(['a-0', 'a-1', 'a-2', 'a-3'])
+    // workspaces: the same walk shape, plus the systemWorkspace flag
+    const wsFirst = (await rig.call('cherry_workspaces', { device: 'dev-A', agentId: 'a-0', limit: 2 })) as ListPage & {
+      systemWorkspace?: boolean
+    }
+    expect(wsFirst.resumeCursor).toMatch(/^cursor:/)
+    const wsSecond = (await rig.call('cherry_workspaces', {
+      device: 'dev-A',
+      agentId: 'a-0',
+      limit: 2,
+      cursor: wsFirst.resumeCursor,
+    })) as ListPage & { systemWorkspace?: boolean }
+    expect(wsSecond.systemWorkspace).toBe(true)
+    expect([...ids(wsFirst, 'workspaceId'), ...ids(wsSecond, 'workspaceId')]).toEqual(['w-0', 'w-1', 'w-2', 'w-3'])
+    // interactions: page clamp 2, five pending cards → resume continues them
+    expect(await roundTrip('cherry_interactions', { device: 'dev-A', sessionId: 's-000' }, 'interactionId')).toEqual([
+      'i-0',
+      'i-1',
+      'i-2',
+      'i-3',
+    ])
+  })
+
+  it('⑰c a token reused with different filters is refused LOCALLY, before any RPC', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'a1', name: 'A' }, { agentId: 'a2', name: 'B' }] as never,
+        sessions: sessionsFixture(40) as never,
+      },
+    })
+    const first = (await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: LIST_PAGE_CLAMP })) as ListPage
+    const before = rig.fake.readCallsFor('agent.sessions.list').length
+
+    await expect(
+      rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a2', limit: 16, cursor: first.resumeCursor }),
+    ).rejects.toThrow(/cursor/i)
+    expect(rig.fake.readCallsFor('agent.sessions.list')).toHaveLength(before)
+  })
+
+  it('⑰d a token from another tool, a raw peer position, and an `after:` token are all refused', async () => {
+    const rig = await makeRig({ agent: { agents: agentsFixture(20) as never, sessions: sessionsFixture(40) as never } })
+    const first = (await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: LIST_PAGE_CLAMP })) as ListPage
+
+    await expect(
+      rig.call('cherry_agents', { device: 'dev-A', limit: 2, cursor: first.resumeCursor }),
+    ).rejects.toThrow(/cursor/i)
+    await expect(rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: '16' })).rejects.toThrow(
+      /cursor/i,
+    )
+    await expect(
+      rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: 2, cursor: 'after:msg-1' }),
+    ).rejects.toThrow(/cursor/i)
+  })
+
+  it('⑰e a token issued by one device is refused on another', async () => {
+    const rig = await makeRig(
+      { agent: { agents: [{ agentId: 'a1', name: 'A' }] as never, sessions: sessionsFixture(40) as never } },
+      { extraDevices: [{ deviceId: 'dev-B', displayName: 'Desk Beta' }] },
+    )
+    const first = (await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'a1', limit: LIST_PAGE_CLAMP })) as ListPage
+    rig.store.upsert({ ...rig.store.list().find((entry) => entry.deviceId === 'dev-A')!, deviceId: 'dev-B', displayName: 'Desk Beta', enabled: true })
+    await rig.connectDevice('dev-B')
+
+    await expect(
+      rig.call('cherry_sessions', { device: 'dev-B', agentId: 'a1', limit: 2, cursor: first.resumeCursor }),
+    ).rejects.toThrow(/cursor/i)
+  })
+
+  it('⑰f interactions keep the pending filter across answers, and the token covers the raw stream', async () => {
+    const interactions = [
+      ...Array.from({ length: 4 }, (_unused, index) => ({
+        interactionId: `p-${index}`,
+        revision: '1',
+        executionId: 'e-1',
+        toolCallId: `t-${index}`,
+        status: 'pending' as const,
+        summary: `Pending ${index}`,
+      })),
+      {
+        interactionId: 'done-0',
+        revision: '1',
+        executionId: 'e-1',
+        toolCallId: 't-done',
+        status: 'approved' as const,
+        summary: 'Approved',
+      },
+      ...Array.from({ length: 2 }, (_unused, index) => ({
+        interactionId: `p-${index + 4}`,
+        revision: '1',
+        executionId: 'e-1',
+        toolCallId: `t-${index + 4}`,
+        status: 'pending' as const,
+        summary: `Pending ${index + 4}`,
+      })),
+    ]
+    const rig = await makeRig({ agent: { agents: [{ agentId: 'a1', name: 'A' }] as never, sessions: sessionsFixture(1) as never, interactions: interactions as never } })
+
+    const seen: string[] = []
+    let cursor: string | undefined
+    for (let step = 0; step < 6; step += 1) {
+      const page = (await rig.call('cherry_interactions', {
+        device: 'dev-A',
+        sessionId: 's-000',
+        limit: 2,
+        ...(cursor === undefined ? {} : { cursor }),
+      })) as ListPage
+      for (const item of page.items) seen.push(String(item['interactionId']))
+      if (page.truncated !== true) break
+      expect(page.resumeCursor).toMatch(/^cursor:/)
+      cursor = page.resumeCursor
+    }
+    expect(seen).toEqual(['p-0', 'p-1', 'p-2', 'p-3', 'p-4', 'p-5'])
+  })
+
+  it('⑰h an overshooting page resumes from the position the walk SENT, not the one it advertised', async () => {
+    const agents = agentsFixture(12)
+    const rig = await makeRig({ agent: { agents: agents as never } })
+    rig.fake.scriptListPages('agent.agents.list', [
+      // page 1: exactly what was asked for (limit 4), position 4
+      { items: agents.slice(0, 4), nextCursor: '4' },
+      // page 2: the peer OVERSHOOTS — five items for a limit of four, and it
+      // advertises a position (9) past the item (a-8) the walk never collected.
+      { items: agents.slice(4, 9), nextCursor: '9' },
+      // the replay of page 2 (the same sent position, the same page)
+      { items: agents.slice(4, 9), nextCursor: '9' },
+      // the continuation past the page, for the answer that takes all five
+      { items: agents.slice(9, 12), nextCursor: null },
+    ])
+
+    const first = (await rig.call('cherry_agents', { device: 'dev-A', limit: 4 })) as ListPage
+    expect(ids(first, 'agentId')).toEqual(['a-0', 'a-1', 'a-2', 'a-3'])
+    expect(first.resumeCursor).toMatch(/^cursor:/)
+
+    // The token names the position the walk SENT for the overshooting page (4),
+    // never the advertised 9: a resume from 9 would skip a-8 entirely.
+    const second = (await rig.call('cherry_agents', {
+      device: 'dev-A',
+      limit: 4,
+      cursor: first.resumeCursor,
+    })) as ListPage
+    expect(ids(second, 'agentId')).toEqual(['a-4', 'a-5', 'a-6', 'a-7'])
+
+    // A wider limit consumes the whole overshooting page, so the token advances
+    // to the position that page advertised and the rest is reachable.
+    const third = (await rig.call('cherry_agents', { device: 'dev-A', limit: 5, cursor: second.resumeCursor })) as ListPage
+    expect(ids(third, 'agentId')).toEqual(['a-4', 'a-5', 'a-6', 'a-7', 'a-8'])
+    expect(third.truncated).toBe(true)
+
+    const fourth = (await rig.call('cherry_agents', { device: 'dev-A', limit: 4, cursor: third.resumeCursor })) as ListPage
+    expect(ids(fourth, 'agentId')).toEqual(['a-9', 'a-10', 'a-11'])
+    expect(fourth.truncated).toBe(false)
+  })
+
+  it('⑰i a malformed payload is refused, and a first-page overshoot has no token to name', async () => {
+    const agents = agentsFixture(12)
+    const rig = await makeRig({ agent: { agents: agents as never } })
+    await expect(
+      rig.call('cherry_agents', { device: 'dev-A', limit: 4, cursor: 'cursor:not-a-payload' }),
+    ).rejects.toThrow(/cursor/i)
+
+    // The overshoot lands on the FIRST page, for which no position was ever
+    // sent: nothing can be named honestly, so no token is invented and the
+    // remedy is a wider `limit` (documented in the description).
+    rig.fake.scriptListPages('agent.agents.list', [{ items: agents.slice(0, 5), nextCursor: '5' }])
+    const page = (await rig.call('cherry_agents', { device: 'dev-A', limit: 4 })) as ListPage
+    expect(page.truncated).toBe(true)
+    expect(page.resumeCursor).toBeUndefined()
+    expect(page.nextCursor).toBeUndefined()
+  })
+
+  it('⑰g the four list tools declare the `cursor` input and no result carries a raw `nextCursor`', async () => {
+    const rig = await makeRig({ agent: { agents: agentsFixture(3) as never, sessions: sessionsFixture(3) as never } })
+    for (const tool of ['cherry_agents', 'cherry_sessions', 'cherry_workspaces', 'cherry_interactions']) {
+      const parameters = rig.tool(tool).parameters as { properties?: Record<string, unknown> }
+      expect(Object.keys(parameters.properties ?? {})).toContain('cursor')
+    }
+    const page = (await rig.call('cherry_sessions', { device: 'dev-A', limit: 100 })) as ListPage
+    expect(page.nextCursor).toBeUndefined()
+    expect(Object.keys(page)).not.toContain('nextCursor')
   })
 })

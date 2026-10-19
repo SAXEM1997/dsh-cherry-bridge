@@ -530,6 +530,19 @@ served, never what the scan kept: a non-empty page nobody wanted is still
 progress. The collected-item ceiling counts **returned** items, so a scan's
 discarded pages do not spend the caller's `limit`.
 
+**The LIST face (issue #65) speaks the same vocabulary with one addition.** A
+list walk is scoped by (method, device, filters), and the peer's page position is
+opaque: replaying one from a different query is a perfectly valid number that
+reads the wrong slice with no error anywhere. So a truncated list answers
+`resumeCursor: "cursor:<opaque>"` — the position PLUS a fingerprint of that
+binding — and the token is refused locally (no dial, no page) when replayed
+against a different tool, device or filter set. The bare peer position never
+leaves the tool: `nextCursor` is internal now. The `after:` anchor form stays
+message-only (a list walk never trims a page, so a stop it can name always has a
+peer position). From a resume point `limit` bounds THAT answer; a page the peer
+overshoots is re-read from the position the walk sent (duplicates, never a gap),
+and `cherry_interactions` counts pre-filter rows against `limit`.
+
 ### `AGGREGATE_BYTES`: one budget, two faces
 
 `AGGREGATE_BYTES` = 256 KiB bounds a **projected message aggregate** (measured

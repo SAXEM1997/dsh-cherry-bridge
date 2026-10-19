@@ -5445,6 +5445,30 @@ var CherryToolEngine = class {
 			...pageOverflow === void 0 ? {} : { pageOverflow }
 		};
 	}
+	/** Decode one list `cursor` argument, or undefined when none was given. */
+	#listResume(raw, binding) {
+		if (raw === void 0 || raw === null) return void 0;
+		return {
+			kind: "cursor",
+			cursor: parseListResumeCursor(raw, binding)
+		};
+	}
+	/**
+	* The public shape of a list walk's result: items, the stop verdict, and — only
+	* when the walk really stopped at a peer position — the RESUMABLE token.
+	*
+	* The peer's own position never leaves this method: it is opaque, unusable as
+	* an input on its own, and exposing it invited callers to replay it (issue
+	* #65). What a caller can act on is a token, so that is what is emitted.
+	*/
+	#listPage(page, binding) {
+		return {
+			items: page.items,
+			truncated: page.truncated,
+			...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason },
+			...page.truncated && page.nextCursor !== void 0 ? { resumeCursor: encodeListResumeCursor(binding, page.nextCursor) } : {}
+		};
+	}
 	#devicesTool() {
 		return defineCherryTool({
 			name: "cherry_devices",
@@ -5521,7 +5545,7 @@ var CherryToolEngine = class {
 	#agentsTool() {
 		return defineCherryTool({
 			name: "cherry_agents",
-			description: "List the Cherry Studio agents available on a device. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one); its `nextCursor`, when present, is the peer's internal page position — not a resume input.",
+			description: "List the Cherry Studio agents available on a device. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). A truncated answer also carries `resumeCursor`: replay it as `cursor` with the same tool, device and filters to continue from that stop point (`limit` then bounds the next answer).",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5534,7 +5558,8 @@ var CherryToolEngine = class {
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
 						description: "Maximum number of agents to return in total across pages (default 100)."
-					}
+					},
+					cursor: LIST_CURSOR_PARAMETER
 				},
 				required: ["device"],
 				additionalProperties: false
@@ -5542,18 +5567,28 @@ var CherryToolEngine = class {
 			execute: async (args) => {
 				const resolved = this.#linkOr(requiredString(args, "device"));
 				if (resolved.link === void 0) return resolved.verdict;
-				const { connection } = resolved.link;
-				return this.#aggregate(connection, "agent.agents.list", {}, (page) => ({
-					...arrayOf(page["items"]),
-					nextCursor: page["nextCursor"]
-				}), { limit: aggregateLimit(args["limit"]) });
+				const { connection, record } = resolved.link;
+				const binding = {
+					method: "agent.agents.list",
+					deviceId: record.deviceId,
+					params: {}
+				};
+				const resume = this.#listResume(args["cursor"], binding);
+				const page = await this.#aggregate(connection, "agent.agents.list", {}, (result) => ({
+					...arrayOf(result["items"]),
+					nextCursor: result["nextCursor"]
+				}), {
+					limit: aggregateLimit(args["limit"]),
+					...resume === void 0 ? {} : { resume }
+				});
+				return this.#listPage(page, binding);
 			}
 		});
 	}
 	#workspacesTool() {
 		return defineCherryTool({
 			name: "cherry_workspaces",
-			description: "List an agent's REGISTERED workspaces, plus whether a system workspace exists. The system workspace has no enumerable id: it is not in `items`, and its identity is only observable by creating a session in it and reading it back. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out.",
+			description: "List an agent's REGISTERED workspaces, plus whether a system workspace exists. The system workspace has no enumerable id: it is not in `items`, and its identity is only observable by creating a session in it and reading it back. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out and carries `resumeCursor`: replay it as `cursor` with the same filters to continue.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5570,7 +5605,8 @@ var CherryToolEngine = class {
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
 						description: "Maximum number of workspaces to return in total across pages (default 100)."
-					}
+					},
+					cursor: LIST_CURSOR_PARAMETER
 				},
 				required: ["device", "agentId"],
 				additionalProperties: false
@@ -5578,21 +5614,28 @@ var CherryToolEngine = class {
 			execute: async (args) => {
 				const resolved = this.#linkOr(requiredString(args, "device"));
 				if (resolved.link === void 0) return resolved.verdict;
-				const { connection } = resolved.link;
-				const agentId = requiredString(args, "agentId");
+				const { connection, record } = resolved.link;
+				const params = { agentId: requiredString(args, "agentId") };
+				const binding = {
+					method: "agent.workspaces.list",
+					deviceId: record.deviceId,
+					params
+				};
+				const resume = this.#listResume(args["cursor"], binding);
 				let systemWorkspace = false;
-				const page = await this.#aggregate(connection, "agent.workspaces.list", { agentId }, (result) => {
+				const page = await this.#aggregate(connection, "agent.workspaces.list", params, (result) => {
 					if (typeof result["systemWorkspace"] === "boolean") systemWorkspace = result["systemWorkspace"];
 					return {
 						...arrayOf(result["items"]),
 						nextCursor: result["nextCursor"]
 					};
-				}, { limit: aggregateLimit(args["limit"]) });
+				}, {
+					limit: aggregateLimit(args["limit"]),
+					...resume === void 0 ? {} : { resume }
+				});
 				return {
-					items: page.items,
-					systemWorkspace,
-					truncated: page.truncated,
-					...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason }
+					...this.#listPage(page, binding),
+					systemWorkspace
 				};
 			}
 		});
@@ -5600,7 +5643,7 @@ var CherryToolEngine = class {
 	#sessionsTool() {
 		return defineCherryTool({
 			name: "cherry_sessions",
-			description: "List an agent's sessions, optionally filtered by workspace. The `agentId` and `workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one); its `nextCursor`, when present, is the peer's internal page position — not a resume input.",
+			description: "List an agent's sessions, optionally filtered by workspace. The `agentId` and `workspaceId` filters pass straight through to the peer. Paginated: `limit` bounds the TOTAL across pages (default 100, max 1000) and is aggregated internally. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out (`limit` is your ceiling, `safety-bound` the 1000-item internal one). A truncated answer also carries `resumeCursor`: replay it as `cursor` with the same tool, device and filters to continue from that stop point (`limit` then bounds the next answer).",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5621,7 +5664,8 @@ var CherryToolEngine = class {
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
 						description: "Maximum number of sessions to return in total across pages (default 100)."
-					}
+					},
+					cursor: LIST_CURSOR_PARAMETER
 				},
 				required: ["device"],
 				additionalProperties: false
@@ -5629,16 +5673,27 @@ var CherryToolEngine = class {
 			execute: async (args) => {
 				const resolved = this.#linkOr(requiredString(args, "device"));
 				if (resolved.link === void 0) return resolved.verdict;
-				const { connection } = resolved.link;
+				const { connection, record } = resolved.link;
 				const agentId = optionalString(args["agentId"]);
 				const workspaceId = optionalString(args["workspaceId"]);
-				return this.#aggregate(connection, "agent.sessions.list", {
+				const params = {
 					...agentId === void 0 ? {} : { agentId },
 					...workspaceId === void 0 ? {} : { workspaceId }
-				}, (page) => ({
-					...arrayOf(page["items"]),
-					nextCursor: page["nextCursor"]
-				}), { limit: aggregateLimit(args["limit"]) });
+				};
+				const binding = {
+					method: "agent.sessions.list",
+					deviceId: record.deviceId,
+					params
+				};
+				const resume = this.#listResume(args["cursor"], binding);
+				const page = await this.#aggregate(connection, "agent.sessions.list", params, (result) => ({
+					...arrayOf(result["items"]),
+					nextCursor: result["nextCursor"]
+				}), {
+					limit: aggregateLimit(args["limit"]),
+					...resume === void 0 ? {} : { resume }
+				});
+				return this.#listPage(page, binding);
 			}
 		});
 	}
@@ -6419,7 +6474,7 @@ var CherryToolEngine = class {
 	#interactionsTool() {
 		return defineCherryTool({
 			name: "cherry_interactions",
-			description: "List the session's PENDING interactions (questions and approval decisions) that need an answer. The peer serves the full four-state set (pending/approved/denied/expired) — the pending filter is applied here. Each entry carries its `kind` (question|decision) and a summary; answer questions with cherry_respond's `response` form and decisions with `decision`. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out.",
+			description: "List the session's PENDING interactions (questions and approval decisions) that need an answer. The peer serves the full four-state set (pending/approved/denied/expired) — the pending filter is applied here. Each entry carries its `kind` (question|decision) and a summary; answer questions with cherry_respond's `response` form and decisions with `decision`. A truncated answer (`truncated` + `truncationReason`) stopped before the peer ran out and carries `resumeCursor`: replay it as `cursor` with the same filters to continue.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6440,7 +6495,8 @@ var CherryToolEngine = class {
 						minimum: 1,
 						maximum: MAX_AGGREGATE_LIMIT,
 						description: "Maximum number of interactions to return in total across pages (default 100)."
-					}
+					},
+					cursor: LIST_CURSOR_PARAMETER
 				},
 				required: ["device", "sessionId"],
 				additionalProperties: false
@@ -6450,12 +6506,20 @@ var CherryToolEngine = class {
 				if (resolved.link === void 0) return resolved.verdict;
 				const { connection, record } = resolved.link;
 				const sessionId = requiredString(args, "sessionId");
+				const params = { sessionId };
+				const binding = {
+					method: "agent.interactions.list",
+					deviceId: record.deviceId,
+					params
+				};
+				const resume = this.#listResume(args["cursor"], binding);
 				await this.#ensureSubscription(record.deviceId, sessionId);
-				const page = await this.#aggregate(connection, "agent.interactions.list", { sessionId }, (result) => ({
+				const page = await this.#aggregate(connection, "agent.interactions.list", params, (result) => ({
 					...arrayOf(result["items"]),
 					nextCursor: result["nextCursor"]
 				}), {
 					limit: aggregateLimit(args["limit"]),
+					...resume === void 0 ? {} : { resume },
 					safetyBound: MAX_AGGREGATE_LIMIT,
 					maxPerPage: INTERACTIONS_LIST_PAGE_CLAMP
 				});
@@ -6463,9 +6527,8 @@ var CherryToolEngine = class {
 				const items = page.items.filter((item) => includeAnswered || item["status"] === "pending").map((item) => this.#interactionView(item));
 				for (const item of page.items) this.#rememberInteraction(record.deviceId, sessionId, item);
 				return {
-					items,
-					truncated: page.truncated,
-					...page.truncationReason === void 0 ? {} : { truncationReason: page.truncationReason }
+					...this.#listPage(page, binding),
+					items
 				};
 			}
 		});
@@ -8185,6 +8248,69 @@ function parseMessageResume(value) {
 		};
 	}
 	return refuse();
+}
+/**
+* The LIST face's stop point (issue #65): a self-describing token that the SAME
+* tool accepts back, bound to the query that produced it.
+*
+* The message face wraps the peer position in `cursor:` / `after:` and is done,
+* because a message walk is scoped by its session. A list walk is scoped by
+* (method, device, filters), and the peer position is opaque: a position from
+* another query is a perfectly valid number that reads the WRONG slice with no
+* error anywhere. So this token carries a fingerprint of the binding and a
+* mismatched replay is refused HERE — before any RPC.
+*/
+const LIST_RESUME_PREFIX = "cursor:";
+/** The `cursor` parameter every list tool shares (issue #65). */
+const LIST_CURSOR_PARAMETER = {
+	type: "string",
+	description: "A `resumeCursor` a previous TRUNCATED answer of this tool returned: replay it with the SAME device and filters to continue from that stop point (`limit` then bounds this answer). A token from another tool, device or filter set is refused locally."
+};
+/** Canonical, key-sorted rendering of the caller's filters (undefined keys dropped). */
+function listParamsFingerprint(params) {
+	const entries = Object.keys(params).sort().filter((key) => params[key] !== void 0).map((key) => [key, params[key]]);
+	return createHash("sha256").update(JSON.stringify(entries)).digest("hex").slice(0, 16);
+}
+function encodeListResumeCursor(binding, peerPosition) {
+	const payload = {
+		v: 1,
+		m: binding.method,
+		d: binding.deviceId,
+		h: listParamsFingerprint(binding.params),
+		p: peerPosition
+	};
+	return LIST_RESUME_PREFIX + Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+/**
+* Decode a list token, refusing anything that is not one this tool emitted for
+* THIS binding. The refusal names the dimension that differs (tool / device /
+* filters) and never echoes the peer position, which is peer-supplied data.
+*
+* An `after:` token is refused by the prefix check: list walks have no anchor
+* form (they never trim a page, so a peer position always exists for a stop the
+* peer reported).
+*/
+function parseListResumeCursor(value, binding) {
+	const refuse = (why) => {
+		throw new Error(`cursor ${why}; omit \`cursor\` to read from the start, or replay the token with the same tool, device and filters.`);
+	};
+	if (typeof value !== "string" || !value.startsWith(LIST_RESUME_PREFIX)) refuse("must be a `cursor:` token this tool emitted");
+	const raw = value.slice(7);
+	let decoded;
+	try {
+		decoded = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+	} catch {
+		refuse("is not a token this tool emitted");
+	}
+	if (typeof decoded !== "object" || decoded === null) refuse("is not a token this tool emitted");
+	const payload = decoded;
+	if (payload["v"] !== 1 || typeof payload["m"] !== "string" || typeof payload["d"] !== "string" || typeof payload["h"] !== "string" || typeof payload["p"] !== "string") refuse("is not a token this tool emitted");
+	if (payload["m"] !== binding.method) refuse("was issued for a different tool");
+	if (payload["d"] !== binding.deviceId) refuse("was issued for a different device");
+	if (payload["h"] !== listParamsFingerprint(binding.params)) refuse("was issued for a different filter set");
+	const peerPosition = payload["p"];
+	if (mangledRemainder(peerPosition)) refuse("is not a token this tool emitted");
+	return peerPosition;
 }
 /**
 * The assistant text a terminal aggregate reports: the awaited RUN's assistant

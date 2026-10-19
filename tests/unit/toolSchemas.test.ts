@@ -124,7 +124,7 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
   it('cherry_workspaces requires device and agentId and paginates like the other list tools', () => {
     const definition = toolOf('cherry_workspaces')
     expect(definition.parameters.required).toEqual(['device', 'agentId'])
-    expect(Object.keys(properties(definition)).sort()).toEqual(['agentId', 'device', 'limit'])
+    expect(Object.keys(properties(definition)).sort()).toEqual(['agentId', 'cursor', 'device', 'limit'])
     expect(properties(definition)['limit']!['maximum']).toBe(1000)
   })
 
@@ -151,6 +151,22 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     expect(cursor['additionalProperties']).toBe(false)
     expect(cursor['required']).toEqual(['sessionId', 'streamEpoch', 'seq'])
     expect(Object.keys(cursor['properties'] as object).sort()).toEqual(['seq', 'sessionId', 'streamEpoch'])
+  })
+
+  it('issue #65: exactly the four list tools declare a resumable `cursor`', () => {
+    const listTools = ['cherry_agents', 'cherry_workspaces', 'cherry_sessions', 'cherry_interactions']
+    for (const definition of registerAll()) {
+      const keys = Object.keys(properties(definition))
+      // The raw peer position is internal: it must not be an INPUT anywhere.
+      expect(keys).not.toContain('nextCursor')
+      if (listTools.includes(definition.name)) {
+        expect(keys).toContain('cursor')
+        expect(properties(definition)['cursor']).toMatchObject({ type: 'string' })
+      } else if (definition.name !== 'cherry_events') {
+        // `cherry_events` has its own cursor OBJECT, declared since Task 8.
+        expect(keys).not.toContain('cursor')
+      }
+    }
   })
 
   it('every read-only tool declares the aggregate limit as an integer within [1, 1000]', () => {
