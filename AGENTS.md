@@ -552,8 +552,9 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   fingerprint, and an 8-hex checksum. The peer position goes **last and
   verbatim** (it may contain the delimiter — the desktop's session cursor is
   `entity:<orderKey>:<uuid>`), so the split stops at a fixed field count. The
-  three binding verdicts keep their own wording; `MAX_LIST_TOKEN_CHARS` (4,096)
-  is enforced by the parser and declared as the parameter's `maxLength`.
+  three binding verdicts keep their own wording; `MAX_RESUME_TOKEN_CHARS` (4,096,
+  shared with `cherry_read`'s `messagesResumeCursor`) is enforced by the parser and
+  declared as the parameter's `maxLength`.
 - **The checksum is the load-bearing half of that change, not the length.** The
   position is the one field no structural check can validate: measured over
   20,000 random single-character corruptions of the old base64-JSON token,

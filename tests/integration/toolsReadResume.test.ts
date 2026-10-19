@@ -725,3 +725,26 @@ describe('issue #72: a LIST resume token is not a message cursor', () => {
     expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before + 1)
   })
 })
+
+/**
+ * Issue #74: the message-face token is CALLER INPUT, so it gets the same kind of
+ * ceiling the list face has. Before this, a 5,000-character `cursor:…` was
+ * accepted and forwarded to the desktop, which answers a position it cannot
+ * parse by serving its FIRST page — the silent "newest page as older history"
+ * class, reached this time by a garbled string rather than a foreign token.
+ */
+describe('issue #74: the message token has a length ceiling', () => {
+  it('⑫ a token over the ceiling is refused locally in BOTH forms — no dial, no page', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: history(10) },
+    })
+    const before = rig.fake.readCallsFor('agent.messages.list').length
+    for (const token of [`cursor:${'9'.repeat(5000)}`, `after:${'9'.repeat(5000)}`]) {
+      await expect(
+        rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: token }),
+      ).rejects.toThrow(/4096/)
+    }
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
+  })
+})

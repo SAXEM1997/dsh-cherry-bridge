@@ -6,7 +6,7 @@ import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import {
   INTERACTIONS_LIST_PAGE_CLAMP,
   LIST_PAGE_CLAMP,
-  MAX_LIST_TOKEN_CHARS,
+  MAX_RESUME_TOKEN_CHARS,
   PARTS_LIST_PAGE_CLAMP,
 } from './defaults.js'
 import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
@@ -2409,11 +2409,13 @@ class CherryToolEngine {
           },
           messagesResumeCursor: {
             type: 'string',
+            maxLength: MAX_RESUME_TOKEN_CHARS,
             description:
               'A `messagesResumeCursor` a previous truncated read (this tool, or cherry_send/cherry_wait) ' +
               'returned: `"cursor:<peer position>"` or `"after:<messageId>"`. Continues the walk at that ' +
               'stop point instead of at the newest message; `limit` bounds what comes back from there. ' +
-              'Omit it to read from the newest message.',
+              'Omit it to read from the newest message. A token this tool did not emit is refused locally, ' +
+              `and ${MAX_RESUME_TOKEN_CHARS} characters is the ceiling.`,
           },
         },
         required: ['device', 'sessionId'],
@@ -6233,6 +6235,17 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
   }
   if (typeof value !== 'string') refuse()
   const token = value as string
+  // Issue #74: the ceiling is judged on the WHOLE token, before either form's
+  // prefix — so `cursor:` and `after:` get the same verdict, and no decoding,
+  // scanning or dial happens for a string that cannot be one of ours. It is the
+  // same bound the list face enforces ({@link MAX_RESUME_TOKEN_CHARS}).
+  if (token.length > MAX_RESUME_TOKEN_CHARS) {
+    throw new Error(
+      `cherry_read: messagesResumeCursor is ${token.length} characters long, over the ` +
+        `${MAX_RESUME_TOKEN_CHARS}-character ceiling for a resume token; omit the argument to read from the ` +
+        'newest message.',
+    )
+  }
   if (token.startsWith(RESUME_CURSOR_PREFIX)) {
     const cursor = token.slice(RESUME_CURSOR_PREFIX.length)
     if (mangledRemainder(cursor)) refuse()
@@ -6351,12 +6364,12 @@ const LIST_TOKEN_FIELDS = 4
 /** The `cursor` parameter every list tool shares (issues #65 and #70). */
 const LIST_CURSOR_PARAMETER = {
   type: 'string',
-  maxLength: MAX_LIST_TOKEN_CHARS,
+  maxLength: MAX_RESUME_TOKEN_CHARS,
   description:
     'A `resumeCursor` a previous TRUNCATED answer of this tool returned: replay it with the SAME ' +
     'device and filters to continue from that stop point (`limit` then bounds this answer). A token ' +
     'from another tool, device or filter set is refused locally, and so is a token this account ' +
-    `cannot have received intact (the token carries a checksum; ${MAX_LIST_TOKEN_CHARS} characters ` +
+    `cannot have received intact (the token carries a checksum; ${MAX_RESUME_TOKEN_CHARS} characters ` +
     'is the ceiling).',
 } as const
 
@@ -6447,9 +6460,9 @@ function parseListResumeCursor(value: unknown, binding: ListResumeBinding): stri
   const token = value as string
   // Length first: the bound is about CALLER INPUT and must not depend on which
   // face the string appears to belong to.
-  if (token.length > MAX_LIST_TOKEN_CHARS) {
+  if (token.length > MAX_RESUME_TOKEN_CHARS) {
     throw new Error(
-      `cursor is ${token.length} characters long, over the ${MAX_LIST_TOKEN_CHARS}-character ceiling for a ` +
+      `cursor is ${token.length} characters long, over the ${MAX_RESUME_TOKEN_CHARS}-character ceiling for a ` +
         'resume token; omit `cursor` to read from the start.',
     )
   }

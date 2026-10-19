@@ -139,15 +139,17 @@ export const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(
 export const LIST_PAGE_CLAMP = 16
 
 /**
- * Hard ceiling on ONE list resume token (issue #70), in characters.
+ * Hard ceiling on ONE resume token (issues #70 and #74), in characters.
  *
- * The token is CALLER INPUT and its tail is the peer's own page position, whose
- * length we do not control: the real desktop's session cursor is
- * `entity:<orderKey>:<uuid>` (~57 characters), the numeric `pageOf` faces are a
- * handful of digits, and a future desktop may use something longer — but
- * nothing legitimate comes near this. The bound exists so a hand-built or
- * model-mangled string is refused by a BOUND instead of being split, hashed and
- * carried to the peer, and so the `cursor` parameter can declare `maxLength`
- * honestly.
+ * BOTH faces take a token back from the caller — `cursor` on the four list
+ * tools, `messagesResumeCursor` on `cherry_read` — and both tail it with a
+ * peer-supplied position whose length we do not control: the desktop's session
+ * cursor is `entity:<orderKey>:<uuid>` (~57 characters), a message cursor
+ * `<ms>:<uuid>`, the numeric `pageOf` faces a handful of digits, and a future
+ * desktop may use something longer — but nothing legitimate comes near this.
+ * The bound exists so a hand-built or model-mangled string is refused by a
+ * BOUND instead of being split, hashed and carried to the peer, and so both
+ * parameters can declare `maxLength` honestly. ONE number for both faces: it
+ * bounds caller INPUT, not what a token means.
  */
-export const MAX_LIST_TOKEN_CHARS = 4_096
+export const MAX_RESUME_TOKEN_CHARS = 4_096
