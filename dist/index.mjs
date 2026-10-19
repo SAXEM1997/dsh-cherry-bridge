@@ -2471,6 +2471,33 @@ function classifyRateTier(method) {
 	return method === "agent.content.read" ? "content" : "shared";
 }
 /**
+* The reconnect wait one read is granted, and whether the CALLER's deadline is
+* what shortens it (issue #21).
+*
+* Returned together, from the RAW remaining time, because the two answers must
+* not be re-derived from the timer value: the wait is CEILED for `setTimeout`
+* (which truncates a fractional delay, and a budget-capped wait firing a
+* millisecond early would report the deadline as expired sub-ms before it is).
+* A raw remaining of 4,999.4 ms against a 5,000 ms allowance therefore yields a
+* 5,000 ms wait — EQUAL to the allowance, yet the deadline was the shorter
+* bound. Deciding `deadlineCapped` from the ceiled wait would report a spent
+* budget as a plain transport loss, and a wait answer converts only the
+* deadline class into the graceful stop that keeps its partial content.
+*
+* A wait is never zero: the caller refuses a spent deadline before this, and
+* `setTimeout` treats anything below 1 ms as "as soon as possible".
+*/
+function reconnectWait(remainingMs, allowanceMs) {
+	if (remainingMs === void 0 || remainingMs >= allowanceMs) return {
+		waitMs: allowanceMs,
+		deadlineCapped: false
+	};
+	return {
+		waitMs: Math.min(allowanceMs, Math.max(1, Math.ceil(remainingMs))),
+		deadlineCapped: true
+	};
+}
+/**
 * The connection's two pacing tiers: an admission is taken from the tier its
 * `method` classifies to (see {@link classifyRateTier}), never from a shared
 * pool, so neither tier's burst spends or delays the other's.
@@ -3176,12 +3203,12 @@ var DeviceConnection = class {
 			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
 			const remaining = this.#remainingMs(opts);
 			if (remaining !== void 0 && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method);
-			const waitMs = remaining === void 0 ? this.#transportRetryWaitMs : Math.min(this.#transportRetryWaitMs, Math.ceil(remaining));
+			const { waitMs, deadlineCapped } = reconnectWait(remaining, this.#transportRetryWaitMs);
 			console.warn(`[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); waiting up to ${Math.round(waitMs)}ms for a reconnect to replay it`);
 			const waited = await this.#awaitReconnect(waitMs, link.client);
 			if (waited.kind === "abandoned") throw lost;
 			if (waited.kind === "expired") {
-				if (waitMs < this.#transportRetryWaitMs) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+				if (deadlineCapped) throw new RpcDeadlineExceededError(this.record.deviceId, method);
 				throw lost;
 			}
 			const reconnected = waited;

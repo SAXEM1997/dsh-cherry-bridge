@@ -359,6 +359,33 @@ function classifyRateTier(method: string): RateTier {
 }
 
 /**
+ * The reconnect wait one read is granted, and whether the CALLER's deadline is
+ * what shortens it (issue #21).
+ *
+ * Returned together, from the RAW remaining time, because the two answers must
+ * not be re-derived from the timer value: the wait is CEILED for `setTimeout`
+ * (which truncates a fractional delay, and a budget-capped wait firing a
+ * millisecond early would report the deadline as expired sub-ms before it is).
+ * A raw remaining of 4,999.4 ms against a 5,000 ms allowance therefore yields a
+ * 5,000 ms wait — EQUAL to the allowance, yet the deadline was the shorter
+ * bound. Deciding `deadlineCapped` from the ceiled wait would report a spent
+ * budget as a plain transport loss, and a wait answer converts only the
+ * deadline class into the graceful stop that keeps its partial content.
+ *
+ * A wait is never zero: the caller refuses a spent deadline before this, and
+ * `setTimeout` treats anything below 1 ms as "as soon as possible".
+ */
+export function reconnectWait(
+  remainingMs: number | undefined,
+  allowanceMs: number,
+): { waitMs: number; deadlineCapped: boolean } {
+  if (remainingMs === undefined || remainingMs >= allowanceMs) {
+    return { waitMs: allowanceMs, deadlineCapped: false }
+  }
+  return { waitMs: Math.min(allowanceMs, Math.max(1, Math.ceil(remainingMs))), deadlineCapped: true }
+}
+
+/**
  * The connection's two pacing tiers: an admission is taken from the tier its
  * `method` classifies to (see {@link classifyRateTier}), never from a shared
  * pool, so neither tier's burst spends or delays the other's.
@@ -1410,13 +1437,12 @@ export class DeviceConnection {
       // two apart, and only the first is the caller's own deadline.
       const remaining = this.#remainingMs(opts)
       if (remaining !== undefined && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method)
-      // CEILED like every other budget-derived timer: `setTimeout` truncates a
-      // fractional delay, and a budget-capped wait that fires a millisecond
-      // early would report the deadline as expired sub-ms before it is.
-      const waitMs =
-        remaining === undefined
-          ? this.#transportRetryWaitMs
-          : Math.min(this.#transportRetryWaitMs, Math.ceil(remaining))
+      // WHICH BOUND IS THE SHORTER ONE comes from the RAW remaining time, in
+      // `reconnectWait` itself — the wait it returns is ceiled, so it can equal
+      // the allowance while the deadline was still the shorter bound. Deriving
+      // the attribution from the timer value would report a spent budget as a
+      // plain transport loss (see that helper).
+      const { waitMs, deadlineCapped } = reconnectWait(remaining, this.#transportRetryWaitMs)
       // The bound LOGGED is the one actually waited for: reporting the configured
       // allowance while a caller's deadline shortened it would make the operator
       // read a 5 s wait where there was 200 ms.
@@ -1427,12 +1453,12 @@ export class DeviceConnection {
       const waited = await this.#awaitReconnect(waitMs, link.client)
       if (waited.kind === 'abandoned') throw lost
       if (waited.kind === 'expired') {
-        // WHICH bound expired is decided by the bound the caller was given, not
-        // by a clock read: `waitMs` is the smaller of the reconnect allowance
-        // and the remaining budget, so a strictly smaller `waitMs` CAN only be
-        // the deadline. (A clock comparison here was the bug: a timer firing a
-        // millisecond early made a deadline-capped wait read as a plain loss.)
-        if (waitMs < this.#transportRetryWaitMs) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+        // NO CLOCK READ HERE, and no comparison of timer values either: a clock
+        // read races a timer that fires a millisecond early, and the timer
+        // value is ceiled, so it can equal the allowance even when the budget
+        // was what capped it. `deadlineCapped` is the FACT of which bound was
+        // shorter, captured from the raw remaining time before the ceiling.
+        if (deadlineCapped) throw new RpcDeadlineExceededError(this.record.deviceId, method)
         throw lost
       }
       const reconnected = waited
