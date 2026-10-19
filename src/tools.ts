@@ -6236,6 +6236,22 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
   if (token.startsWith(RESUME_CURSOR_PREFIX)) {
     const cursor = token.slice(RESUME_CURSOR_PREFIX.length)
     if (mangledRemainder(cursor)) refuse()
+    // Issue #72, the RELEASED half: a v1 list token (0.1.6 — `cursor:` +
+    // base64url of `{v,m,d,h,p}`) lives under this prefix and its payload is
+    // colon-free base64url, so it arrives here as a perfectly ordinary
+    // position and used to be forwarded to the desktop, which answers a
+    // position it cannot parse by serving its FIRST page. The detector fires
+    // only for a colon-free remainder that base64-decodes to a `{v:1,…}`
+    // object: every real peer position is `<ms>:<id>` (has a colon) or a
+    // numeric offset, so none can be mistaken for one.
+    if (looksLikeV1ListToken(cursor)) {
+      throw new Error(
+        'cherry_read: messagesResumeCursor is a v1 LIST `resumeCursor` (issued by an older plugin version, ' +
+          'before list tokens were compact): it resumes a list walk, not a message history, and it can no ' +
+          'longer be verified. Omit the argument to read from the newest message, or pass the token this ' +
+          'tool returned.',
+      )
+    }
     return { kind: 'cursor', cursor }
   }
   if (token.startsWith(RESUME_ANCHOR_PREFIX)) {
@@ -6245,11 +6261,13 @@ function parseMessageResume(value: unknown): MessageResume | undefined {
   }
   if (token.startsWith(LIST_RESUME_PREFIX)) {
     // Issue #72, the other direction: a token the four list tools minted. The
-    // two faces are told apart by PREFIX — the peer's position inside a
-    // `cursor:` token is never inspected, so `cursor:list:20` above is still a
-    // message cursor while `list:…` is not. Forwarding one would hand the
-    // desktop a position it cannot parse, and it answers that by serving its
-    // FIRST page as if it were the continuation.
+    // two faces are told apart by PREFIX, never by scanning a position for our
+    // own marker — `cursor:list:20` above is still a message cursor. (The branch
+    // above is the one exception, and it is not about the peer's format: it
+    // DECODES our own retired v1 list token, whose payload happens to be
+    // indistinguishable from a position.) Forwarding a list token would hand
+    // the desktop a position it cannot parse, and it answers that by serving
+    // its FIRST page as if it were the continuation.
     throw new Error(
       'cherry_read: messagesResumeCursor is a LIST `resumeCursor` (`list:…`) — it resumes a list walk ' +
         '(cherry_agents / cherry_workspaces / cherry_sessions / cherry_interactions), not a message history. ' +

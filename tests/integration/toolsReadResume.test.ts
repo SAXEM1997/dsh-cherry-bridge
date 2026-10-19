@@ -703,6 +703,19 @@ describe('issue #72: a LIST resume token is not a message cursor', () => {
     // Refused before any history work: the argument never became a peer cursor.
     expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
 
+    // The v1 LIST token — the format 0.1.6 actually SHIPPED — lives under
+    // `cursor:` and its payload is colon-free base64url, so it arrives here as a
+    // perfectly ordinary position. It must be named and refused, not forwarded:
+    // the desktop answers an unparseable position by serving its FIRST page.
+    const v1 = `cursor:${Buffer.from(
+      JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+      'utf8',
+    ).toString('base64url')}`
+    await expect(
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: v1 }),
+    ).rejects.toThrow(/v1 LIST `resumeCursor`/)
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
+
     // The peer position is opaque. A token whose POSITION begins with `list:`
     // is still a message cursor, and the peer's own verdict is what surfaces —
     // the fake peer parses positions numerically and rejects this one.

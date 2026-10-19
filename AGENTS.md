@@ -570,9 +570,13 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   message cursor and was forwarded to the desktop, which answers an unparseable
   position by serving its FIRST page — the silent "newest page as older history"
   again. Each face now refuses the other's prefix with a message naming the
-  mistake (and, on the list side, a v1 token — which lived under `cursor:` — is
-  named as an older format FIRST). The check is on the WHOLE token's prefix and
-  never on the peer's position: `cursor:list:20` is still a message cursor whose
+  mistake where the prefix identifies the other face (a bare `after:` on a list
+  tool gets the generic "must be a `list:` token" verdict, and that is enough).
+  The two exceptions are about OUR OWN retired formats, never about the peer's:
+  a v1 list token is recognised by DECODING it (it lived under `cursor:` and its
+  payload is colon-free base64url, so the message face would otherwise forward
+  it), and it is named as an older format FIRST. A peer position is never
+  inspected for a marker: `cursor:list:20` is still a message cursor whose
   `list:20` position travels verbatim, because the peer's format is opaque.
 - A v1 token (base64 JSON, `{v,m,d,h,p}`) is refused by name — a plugin upgrade
   invalidates a held token, and "start the walk over" is the actionable answer,

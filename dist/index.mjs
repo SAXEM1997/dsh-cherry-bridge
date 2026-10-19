@@ -8248,6 +8248,7 @@ function parseMessageResume(value) {
 	if (token.startsWith(RESUME_CURSOR_PREFIX)) {
 		const cursor = token.slice(7);
 		if (mangledRemainder(cursor)) refuse();
+		if (looksLikeV1ListToken(cursor)) throw new Error("cherry_read: messagesResumeCursor is a v1 LIST `resumeCursor` (issued by an older plugin version, before list tokens were compact): it resumes a list walk, not a message history, and it can no longer be verified. Omit the argument to read from the newest message, or pass the token this tool returned.");
 		return {
 			kind: "cursor",
 			cursor
