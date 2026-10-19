@@ -725,3 +725,55 @@ describe('issue #72: a LIST resume token is not a message cursor', () => {
     expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before + 1)
   })
 })
+
+/**
+ * Issue #74: the message-face token is CALLER INPUT, so it gets the same kind of
+ * ceiling the list face has. Before this, a 5,000-character `cursor:…` was
+ * accepted and forwarded to the desktop, which answers a position it cannot
+ * parse by serving its FIRST page — the silent "newest page as older history"
+ * class, reached this time by a garbled string rather than a foreign token.
+ */
+describe('issue #74: the message token has a length ceiling', () => {
+  it('⑫ a token over the ceiling is refused locally in BOTH forms — no dial, no page', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: history(10) },
+    })
+    const before = rig.fake.readCallsFor('agent.messages.list').length
+    for (const token of [`cursor:${'9'.repeat(5000)}`, `after:${'9'.repeat(5000)}`]) {
+      await expect(
+        rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: token }),
+      ).rejects.toThrow(/4096/)
+    }
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
+  })
+
+  it('⑬ the ceiling is judged on the WHOLE token, before the form it looks like', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: history(10) },
+    })
+    const messageOf = (token: string): Promise<string> =>
+      rig
+        .call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: token })
+        .then(
+          () => '(resolved)',
+          (error: unknown) => (error as Error).message,
+        )
+
+    // EXACTLY at the ceiling: accepted STRUCTURALLY — our refusal is absent, so
+    // the position was forwarded and the PEER's verdict is what came back (the
+    // fake peer's own schema rejects a 4 KiB cursor before it pages). This pins
+    // the off-by-one: `>` must never become `>=`.
+    const atCeiling = `cursor:${'9'.repeat(4096 - 'cursor:'.length)}`
+    expect(atCeiling).toHaveLength(4096)
+    const accepted = await messageOf(atCeiling)
+    expect(accepted).not.toMatch(/4096|ceiling/)
+
+    // OVER the ceiling with the OTHER face's prefix: the length verdict wins, so
+    // the two mistakes are never reported as each other.
+    const overLimit = await messageOf(`list:v2:s:${'9'.repeat(5000)}`)
+    expect(overLimit).toMatch(/4096/)
+    expect(overLimit).not.toMatch(/a LIST `resumeCursor`/)
+  })
+})

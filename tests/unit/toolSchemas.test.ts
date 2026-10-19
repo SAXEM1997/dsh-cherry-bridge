@@ -173,6 +173,15 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     }
   })
 
+  it('issue #74: cherry_read bounds its resume token the way the list tools do', () => {
+    // The declaration carries the ceiling the parser enforces. The number is
+    // pinned LITERALLY: moving it is a declaration change, not a refactor.
+    expect(properties(toolOf('cherry_read'))['messagesResumeCursor']).toMatchObject({
+      type: 'string',
+      maxLength: 4096,
+    })
+  })
+
   it('every read-only tool declares the aggregate limit as an integer within [1, 1000]', () => {
     for (const definition of registerReadOnly()) {
       const limit = properties(definition)['limit']

@@ -2262,18 +2262,20 @@ const PARTS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 16896);
 /** Interactions per interactions.list page: inline input + inline summary. */
 const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 /**
-* Hard ceiling on ONE list resume token (issue #70), in characters.
+* Hard ceiling on ONE resume token (issues #70 and #74), in characters.
 *
-* The token is CALLER INPUT and its tail is the peer's own page position, whose
-* length we do not control: the real desktop's session cursor is
-* `entity:<orderKey>:<uuid>` (~57 characters), the numeric `pageOf` faces are a
-* handful of digits, and a future desktop may use something longer — but
-* nothing legitimate comes near this. The bound exists so a hand-built or
-* model-mangled string is refused by a BOUND instead of being split, hashed and
-* carried to the peer, and so the `cursor` parameter can declare `maxLength`
-* honestly.
+* BOTH faces take a token back from the caller — `cursor` on the four list
+* tools, `messagesResumeCursor` on `cherry_read` — and both tail it with a
+* peer-supplied position whose length we do not control: the desktop's session
+* cursor is `entity:<orderKey>:<uuid>` (~57 characters), a message cursor
+* `<ms>:<uuid>`, the numeric `pageOf` faces a handful of digits, and a future
+* desktop may use something longer — but nothing legitimate comes near this.
+* The bound exists so a hand-built or model-mangled string is refused by a
+* BOUND instead of being split, hashed and carried to the peer, and so both
+* parameters can declare `maxLength` honestly. ONE number for both faces: it
+* bounds caller INPUT, not what a token means.
 */
-const MAX_LIST_TOKEN_CHARS = 4096;
+const MAX_RESUME_TOKEN_CHARS = 4096;
 //#endregion
 //#region src/urlHost.ts
 /**
@@ -5734,7 +5736,8 @@ var CherryToolEngine = class {
 					},
 					messagesResumeCursor: {
 						type: "string",
-						description: "A `messagesResumeCursor` a previous truncated read (this tool, or cherry_send/cherry_wait) returned: `\"cursor:<peer position>\"` or `\"after:<messageId>\"`. Continues the walk at that stop point instead of at the newest message; `limit` bounds what comes back from there. Omit it to read from the newest message."
+						maxLength: MAX_RESUME_TOKEN_CHARS,
+						description: `A \`messagesResumeCursor\` a previous truncated read (this tool, or cherry_send/cherry_wait) returned: \`"cursor:<peer position>"\` or \`"after:<messageId>"\`. Continues the walk at that stop point instead of at the newest message; \`limit\` bounds what comes back from there. Omit it to read from the newest message. A token this tool did not emit is refused locally, and ${MAX_RESUME_TOKEN_CHARS} characters is the ceiling.`
 					}
 				},
 				required: ["device", "sessionId"],
@@ -8245,6 +8248,7 @@ function parseMessageResume(value) {
 	};
 	if (typeof value !== "string") refuse();
 	const token = value;
+	if (token.length > 4096) throw new Error(`cherry_read: messagesResumeCursor is ${token.length} characters long, over the ${MAX_RESUME_TOKEN_CHARS}-character ceiling for a resume token; omit the argument to read from the newest message.`);
 	if (token.startsWith(RESUME_CURSOR_PREFIX)) {
 		const cursor = token.slice(7);
 		if (mangledRemainder(cursor)) refuse();
@@ -8332,8 +8336,8 @@ const LIST_TOKEN_FIELDS = 4;
 /** The `cursor` parameter every list tool shares (issues #65 and #70). */
 const LIST_CURSOR_PARAMETER = {
 	type: "string",
-	maxLength: MAX_LIST_TOKEN_CHARS,
-	description: `A \`resumeCursor\` a previous TRUNCATED answer of this tool returned: replay it with the SAME device and filters to continue from that stop point (\`limit\` then bounds this answer). A token from another tool, device or filter set is refused locally, and so is a token this account cannot have received intact (the token carries a checksum; ${MAX_LIST_TOKEN_CHARS} characters is the ceiling).`
+	maxLength: MAX_RESUME_TOKEN_CHARS,
+	description: `A \`resumeCursor\` a previous TRUNCATED answer of this tool returned: replay it with the SAME device and filters to continue from that stop point (\`limit\` then bounds this answer). A token from another tool, device or filter set is refused locally, and so is a token this account cannot have received intact (the token carries a checksum; ${MAX_RESUME_TOKEN_CHARS} characters is the ceiling).`
 };
 /** Canonical, key-sorted rendering of the caller's filters (undefined keys dropped). */
 function listParamsFingerprint(params) {
@@ -8397,7 +8401,7 @@ function parseListResumeCursor(value, binding) {
 	};
 	if (typeof value !== "string") refuse("must be a `list:` token this tool emitted");
 	const token = value;
-	if (token.length > 4096) throw new Error(`cursor is ${token.length} characters long, over the ${MAX_LIST_TOKEN_CHARS}-character ceiling for a resume token; omit \`cursor\` to read from the start.`);
+	if (token.length > 4096) throw new Error(`cursor is ${token.length} characters long, over the ${MAX_RESUME_TOKEN_CHARS}-character ceiling for a resume token; omit \`cursor\` to read from the start.`);
 	if (token.startsWith(RESUME_CURSOR_PREFIX)) {
 		if (looksLikeV1ListToken(token.slice(7))) throw new Error("cursor was issued by an older plugin version (a v1 list token, from before list tokens were compact and checksummed), so it can no longer be verified; start this walk over with `cursor` omitted.");
 		refuse("is a MESSAGE-face token (`cursor:<peer position>`, i.e. a `messagesResumeCursor`), which a list walk never issues — a list token starts with `list:`");
