@@ -802,10 +802,36 @@ export function resolveTrustedHosts(ctx: CherryHttpContext): readonly string[] {
   if (runtime?.trustedHosts !== undefined) return runtime.trustedHosts
   const startup = asWebRuntime(ctx.get?.('webStartup'))
   if (startup?.trustedHosts !== undefined) {
-    // The listener bind rides along as a bare hostname (see above).
-    return startup.host === undefined ? [...startup.trustedHosts] : [...startup.trustedHosts, startup.host]
+    // The listener bind rides along as a bare hostname, converted to the
+    // AUTHORITY shape the fence parses (see `asTrustedEntry`).
+    return startup.host === undefined
+      ? [...startup.trustedHosts]
+      : [...startup.trustedHosts, asTrustedEntry(startup.host)]
   }
   return []
+}
+
+/**
+ * The listener bind as a `trustedHosts` ENTRY, i.e. an authority the fence can
+ * parse.
+ *
+ * `webStartup.host` is a BARE hostname (`--host fe80::1`), while every entry is
+ * an authority: {@link parseAuthority} prefixes `http://` and hands it to WHATWG
+ * URL. An IPv6 literal MUST be bracketed in an authority — `new URL('http://fe80::1')`
+ * throws — so a folded bare literal was silently unusable, and an IPv6 LAN bind
+ * kept only loopback (fail-closed: an availability gap, not a security hole;
+ * issue #9). Bracketing is the whole normalization: IPv4 addresses and DNS
+ * names already parse as-is, and a value that is already bracketed is left
+ * alone, so a hand-written `[fe80::2]` cannot become `[[fe80::2]]` and parse to
+ * nothing — re-creating the very gap this closes.
+ *
+ * A zone-scoped literal (`fe80::1%eth0`) still parses to nothing: WHATWG URL
+ * wants `%25` there and a browser sends no zone id at all, so it is left to the
+ * parser rather than guessed at.
+ */
+function asTrustedEntry(host: string): string {
+  if (host.startsWith('[') || !host.includes(':')) return host
+  return `[${host}]`
 }
 
 /**

@@ -744,6 +744,16 @@ Every `/cherry-remote/api` route re-checks same-origin before acting, in order:
 refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 (4) `Origin` absent → **allow** (curl, not a cross-site page).
 
+- **A folded bind is normalized to an AUTHORITY.** `webStartup.host` is a bare
+  hostname, but every `trustedHosts` entry is parsed with
+  `new URL('http://' + entry)`, and an IPv6 literal MUST be bracketed there. So
+  an IPv6 `--host` is bracketed when folded (`fe80::1` → `[fe80::1]`) and a
+  value that is already bracketed is left alone (`[[fe80::2]]` would parse to
+  nothing). Without this an IPv6 LAN bind contributed no usable entry and only
+  loopback stayed reachable — fail-closed, but an availability gap (issue #9).
+  Zone-scoped literals (`fe80::1%eth0`) still parse to nothing: WHATWG URL wants
+  `%25` and a browser sends no zone id at all.
+
 ## Upstream references
 
 Neither reference lives in this repository.
