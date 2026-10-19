@@ -5,6 +5,21 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## Unreleased
+
+### Fixed
+
+- **A resume token is never emitted past the length the same tool accepts**
+  (#76). Both faces judge `MAX_RESUME_TOKEN_CHARS` (4,096) on replay, but the
+  emit side did not: a peer answering a truncated page with a position longer
+  than ~4,089 characters made the bridge mint a stop point its own parser then
+  refused, so the caller held a token that could never be used. The ceiling is
+  now enforced on the way OUT as well — the message face's `cursor:` and
+  `after:` forms and the list face's `resumeCursor` alike — and an over-long
+  stop point is simply not named: `truncated` still says the walk was cut, and
+  a wider `limit` is the remedy that works. A token of exactly 4,096
+  characters is still emitted.
+
 ## v0.1.7 (2026-10-19)
 
 The resume-token batch. **A resume token issued by v0.1.6 cannot be replayed
