@@ -583,12 +583,22 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   invalidates a held token, and "start the walk over" is the actionable answer,
   so that refusal does NOT reuse the generic "…or replay the token" tail: a v1
   token can never be replayed, whoever holds it.
-- **Only a position this face would accept is ever named.** An empty peer
-  position (or one carrying whitespace/control characters, which the parser
-  rejects) yields no token at all: `#listPage` runs the same `optionalString`
-  guard the message face uses, because a token the tool refuses to replay is
-  worse than none — `truncated` already says the walk was cut, and a wider
-  `limit` is the remedy that works.
+- **Both faces name only a remainder their own parser would accept.** The
+  message face's `cursor:` position and `after:` anchor, and the list face's
+  peer position, are judged by `mangledRemainder` — the SAME predicate
+  `parseMessageResume` and `parseListResumeCursor` apply on replay — so the
+  two sides cannot drift into two dialects. It refuses an empty remainder, one
+  that is not equal to its own `.trim()` (leading/trailing whitespace), and one
+  carrying a control character ANYWHERE; an interior plain space is legal and
+  round-trips (`a b`). The failure mode it prevents is the emitter minting a
+  stop point the same tool then refuses: the caller holds a token that can
+  never be used, and the refusal surfaces at the resume call instead of at the
+  answer that produced it. A refused remainder yields no token at all —
+  `truncated` already says the walk was cut, and a wider `limit` is the remedy
+  that works. The message face applies this to the `after:` anchor as well as
+  the `cursor:` position: a message id is an `opaqueId` too, so a padded id is
+  schema-valid and really does reach the anchor arm. The LENGTH ceiling is the
+  sibling guard in the next bullet.
 - **The ceiling is enforced on the way OUT too — the same refusal in one more
   dimension.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
   over it is one this tool would refuse on replay, and emitting it would hand
@@ -602,18 +612,21 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   cannot leave it behind. This is about what the tool ACCEPTS; a well-behaved
   peer is far below it (the protocol's own `opaqueId` caps a cursor at 256
   characters).
-- **The `after:` arm is pinned on the function, not through a tool.** Its anchor
-  is a message ID, and projecting that message sends the same id to
-  `agent.parts.list`, whose `messageId` is an `opaqueId` (256 characters). A peer
-  item carrying an id above the ceiling therefore fails its parts walk and is
-  never RETURNED, so no walk can reach the point of naming it: the state is
-  unreachable through the protocol, not merely untested. The guard stays
-  regardless — the emitter must never mint what the parser refuses, whatever the
-  peer's cap becomes — and `tests/unit/resumeTokenEmit.test.ts` drives
-  `messageResumeToken` directly to pin it (both arms, both sides of the
-  boundary). The `cursor:` arm and the list face keep their end-to-end tests
-  (`toolsReadResume.test.ts` ⑭a/⑭b, `toolsRead.test.ts` ⑦h), which is why that
-  helper is exported.
+- **The `after:` arm's LENGTH case is pinned on the function; its CONTENT case
+  runs through the tool.** An anchor is a message ID, and projecting that
+  message sends the same id to `agent.parts.list`, whose `messageId` is an
+  `opaqueId`. A peer item carrying an id above the token ceiling therefore
+  fails its parts walk and is never RETURNED, so the over-long state is
+  unreachable through the protocol, not merely untested; that arm is pinned by
+  driving `messageResumeToken` directly (`tests/unit/resumeTokenEmit.test.ts`,
+  both arms, both sides of the boundary), and the guard stays regardless,
+  because the emitter must never mint what the parser refuses, whatever the
+  peer's cap becomes. The CONTENT refusal IS reachable: `opaqueId` allows
+  padding, so the parts walk for `' m-0 '` succeeds and that message becomes
+  the anchor — `tests/integration/toolsReadResume.test.ts` ⑭d/⑭e/⑭f drive both
+  arms through the tools. The `cursor:` arm and the list face keep their
+  end-to-end tests as well (`toolsReadResume.test.ts` ⑭a/⑭b,
+  `toolsRead.test.ts` ⑦h), which is why that helper is exported.
 
 ### `AGGREGATE_BYTES`: one budget, two faces
 

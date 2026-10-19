@@ -153,13 +153,16 @@ subscription was lost and could not be rebuilt, so the outcome is
   `aggregate-bytes` and `deadline` mean different things, see above) and,
   whenever a stop point can be named honestly, carries a `messagesResumeCursor`
   resume token. **When it cannot be named the token is absent**: the peer's
-  position is empty, the token would exceed the 4,096-character ceiling, or there
-  is no message id to anchor on — `truncated` stays `true` and a wider `limit` is
-  the remedy that works (for a wait answer cut by its deadline, the remedy is
-  `cherry_read` instead). The four list tools' `resumeCursor` obeys the same rule
-  and additionally refuses to wrap a position carrying whitespace/control
-  characters. A message whose own parts could not be fully read carries
-  `incomplete: true` (inside a wait answer, a message cut by the deadline carries
+  position is empty, carries leading/trailing whitespace or a control character,
+  the token would exceed the 4,096-character ceiling, or there is no message id
+  to anchor on — `truncated` stays `true` and a wider `limit` is the remedy that
+  works (for a wait answer cut by its deadline, the remedy is `cherry_read`
+  instead). **Both faces obey one rule**: the message face's
+  `messagesResumeCursor` and the four list tools' `resumeCursor` are emitted only
+  when this tool would accept them back; an interior plain space is legal, and
+  only leading/trailing whitespace and control characters are refused.
+  A message whose own parts could not be fully read carries `incomplete: true`
+  (inside a wait answer, a message cut by the deadline carries
   `partsTruncated: "deadline"`).
 - **A wait answer has an assembly budget of its own.** After the window ends,
   `cherry_send(wait: true)` / `cherry_wait` still read some history (the message

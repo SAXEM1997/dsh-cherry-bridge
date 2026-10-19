@@ -68,3 +68,51 @@ describe('issue #76: the message token is never minted past the ceiling', () => 
     expect(messageResumeToken(consumedWhole(''), 2, 'm-1')).toBeUndefined()
   })
 })
+
+/**
+ * Issue #80: the CONTENT dimension of the same symmetry #76 bounded by LENGTH.
+ *
+ * `messageResumeToken` filtered a peer answer through `optionalString` (which
+ * rejects `''` and nothing else), while `parseMessageResume` refuses any
+ * remainder `mangledRemainder` calls mangled. A peer page whose `nextCursor` was
+ * `' 4 '` — schema-legal, `opaqueId` only forbids lone surrogates — therefore
+ * minted `cursor: 4 `, a token the same tool refuses on replay. Both arms have
+ * this hole, so both are pinned here on the pure function.
+ *
+ * What `mangledRemainder` actually refuses, precisely: a remainder that is empty,
+ * that is not equal to its own `.trim()` (leading/trailing whitespace), or that
+ * carries a control character ANYWHERE. An interior plain space is legal and
+ * round-trips — the guard is not "no whitespace".
+ */
+describe('issue #80: the message token is never minted from a mangled remainder', () => {
+  /** A page the walk stopped INSIDE: items were left, so the `after:` arm is taken. */
+  const stoppedInside = (): CherryPage<unknown> => ({ items: ['m-0', 'm-1'], truncated: true })
+
+  /** A page the walk consumed whole: its own position is the stop point. */
+  const consumedWhole = (nextCursor: string): CherryPage<unknown> => ({
+    items: ['m-0', 'm-1'],
+    truncated: true,
+    nextCursor,
+  })
+
+  it('names no `cursor:` position with padding or a control character', () => {
+    // Leading/trailing whitespace: `' 4 '` is what a peer padding its opaque
+    // position produces, and it used to mint `cursor: 4 `.
+    expect(messageResumeToken(consumedWhole(' 4 '), 2, 'm-1')).toBeUndefined()
+    // A control character ANYWHERE, including the middle.
+    expect(messageResumeToken(consumedWhole('4\u0000'), 2, 'm-1')).toBeUndefined()
+    // The clean position on the same shape is still named.
+    expect(messageResumeToken(consumedWhole('4'), 2, 'm-1')).toBe('cursor:4')
+    // An INTERIOR plain space is legal: only the ENDS are judged.
+    expect(messageResumeToken(consumedWhole('4 5'), 2, 'm-1')).toBe('cursor:4 5')
+  })
+
+  it('names no `after:` anchor with padding or a control character', () => {
+    expect(messageResumeToken(stoppedInside(), 1, ' m-1 ')).toBeUndefined()
+    expect(messageResumeToken(stoppedInside(), 1, 'm\u00071')).toBeUndefined()
+    // The clean anchor on the same shape is still named.
+    expect(messageResumeToken(stoppedInside(), 1, 'm-1')).toBe('after:m-1')
+    // Interior space, same rule as the cursor arm.
+    expect(messageResumeToken(stoppedInside(), 1, 'a b')).toBe('after:a b')
+  })
+})

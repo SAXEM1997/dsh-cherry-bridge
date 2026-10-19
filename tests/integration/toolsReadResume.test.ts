@@ -857,3 +857,106 @@ describe('issue #76: the emit side never names a token the parser would refuse',
   // produce the state. That arm is pinned by `tests/unit/resumeTokenEmit.test.ts`
   // instead, which drives `messageResumeToken` directly.
 })
+
+/**
+ * Issue #80: the CONTENT dimension of the same round-trip symmetry #76 bounded
+ * by LENGTH.
+ *
+ * `messageResumeToken` used to filter a peer answer through `optionalString`,
+ * which rejects `''` and nothing else, while the parsers that read a token back
+ * reject any remainder `mangledRemainder` calls mangled — leading/trailing
+ * whitespace, or a control character anywhere. A peer page whose `nextCursor`
+ * was `' 4 '` therefore minted `cursor: 4 `, and the next `cherry_read` refused
+ * the tool's own token. This is not a theoretical shape: `pageParams.cursor`
+ * (and `agent.parts.list`'s `messageId`) is an `opaqueId` — `unicodeText`
+ * bounded at 256 characters, and `unicodeText` only forbids lone surrogates —
+ * so a padded position and a padded message id are both SCHEMA-VALID, and both
+ * arms are reachable through a real tool.
+ *
+ * The fix is that the emitter runs the parser's own predicate, so the two sides
+ * cannot disagree by construction. What must NOT change: the content already
+ * read is returned, `truncated` still says the walk was cut, and a CLEAN
+ * position/anchor on the same shapes is still named — this is a refusal of
+ * mangled remainders, not a blanket refusal to emit.
+ */
+describe('issue #80: the emit side applies the parser’s content predicate to BOTH arms', () => {
+  it('⑭d a padded `cursor:` position mints no token, and the content is still returned', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1)] },
+    })
+    // The walk consumed its whole collected window, so the peer's position is
+    // the stop point — and that position carries padding `nextCursor` is
+    // schema-legal in (`opaqueId`).
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0), wire(1)], nextCursor: ' 4 ' },
+    ])
+
+    const page = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 2 })) as ReadResult
+    // The stop point is not a reason to lose what was read before it.
+    expect(ids(page)).toEqual(['m-0', 'm-1'])
+    expect(page.truncated).toBe(true)
+    expect(page.truncationReason).toBe('limit')
+    // The regression: this used to be `cursor: 4 `, which
+    // `parseMessageResume` refuses on the way back.
+    expect(page.messagesResumeCursor).toBeUndefined()
+  })
+
+  it('⑭e a padded `after:` anchor mints no token either', async () => {
+    // The anchor arm is reachable through the protocol because the anchor is a
+    // message ID, and `agent.parts.list`'s `messageId` is the same `opaqueId`
+    // that accepts padding — so the parts walk for `' m-0 '` SUCCEEDS, the
+    // message is returned, and it can become the anchor.
+    const padded = (index: number): FakeMessageRecord => ({ ...tiny(index), messageId: ` m-${index} ` })
+    const paddedWire = (index: number): Record<string, unknown> => ({ ...wire(index), messageId: ` m-${index} ` })
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [padded(0), padded(1)] },
+    })
+    // A peer that OVERSHOTS the requested page: `limit: 1` asks for one item and
+    // the page carries two, so the walk stops INSIDE its collected window and
+    // would name `after: m-0 ` as the anchor.
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: [paddedWire(0), paddedWire(1)], nextCursor: null },
+    ])
+
+    const page = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1 })) as ReadResult
+    // The padded id really did survive projection — this is the reachable
+    // shape, not a hypothetical one.
+    expect(page.messages[0]?.messageId).toBe(' m-0 ')
+    expect(page.truncated).toBe(true)
+    expect(page.messagesResumeCursor).toBeUndefined()
+  })
+
+  it('⑭f a CLEAN cursor position is still named — the guard rejects padding, nothing else', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1)] },
+    })
+    rig.fake.scriptListPages('agent.messages.list', [{ items: [wire(0)], nextCursor: '2' }])
+
+    const page = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1 })) as ReadResult
+    expect(ids(page)).toEqual(['m-0'])
+    expect(page.truncated).toBe(true)
+    expect(page.truncationReason).toBe('limit')
+    expect(page.messagesResumeCursor).toBe('cursor:2')
+  })
+
+  it('⑭f a CLEAN anchor on the same shape is still named — clean ids round-trip unchanged', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: { agents: [AGENT], sessions: [SESSION], messages: [tiny(0), tiny(1)] },
+    })
+    // The SAME overshooting page as ⑭e, with clean ids: the stop is still inside
+    // the window, so the anchor must still be named. If this went undefined the
+    // guard would be refusing the SHAPE rather than the padding.
+    rig.fake.scriptListPages('agent.messages.list', [
+      { items: [wire(0), wire(1)], nextCursor: null },
+    ])
+
+    const page = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', limit: 1 })) as ReadResult
+    expect(ids(page)).toEqual(['m-0'])
+    expect(page.truncated).toBe(true)
+    expect(page.messagesResumeCursor).toBe('after:m-0')
+  })
+})
