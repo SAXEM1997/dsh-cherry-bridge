@@ -534,7 +534,7 @@ discarded pages do not spend the caller's `limit`.
 list walk is scoped by (method, device, filters), and the peer's page position is
 opaque: replaying one from a different query is a perfectly valid number that
 reads the wrong slice with no error anywhere. So a truncated list answers
-`resumeCursor: "cursor:<opaque>"` — the position PLUS a fingerprint of that
+`resumeCursor: "list:<opaque>"` — the position PLUS a fingerprint of that
 binding — and the token is refused locally (no dial, no page) when replayed
 against a different tool, device or filter set. The bare peer position never
 leaves the tool: `nextCursor` is internal now. The `after:` anchor form stays
@@ -545,7 +545,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
 
 **The token itself is compact and checksummed (issue #70):**
 
-    cursor:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>
+    list:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>
 
 - One character per tool (`a`/`w`/`s`/`i`) instead of the method name, a 12-hex
   **digest** of the deviceId instead of the 36-character UUID, an 8-hex filter
@@ -564,6 +564,20 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   single-character corruption is now refused locally (a test walks every
   position of a real token), and the token is 225 → ~100 characters on the
   sessions worst case, ~150 → ~44 on the numeric faces.
+- **Two faces, two prefixes (issue #72).** The message face owns `cursor:` /
+  `after:`; the list face owns `list:`. They must stay disjoint: while they
+  shared one prefix, a list token replayed as `messagesResumeCursor` was a legal
+  message cursor and was forwarded to the desktop, which answers an unparseable
+  position by serving its FIRST page — the silent "newest page as older history"
+  again. Each face now refuses the other's prefix with a message naming the
+  mistake where the prefix identifies the other face (a bare `after:` on a list
+  tool gets the generic "must be a `list:` token" verdict, and that is enough).
+  The two exceptions are about OUR OWN retired formats, never about the peer's:
+  a v1 list token is recognised by DECODING it (it lived under `cursor:` and its
+  payload is colon-free base64url, so the message face would otherwise forward
+  it), and it is named as an older format FIRST. A peer position is never
+  inspected for a marker: `cursor:list:20` is still a message cursor whose
+  `list:20` position travels verbatim, because the peer's format is opaque.
 - A v1 token (base64 JSON, `{v,m,d,h,p}`) is refused by name — a plugin upgrade
   invalidates a held token, and "start the walk over" is the actionable answer,
   so that refusal does NOT reuse the generic "…or replay the token" tail: a v1

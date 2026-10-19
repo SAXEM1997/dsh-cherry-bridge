@@ -430,6 +430,12 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
     // not do (a desktop keyset token, a loopback offset and a future format are
     // all valid). A nested prefix is also something we could genuinely emit, so
     // refusing it would break the round trip it exists to guarantee.
+    //
+    // A token from the OTHER face is a different matter, and the difference is
+    // exact: that is a check on the WHOLE token's prefix (`list:`, issue #72 in
+    // `⑪` below), never an interpretation of what follows it. The two are
+    // disjoint "cursor:"+"list:" — a peer position starting with `list:` still
+    // travels, which `⑪` also pins.
     for (const token of ['20', 'garbage', '', 'after:', 'cursor:', 'cursor: 20', 'cursor:20 ', 'after:\n7']) {
       await expect(
         rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: token }),
@@ -655,5 +661,67 @@ describe('issue #26: the message stop point is a resume INPUT', () => {
     // would have needed five.
     expect(resumeCalls).toHaveLength(2)
     expect(ids(resumed)).toEqual(['n-5'])
+  })
+})
+
+/**
+ * Issue #72: the two resume-token faces are disjoint by PREFIX (`cursor:` /
+ * `after:` here, `list:` on the four list tools). Before that split a list
+ * token was a perfectly ordinary `cursor:` payload to this face, so it was
+ * forwarded to the desktop verbatim — and the desktop answers an unparseable
+ * position by falling back to its FIRST page, i.e. "continue from here" silently
+ * re-read the newest page as older history.
+ *
+ * The second half of the test is the other half of the invariant: the refusal
+ * is a check on the WHOLE token, never a scan for our marker inside the peer's
+ * position. A position that happens to start with `list:` is still the peer's
+ * business and must travel verbatim — this bridge does not parse peer cursors.
+ */
+describe('issue #72: a LIST resume token is not a message cursor', () => {
+  it('⑪ a minted list token is refused, while a position that looks like one still travels', async () => {
+    const rig = await makeRig({
+      hello: { limits: { pageItems: LIST_PAGE_CLAMP } },
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION, { ...SESSION, sessionId: 's-2' }, { ...SESSION, sessionId: 's-3' }],
+        messages: history(40),
+      },
+    })
+
+    // Minted by the list face itself, so the two faces cannot drift apart.
+    const listToken = (
+      (await rig.call('cherry_sessions', { device: 'dev-A', agentId: 'agent-1', limit: 2 })) as {
+        resumeCursor?: string
+      }
+    ).resumeCursor as string
+    expect(listToken).toMatch(/^list:v2:s:/)
+
+    const before = rig.fake.readCallsFor('agent.messages.list').length
+    await expect(
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: listToken }),
+    ).rejects.toThrow(/a LIST `resumeCursor`/i)
+    // Refused before any history work: the argument never became a peer cursor.
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
+
+    // The v1 LIST token — the format 0.1.6 actually SHIPPED — lives under
+    // `cursor:` and its payload is colon-free base64url, so it arrives here as a
+    // perfectly ordinary position. It must be named and refused, not forwarded:
+    // the desktop answers an unparseable position by serving its FIRST page.
+    const v1 = `cursor:${Buffer.from(
+      JSON.stringify({ v: 1, m: 'agent.sessions.list', d: 'dev-A', h: '0'.repeat(16), p: '2' }),
+      'utf8',
+    ).toString('base64url')}`
+    await expect(
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: v1 }),
+    ).rejects.toThrow(/v1 LIST `resumeCursor`/)
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before)
+
+    // The peer position is opaque. A token whose POSITION begins with `list:`
+    // is still a message cursor, and the peer's own verdict is what surfaces —
+    // the fake peer parses positions numerically and rejects this one.
+    await expect(
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', messagesResumeCursor: 'cursor:list:20' }),
+    ).rejects.toThrow(/Invalid page cursor/)
+    expect(rig.fake.readCallsFor('agent.messages.list')).toHaveLength(before + 1)
   })
 })
