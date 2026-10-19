@@ -83,6 +83,44 @@ function writeLossError(error: unknown): Error {
 }
 
 /**
+ * A request that was NOT answered before its own client-side timeout, as its own
+ * type rather than a message (issue #21).
+ *
+ * The distinction is only observable to a caller that chose the timeout: a
+ * deadline-bounded walk derives every per-request timeout from its remaining
+ * budget ({@link JsonRpcClient.request}'s `deadline`), so a timeout there means
+ * "my budget ran out, stop the walk" — which is a STOP, not a failure of the
+ * peer or of the request. Matching the message text would make that decision
+ * depend on wording; the class makes it depend on the event.
+ *
+ * The message is unchanged, byte for byte, because it is what every existing
+ * operator-facing report and test quotes.
+ */
+export class RequestTimeoutError extends Error {
+  readonly method: string
+  readonly timeoutMs: number
+  /**
+   * Whether {@link timeoutMs} was DERIVED from the caller's deadline (it was
+   * shorter than the requested timeout), i.e. whether the budget is what ran out.
+   *
+   * This is a positive flag rather than a clock comparison on purpose: a timer
+   * may fire a millisecond EARLY, so "has the deadline passed by the time I
+   * handle the rejection" is a race, while "my timeout was clamped by it" is a
+   * fact about how the error was produced.
+   */
+  readonly clampedByDeadline: boolean
+
+  constructor(method: string, timeoutMs: number, clampedByDeadline = false) {
+    super(`JSON-RPC request "${method}" timed out after ${timeoutMs}ms`)
+    this.name = 'RequestTimeoutError'
+    this.method = method
+    this.timeoutMs = timeoutMs
+    this.clampedByDeadline = clampedByDeadline
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+/**
  * The structured error a peer returns for a request. `code` is the literal
  * 1000 the transport reserves for protocol failures; `data.reason` is the
  * discriminator consumers switch on.
@@ -98,6 +136,33 @@ export class JsonRpcRequestError extends Error {
     this.data = data
     Object.setPrototypeOf(this, new.target.prototype)
   }
+}
+
+/**
+ * Per-request options. Shared by this client and by the connection facade, which
+ * forwards them after its own lifecycle handling (`#businessRequest`).
+ */
+export interface JsonRpcRequestOptions {
+  /** Per-request timeout in milliseconds (default: the client's own). */
+  timeoutMs?: number
+  /**
+   * The instant (on `performance.now()`'s MONOTONIC clock) this request may no
+   * longer be useful, owned by the caller's own budget (issue #21).
+   *
+   * Two layers consume it, each where its own wait happens:
+   *
+   *  - HERE: the effective per-request timeout becomes
+   *    `min(timeoutMs, remaining)`. A request can never outlive the budget, and
+   *    a budget farther away than the ordinary timeout never lengthens one.
+   *  - in the CONNECTION: a read that loses its link may not wait for a
+   *    reconnect past it, and may not replay once it has passed.
+   *
+   * A MONOTONIC instant rather than a duration on purpose: the remaining budget
+   * is recomputed at each point that waits, so time already spent (pacing,
+   * reconnect) is always charged to it. A wall clock is the wrong clock for the
+   * same reason the waiter's own deadline uses `performance.now()`.
+   */
+  deadline?: number
 }
 
 interface PendingRequest {
@@ -215,7 +280,7 @@ export class JsonRpcClient {
     this.startReadLoop()
   }
 
-  request<T>(method: string, params: unknown, opts?: { timeoutMs?: number }): Promise<T> {
+  request<T>(method: string, params: unknown, opts?: JsonRpcRequestOptions): Promise<T> {
     if (this.disposed) return Promise.reject(new Error('JSON-RPC client disposed'))
     // Fail fast once the channel is known dead: queueing onto it would only
     // burn a full timeout before rejecting anyway.
@@ -234,7 +299,18 @@ export class JsonRpcClient {
       return Promise.reject(new Error(`Invalid JSON-RPC request for method "${method}"`))
     }
 
-    const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs
+    // THE DEADLINE IS A CLAMP, NOT A REPLACEMENT (issue #21): the request may
+    // never outlive the budget its caller set, and a deadline farther away than
+    // the ordinary per-request timeout changes nothing — the shorter of the two
+    // wins. That is what keeps a single stuck request from eating a whole
+    // answer's budget, and it is why a timeout observed on a deadline-bounded
+    // call means the budget ran out rather than that the peer is silent.
+    const requestedTimeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs
+    const remainingMs =
+      opts?.deadline === undefined ? undefined : opts.deadline - performance.now()
+    const clampedMs = remainingMs === undefined ? undefined : Math.max(1, Math.ceil(remainingMs))
+    const clipped = clampedMs !== undefined && clampedMs < requestedTimeoutMs
+    const timeoutMs = clipped ? clampedMs : requestedTimeoutMs
 
     return new Promise<T>((resolve, reject) => {
       const send = (abortError?: Error): void => {
@@ -260,7 +336,7 @@ export class JsonRpcClient {
         // Register before writing: the response can land as soon as the write
         // is queued, and an unregistered id would be dropped as unknown.
         const timer = setTimeout(() => {
-          this.finish(id, `JSON-RPC request "${method}" timed out after ${timeoutMs}ms`)
+          this.finish(id, new RequestTimeoutError(method, timeoutMs, clipped))
         }, timeoutMs)
         this.pending.set(id, {
           resolve: resolve as (value: unknown) => void,
@@ -379,11 +455,11 @@ export class JsonRpcClient {
   }
 
   /** Settles one pending request and releases its in-flight slot. */
-  private finish(id: number, message: string): void {
+  private finish(id: number, error: Error): void {
     const pending = this.pending.get(id)
     if (pending === undefined) return
     this.release(id)
-    pending.reject(new Error(message))
+    pending.reject(error)
   }
 
   private resolve(id: number, value: unknown): void {

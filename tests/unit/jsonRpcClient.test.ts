@@ -11,7 +11,12 @@ import {
   type SecureChannel,
 } from '@cherrystudio/remote-transport'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
-import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
+import {
+  isChannelClosedError,
+  JsonRpcClient,
+  JsonRpcRequestError,
+  RequestTimeoutError,
+} from '../../src/rpc/jsonRpcClient.js'
 
 const PROTOCOL_VERSION = 1
 
@@ -343,6 +348,35 @@ describe('JsonRpcClient', () => {
     // instead of resolving or hanging forever.
     await expect(client.request('echo.never', {}, { timeoutMs: 100 })).rejects.toThrow()
   })
+
+  it('④d (issue #21) a request deadline CLAMPS the per-request timeout and its timeout is a typed error', async () => {
+    // The deadline is a clamp on the SHORTER side: a 60 s per-request timeout
+    // must not outlive a 100 ms budget, and a budget farther away than the
+    // ordinary timeout must not lengthen one. The rejection is typed because
+    // the caller that set the deadline has to tell "my budget ran out" (stop the
+    // walk) apart from "the peer is silent" — and it cannot do that by reading
+    // the message text.
+    const { client } = await openLoopback({ timeoutMs: undefined })
+
+    const started = Date.now()
+    const error = (await client
+      .request('echo.never', {}, { timeoutMs: 60_000, deadline: performance.now() + 100 })
+      .catch((reason: unknown) => reason)) as Error
+    const elapsed = Date.now() - started
+
+    expect(error).toBeInstanceOf(RequestTimeoutError)
+    expect((error as RequestTimeoutError).method).toBe('echo.never')
+    // Derived from the budget, never the requested 60 s: the exact value is
+    // `ceil(remaining)`, so it can only be at or just below the 100 ms budget.
+    expect((error as RequestTimeoutError).timeoutMs).toBeGreaterThan(0)
+    expect((error as RequestTimeoutError).timeoutMs).toBeLessThanOrEqual(100)
+    // The flag the deadline-bounded walk switches on: the timeout was SHORTENED
+    // by the budget, so a caller may read the timeout as "my budget ran out".
+    expect((error as RequestTimeoutError).clampedByDeadline).toBe(true)
+    // The message is unchanged: operators and existing reports quote it.
+    expect(error.message).toContain('timed out after')
+    expect(elapsed).toBeLessThan(2_000)
+  }, 20_000)
 
   it('④c (v0.1.3 P3-B4) an un-parameterised client waits 60s — the protocol idleMs — for an answer', async () => {
     // The default is a PROTOCOL decision, not a taste one: a client timeout

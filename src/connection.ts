@@ -4,6 +4,7 @@ import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-t
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
 import { remoteConnectPath } from '@cherrystudio/remote-protocol'
 import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import type { JsonRpcRequestOptions } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { digestIdentity } from './diagnostics.js'
 import {
@@ -135,6 +136,32 @@ export class TransportLostError extends Error {
     this.name = 'TransportLostError'
     this.device = device
     this.state = state
+    this.method = method
+    Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+/**
+ * The caller's DEADLINE ran out while a read was being recovered (issue #21).
+ *
+ * Distinct from {@link TransportLostError}, which says "the link died and I ran
+ * out of patience for a reconnect". This one says something the caller already
+ * knows but must be able to act on: the answer's own time budget is spent, so
+ * no further attempt is worth making. A deadline-bounded walk treats it as a
+ * STOP (return what has been read), while a mere link loss is a failure — and
+ * the two must not be confused, because only one of them has content behind it.
+ *
+ * It is NOT `DeviceUnavailableError` either: the device may be perfectly well
+ * and the budget may have expired in pacing or in a slow peer.
+ */
+export class RpcDeadlineExceededError extends Error {
+  readonly device: string
+  readonly method: string
+
+  constructor(device: string, method: string) {
+    super(`device ${device}: the request deadline passed before "${method}" could be attempted again`)
+    this.name = 'RpcDeadlineExceededError'
+    this.device = device
     this.method = method
     Object.setPrototypeOf(this, new.target.prototype)
   }
@@ -669,7 +696,7 @@ export class DeviceConnection {
   readonly #facade: JsonRpcClient = new Proxy({} as JsonRpcClient, {
     get: (_target, prop) => {
       if (prop === 'request') {
-        return (method: string, params: unknown, opts?: { timeoutMs?: number }) =>
+        return (method: string, params: unknown, opts?: JsonRpcRequestOptions) =>
           this.#businessRequest(method, params, opts)
       }
       if (prop === 'onNotification') {
@@ -1275,8 +1302,32 @@ export class DeviceConnection {
     return link.client.request<T>(method, params, timeoutMs === undefined ? undefined : { timeoutMs })
   }
 
-  /** Business request: offline fail-fast, then rate smoothing, then the rpc window. */
-  async #businessRequest<T>(method: string, params: unknown, opts?: { timeoutMs?: number }): Promise<T> {
+  /**
+   * The remaining time this request may still spend, or undefined when it has no
+   * deadline (issue #21). Recomputed at each point that waits, so pacing and a
+   * reconnect are both charged to the same budget.
+   */
+  #remainingMs(opts: JsonRpcRequestOptions | undefined): number | undefined {
+    return opts?.deadline === undefined ? undefined : opts.deadline - performance.now()
+  }
+
+  /** Whether the caller's deadline has already passed (false without one). */
+  #deadlinePassed(opts: JsonRpcRequestOptions | undefined): boolean {
+    const remaining = this.#remainingMs(opts)
+    return remaining !== undefined && remaining <= 0
+  }
+
+  /**
+   * Business request: offline fail-fast, then rate smoothing, then the rpc window.
+   *
+   * A caller-supplied `deadline` ({@link JsonRpcRequestOptions}) bounds the two
+   * waits this layer owns — the reconnect wait before a replay, and the replay
+   * itself — while the rpc layer bounds the request's own timeout with it. That
+   * is the whole point of the option: without it, a flapping link lets every
+   * read absorb another `transportRetryWaitMs`, so an answer whose deadline
+   * already passed can still take minutes (issue #21).
+   */
+  async #businessRequest<T>(method: string, params: unknown, opts?: JsonRpcRequestOptions): Promise<T> {
     if (this.#state !== 'connected') {
       console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
       throw new DeviceUnavailableError(this.record.deviceId, this.#state)
@@ -1296,6 +1347,11 @@ export class DeviceConnection {
       console.warn(`[cherry-remote] request "${method}" rejected: device ${this.record.deviceId} is ${this.#state}`)
       throw new DeviceUnavailableError(this.record.deviceId, this.#state)
     }
+    // The admission itself costs time (up to a whole rate window), so the
+    // deadline is re-judged after it, and only once the structured state error
+    // above has had its chance to win: issuing here would spend a request whose
+    // answer the caller has no budget left to use.
+    if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method)
     try {
       return await link.client.request<T>(method, params, opts)
     } catch (error) {
@@ -1311,12 +1367,27 @@ export class DeviceConnection {
       // Only a read is replayed (see RETRYABLE_READ_METHODS); only a live
       // lifecycle has a reconnect to wait for.
       if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost
+      // THE RECONNECT WAIT IS PART OF THE CALLER'S BUDGET, not a fixed tax on
+      // top of it: capped by the remaining deadline, and skipped entirely when
+      // nothing is left. `undefined` below then means either "the wait bound
+      // expired" or "the lifecycle moved on"; the remaining budget tells the
+      // two apart, and only the first is the caller's own deadline.
+      const remaining = this.#remainingMs(opts)
+      if (remaining !== undefined && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+      const waitMs =
+        remaining === undefined ? this.#transportRetryWaitMs : Math.min(this.#transportRetryWaitMs, remaining)
+      // The bound LOGGED is the one actually waited for: reporting the configured
+      // allowance while a caller's deadline shortened it would make the operator
+      // read a 5 s wait where there was 200 ms.
       console.warn(
         `[cherry-remote] request "${method}" lost its link in flight (device ${this.record.deviceId}); ` +
-          `waiting up to ${this.#transportRetryWaitMs}ms for a reconnect to replay it`,
+          `waiting up to ${Math.round(waitMs)}ms for a reconnect to replay it`,
       )
-      const reconnected = await this.#awaitReconnect(this.#transportRetryWaitMs, link.client)
-      if (reconnected === undefined) throw lost
+      const reconnected = await this.#awaitReconnect(waitMs, link.client)
+      if (reconnected === undefined) {
+        if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+        throw lost
+      }
       // The link GENERATION the wait resolved on, re-checked before the replay
       // is spent. This is why `#awaitReconnect` returns the epoch at all: a
       // link loss is not a teardown, so a wait parked across one is not
@@ -1340,6 +1411,11 @@ export class DeviceConnection {
       // it disposes the target client, and firing into a disposed client would
       // surface raw disposal text — a verdict the caller cannot act on.
       if (!this.#running || this.#state !== 'connected') throw lost
+      // The replay takes ANOTHER pacing admission, so the budget is judged once
+      // more before it is spent: the reconnect wait may have used the last of
+      // it, and replaying into a spent budget would only produce a timeout the
+      // caller cannot use.
+      if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method)
       try {
         return await reconnected.client.request<T>(method, params, opts)
       } catch (error) {

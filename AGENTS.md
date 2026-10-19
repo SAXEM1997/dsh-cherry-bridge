@@ -356,6 +356,59 @@ verifies every byte it hands back.
   paging at `limit: 1` would spend the page budget on a history a full page
   reaches in dozens.
 
+### Wait answers: one absolute deadline
+
+The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
+timeout and idle faces) runs AFTER — or at the end of — the caller's wait
+window, so the window cannot bound it. It used to have no time bound at all:
+since #12 a read whose link dies waits up to `transportRetryWaitMs` (5 s) for a
+reconnect before replaying, so under a flapping link each of the walk's ~30
+requests could absorb that wait — a 1 s window answering ~150 s later, the shape
+#3 fixed with a message ceiling and a byte budget (issue #21).
+
+- **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
+  clamp(window, WAIT_ANSWER_TAIL_FLOOR_MS, WAIT_ANSWER_TAIL_MS)` — one more
+  window, floored at 1 s (the tool's window has a 1 ms minimum, and a 1 ms
+  budget would return the stub receipt for a reply one round trip away) and
+  capped at 15 s (the largest single item in the walk is one 32 MiB `{ref}` at
+  ~1,365 sequential slices, single-digit seconds on a LAN; the rest of the walk
+  is bounded to 20 messages). It is built on `performance.now()`, the same
+  monotonic clock as the waiter's own deadline.
+- **Every wait is charged to it, where the wait happens.** The rpc layer clamps
+  a request's own timeout to `min(timeoutMs, remaining)` (so a budget farther
+  away never lengthens one, and one stuck request cannot eat a whole answer);
+  the connection caps the reconnect wait by the remaining budget and refuses a
+  replay once it has expired (`RpcDeadlineExceededError`). The walk re-judges
+  the deadline BEFORE every request so a spent budget never spends an admission
+  and a round trip, and between messages so one message's parts walk cannot
+  start with no time left.
+- **A spent budget is a STOP, not a failure.** The message walk, the parts walk
+  and each content slice all stop where they are and report `'deadline'` — the
+  third `truncationReason`, beside `'limit'` and `'aggregate-bytes'` — and the
+  content already read is returned (spec §3.6: a timeout answer exists to hand
+  back partial content). A message whose own parts were cut carries
+  `partsTruncated: 'deadline'` + `incomplete`; a `{ref}` that could not be
+  verified in time is `unavailable` (the degradable class). **Only** the two
+  time-exhaustion classes are converted: a peer refusal, an offline device or an
+  integrity failure after the deadline still surfaces as itself, because
+  reporting it as `'deadline'` would send the caller looking at their own clock.
+- **`clampedByDeadline` is a flag, not a clock test.** A timer may fire a
+  millisecond early, so "has the deadline passed by the time I handle the
+  rejection" is a race; `RequestTimeoutError` records whether its timeout was
+  DERIVED from the deadline, which is a fact about how the error was produced.
+  A plain client timeout (the 60 s default) is not the budget and is not
+  converted.
+- **The snapshot is inside the budget and inside the degrade arm.** Every wait
+  answer starts with `agent.sessions.get` (it carries `historyRevision`). It
+  rides the same deadline, and its failure degrades to the stub receipt
+  (`aggregateError` + `guidance`) exactly like a failed walk — the #3 invariant:
+  a run's verdict and its identifiers survive a content failure. This covers
+  BOTH wait faces; before #21 a dead link there made `cherry_send` reject.
+
+What this is NOT: a global time budget for `cherry_read` or the list tools. They
+have no deadline argument, so nothing above applies to them — their bounds are
+`limit`, the safety breaker and the byte budgets.
+
 ### Stop-point cursors (the teaching case)
 
 `messagesResumeCursor` is a stop point **and** an input: `cherry_read` takes it
@@ -365,7 +418,7 @@ message-walk faces (the read face and the terminal/timeout/idle aggregate)
 derive it from the SAME helper, `messageResumeToken`, so they cannot drift into
 two dialects.
 
-Two `truncationReason` values mean different things:
+Three `truncationReason` values mean different things:
 
 - **`limit`** — the caller's own ceiling was reached with more available. Fix:
   raise `limit`, or resume with the token and keep walking in another answer.
@@ -375,6 +428,11 @@ Two `truncationReason` values mean different things:
   how the older messages are reached; from a resume point `limit` bounds how
   many messages one answer carries, so a long history is walked in successive
   answers, each carrying the next stop point.
+- **`deadline`** — the WAIT ANSWER's own assembly budget ran out (see
+  [Wait answers](#wait-answers-one-absolute-deadline)). Neither the caller nor
+  the peer did anything wrong, so neither raising `limit` nor resuming helps by
+  itself: the content that was read is returned (with the token when one can be
+  named), and the rest is reached with `cherry_read`, which has no deadline.
 
 Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
 `limit`" was a field defect: a caller raised `limit` repeatedly, paid for every
@@ -444,10 +502,13 @@ stop only ever drops **older** messages.
 - **Message-walk truncation** (`truncated` + `truncationReason` +
   `messagesResumeCursor`) drops the **older** messages. It never cuts inside a
   returned message's parts.
-- **Parts-walk truncation** (`partsTruncated: 'safety-bound'` +
-  `partsResumeCursor`, a local circuit breaker at `DEFAULT_PARTS_SAFETY_BOUND` =
-  10,000 — the protocol caps nothing there) drops that one message's **later**
-  parts. Parts are read oldest-first.
+- **Parts-walk truncation** (`partsTruncated` + `partsResumeCursor`) drops that
+  one message's **later** parts; parts are read oldest-first. The reason is
+  `'safety-bound'` for the local circuit breaker at `DEFAULT_PARTS_SAFETY_BOUND`
+  = 10,000 (the protocol caps nothing there) and `'deadline'` when a wait
+  answer's budget cut the walk (see
+  [Wait answers](#wait-answers-one-absolute-deadline)); the parts walk has no
+  byte budget of its own.
 
 A returned message missing its own content carries `incomplete: true`, plus
 `unavailableParts` when parts were unreadable — a content verdict on the
