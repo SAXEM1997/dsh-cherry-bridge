@@ -15,6 +15,7 @@ are process records, and they stay in `docs/superpowers/**` (not published).
 4. [Design decisions and invariants](#design-decisions-and-invariants)
 5. [Upstream references](#upstream-references)
 6. [Release](#release)
+7. [Agent skills](#agent-skills)
 
 ---
 
@@ -993,3 +994,21 @@ Notes on documentary labels: `Task N`, `spec §x`, `controller ruling`,
 process records under `docs/superpowers/**` — **not published** with the package.
 They stay where the rule is, as provenance. `tests/loopback/fakeCherry.ts` is an
 in-test loopback fake peer, not a shipped artifact.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues, via the `gh` CLI (`origin` is a GitLab
+mirror; issues are on GitHub only). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage labels, unchanged from the defaults (`needs-triage`,
+`needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root, both
+created lazily. See `docs/agents/domain.md`.
