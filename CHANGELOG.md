@@ -5,7 +5,12 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
-## Unreleased
+## v0.1.8 (2026-10-20)
+
+The emit-side half of the resume-token story. Every stop point this bridge names
+is now one it will accept back, and the documentation says what a missing token
+actually means. No protocol or wire change — a token issued by v0.1.7 is still
+accepted.
 
 ### Fixed
 
@@ -53,6 +58,19 @@ surface change.
   the table is varied and its non-vacuity is asserted). The `after:` anchor
   deliberately takes only the content one, because that is exactly what its
   parser checks.
+
+### Docs
+
+- **A missing resume token no longer reads as "the history ended"** (#88, #89).
+  The emit-side guards mean a TRUNCATED walk can omit the token while older
+  messages remain unread, and five docblocks, both READMEs and `AGENTS.md` said
+  the opposite (one of them: "absent only when …"). The absence is now stated as
+  two cases distinguished by `truncated`, and the remedy follows the reason
+  rather than a blanket "raise `limit`": a `limit` stop answers to a wider
+  `limit` only where the caller owns that ceiling (`cherry_read`, the four list
+  tools), an `aggregate-bytes` stop is the answer's own output budget, a
+  `safety-bound` stop is the internal circuit breaker, and a wait answer's
+  `limit` or `deadline` stop is continued with `cherry_read`.
 
 ## v0.1.7 (2026-10-19)
 
