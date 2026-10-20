@@ -17,8 +17,8 @@ surface change.
   now enforced on the way OUT as well — the message face's `cursor:` and
   `after:` forms and the list face's `resumeCursor` alike — and an over-long
   stop point is simply not named: `truncated` still says the walk was cut, and
-  the remedy then follows the reason (`limit` widens; `aggregate-bytes` does
-  not move). A token of exactly 4,096 characters is still emitted.
+  the remedy then follows the reason. A token of exactly 4,096 characters is
+  still emitted.
 - **A resume token is never minted from a remainder the same tool refuses**
   (#80). Both parsers reject a remainder `mangledRemainder` calls mangled —
   empty, not equal to its own `.trim()` (leading/trailing whitespace), or
