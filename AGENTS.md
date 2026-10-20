@@ -609,11 +609,15 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   same tool then refuses: the caller holds a token that can never be used, and
   the refusal surfaces at the resume call instead of at the answer that produced
   it. A refused remainder yields no token at all — `truncated` already says the
-  walk was cut, and a wider `limit` is the remedy that works. The message face
-  applies the content rule to the `after:` anchor as well as the `cursor:`
-  position: a message id is an `opaqueId` too, so a padded id is schema-valid and
-  really does reach the anchor arm. The LENGTH ceiling is the sibling guard in
-  the next bullet.
+  walk was cut, and the remedy then follows the REASON rather than the absence:
+  a wider `limit` moves a `'limit'` stop only, an `'aggregate-bytes'` stop is
+  that answer's own output budget (more round trips, same budget), a
+  `'safety-bound'` stop is an internal circuit breaker a caller cannot move, and
+  a `'deadline'` stop — a wait answer's reason — is continued with `cherry_read`,
+  which carries no deadline. The message face applies the content rule to the
+  `after:` anchor as well as the `cursor:` position: a message id is an
+  `opaqueId` too, so a padded id is schema-valid and really does reach the anchor
+  arm. The LENGTH ceiling is the sibling guard in the next bullet.
 - **The ceiling is enforced on the way OUT too — the same refusal in one more
   dimension.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
   over it is one this tool would refuse on replay, and emitting it would hand
@@ -621,12 +625,12 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   token string through `withinResumeTokenCeiling` — the message face's
   `cursor:` and `after:` arms alike, and the list face's encoded token — and
   name nothing when it is over the bound: `truncated` still says the walk was
-  cut, and a wider `limit` is the remedy that works. The comparison is `<=`, so
-  exactly 4,096 characters is still emitted. The guard measures the string it is
-  about to hand out, never a reconstruction of its length, so a format change
-  cannot leave it behind. This is about what the tool ACCEPTS; a well-behaved
-  peer is far below it (the protocol's own `opaqueId` caps a cursor at 256
-  characters).
+  cut, and the remedy follows the reason as set out above. The comparison is
+  `<=`, so exactly 4,096 characters is still emitted. The guard measures the
+  string it is about to hand out, never a reconstruction of its length, so a
+  format change cannot leave it behind. This is about what the tool ACCEPTS; a
+  well-behaved peer is far below it (the protocol's own `opaqueId` caps a cursor
+  at 256 characters).
 - **The `after:` arm's LENGTH case is pinned on the function; its CONTENT case
   runs through the tool.** An anchor is a message ID, and projecting that
   message sends the same id to `agent.parts.list`, whose `messageId` is an
