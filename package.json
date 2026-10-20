@@ -1,6 +1,6 @@
 {
   "name": "dsh-cherry-bridge",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "type": "module",
   "private": false,
   "packageManager": "npm@10.9.9",
