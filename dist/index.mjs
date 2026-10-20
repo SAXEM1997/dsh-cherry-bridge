@@ -7680,9 +7680,11 @@ var CherryToolEngine = class {
 	}
 	/**
 	* The timeout result: NOT a failure. Partial content read so far +, whenever a
-	* stop point can be named honestly, a `messagesResumeCursor` token marking where
-	* the unread history begins — absent when the walk reached the peer's last page
-	* or its last returned message carried no id.
+	* stop point can be named honestly, a `messagesResumeCursor` token marking
+	* where the unread history begins. The token is missing in TWO OPPOSITE cases
+	* — a COMPLETE walk, or a TRUNCATED one whose stop point could not be named —
+	* and `messagesTruncated` is what tells them apart; see
+	* {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*
 	* The spec's own sentence (§3.6, 2026-10-09 design: 「超时不是失败：返回已收到
 	* 的部分内容 + 当前游标，agent 可续查」) is a statement of that contract in
@@ -7909,9 +7911,10 @@ var CherryToolEngine = class {
 	*    `messagesResumeCursor`: the read scans from the newest end to the anchor
 	*    and continues strictly after it.
 	*
-	* The token is absent only when there is nothing older to point at (the walk
-	* reached the peer's last page having returned everything it collected).
-	* See {@link CherryMessageWalkVerdict.messagesResumeCursor}.
+	* The token is missing in TWO OPPOSITE cases — a COMPLETE walk, and a
+	* TRUNCATED one whose stop point could not be named — and `messagesTruncated`
+	* is what tells them apart; absence never means "nothing older left" on its
+	* own. See {@link CherryMessageWalkVerdict.messagesResumeCursor}.
 	*/
 	async #readTerminalMessages(connection, sessionId, session, deadline) {
 		const historyRevision = optionalString(session["historyRevision"]);
@@ -8215,11 +8218,13 @@ function nameablePeerPosition(value) {
 /**
 * The token ceiling, enforced on the way OUT as well as in. A token this tool
 * refuses to replay is worse than no token at all: `truncated` already says the
-* walk was cut and a wider `limit` is the remedy that works, so a stop point
-* whose token would push past {@link MAX_RESUME_TOKEN_CHARS} is simply not
-* named. Measured on the FINAL string, never on a reconstruction of its length,
-* so a format change cannot leave the guard behind. Exactly at the ceiling is
-* accepted — it is a length the parser takes back.
+* walk was cut, and the remedy then follows the reason — a `'limit'` stop
+* answers to a wider `limit` only where the caller owns that ceiling — so a
+* stop point whose token would push past
+* {@link MAX_RESUME_TOKEN_CHARS} is simply not named. Measured on the FINAL
+* string, never on a reconstruction of its length, so a format change cannot
+* leave the guard behind. Exactly at the ceiling is accepted — it is a length
+* the parser takes back.
 */
 function withinResumeTokenCeiling(token) {
 	return token.length <= 4096 ? token : void 0;

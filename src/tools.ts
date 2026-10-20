@@ -391,9 +391,15 @@ export interface CherryReadSnapshot {
    *
    * Present exactly when `truncated` is true and a stop point can be named
    * honestly; because the walk runs newest-first, it marks OLDER messages as
-   * still unread — the only direction a truncation leaves behind. It is ABSENT
-   * when the walk reached the peer's last page having returned everything it
-   * collected: there is nothing older left to name, and no marker is invented.
+   * still unread — the only direction a truncation leaves behind.
+   *
+   * IT IS ABSENT IN TWO OPPOSITE CASES, and `truncated` is what tells them
+   * apart: a COMPLETE walk (`truncated: false` — nothing older left), and a
+   * TRUNCATED walk whose stop point could not be named (`truncated: true` plus
+   * `truncationReason` — older messages still unread). The absence therefore
+   * never means "nothing older left" on its own. WHICH stops can be named is
+   * decided in ONE place ({@link messageResumeToken}); the refusal cases are not
+   * restated here.
    *
    * WHAT REACHES THE UNREAD MESSAGES DEPENDS ON THE REASON. A `'limit'` stop was
    * the caller's own ceiling: raise `limit`, or resume with this token to walk
@@ -403,6 +409,12 @@ export interface CherryReadSnapshot {
    * messages are reached. From the resume point `limit` bounds how many messages
    * ONE answer carries, so a long history is walked in successive answers, each
    * carrying the next stop point.
+   *
+   * WITH NO TOKEN NAMED, the reason is all the caller has: a `'limit'` stop is
+   * still reachable by widening `limit`; a `'safety-bound'` stop is the internal
+   * circuit breaker, which no wider `limit` moves; and an `'aggregate-bytes'`
+   * stop has no remedy in that answer at all — the budget, not the ceiling, is
+   * what stopped it. The loss is stated rather than repaired.
    */
   messagesResumeCursor?: string
 }
@@ -447,10 +459,19 @@ export interface CherryMessageWalkVerdict {
    * `cursor:<peer position>` when the whole collected window was returned;
    * `after:<last returned message id>` when the byte stop happened INSIDE that
    * window, because the peer's position sits past messages this walk trimmed
-   * and `AgentMessage` carries no `createdAt` to synthesise a closer one. The
-   * token is OMITTED when nothing older is left to name (the walk reached the
-   * peer's last page having returned everything it collected) — absence says
-   * "no marker", `messagesTruncated` still says the walk was cut.
+   * and `AgentMessage` carries no `createdAt` to synthesise a closer one.
+   *
+   * IT IS ABSENT IN TWO OPPOSITE CASES, and `messagesTruncated` is what tells
+   * them apart: a COMPLETE walk (`messagesTruncated` absent or false — nothing
+   * older left), and a TRUNCATED walk whose stop point could not be named
+   * (`messagesTruncated: true` plus `messagesTruncationReason` — older history
+   * still unread). The absence never means "nothing older left" on its own.
+   * WHICH stops can be named is decided in ONE place
+   * ({@link messageResumeToken}) and is the same rule as
+   * {@link CherryReadSnapshot.messagesResumeCursor}. THE REMEDY IS NOT THE SAME
+   * ON THIS FACE: a `'limit'` stop here is the walk's own fixed message
+   * allowance — these tools take no `limit` argument — so the way further is
+   * `cherry_read`, which also carries no deadline.
    */
   messagesResumeCursor?: string
 }
@@ -2102,9 +2123,13 @@ class CherryToolEngine {
     // round-trip symmetry (a token a tool emits is a token that tool accepts) is
     // the whole point of the token, so a peer answering `nextCursor: ''`, one
     // carrying whitespace/control characters, or one shaped like our retired v1
-    // token gets NO token; `truncated` still says the walk was cut and a wider
-    // `limit` is the remedy. The rule is NOT restated here or in the message
-    // face: `nameablePeerPosition` is the one place it lives, so the emitters and
+    // token gets NO token. The absence has TWO opposite cases — a COMPLETE walk,
+    // and a TRUNCATED one whose stop could not be named — and only `truncated`
+    // tells them apart. The remedy follows the REASON: a `'limit'` stop answers
+    // to a wider `limit`; a `'safety-bound'` stop does not, because it is an
+    // internal circuit breaker a caller cannot move. The rule is NOT restated
+    // here or in the message face:
+    // `nameablePeerPosition` is the one place it lives, so the emitters and
     // their parsers cannot drift (issue #85).
     const position = nameablePeerPosition(optionalString(page.nextCursor))
     // The same refusal one dimension further: an encoded token over
@@ -5579,9 +5604,11 @@ class CherryToolEngine {
 
   /**
    * The timeout result: NOT a failure. Partial content read so far +, whenever a
-   * stop point can be named honestly, a `messagesResumeCursor` token marking where
-   * the unread history begins — absent when the walk reached the peer's last page
-   * or its last returned message carried no id.
+   * stop point can be named honestly, a `messagesResumeCursor` token marking
+   * where the unread history begins. The token is missing in TWO OPPOSITE cases
+   * — a COMPLETE walk, or a TRUNCATED one whose stop point could not be named —
+   * and `messagesTruncated` is what tells them apart; see
+   * {@link CherryMessageWalkVerdict.messagesResumeCursor}.
    *
    * The spec's own sentence (§3.6, 2026-10-09 design: 「超时不是失败：返回已收到
    * 的部分内容 + 当前游标，agent 可续查」) is a statement of that contract in
@@ -5856,9 +5883,10 @@ class CherryToolEngine {
    *    `messagesResumeCursor`: the read scans from the newest end to the anchor
    *    and continues strictly after it.
    *
-   * The token is absent only when there is nothing older to point at (the walk
-   * reached the peer's last page having returned everything it collected).
-   * See {@link CherryMessageWalkVerdict.messagesResumeCursor}.
+   * The token is missing in TWO OPPOSITE cases — a COMPLETE walk, and a
+   * TRUNCATED one whose stop point could not be named — and `messagesTruncated`
+   * is what tells them apart; absence never means "nothing older left" on its
+   * own. See {@link CherryMessageWalkVerdict.messagesResumeCursor}.
    */
   async #readTerminalMessages(
     connection: DeviceConnection,
@@ -6223,11 +6251,13 @@ function nameablePeerPosition(value: string | undefined): string | undefined {
 /**
  * The token ceiling, enforced on the way OUT as well as in. A token this tool
  * refuses to replay is worse than no token at all: `truncated` already says the
- * walk was cut and a wider `limit` is the remedy that works, so a stop point
- * whose token would push past {@link MAX_RESUME_TOKEN_CHARS} is simply not
- * named. Measured on the FINAL string, never on a reconstruction of its length,
- * so a format change cannot leave the guard behind. Exactly at the ceiling is
- * accepted — it is a length the parser takes back.
+ * walk was cut, and the remedy then follows the reason — a `'limit'` stop
+ * answers to a wider `limit` only where the caller owns that ceiling — so a
+ * stop point whose token would push past
+ * {@link MAX_RESUME_TOKEN_CHARS} is simply not named. Measured on the FINAL
+ * string, never on a reconstruction of its length, so a format change cannot
+ * leave the guard behind. Exactly at the ceiling is accepted — it is a length
+ * the parser takes back.
  */
 function withinResumeTokenCeiling(token: string): string | undefined {
   return token.length <= MAX_RESUME_TOKEN_CHARS ? token : undefined

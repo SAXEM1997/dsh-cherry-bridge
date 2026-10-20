@@ -97,7 +97,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`，后者是 1000 条内部上限）；停点可命名时还给出 `resumeCursor`——用同一 device 与过滤条件把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**，不会转发给对端。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。被截断时必带 `truncated`+`truncationReason`；停点可命名时还给出 `resumeCursor`——用相同过滤条件回传为 `cursor` 即可续读。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`），停点可命名时还给出 `resumeCursor`——用同一 device 与**相同过滤条件**把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**。 |
-| `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算。**被挡下的更旧消息用 `messagesResumeCursor` 续读**：把本次返回的 `messagesResumeCursor` 原样传给下一次调用的 `messagesResumeCursor` 参数即可从停点继续（`limit` 此时约束的是**从停点起**本次最多返回多少条），长历史分几次回答读完。停点不可命名时**没有**这个令牌（`truncated` 仍为 `true`，此时提高 `limit` 才是可用的补救，详见[错误与限制](#错误与限制)）。两种令牌：`cursor:<peer position>`（整窗读完后的 peer 分页位置）与 `after:<messageId>`（停在窗内，续读从最新端扫到该消息、返回它更旧的那些）。不是本工具发出的令牌会被**本地拒绝**（不转发给桌面端——桌面端会静默回退到最新页）；`after:` 锚点在历史里找不到则**报错**，不会返回空结果。 |
+| `cherry_read` | 读会话消息历史快照，**从新到旧**返回（`limit` 丢掉的是**最旧**的消息）。附件 part 只回 `name`/`mediaType`/`byteLength`，`content` 为空——字节不取。被截断时 `truncated` + `truncationReason` 一定说明：`limit` 表示你设的条数到了，提高 `limit` 即可；`aggregate-bytes` 表示单次回答达到了**输出大小上限**——与 `limit` 无关，提高 `limit` 只会多付往返、仍停在同一预算。**被挡下的更旧消息用 `messagesResumeCursor` 续读**：把本次返回的 `messagesResumeCursor` 原样传给下一次调用的 `messagesResumeCursor` 参数即可从停点继续（`limit` 此时约束的是**从停点起**本次最多返回多少条），长历史分几次回答读完。停点不可命名时**没有**这个令牌（`truncated` 仍为 `true`，**缺失本身不代表历史已到底**；补救按 `truncationReason` 分：`limit` 可以提高 `limit`，`aggregate-bytes` 不行——被挡住的旧消息在这一回答里拿不到，详见[错误与限制](#错误与限制)）。两种令牌：`cursor:<peer position>`（整窗读完后的 peer 分页位置）与 `after:<messageId>`（停在窗内，续读从最新端扫到该消息、返回它更旧的那些）。不是本工具发出的令牌会被**本地拒绝**（不转发给桌面端——桌面端会静默回退到最新页）；`after:` 锚点在历史里找不到则**报错**，不会返回空结果。 |
 | `cherry_events` | 读取该会话缓冲区内比 `cursor` 更新的事件，并在投递后 ack。返回 `{events, nextCursor}`；把 `nextCursor` 作为下次的 `cursor` 传回即可续读。 |
 | `cherry_create` | 在 agent 工作区创建会话（工作区选择**必填**；创建后回读身份）。 |
 | `cherry_send` | 向会话发消息，默认等待运行到终态并返回助手文本；`wait: false` 立即返回命令回执。内容被截断时 `messagesTruncated`/`messagesTruncationReason` 说的是**消息**被截断（丢更旧的）；`deadline` 表示**回答自身的装配时限**到了（见下），已读到的内容照常返回。 |
@@ -130,8 +130,13 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 - 历史走查被截断时一定说明（`truncationReason`，`limit` / `aggregate-bytes` / `deadline` 三种含义不同，见上），
   并在停点可命名时给出 `messagesResumeCursor` 续读令牌。**停点不可命名时就不给**：对端位置为空、
   带首尾空白或任意控制字符、形如已停用的 v1 令牌、令牌会超过 4096 字符上限、或没有可当锚点的
-  消息 id——此时 `truncated` 仍为 `true`，提高 `limit` 是可用的补救（wait 类回答被时限截断时则是
-  改用 `cherry_read` 续读）。**两个面是同一条规则**：消息面的 `messagesResumeCursor` 与四个列表工具的
+  消息 id——此时 `truncated` 仍为 `true`，**缺失本身不代表历史已到底**。补救按 `truncationReason`
+  分：`limit` 停点只有在调用方自己握着上限时才靠更宽的 `limit`（`cherry_read` 与四个列表工具）；
+  **wait 类回答的 `limit` 是它自己的固定条数额度**，更旧的历史要用 `cherry_read` 去读。
+  `aggregate-bytes` 停点不行——预算是它停下的原因，更宽的 `limit` 只会多付往返，被挡住的旧消息
+  在这一回答里拿不到；`safety-bound` 停点是内部熔断，调用方动不了它；`deadline`（只出现在 wait
+  类回答）同样改用 `cherry_read` 续读，它没有时限。
+  **两个面是同一条规则**：消息面的 `messagesResumeCursor` 与四个列表工具的
   `resumeCursor` 都只发出本工具会收回的令牌；位置内部的普通空格合法，不会因此被拒。
   某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带 `partsTruncated: "deadline"`）。
 - **等待类回答有自己的装配时限**：`cherry_send(wait: true)` / `cherry_wait` 在窗口结束后仍要读一段历史
