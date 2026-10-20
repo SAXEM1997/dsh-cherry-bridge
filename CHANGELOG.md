@@ -17,8 +17,8 @@ surface change.
   now enforced on the way OUT as well — the message face's `cursor:` and
   `after:` forms and the list face's `resumeCursor` alike — and an over-long
   stop point is simply not named: `truncated` still says the walk was cut, and
-  a wider `limit` is the remedy that works. A token of exactly 4,096
-  characters is still emitted.
+  the remedy then follows the reason (`limit` widens; `aggregate-bytes` does
+  not move). A token of exactly 4,096 characters is still emitted.
 - **A resume token is never minted from a remainder the same tool refuses**
   (#80). Both parsers reject a remainder `mangledRemainder` calls mangled —
   empty, not equal to its own `.trim()` (leading/trailing whitespace), or
@@ -30,8 +30,8 @@ surface change.
   the refusal surfaced at the resume call instead of at the answer that
   produced it. The message face now applies the parser's own predicate to BOTH
   the `cursor:` position and the `after:` anchor, so a mangled remainder yields
-  no token at all — `truncated` still says the walk was cut, and a wider
-  `limit` is the remedy that works. The list face already ran that guard.
+  no token at all — `truncated` still says the walk was cut, and the remedy
+  then follows the reason. The list face already ran that guard.
 - **The tool DESCRIPTIONS no longer promise a resume token unconditionally**
   (#82). They are the contract a model reads, and the four list tools promised
   `resumeCursor` for every truncated answer, while `cherry_read` named the wrong

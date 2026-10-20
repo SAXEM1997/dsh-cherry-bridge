@@ -8218,8 +8218,9 @@ function nameablePeerPosition(value) {
 /**
 * The token ceiling, enforced on the way OUT as well as in. A token this tool
 * refuses to replay is worse than no token at all: `truncated` already says the
-* walk was cut, and the remedy then follows the reason — a wider `limit` moves a
-* `'limit'` stop only — so a stop point whose token would push past
+* walk was cut, and the remedy then follows the reason — a `'limit'` stop
+* answers to a wider `limit` only where the caller owns that ceiling — so a
+* stop point whose token would push past
 * {@link MAX_RESUME_TOKEN_CHARS} is simply not named. Measured on the FINAL
 * string, never on a reconstruction of its length, so a format change cannot
 * leave the guard behind. Exactly at the ceiling is accepted — it is a length
