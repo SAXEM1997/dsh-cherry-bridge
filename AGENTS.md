@@ -610,14 +610,17 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   the refusal surfaces at the resume call instead of at the answer that produced
   it. A refused remainder yields no token at all — `truncated` already says the
   walk was cut, and the remedy then follows the REASON rather than the absence:
-  a wider `limit` moves a `'limit'` stop only, an `'aggregate-bytes'` stop is
-  that answer's own output budget (more round trips, same budget), a
-  `'safety-bound'` stop is an internal circuit breaker a caller cannot move, and
-  a `'deadline'` stop — a wait answer's reason — is continued with `cherry_read`,
-  which carries no deadline. The message face applies the content rule to the
-  `after:` anchor as well as the `cursor:` position: a message id is an
-  `opaqueId` too, so a padded id is schema-valid and really does reach the anchor
-  arm. The LENGTH ceiling is the sibling guard in the next bullet.
+  a `'limit'` stop answers to a wider `limit` only where the caller owns that
+  ceiling (`cherry_read` and the four list tools — a WAIT answer's `'limit'` is
+  its own fixed message allowance, so `cherry_read` is the way further), an
+  `'aggregate-bytes'` stop is that answer's own output budget (more round trips,
+  same budget), a `'safety-bound'` stop is an internal circuit breaker a caller
+  cannot move, and a `'deadline'` stop — a wait answer's reason — is continued
+  with `cherry_read`, which carries no deadline. The message face applies the
+  content rule to the `after:` anchor as well as the `cursor:` position: a
+  message id is an `opaqueId` too, so a padded id is schema-valid and really does
+  reach the anchor arm. The LENGTH ceiling is the sibling guard in the next
+  bullet.
 - **The ceiling is enforced on the way OUT too — the same refusal in one more
   dimension.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
   over it is one this tool would refuse on replay, and emitting it would hand

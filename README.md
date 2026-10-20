@@ -131,9 +131,11 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   并在停点可命名时给出 `messagesResumeCursor` 续读令牌。**停点不可命名时就不给**：对端位置为空、
   带首尾空白或任意控制字符、形如已停用的 v1 令牌、令牌会超过 4096 字符上限、或没有可当锚点的
   消息 id——此时 `truncated` 仍为 `true`，**缺失本身不代表历史已到底**。补救按 `truncationReason`
-  分：`limit` 停点可以靠更宽的 `limit`；`aggregate-bytes` 停点不行——预算是它停下的原因，更宽的
-  `limit` 只会多付往返，被挡住的旧消息在这一回答里拿不到；`safety-bound` 停点是内部熔断，调用方
-  动不了它；`deadline`（只出现在 wait 类回答）改用 `cherry_read` 续读，它没有时限。
+  分：`limit` 停点只有在调用方自己握着上限时才靠更宽的 `limit`（`cherry_read` 与四个列表工具）；
+  **wait 类回答的 `limit` 是它自己的固定条数额度**，更旧的历史要用 `cherry_read` 去读。
+  `aggregate-bytes` 停点不行——预算是它停下的原因，更宽的 `limit` 只会多付往返，被挡住的旧消息
+  在这一回答里拿不到；`safety-bound` 停点是内部熔断，调用方动不了它；`deadline`（只出现在 wait
+  类回答）同样改用 `cherry_read` 续读，它没有时限。
   **两个面是同一条规则**：消息面的 `messagesResumeCursor` 与四个列表工具的
   `resumeCursor` 都只发出本工具会收回的令牌；位置内部的普通空格合法，不会因此被拒。
   某条消息自身 parts 没读全时带 `incomplete: true`（wait 类回答里被时限截断的那条消息会带 `partsTruncated: "deadline"`）。

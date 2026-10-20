@@ -157,10 +157,13 @@ subscription was lost and could not be rebuilt, so the outcome is
   looks like a retired v1 token, the token would exceed the 4,096-character
   ceiling, or there is no message id to anchor on. The absence does **not** mean
   the history ended (`truncated` stays `true`); the remedy follows the reason —
-  a `limit` stop answers to a wider `limit`, an `aggregate-bytes` stop does not
-  (nothing reaches past it in that answer), a `safety-bound` stop is an internal
-  circuit breaker no caller can move, and a wait answer cut by its deadline is
-  continued with `cherry_read`. **Both faces obey one rule**:
+  a `limit` stop answers to a wider `limit` only where the caller owns that
+  ceiling (`cherry_read` and the four list tools; a **wait answer's** `limit` is
+  its own fixed allowance, so read further with `cherry_read`), an
+  `aggregate-bytes` stop does not (nothing reaches past it in that answer), a
+  `safety-bound` stop is an internal circuit breaker no caller can move, and a
+  wait answer cut by its deadline is continued with `cherry_read`, which carries
+  no deadline. **Both faces obey one rule**:
   the message face's `messagesResumeCursor` and the four list tools'
   `resumeCursor` are emitted only when this tool would accept them back; an
   interior plain space is legal and is not a reason to withhold one.

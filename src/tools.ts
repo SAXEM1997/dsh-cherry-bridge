@@ -411,9 +411,10 @@ export interface CherryReadSnapshot {
    * carrying the next stop point.
    *
    * WITH NO TOKEN NAMED, the reason is all the caller has: a `'limit'` stop is
-   * still reachable by widening `limit`, while an `'aggregate-bytes'` stop has no
-   * remedy in that answer — the budget, not the ceiling, is what stopped it, so
-   * the loss is stated rather than repaired.
+   * still reachable by widening `limit`; a `'safety-bound'` stop is the internal
+   * circuit breaker, which no wider `limit` moves; and an `'aggregate-bytes'`
+   * stop has no remedy in that answer at all — the budget, not the ceiling, is
+   * what stopped it. The loss is stated rather than repaired.
    */
   messagesResumeCursor?: string
 }
@@ -467,8 +468,10 @@ export interface CherryMessageWalkVerdict {
    * still unread). The absence never means "nothing older left" on its own.
    * WHICH stops can be named is decided in ONE place
    * ({@link messageResumeToken}) and is the same rule as
-   * {@link CherryReadSnapshot.messagesResumeCursor}, which also says what
-   * reaches the unread messages when no token exists.
+   * {@link CherryReadSnapshot.messagesResumeCursor}. THE REMEDY IS NOT THE SAME
+   * ON THIS FACE: a `'limit'` stop here is the walk's own fixed message
+   * allowance — these tools take no `limit` argument — so the way further is
+   * `cherry_read`, which also carries no deadline.
    */
   messagesResumeCursor?: string
 }
@@ -2120,11 +2123,12 @@ class CherryToolEngine {
     // round-trip symmetry (a token a tool emits is a token that tool accepts) is
     // the whole point of the token, so a peer answering `nextCursor: ''`, one
     // carrying whitespace/control characters, or one shaped like our retired v1
-    // token gets NO token. The absence never means the walk was complete
-    // (`truncated` still says it was cut) and the remedy follows the REASON: a
-    // `'limit'` stop answers to a wider `limit`; a `'safety-bound'` stop does
-    // not, because it is an internal circuit breaker a caller cannot move. The
-    // rule is NOT restated here or in the message face:
+    // token gets NO token. The absence has TWO opposite cases — a COMPLETE walk,
+    // and a TRUNCATED one whose stop could not be named — and only `truncated`
+    // tells them apart. The remedy follows the REASON: a `'limit'` stop answers
+    // to a wider `limit`; a `'safety-bound'` stop does not, because it is an
+    // internal circuit breaker a caller cannot move. The rule is NOT restated
+    // here or in the message face:
     // `nameablePeerPosition` is the one place it lives, so the emitters and
     // their parsers cannot drift (issue #85).
     const position = nameablePeerPosition(optionalString(page.nextCursor))

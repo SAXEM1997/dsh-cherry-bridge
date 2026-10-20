@@ -2485,7 +2485,8 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
     rig.fake.scriptListPages('agent.agents.list', [{ items: agents.slice(0, 2), nextCursor: overLong }])
     // `parseListResumeCursor` refuses this token by its length, so naming it would
     // hand the caller a stop point no replay can use. No token; `truncated` still
-    // says the walk was cut and a wider `limit` is the remedy that works.
+    // says the walk was cut, and — this being a `'limit'` stop on a list tool —
+    // a wider `limit` is the remedy.
     const cut = (await rig.call('cherry_agents', { device: 'dev-A', limit: 2 })) as ListPage
     expect(cut.truncated).toBe(true)
     expect(cut.resumeCursor).toBeUndefined()
