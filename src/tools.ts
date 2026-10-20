@@ -2600,10 +2600,13 @@ class CherryToolEngine {
       // Only a TRUNCATED walk has unread history, and the token then marks the
       // stop point (OLDER messages remain unread) —
       // {@link CherryReadSnapshot.messagesResumeCursor}. Whether that stop can
-      // be NAMED is not the walk's verdict: it depends on the peer's payload and
-      // is decided in ONE place ({@link messageResumeToken}, through
-      // {@link nameablePeerPosition}), so the cases are not enumerated again
-      // here.
+      // be NAMED is not the walk's verdict: it depends on the peer's payload,
+      // and {@link messageResumeToken} is the ONE place that judges it — content
+      // through `nameableRemainder`, length through `withinResumeTokenCeiling`,
+      // and, for a POSITION only, the retired-v1 check
+      // ({@link nameablePeerPosition}; the anchor arm deliberately skips it,
+      // exactly as `parseMessageResume`'s `after:` branch does). The refusal
+      // cases are therefore not enumerated again here.
       //
       // The key is OMITTED rather than emitted `undefined`, and its absence only
       // means something once read together with `truncated`: the two cases have
@@ -2611,12 +2614,15 @@ class CherryToolEngine {
       //
       //  - a COMPLETE walk (nothing older left): `truncated: false`, no token —
       //    the absence really does say "nothing older left";
-      //  - a TRUNCATED walk whose stop point cannot be named — an empty or
-      //    malformed position, a token past the length ceiling, a retired-v1
-      //    shape, no message id to anchor — `truncated: true` plus a
-      //    `truncationReason`, no token: OLDER MESSAGES REMAIN UNREAD, and the
-      //    remedy is a wider `limit`, or `cherry_read` (which has no deadline)
-      //    for a `deadline` stop — never "you reached the end".
+      //  - a TRUNCATED walk whose stop point cannot be named: `truncated: true`
+      //    plus a `truncationReason`, no token — OLDER MESSAGES REMAIN UNREAD,
+      //    and the absence never means they ran out. The remedy follows the
+      //    REASON: only a `limit` stop answers to a wider `limit`; a
+      //    `safety-bound` stop is the local page breaker, and an
+      //    `aggregate-bytes` stop is this answer's own output budget, which a
+      //    wider `limit` does not move (more round trips, same budget). A
+      //    `deadline` stop is a WAIT face's reason — `cherry_read` carries no
+      //    deadline — so it is never this literal's.
       ...(truncated && resumeToken !== undefined ? { messagesResumeCursor: resumeToken } : {}),
     }
   }
