@@ -2618,7 +2618,7 @@ class CherryToolEngine {
       //    plus a `truncationReason`, no token — OLDER MESSAGES REMAIN UNREAD,
       //    and the absence never means they ran out. The remedy follows the
       //    REASON: only a `limit` stop answers to a wider `limit`; a
-      //    `safety-bound` stop is the local page breaker, and an
+      //    `safety-bound` stop is the internal circuit breaker, and an
       //    `aggregate-bytes` stop is this answer's own output budget, which a
       //    wider `limit` does not move (more round trips, same budget). A
       //    `deadline` stop is a WAIT face's reason — `cherry_read` carries no
