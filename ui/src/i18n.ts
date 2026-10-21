@@ -210,7 +210,7 @@ const zh: Dict = {
  */
 const en: Dict = {
   // -- app shell ------------------------------------------------------------
-  'app.title': 'Cherry Studio Bridge',
+  'app.title': 'Cherry Bridge',
   'app.subtitle':
     'Connect this machine’s DeepSeek Harness to a Cherry Studio desktop over the remote transport. Device records live in the plugin data directory; this page never touches a credential.',
   'app.eventSourceUnavailable': 'EventSource is unavailable in this environment',
