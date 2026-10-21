@@ -137,7 +137,7 @@ describe('the dictionaries are structurally aligned', () => {
     // `app.title` is the plugin's name in BOTH the nav label and the page
     // heading; the English half was chosen with the user ("bridge那个吧").
     expect(zh['app.title']).toBe('Cherry 互联')
-    expect(en['app.title']).toBe('Cherry Studio Bridge')
+    expect(en['app.title']).toBe('Cherry Bridge')
     // The one English string that used to sit inside a Chinese page: adopted as
     // a key rather than left as a literal.
     expect(zh['app.eventSourceUnavailable']).toBe('此环境不支持 EventSource')
@@ -148,7 +148,7 @@ describe('the dictionaries are structurally aligned', () => {
 describe('createTranslator', () => {
   it('reads the active locale dictionary', () => {
     expect(createTranslator('zh')('app.title')).toBe('Cherry 互联')
-    expect(createTranslator('en')('app.title')).toBe('Cherry Studio Bridge')
+    expect(createTranslator('en')('app.title')).toBe('Cherry Bridge')
   })
 
   it('substitutes {name} params, stringifying numbers', () => {

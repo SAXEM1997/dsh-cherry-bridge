@@ -160,7 +160,7 @@ describe('locale/*.json structure', () => {
     // `app.title` is the ONE value that silently degrades to the package name.
     expect(metaOf('en').title).toBe(dictionaries.en['app.title'])
     expect(metaOf('zh').title).toBe(dictionaries.zh['app.title'])
-    expect(metaOf('en').title).toBe('Cherry Studio Bridge')
+    expect(metaOf('en').title).toBe('Cherry Bridge')
     expect(metaOf('zh').title).toBe('Cherry 互联')
     // The English description is the manifest's own, verbatim.
     expect(metaOf('en').description).toBe(pkg.description)
