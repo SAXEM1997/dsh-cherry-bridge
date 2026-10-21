@@ -81,6 +81,24 @@ export const DEFAULT_CONTENT_READ_BUDGET_PER_SECOND = 256
  */
 export const DEFAULT_TRANSPORT_RETRY_WAIT_MS = 5_000
 
+/**
+ * How long a DEVICE TOOL waits for an establishment attempt that is already in
+ * flight (`state === 'connecting'`) before judging the device.
+ *
+ * WHY THIS EXISTS: the connection pool builds a `DeviceConnection` on FIRST
+ * TOUCH and that constructor dials immediately, so every tool called in the
+ * same tick as the first touch — and every tool called during a reconnect —
+ * observed `connecting` and answered `device-unavailable` about a connection
+ * that comes up a moment later. The state is a transient, not a verdict.
+ *
+ * It is deliberately NOT a reconnect budget: an `offline` device is parked in
+ * its backoff, where waiting cannot change anything, so the tools answer at
+ * once. Five seconds is ~15x a LAN dial plus handshake; a bound longer than
+ * that only delays the unavoidable answer, and the tool call is the caller's
+ * unit of patience.
+ */
+export const DEVICE_SETTLE_WAIT_MS = 5_000
+
 /** 2 MiB of event text cached per session (spec §3.5). */
 export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 

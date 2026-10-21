@@ -222,6 +222,24 @@ These are load-bearing; the code comments are the long version.
   the original receipt. Only the same id with a *different* body is an
   idempotency conflict.
 
+### The `connecting` window: waited out, then judged
+
+- The pool builds a `DeviceConnection` on **first touch** and dials it at once
+  (`connectionFor`), so a tool called in the same tick — or during a reconnect —
+  observes `connecting`: **an attempt in flight, not a verdict**. It used to be
+  answered `device-unavailable` about a connection that came up a moment later.
+- `#resolve` (the eleven device tools; `cherry_devices` and `cherry_unpair` take
+  their own paths) and `cherry_devices`' rows wait for that
+  attempt, bounded by `DEVICE_SETTLE_WAIT_MS` = 5 s: the wait ends on the first
+  transition out of `connecting`, or on the bound with the state it finds, so the
+  error face is the same — just later, after the attempt had its chance. It
+  precedes a wait answer's `AssemblyDeadline`, so it is outside that window.
+- **Only `connecting` is waited on.** `offline` (parked in backoff), `disabled`
+  and `identity-mismatch` answer at once: no wait can change them, and a
+  powered-off desktop would pay the bound on every call. Nothing here starts a
+  dial — the pool already did — so tools still never dial implicitly; kicking a
+  device out of backoff is separate work.
+
 ### Memory: 32 MiB per ref, ~3× assembly, 4 refs at once
 
 - `MAX_EXTERNALIZED_BYTES` = 32 MiB caps **one `{ref}`**, the same ceiling the

@@ -114,6 +114,12 @@ interface RigOptions {
   connection?: { rateBudgetPerSecond?: number; rpcTimeoutMs?: number }
   /** Skip `connect()` so the device stays offline (the §6 offline face). */
   skipConnect?: boolean
+  /**
+   * How long a device tool waits for an IN-FLIGHT (`connecting`) attempt before
+   * judging the device. Production omits it (the 5 s default); the tests drive it
+   * down so the bounded-wait case needs no real 5 s.
+   */
+  deviceSettleWaitMs?: number
   /** Local policy knobs (e.g. a low parts circuit-breaker) for the engine. */
   engine?: CherryToolEngineOptions
 }
@@ -181,6 +187,7 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     evict: () => {
       throw new Error('the read-only suite never evicts')
     },
+    ...(rigOptions.deviceSettleWaitMs === undefined ? {} : { deviceSettleWaitMs: rigOptions.deviceSettleWaitMs }),
   }
   registerCherryTools(ctx, deps, rigOptions.engine ?? {})
 
@@ -1408,6 +1415,43 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(error).toBeInstanceOf(DeviceUnavailableError)
     expect(error).toMatchObject({ device: 'dev-A', state: 'offline' })
     expect(rig.fake.socketCount).toBe(0)
+  })
+
+  // The pool creates a connection on FIRST TOUCH and dials immediately, so a
+  // tool called in the same tick always observes `connecting`. That state is a
+  // TRANSIENT, not a verdict (issue #99): the call waits for the attempt that is
+  // already in flight instead of refusing a connection that is up a moment
+  // later. The peer delays every request, so the window is wide enough to hit.
+  it('⑥g a device caught MID-DIAL is waited for: the call answers once the attempt settles', async () => {
+    const rig = await makeRig({ requestDelayMs: 100 }, { skipConnect: true, deviceSettleWaitMs: 2_000 })
+    void rig.connectDevice('dev-A').catch(() => {})
+    // `connect()` sets `connecting` before it yields (the dial is its first
+    // await), so this call cannot race the transition it is testing.
+    expect(await rig.call('cherry_agents', { device: 'dev-A' })).toMatchObject({ items: [] })
+  })
+
+  it('⑥h the wait is BOUNDED: an attempt that outlives it still reports `connecting`', async () => {
+    // A handshake the peer never finishes before the bound: the tool must not
+    // turn the wait into an unbounded park. The injected 100 ms (not the 5 s
+    // production default) is what keeps this test fast.
+    const rig = await makeRig({ handshakeDelayMs: 5_000 }, { skipConnect: true, deviceSettleWaitMs: 100 })
+    void rig.connectDevice('dev-A').catch(() => {})
+    const started = Date.now()
+    const error = await rig
+      .call('cherry_agents', { device: 'dev-A' })
+      .then(() => undefined, (thrown: unknown) => thrown)
+    expect(error).toBeInstanceOf(DeviceUnavailableError)
+    expect(error).toMatchObject({ device: 'dev-A', state: 'connecting' })
+    expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  it('⑥i `cherry_devices` waits out the same window, so the first row is not `connecting`', async () => {
+    const rig = await makeRig({ requestDelayMs: 100 }, { skipConnect: true, deviceSettleWaitMs: 2_000 })
+    void rig.connectDevice('dev-A').catch(() => {})
+    const answer = (await rig.call('cherry_devices', {})) as {
+      devices: Array<{ deviceId: string; state: string }>
+    }
+    expect(answer.devices[0]).toMatchObject({ deviceId: 'dev-A', state: 'connected' })
   })
 
   it('⑦a a REVISION_EXPIRED on the baseline re-pulls sessions.get → messages.list and retries the whole round once', async () => {

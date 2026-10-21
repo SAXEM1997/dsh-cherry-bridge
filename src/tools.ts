@@ -4,6 +4,7 @@ import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
 import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import {
+  DEVICE_SETTLE_WAIT_MS,
   INTERACTIONS_LIST_PAGE_CLAMP,
   LIST_PAGE_CLAMP,
   MAX_RESUME_TOKEN_CHARS,
@@ -1030,6 +1031,14 @@ export interface CherryToolsDeps {
    * this one subscribes the engine to ONE device's transitions.
    */
   watchDeviceState?: (deviceId: string, cb: (state: DeviceState) => void) => void
+  /**
+   * How long a device tool waits for an establishment attempt that is ALREADY
+   * IN FLIGHT (`state === 'connecting'`) before judging the device (issue #99).
+   *
+   * OPTIONAL: production omits it and takes {@link DEVICE_SETTLE_WAIT_MS}; test
+   * rigs drive it down so the bounded case needs no real five seconds.
+   */
+  deviceSettleWaitMs?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -1617,10 +1626,14 @@ class CherryToolEngine {
    * ⑤): the candidate list is the answer. A MISS is a verdict too — see
    * {@link CherryDeviceNotFound} — and it carries the ids the caller could have
    * meant so the answer stays actionable.
+   *
+   * ASYNC because of the `connecting` wait below: the pool dials on first touch
+   * and on every reconnect, so a tool called in that window used to be refused
+   * for a connection that comes up a moment later (issue #99).
    */
-  #resolve(
+  async #resolve(
     device: string,
-  ): ResolvedDevice | CherryAmbiguousDevice | CherryDeviceNotFound | CherryDeviceUnavailable {
+  ): Promise<ResolvedDevice | CherryAmbiguousDevice | CherryDeviceNotFound | CherryDeviceUnavailable> {
     const resolution: DeviceResolution = this.#deps.store.resolve(device)
     if ('ambiguous' in resolution) {
       return { error: 'ambiguous-device', device, candidates: resolution.ambiguous }
@@ -1634,10 +1647,21 @@ class CherryToolEngine {
     // transition this exists for can land while the device is already offline,
     // and the watch must be in place from the first call either way.
     this.#watchConnection(resolution.deviceId, connection)
-    if (connection.state !== 'connected') {
+    // `connecting` is an attempt IN FLIGHT, not a verdict (issue #99): the pool
+    // dials on first touch and on every reconnect, so refusing here used to
+    // report a failure about a connection that comes up a moment later. Wait for
+    // that attempt — bounded, and never starting one — then judge the state it
+    // settled on. Every other non-connected state is answered at once: no wait
+    // can change `offline` (parked in backoff), `disabled` or
+    // `identity-mismatch`, and waiting would only delay the answer.
+    const state =
+      connection.state === 'connecting'
+        ? await connection.waitForSettled(this.#deps.deviceSettleWaitMs ?? DEVICE_SETTLE_WAIT_MS)
+        : connection.state
+    if (state !== 'connected') {
       // The established Task 5 shape: the tool never dials implicitly, and the
       // caller gets the same `{device, state}` verdict the RPC layer throws.
-      return { error: 'device-unavailable', device: resolution.deviceId, state: connection.state }
+      return { error: 'device-unavailable', device: resolution.deviceId, state }
     }
     return { record: resolution, connection }
   }
@@ -1675,6 +1699,10 @@ class CherryToolEngine {
   /**
    * Resolve-or-verdict: every non-`cherry_devices` tool needs a live link.
    *
+   * `connecting` is waited out inside {@link #resolve} first, so the
+   * `DeviceUnavailableError` below is only ever raised for a state the wait
+   * could not improve on (bounded by `deviceSettleWaitMs`).
+   *
    * The failure faces are deliberately DIFFERENT (controller ruling ⑤): an
    * ambiguous selector and a MISS are ANSWERS — the candidate list, or the
    * known ids, returned in band, because the caller can act on them — while a
@@ -1687,8 +1715,8 @@ class CherryToolEngine {
    * `cherry_devices` does not come through this method — it goes through
    * {@link #selectRecords}, which returns the verdict in band.
    */
-  #requireConnection(device: string): ResolvedDevice | CherryAmbiguousDevice {
-    const resolved = this.#resolve(device)
+  async #requireConnection(device: string): Promise<ResolvedDevice | CherryAmbiguousDevice> {
+    const resolved = await this.#resolve(device)
     if (!this.#isVerdict(resolved)) return resolved
     if (resolved.error === 'ambiguous-device') return resolved
     if (resolved.error === 'not-found') {
@@ -1710,14 +1738,13 @@ class CherryToolEngine {
    * replace it with a weaker, wrong one — a miss under a READ-ONLY archive
    * would describe a store that still holds a valid token as "no such device".
    */
-  #linkOr(
-    device: string,
-  ):
+  async #linkOr(device: string): Promise<
     | { link: ResolvedDevice; verdict?: undefined }
-    | { link?: undefined; verdict: CherryAmbiguousDevice | CherryArchiveQuarantined } {
+    | { link?: undefined; verdict: CherryAmbiguousDevice | CherryArchiveQuarantined }
+  > {
     const quarantined = this.#quarantineVerdict()
     if (quarantined !== undefined) return { verdict: quarantined }
-    const resolved = this.#requireConnection(device)
+    const resolved = await this.#requireConnection(device)
     if ('error' in resolved) return { verdict: resolved }
     return { link: resolved }
   }
@@ -2172,11 +2199,12 @@ class CherryToolEngine {
         const quarantined = this.#quarantineVerdict()
         if (quarantined !== undefined) return quarantined
         if (selector === undefined) {
-          return { devices: this.#deps.store.list().map((record) => this.#deviceView(record)) }
+          const records = this.#deps.store.list()
+          return { devices: await Promise.all(records.map((record) => this.#deviceView(record))) }
         }
         const selected = this.#selectRecords(selector)
         if (!Array.isArray(selected)) return selected
-        return { devices: selected.map((record) => this.#deviceView(record)) }
+        return { devices: await Promise.all(selected.map((record) => this.#deviceView(record))) }
       },
     })
   }
@@ -2208,7 +2236,9 @@ class CherryToolEngine {
   }
 
   /**
-   * One device's view WITHOUT dialing.
+   * One device's view WITHOUT dialing — but after waiting out an attempt that is
+   * already in flight, exactly as {@link #resolve} does, so a cold-start row
+   * does not present a transient `connecting` as the device's answer.
    *
    * A disabled record is authoritative: the pooled connection is constructed
    * with its own `record.enabled` snapshot and reports `disabled` only once
@@ -2216,11 +2246,18 @@ class CherryToolEngine {
    * for a device whose connection was never started. Everything else falls back
    * to the connection's own CLOSED state set.
    */
-  #deviceView(record: DeviceRecord): CherryDeviceView {
+  async #deviceView(record: DeviceRecord): Promise<CherryDeviceView> {
     let state: DeviceState = record.enabled ? 'offline' : 'disabled'
     if (record.enabled) {
       try {
-        state = this.#deps.connect(record.deviceId).state
+        const connection = this.#deps.connect(record.deviceId)
+        // Same transient as {@link #resolve} (issue #99): a row rendered while
+        // the first dial is in flight must not present `connecting` as the
+        // device's answer. Bounded, and only for an attempt already running.
+        state =
+          connection.state === 'connecting'
+            ? await connection.waitForSettled(this.#deps.deviceSettleWaitMs ?? DEVICE_SETTLE_WAIT_MS)
+            : connection.state
       } catch (error) {
         // A device that cannot even be resolved to a connection still deserves a
         // truthful row; `offline` is the fallback verdict.
@@ -2268,7 +2305,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const binding: ListResumeBinding = { method: 'agent.agents.list', deviceId: record.deviceId, params: {} }
@@ -2312,7 +2349,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const agentId = requiredString(args, 'agentId')
@@ -2367,7 +2404,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const agentId = optionalString(args['agentId'])
@@ -2466,7 +2503,7 @@ class CherryToolEngine {
         // a malformed cursor, which would present the newest page again as
         // "continued history" — the refusal has to be ours.
         const resume = parseMessageResume(args['messagesResumeCursor'])
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
@@ -3201,7 +3238,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
@@ -3319,7 +3356,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
 
@@ -3440,7 +3477,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
@@ -3671,7 +3708,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
@@ -3835,7 +3872,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
@@ -3945,7 +3982,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
@@ -4051,7 +4088,7 @@ class CherryToolEngine {
         additionalProperties: false,
       },
       execute: async (args) => {
-        const resolved = this.#linkOr(requiredString(args, 'device'))
+        const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
