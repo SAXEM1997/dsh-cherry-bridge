@@ -57,7 +57,7 @@ export const LOCALE_IDS: readonly LocaleId[] = ['zh', 'en']
  */
 const zh: Dict = {
   // -- app shell ------------------------------------------------------------
-  'app.title': 'Cherry Studio 互联',
+  'app.title': 'Cherry 互联',
   'app.subtitle':
     '通过远程传输把本机 DeepSeek Harness 连接到 Cherry Studio 桌面端；设备档案保存在插件数据目录，页面不接触任何凭据。',
   // The one string that used to reach a Chinese page in English (App.tsx's

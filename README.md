@@ -159,7 +159,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 ## 设置页与启用范围
 
 插件同时是 **web client bundle**（`package.json` 的 `dsh.client`，导出 `./client`），通过
-`settings.section` 槽位注册 **`cherry-remote`**（导航标签「Cherry Studio 互联」）页面：
+`settings.section` 槽位注册 **`cherry-remote`**（导航标签「Cherry 互联」）页面：
 设备卡片（启用/停用/删除）、配对向导（粘贴 → 6 位验证码 → 终态）、启用范围面板，以及经
 `/cherry-remote/api/events` SSE 推送的实时状态。
 
