@@ -839,7 +839,7 @@ describe('settings page registration', () => {
     expect(registration?.options.id).toBe(SETTINGS_NAMESPACE)
     expect(typeof registration?.options.order).toBe('number')
     // The label is a callback so the shell can re-resolve it on a locale change.
-    expect(registration?.options.label()).toBe('Cherry Studio 互联')
+    expect(registration?.options.label()).toBe('Cherry 互联')
     // Localization is NOT a second registration path: the host locale is read
     // through `ctx.get`, so no `locale` field may appear on the entry.
     expect(Object.keys(registration?.options ?? {})).not.toContain('locale')
@@ -868,7 +868,7 @@ describe('settings page registration', () => {
     render(createElement(Section as ComponentType))
 
     // The page the shell would show is this plugin's settings view.
-    expect(screen.getByText('Cherry Studio 互联')).toBeTruthy()
+    expect(screen.getByText('Cherry 互联')).toBeTruthy()
     expect(screen.getByLabelText('配对信息')).toBeTruthy()
     // Fourth DIRECT render path: the scope panel read its `/scope` answer through
     // the same harness (this is the component the shell renders, so it is the

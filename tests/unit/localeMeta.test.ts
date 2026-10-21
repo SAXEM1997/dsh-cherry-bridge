@@ -161,7 +161,7 @@ describe('locale/*.json structure', () => {
     expect(metaOf('en').title).toBe(dictionaries.en['app.title'])
     expect(metaOf('zh').title).toBe(dictionaries.zh['app.title'])
     expect(metaOf('en').title).toBe('Cherry Studio Bridge')
-    expect(metaOf('zh').title).toBe('Cherry Studio 互联')
+    expect(metaOf('zh').title).toBe('Cherry 互联')
     // The English description is the manifest's own, verbatim.
     expect(metaOf('en').description).toBe(pkg.description)
     expect(metaOf('zh').description).toBe(
