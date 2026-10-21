@@ -224,11 +224,12 @@ These are load-bearing; the code comments are the long version.
 
 ### The `connecting` window: waited out, then judged
 
-- The pool builds a `DeviceConnection` on **first touch** and its constructor
-  dials immediately, so a tool called in the same tick — or during a reconnect —
+- The pool builds a `DeviceConnection` on **first touch** and dials it at once
+  (`connectionFor`), so a tool called in the same tick — or during a reconnect —
   observes `connecting`: **an attempt in flight, not a verdict**. It used to be
   answered `device-unavailable` about a connection that came up a moment later.
-- `#resolve` (the twelve device tools) and `cherry_devices`' rows wait for that
+- `#resolve` (the eleven device tools; `cherry_devices` and `cherry_unpair` take
+  their own paths) and `cherry_devices`' rows wait for that
   attempt, bounded by `DEVICE_SETTLE_WAIT_MS` = 5 s: the wait ends on the first
   transition out of `connecting`, or on the bound with the state it finds, so the
   error face is the same — just later, after the attempt had its chance. It
