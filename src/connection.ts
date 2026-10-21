@@ -628,6 +628,13 @@ export class DeviceConnection {
   readonly #transportRetryWaitMs: number
   readonly #stateListeners = new Set<(state: DeviceState) => void>()
   /**
+   * Callers parked in {@link waitForSettled}. Separate from the state listeners
+   * because their lifetime is ONE wait: a listener stays for the lifecycle, a
+   * settle waiter removes itself the moment it is answered (or times out), and
+   * mixing them would leave every answered wait in the multicast set.
+   */
+  readonly #settleWaiters = new Set<(state: DeviceState) => void>()
+  /**
    * Waits parked inside `#awaitReconnect`. close() drains them: a shutdown has
    * no reconnect to wait for, and — the case that matters — a close() followed
    * by a fresh connect() must not let an OLD lifecycle's replay ride the new
@@ -781,6 +788,53 @@ export class DeviceConnection {
    */
   onState(cb: (state: DeviceState) => void): void {
     this.#stateListeners.add(cb)
+  }
+
+  /**
+   * Waits for an attempt that is ALREADY IN FLIGHT to settle, bounded by
+   * `timeoutMs`, and answers with the state it ends on.
+   *
+   * The only state this waits on is `connecting`: an attempt is running, and
+   * its outcome is what the caller asked about. `connected` is answered at
+   * once, and so are `offline` (parked in backoff), `disabled` and
+   * `identity-mismatch` — no wait can change those, and waiting on them would
+   * merely delay the caller's answer by the whole bound. `offline` is the
+   * common case for a genuinely powered-off desktop, so it is the one that
+   * matters: the tools stay fail-fast there.
+   *
+   * This NEVER starts an attempt — it observes one the pool already started.
+   * That is the line the tool face has always drawn (a tool must not dial); the
+   * wait only stops the tool from calling a live dial a failure.
+   *
+   * The bound expiring is not an error: the current state (`connecting`) is
+   * returned, and the caller judges it exactly as it would have without the
+   * wait.
+   */
+  async waitForSettled(timeoutMs: number): Promise<DeviceState> {
+    if (this.#state !== 'connecting' || timeoutMs <= 0) return this.#state
+    return new Promise<DeviceState>((resolve) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const finish = (state: DeviceState): void => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        this.#settleWaiters.delete(onState)
+        resolve(state)
+      }
+      // The waiter's own filter: a transition to `offline` IS the attempt
+      // settling (failed); only a transition INTO `connecting` is not an
+      // answer, and `#setState` never reports a state it is already in.
+      const onState = (state: DeviceState): void => {
+        if (state !== 'connecting') finish(state)
+      }
+      timer = setTimeout(() => finish(this.#state), timeoutMs)
+      this.#settleWaiters.add(onState)
+      // The attempt may have settled between the guard above and the
+      // registration; that transition is already gone from the multicast, so
+      // it has to be observed by hand.
+      if (this.#state !== 'connecting') finish(this.#state)
+    })
   }
 
   /**
@@ -1580,6 +1634,13 @@ export class DeviceConnection {
         cb(next)
       } catch (error) {
         console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}`, error)
+      }
+    }
+    for (const cb of [...this.#settleWaiters]) {
+      try {
+        cb(next)
+      } catch (error) {
+        console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}`, error)
       }
     }
   }
