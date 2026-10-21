@@ -5,6 +5,29 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## v0.1.9 (2026-10-21)
+
+Two field annoyances, neither touching the protocol surface.
+
+### Fixed
+
+- **The settings page title no longer truncates** (#95, #97). The nav label and
+  the page heading are one string per language (`app.title`), and "Cherry Studio
+  互联" overflowed a narrow settings sidebar — the English half was longer
+  still. They are now **Cherry 互联** / **Cherry Bridge**. The plugin-list row
+  moves with them, because `locale/*.json` `meta.title` is pinned to the same
+  dictionary value on purpose.
+- **A device caught while it is still dialing is waited for, not refused**
+  (#99). The connection pool builds a `DeviceConnection` on first touch and
+  dials immediately, while the tools read `connection.state` in the same tick —
+  so the first device tool call after an idle period or a restart answered
+  `device-unavailable { state: "connecting" }` about a connection that came up
+  a moment later, and `cherry_devices` showed the same transient as a row. Both
+  device entry points now wait for the in-flight attempt, bounded at
+  `DEVICE_SETTLE_WAIT_MS` = 5 s. Only `connecting` is waited on: `offline`
+  (parked in its backoff), `disabled` and `identity-mismatch` still answer at
+  once, and nothing starts a dial the pool had not already started.
+
 ## v0.1.8 (2026-10-20)
 
 The emit-side half of the resume-token story. Every stop point this bridge names
