@@ -1739,9 +1739,9 @@ const CONTRACT_DIFFERENCES = [
 		id: "rate-limit-terminates-session",
 		title: "Over-limit rate limiting is generation-dependent: a whole-session 1011 close (≤2.1.6) or a per-request refusal (≥2.1.7)",
 		realPeer: "Through 2.1.6, exceeding the desktop's per-socket budget (64 req/s shared, 512 req/s content; implementation values with no negotiation channel) terminated the ENTIRE session with close code 1011. From 2.1.7 (PR #21687) the shared allowance is 256 req/s and an over-budget request is answered with ONE structured `RATE_LIMITED` failure carrying `retryAfterMs`, while the session survives.",
-		fakePeer: "The fake models the ≤2.1.6 generation: it closes the session with 1011 once `rateLimitPerSecond` is exceeded, so the client's offline→backoff→reconnect path is exercised rather than a request-level refusal.",
+		fakePeer: "The fake models BOTH generations: `rateLimitMode` `close` (the ≤2.1.6 default) closes the session with 1011 once `rateLimitPerSecond` is exceeded, exercising the offline→backoff→reconnect path; `refuse` answers one structured `RATE_LIMITED` failure with `retryAfterMs` and keeps the session, exercising the bounded replay.",
 		schemaAnchor: "remoteLimits + peer close code 1011 (≤2.1.6) / failure data reason RATE_LIMITED + retryAfterMs (≥2.1.7); implementation values, not protocol promises",
-		checklistStep: "rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an unpaced probe) and drive a burst above the allowance; confirm each over-budget request is refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live. On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart)."
+		checklistStep: "rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an unpaced probe) and drive a burst above the allowance; confirm each over-budget request is refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live, a refused READ succeeds after ONE replay, and a refused COMMAND surfaces as a verdict and is not replayed. On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart)."
 	},
 	{
 		id: "execution-terminal-no-interrupted",
@@ -2227,6 +2227,19 @@ const DEFAULT_RATE_BUDGET_PER_SECOND = 32;
 * rather than by design.
 */
 const DEFAULT_CONTENT_READ_BUDGET_PER_SECOND = 256;
+/**
+* The longest a READ may wait for the peer's rate window to clear before its
+* ONE bounded replay (`RATE_LIMITED` + `retryAfterMs`, desktop >= 2.1.7).
+*
+* Why the peer's own window and not a separate budget: the desktop derives
+* `retryAfterMs` from its 1 s accounting window, so a larger value cannot come
+* from the peer, and waiting longer would hold a tool call for no reason. The
+* caller's own deadline (`JsonRpcRequestOptions.deadline`) still clamps it, and
+* a wait answer's `AssemblyDeadline` is what makes a refusal near the budget a
+* `'deadline'` stop rather than an overrun. A COMMAND never takes this wait: its
+* refusal is a verdict on that arrival, and commands are never replayed.
+*/
+const RATE_LIMIT_MAX_WAIT_MS = 1e3;
 /** 2 MiB of event text cached per session (spec §3.5). */
 const DEFAULT_PER_SESSION_CACHE_BYTES = 2097152;
 /**
@@ -2403,6 +2416,29 @@ const DEFAULT_PROTOCOL_VERSIONS = [1];
 const SILENCE_FACTOR = 2;
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
 const DISPOSED_RE = /^JSON-RPC client disposed$/;
+/**
+* The peer's structured over-budget refusal (desktop >= 2.1.7), or undefined.
+*
+* 2.1.7 answers an over-budget request with ONE `RATE_LIMITED` failure carrying
+* `retryAfterMs` and keeps the session; <=2.1.6 instead closed the whole socket
+* with 1011, which is the transport-loss path and never reaches this check.
+*/
+function rateLimitRefusal(error) {
+	if (!(error instanceof JsonRpcRequestError)) return void 0;
+	const data = error.data;
+	if (typeof data !== "object" || data === null) return void 0;
+	return data["reason"] === "RATE_LIMITED" ? error : void 0;
+}
+/**
+* How long a refusal asks the caller to wait, bounded by
+* {@link RATE_LIMIT_MAX_WAIT_MS}. An absent or unusable value is 0: retry at
+* the next pacing slot rather than invent a delay the peer never asked for.
+*/
+function rateLimitWaitMs(refusal) {
+	const raw = refusal.data["retryAfterMs"];
+	if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return 0;
+	return Math.min(raw, RATE_LIMIT_MAX_WAIT_MS);
+}
 /**
 * The read methods whose transport loss may be replayed automatically.
 *
@@ -3270,6 +3306,8 @@ var DeviceConnection = class {
 		try {
 			return await link.client.request(method, params, opts);
 		} catch (error) {
+			const refusal = rateLimitRefusal(error);
+			if (refusal !== void 0) return await this.#replayAfterRateLimit(refusal, method, params, opts);
 			if (!this.#isTransportLoss(error)) throw error;
 			const lost = new TransportLostError(this.record.deviceId, "connected", method, { cause: error });
 			if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw lost;
@@ -3294,6 +3332,51 @@ var DeviceConnection = class {
 				if (this.#isTransportLoss(error) || DISPOSED_RE.test(String(error?.message ?? ""))) throw lost;
 				throw error;
 			}
+		}
+	}
+	/**
+	* ONE bounded replay for a READ the peer refused because the socket is over
+	* its rate window.
+	*
+	* 2.1.7 answers that request with a structured `RATE_LIMITED` failure and a
+	* `retryAfterMs` instead of closing the session (see `rateLimitRefusal`), so
+	* the caller no longer learns it was throttled by losing its connection:
+	* without this, a transient refusal became a failed tool call whose part text
+	* the projection would even degrade.
+	*
+	* The shape mirrors the transport-loss replay, for the same reasons:
+	*
+	*  - only a READ is replayed (a command's refusal is a verdict on that
+	*    arrival, and commands are never replayed — receipts recover them);
+	*  - the wait is charged to the caller's deadline and never extends it, so a
+	*    wait answer's budget turns a refusal near its bound into a `'deadline'`
+	*    stop instead of an overrun;
+	*  - the replay takes a FRESH pacing admission: it is a new arrival at the
+	*    peer, and skipping the admission would replay into the same full window.
+	*
+	* A SECOND refusal is a real failure and propagates as itself (the fresh
+	* `retryAfterMs` is the more useful one); a link lost under the replay is
+	* reported as the classified `TransportLostError`, never as bare text.
+	*/
+	async #replayAfterRateLimit(refusal, method, params, opts) {
+		if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw refusal;
+		const remaining = this.#remainingMs(opts);
+		if (remaining !== void 0 && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+		const requested = rateLimitWaitMs(refusal);
+		const waitMs = Math.min(requested, remaining ?? Number.POSITIVE_INFINITY);
+		const deadlineSpent = remaining !== void 0 && requested >= remaining;
+		if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+		if (!this.#running || this.#state !== "connected") throw refusal;
+		if (deadlineSpent || this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+		await this.#limiter.acquire(method);
+		const link = this.#link;
+		if (!this.#running || this.#state !== "connected" || link === void 0) throw refusal;
+		if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method);
+		try {
+			return await link.client.request(method, params, opts);
+		} catch (error) {
+			if (this.#isTransportLoss(error)) throw new TransportLostError(this.record.deviceId, "connected", method, { cause: error });
+			throw error;
 		}
 	}
 	/** Whether a rejection is the dead channel, as opposed to a peer's own answer. */
@@ -6140,13 +6223,23 @@ var CherryToolEngine = class {
 	*    back a snapshot that looks complete while containing content the peer
 	*    never certified. That is worse than an error: the caller cannot tell it
 	*    apart from a good read. It keeps failing loudly.
+	*  - **NOT degradable — a RATE LIMIT.** A `RATE_LIMITED` refusal is
+	*    SESSION-wide, not part-specific: the peer refused the arrival, it did not
+	*    fail to serve THIS part. Degrading would hand back a "complete" message
+	*    whose text is empty for a reason the caller could act on (wait and ask
+	*    again) — and if one slice is refused the others will be too, so the
+	*    snapshot would be missing precisely what was requested. The connection
+	*    already waited out `retryAfterMs` and replayed the slice ONCE, so a
+	*    second refusal is a real failure and the whole read fails with it.
 	*
 	* The discriminator is the DIGEST CHECK specifically, which is why
 	* {@link CherryToolEngine.#readExternalized} marks it: matching on message
-	* text would break the moment the wording changed.
+	* text would break the moment the wording changed. The rate-limit arm keys on
+	* the peer's REASON, never on wording.
 	*/
 	#degradableReadFailure(error) {
-		return !(error instanceof ContentIntegrityError);
+		if (error instanceof ContentIntegrityError) return false;
+		return failureReason(error) !== "RATE_LIMITED";
 	}
 	/**
 	* The pre-flight refusal of a `{ref}` whose DECLARED size is above the cap —

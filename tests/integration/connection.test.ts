@@ -1930,3 +1930,130 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(fakeInfo.fake.methodCount('agent.interactions.get')).toBe(1)
   }, 20_000)
 })
+
+/**
+ * Issue #104: desktop 2.1.7 answers an over-budget request with ONE structured
+ * `RATE_LIMITED` failure + `retryAfterMs` and keeps the session (through 2.1.6
+ * it closed the whole socket with 1011, which the transport-loss tests cover).
+ * The client must wait that delay out and replay a READ once, never a command.
+ */
+describe('issue #104: a RATE_LIMITED refusal (desktop >= 2.1.7)', () => {
+  it('⑭a waits `retryAfterMs` and replays a READ once, without losing the socket', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      // Housekeeping is exempt so the handshake itself can complete; the cap
+      // applies to the reads this test drives. Budget 1 + a 100 ms window: the
+      // warm-up read is admitted, the measured read is over budget, and its
+      // replay lands after the window cleared.
+      rateLimitMethods: ['agent.agents.list'],
+      rateLimitPerSecond: 1,
+      rateLimitMode: 'refuse',
+      rateLimitRetryAfterMs: 150,
+      rateLimitWindowMs: 100,
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      rateBudgetPerSecond: 1_000,
+    })
+    await connection.connect()
+
+    // Fill the window (this arrival is admitted: 1 <= budget).
+    await connection.rpc.request('agent.agents.list', { limit: 1 })
+
+    const started = Date.now()
+    await expect(connection.rpc.request('agent.agents.list', { limit: 1 })).resolves.toBeTruthy()
+    const elapsed = Date.now() - started
+
+    // The refusal asked for 150 ms and the client actually waited it out — and
+    // did not wait the 1 s cap or a full window: the ask, not a guess.
+    expect(elapsed).toBeGreaterThanOrEqual(120)
+    expect(elapsed).toBeLessThan(600)
+    // ...then replayed EXACTLY once: two successes plus the refused arrival.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(3)
+    expect(fakeInfo.fake.socketCount).toBe(1)
+    expect(connection.state).toBe('connected')
+  }, 10_000)
+
+  it('⑭b a second refusal is a real failure: RATE_LIMITED surfaces, the session stays up, no third attempt', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      rateLimitMethods: ['agent.agents.list'],
+      rateLimitPerSecond: 0,
+      rateLimitMode: 'refuse',
+      rateLimitRetryAfterMs: 1,
+      // Long enough that the replay lands inside the SAME full window.
+      rateLimitWindowMs: 10_000,
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      rateBudgetPerSecond: 1_000,
+    })
+    await connection.connect()
+
+    const error = await connection.rpc.request('agent.agents.list', { limit: 1 }).catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    // The refusal stays actionable: the caller keeps the delay the peer asked for.
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'RATE_LIMITED', retryAfterMs: 1 })
+    // The replay is the LAST attempt.
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(2)
+    expect(fakeInfo.fake.socketCount).toBe(1)
+    expect(connection.state).toBe('connected')
+  }, 10_000)
+
+  it('⑭c a COMMAND is never replayed after RATE_LIMITED', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      rateLimitMethods: ['agent.messages.send'],
+      rateLimitPerSecond: 0,
+      rateLimitMode: 'refuse',
+      rateLimitRetryAfterMs: 1,
+      rateLimitWindowMs: 10_000,
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      rateBudgetPerSecond: 1_000,
+    })
+    await connection.connect()
+
+    const error = await connection.rpc
+      .request('agent.messages.send', { commandId: 'c-1', sessionId: 's-1', text: 'hi', expectedIdleRevision: '1000' })
+      .catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'RATE_LIMITED' })
+    // A command's refusal is a verdict on that arrival: one attempt, no replay.
+    expect(fakeInfo.fake.methodCount('agent.messages.send')).toBe(1)
+  }, 10_000)
+
+  it('⑭d the wait is charged to the caller deadline and never extends it', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      rateLimitMethods: ['agent.agents.list'],
+      rateLimitPerSecond: 0,
+      rateLimitMode: 'refuse',
+      rateLimitRetryAfterMs: 5_000,
+      rateLimitWindowMs: 10_000,
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      rateBudgetPerSecond: 1_000,
+    })
+    await connection.connect()
+
+    const started = Date.now()
+    const error = await connection.rpc
+      .request('agent.agents.list', { limit: 1 }, { deadline: performance.now() + 500 })
+      .catch((reason: unknown) => reason)
+    const elapsed = Date.now() - started
+    // A deadline shorter than the requested wait means the wait is CLAMPED to
+    // the remaining budget and the call fails as the caller's own budget, never
+    // as the peer's refusal (and never by overrunning the deadline).
+    expect(error).toBeInstanceOf(RpcDeadlineExceededError)
+    expect(elapsed).toBeGreaterThanOrEqual(400)
+    expect(elapsed).toBeLessThan(2_000)
+    expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
+  }, 10_000)
+})

@@ -3043,13 +3043,23 @@ class CherryToolEngine {
    *    back a snapshot that looks complete while containing content the peer
    *    never certified. That is worse than an error: the caller cannot tell it
    *    apart from a good read. It keeps failing loudly.
+   *  - **NOT degradable — a RATE LIMIT.** A `RATE_LIMITED` refusal is
+   *    SESSION-wide, not part-specific: the peer refused the arrival, it did not
+   *    fail to serve THIS part. Degrading would hand back a "complete" message
+   *    whose text is empty for a reason the caller could act on (wait and ask
+   *    again) — and if one slice is refused the others will be too, so the
+   *    snapshot would be missing precisely what was requested. The connection
+   *    already waited out `retryAfterMs` and replayed the slice ONCE, so a
+   *    second refusal is a real failure and the whole read fails with it.
    *
    * The discriminator is the DIGEST CHECK specifically, which is why
    * {@link CherryToolEngine.#readExternalized} marks it: matching on message
-   * text would break the moment the wording changed.
+   * text would break the moment the wording changed. The rate-limit arm keys on
+   * the peer's REASON, never on wording.
    */
   #degradableReadFailure(error: unknown): boolean {
-    return !(error instanceof ContentIntegrityError)
+    if (error instanceof ContentIntegrityError) return false
+    return failureReason(error) !== 'RATE_LIMITED'
   }
 
   /**

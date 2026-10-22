@@ -2713,3 +2713,44 @@ describe('issue #103: failure metadata on the shared projection', () => {
     expect(idle.messages.find((message) => message.messageId === 'm-1')!.failure).toEqual(failed.failure)
   })
 })
+
+describe('issue #104: a rate-limited content read is not degraded', () => {
+  it('④z a RATE_LIMITED content read fails the WHOLE read after one replay, never an `unavailable` part', async () => {
+    // A rate limit is SESSION-wide: if the slice is refused, the others will be
+    // too. Degrading the part would hand back a "complete" message whose text
+    // is silently empty — exactly the shape `incomplete` exists to prevent. The
+    // connection waits `retryAfterMs` and replays once; a second refusal ends
+    // the read.
+    const big = 'R'.repeat(30 * 1024)
+    const rig = await makeRig({
+      rateLimitMethods: ['agent.content.read'],
+      rateLimitPerSecond: 0,
+      rateLimitMode: 'refuse',
+      rateLimitRetryAfterMs: 1,
+      rateLimitWindowMs: 10_000,
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: big, external: true }],
+          },
+        ],
+      },
+    })
+
+    const error = await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }).catch((reason: unknown) => reason)
+    // The read FAILED with the peer's rate-limit verdict; it did not come back
+    // as a "complete" snapshot whose part text is silently empty.
+    expect(error).toBeInstanceOf(Error)
+    expect((error as { data?: unknown }).data).toMatchObject({ reason: 'RATE_LIMITED' })
+    // The slice was refused and replayed exactly once; the second refusal ended it.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(2)
+  })
+})

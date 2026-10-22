@@ -105,16 +105,18 @@ export const CONTRACT_DIFFERENCES: readonly ContractDifference[] = [
       'is answered with ONE structured `RATE_LIMITED` failure carrying `retryAfterMs`, while the ' +
       'session survives.',
     fakePeer:
-      'The fake models the ≤2.1.6 generation: it closes the session with 1011 once ' +
-      '`rateLimitPerSecond` is exceeded, so the client\'s offline→backoff→reconnect path is exercised ' +
-      'rather than a request-level refusal.',
+      'The fake models BOTH generations: `rateLimitMode` `close` (the ≤2.1.6 default) closes the ' +
+      'session with 1011 once `rateLimitPerSecond` is exceeded, exercising the ' +
+      'offline→backoff→reconnect path; `refuse` answers one structured `RATE_LIMITED` failure with ' +
+      '`retryAfterMs` and keeps the session, exercising the bounded replay.',
     schemaAnchor:
       'remoteLimits + peer close code 1011 (≤2.1.6) / failure data reason RATE_LIMITED + retryAfterMs (≥2.1.7); implementation values, not protocol promises',
     checklistStep:
       'rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an ' +
       'unpaced probe) and drive a burst above the allowance; confirm each over-budget request is ' +
-      'refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live. On ≤2.1.6, the same ' +
-      'burst closes the socket with 1011 (state offline, backoff restart).',
+      'refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live, a refused READ ' +
+      'succeeds after ONE replay, and a refused COMMAND surfaces as a verdict and is not replayed. ' +
+      'On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart).',
   },
   {
     id: 'execution-terminal-no-interrupted',

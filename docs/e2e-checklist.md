@@ -63,7 +63,7 @@ code **1011 终止整条会话**；≥2.1.7（PR #21687）共享额度改为 256
 
 **手动核验步骤**（与 `CONTRACT_DIFFERENCES[2].checklistStep` 同源，逐字一致）：
 
-- [ ] rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an unpaced probe) and drive a burst above the allowance; confirm each over-budget request is refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live. On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart).
+- [ ] rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an unpaced probe) and drive a burst above the allowance; confirm each over-budget request is refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live, a refused READ succeeds after ONE replay, and a refused COMMAND surfaces as a verdict and is not replayed. On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart).
 
 **期望**：按对端版本二选一命中；两种形态都**不出现**未分类的 bare channel-closed 文本。
 
