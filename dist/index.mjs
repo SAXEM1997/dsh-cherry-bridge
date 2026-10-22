@@ -6388,37 +6388,97 @@ var CherryToolEngine = class {
 				releaseSlot?.();
 			}
 		} else text = "";
+		const legacy = this.#legacyAttachment(kind, raw, text);
 		return {
 			partId,
 			kind,
 			revision,
-			content: text,
-			...this.#attachmentFace(kind, raw, content),
+			content: legacy === void 0 ? text : legacy.remainder,
+			...legacy === void 0 ? this.#attachmentFace(kind, raw, content) : this.#attachmentFace(kind, raw, content, legacy.record),
 			...typeof raw["state"] === "string" ? { state: raw["state"] } : {},
 			...typeof raw["toolName"] === "string" ? { toolName: raw["toolName"] } : {},
 			...typeof raw["toolCallId"] === "string" ? { toolCallId: raw["toolCallId"] } : {}
 		};
 	}
 	/**
+	* The ONE place a legacy `data` part is recognised as an attachment: the
+	* structural discriminator, the JSON parse, and the lossless CONTENT rule.
+	*
+	* The legal legacy face is `{kind: 'data', name: 'file', content: {text:
+	* '{\"mediaType\":…,\"filename\":…}'}}` — the metadata SERIALIZED AS JSON in
+	* `content.text`, observed on the wire (2.1.7 desktop, image upload,
+	* 2026-10-22). An OBJECT inside `content` is not producible by a conforming
+	* peer at all: the pinned protocol 0.5.0 types `content` as a strict
+	* `{text}` | `{ref}` union, so the old documentation described a shape no
+	* peer can emit — and the real one was never lifted, which is how an image
+	* upload reached a model as a JSON blob.
+	*
+	* WHY THE NAME IS THE DISCRIMINATOR, and why it is not a heuristic: a `data`
+	* part always carries a `name` (an `opaqueId`), and the desktop uses it as
+	* the data KIND label — an attachment is `'file'`, a task event is
+	* `'data-compaction-anchor'`, an error is `'data-error'`. Several of those
+	* payloads are JSON too, so "the text parses" proves nothing; `'file'` is the
+	* one label that means "this is an attachment".
+	*
+	* NOTHING IS EVER DEGRADED: a text that does not parse, parses to a
+	* non-record, or carries neither `mediaType` nor `filename` as a string is
+	* not an attachment, and the part passes through COMPLETELY unchanged
+	* (`remainder` is the raw text, no field is lifted) — this runs on every
+	* `data` part of every read, so a throw here would take down the whole
+	* snapshot.
+	*
+	* THE CONTENT RULE: `remainder` is EMPTY when every key of the record is one
+	* this face projects (`mediaType`, `filename`) — the metadata is fully
+	* represented, and a model sees structure rather than a blob. A record
+	* carrying ANY other key keeps its raw text, so a field we do not project is
+	* never silently dropped (lossless by default).
+	*/
+	#legacyAttachment(kind, raw, text) {
+		if (kind !== "data" || optionalString(raw["name"]) !== "file") return void 0;
+		let parsed;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			return;
+		}
+		if (!isRecord(parsed)) return void 0;
+		if (optionalString(parsed["filename"]) === void 0 && optionalString(parsed["mediaType"]) === void 0) return;
+		const everythingLifted = Object.keys(parsed).every((key) => key === "mediaType" || key === "filename");
+		return {
+			record: parsed,
+			remainder: everythingLifted ? "" : text
+		};
+	}
+	/**
 	* The descriptive metadata of an attachment part — and deliberately NOT a
 	* way to reach its bytes.
 	*
-	* Two peer generations are covered, because both are inside the verified
-	* range and they disagree about where the metadata lives:
+	* Two legal faces are covered, because both are inside the verified range and
+	* they disagree about where the metadata lives:
 	*
 	*  - **Cherry ≥ 2.1.5** — `{kind: 'file', name, ref}`, ref at the TOP level.
-	*  - **Cherry 2.1.4** — `{kind: 'data', name, content: {mediaType, filename}}`.
+	*  - **legacy** — `{kind: 'data', name: 'file', content: {text: '<JSON>'}}`,
+	*    the metadata as JSON TEXT. {@link CherryToolEngine.#legacyAttachment}
+	*    parses it and passes the record in here.
+	*
+	* A THIRD arm — a `data` part carrying `{mediaType, filename}` as an OBJECT
+	* inside `content` — is schema-ILLEGAL under the pinned protocol (see the
+	* docblock above) and stays as a DEFENSIVE lift for a peer that violates it.
+	* It is not the 2.1.4 projection: that story was wrong, and a misbehaving
+	* peer's parts are not re-validated client-side, so the guarded arm costs
+	* nothing and covers exactly the peer it was written for.
 	*
 	* Only string fields are lifted: a null `filename` (the peer's explicit "no
 	* name") stays absent rather than becoming the string "null". Anything a
 	* caller needs beyond this — the bytes — stays behind `agent.content.read`,
-	* which this plugin does not call for a file part.
+	* which this plugin does not call for a file part. A legacy `data` part
+	* carries no `byteLength`, so none is reported for it.
 	*/
-	#attachmentFace(kind, raw, content) {
+	#attachmentFace(kind, raw, content, metadata) {
 		if (kind !== "file" && kind !== "data") return {};
 		const ref = isRecord(raw["ref"]) ? raw["ref"] : isRecord(content["ref"]) ? content["ref"] : {};
-		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(content["filename"]);
-		const mediaType = optionalString(ref["mediaType"]) ?? optionalString(content["mediaType"]);
+		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(metadata?.["filename"]) ?? optionalString(content["filename"]);
+		const mediaType = optionalString(ref["mediaType"]) ?? optionalString(metadata?.["mediaType"]) ?? optionalString(content["mediaType"]);
 		const byteLength = optionalString(ref["byteLength"]);
 		return {
 			...name === void 0 ? {} : { name },

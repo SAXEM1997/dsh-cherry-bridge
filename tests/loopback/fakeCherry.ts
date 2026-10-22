@@ -505,12 +505,34 @@ export interface FakePartRecord {
   state?: 'completed' | 'streaming' | 'failed'
   toolName?: string
   toolCallId?: string
+  /**
+   * A `file` part's `name`, or a `data` part's `name` LABEL (the data KIND —
+   * `'file'` for an attachment, `'data-compaction-anchor'` for a task event;
+   * default `'data'`). Never an attachment's filename: on a legacy attachment
+   * the filename lives inside the JSON metadata text.
+   */
   name?: string
   /**
    * The media type a `file` part advertises on its ref (default
-   * `application/octet-stream`). Ignored by the other kinds.
+   * `application/octet-stream`). On a `data` part it asks for the legacy
+   * ATTACHMENT face instead, and becomes the `mediaType` inside the metadata
+   * record. Ignored by the other kinds.
    */
   mediaType?: string
+  /**
+   * The attachment FILENAME a legacy `data` part reports in its metadata
+   * record. Omitted (or `null`) means the peer has none — it serializes an
+   * explicit `"filename":null`.
+   */
+  filename?: string | null
+  /**
+   * A `data` part's metadata record, SERIALIZED AS JSON into `content.text` —
+   * the live shape (`{kind:'data', name:'file', content:{text:'{"mediaType":…,
+   * "filename":…}'}}`). Setting it switches the `data` arm to the JSON-text
+   * form VERBATIM, extra keys included, so a fixture can pin the lossless
+   * content rule. `name` defaults to `'file'` (the attachment label).
+   */
+  dataRecord?: Record<string, unknown>
 }
 
 /** One event appended to a fake journal; `seq`/`streamEpoch` are assigned on append. */
@@ -2471,18 +2493,54 @@ export class FakeCherry {
         },
       }
     }
-    // The PRE-2.1.5 file projection (Cherry 2.1.4, still inside the verified
-    // range) is a `data` part whose metadata sits INSIDE `content` —
-    // `dataPart(partId, revision, 'file', { mediaType, filename })`, with an
-    // explicit null filename when the peer has none. A fixture that names a
-    // mediaType on a `data` part asks for exactly that shape.
-    if (part.kind === 'data' && part.mediaType !== undefined) {
-      return {
-        partId,
-        revision,
-        kind: 'data',
-        name: 'file',
-        content: { mediaType: part.mediaType, filename: part.name ?? null },
+    // A `data` part's payload is JSON TEXT, never an object: the pinned
+    // protocol types `content` as a strict `{text}` | `{ref}` union, so the
+    // desktop's `dataPart` helper (`JSON.stringify` into `contentOf`) is the
+    // only shape a peer can produce. The structural ATTACHMENT marker is
+    // `name: 'file'` — every other `data` payload carries its own label
+    // (`data-compaction-anchor`, `data-error`, …), so the name is what
+    // separates a legacy attachment from a task event whose text also happens
+    // to be JSON.
+    //
+    // A fixture that asks to be an attachment (`dataRecord`, or a `mediaType`)
+    // gets exactly the live face; anything else keeps its plain text and a
+    // non-attachment name.
+    if (part.kind === 'data') {
+      // `dataPart(partId, revision, 'file', { mediaType, filename })`: the
+      // NAME is the kind label, the filename rides in the record.
+      const record =
+        part.dataRecord ??
+        (part.mediaType === undefined
+          ? undefined
+          : { mediaType: part.mediaType, filename: part.filename ?? null })
+      if (record !== undefined) {
+        // The record goes through the peer's own `contentOf`: inline below
+        // `INLINE_TEXT_LIMIT`, a `{ref}` above it. The lift sees the SAME text
+        // either way (a ref is resolved and verified before projection).
+        const metadata = new TextEncoder().encode(JSON.stringify(record))
+        const metadataDigest = sha256Hex(metadata)
+        if (!pinned) {
+          this.#contentBytes.set(key, metadata)
+          this.#contentDigests.set(key, metadataDigest)
+        }
+        return {
+          partId,
+          revision,
+          kind: 'data',
+          name: part.name ?? 'file',
+          content:
+            metadata.length <= INLINE_TEXT_LIMIT
+              ? { text: new TextDecoder().decode(metadata) }
+              : {
+                  ref: {
+                    contentId: partId,
+                    revision,
+                    byteLength: String(this.#contentByteOverrides.get(key) ?? metadata.length),
+                    mediaType: 'text/plain',
+                    sha256: advertised,
+                  },
+                },
+        }
       }
     }
     return {
@@ -2493,7 +2551,9 @@ export class FakeCherry {
       ...(part.kind === 'tool-input' || part.kind === 'tool-output'
         ? { toolName: part.toolName ?? 'tool', ...(part.toolCallId === undefined ? {} : { toolCallId: part.toolCallId }) }
         : {}),
-      ...(part.kind === 'data' ? { name: part.name ?? 'file' } : {}),
+      // NOT 'file': a plain-text `data` part must never become an attachment
+      // candidate (the attachment arm above owns that label).
+      ...(part.kind === 'data' ? { name: part.name ?? 'data' } : {}),
       ...(part.kind === 'text' || part.kind === 'reasoning' || part.kind === 'tool-input'
         ? { state: part.state ?? 'completed' }
         : part.kind === 'tool-output'

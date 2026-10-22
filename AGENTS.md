@@ -765,13 +765,13 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 - A failed message may carry `failure: {reasonCode, retryable, message}`
   (peer classification, retry-worthiness, bounded summary); only its
   `source`/`context` are withheld.
-- Attachment parts (`kind: 'file'`, and the pre-2.1.5 `kind: 'data'` shape) are
-  reported as `name`/`mediaType`/`byteLength` with an **empty** `content`, and
-  no `unavailable` (nothing failed — the bytes were deliberately not fetched).
-  The read path is a text channel; bytes never enter it.
-- A terminal aggregate that fails to assemble is a **content** problem, not a
-  verdict on the run: the run's status still stands, and the guidance points at
-  `cherry_read`.
+- Attachments — `kind: 'file'`, and legacy `kind: 'data'` named `file` whose
+  `{mediaType, filename}` is JSON in `content.text` — report `name`/`mediaType`
+  (`byteLength` from a ref only), no `unavailable` (bytes not fetched), and
+  `content` **empty** unless the record has a key we skip (then raw text,
+  lossless).
+- A terminal aggregate that cannot assemble is a **content** problem, not a
+  verdict — the status stands; guidance points at `cherry_read`.
 
 ### Device selector
 

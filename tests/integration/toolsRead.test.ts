@@ -1167,11 +1167,14 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(parts[0]!.content).toBe('look at this')
   })
 
-  it('④l the pre-2.1.5 `data`-kind file projection reports the same metadata, so an upgrade never anonymizes an attachment', async () => {
-    // Cherry 2.1.4 (inside the verified range) projected the same file as a
-    // `data` part carrying `{mediaType, filename}` INSIDE `content`. The two
-    // generations must reach the caller in the same shape, or a desktop upgrade
-    // would silently turn a named attachment back into an empty part.
+  it('④l a legacy `data`-kind attachment lifts its metadata out of the JSON text, so a desktop upgrade never anonymizes an attachment', async () => {
+    // THE LIVE SHAPE (wire dump, 2026-10-22): the desktop projects a legacy
+    // attachment as `{kind: 'data', name: 'file', content: {text: '<JSON>'}}`.
+    // The metadata is SERIALIZED AS JSON in `content.text` — the old fixture's
+    // `content: {mediaType, filename}` object is schema-ILLEGAL under the
+    // pinned protocol (`content` is a strict `{text}` | `{ref}` union), so it
+    // pinned a shape no peer can produce and the lift never ran on the real
+    // one: an image upload reached the model as a JSON blob.
     const rig = await makeRig({
       agent: {
         agents: [{ agentId: 'agent-1', name: 'Agent One' }],
@@ -1191,7 +1194,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
             role: 'user',
             status: 'success',
             parts: [
-              { kind: 'data', text: '', name: 'report.pdf', mediaType: 'application/pdf' },
+              { kind: 'data', text: '', filename: 'report.pdf', mediaType: 'application/pdf' },
               { kind: 'data', text: '', mediaType: 'image/jpeg' }, // filename: null — the peer's explicit "no name"
             ],
           },
@@ -1208,6 +1211,142 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // a media type the peer did not state stays absent too.
     expect(parts[1]!).toMatchObject({ kind: 'data', content: '', mediaType: 'image/jpeg' })
     expect(parts[1]!).not.toHaveProperty('name')
+    // The lift is structural on BOTH sides: no `byteLength` (this shape carries
+    // none), and no content read (nothing here is a `{ref}`).
+    expect(parts[0]!).not.toHaveProperty('byteLength')
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('④m a legacy `data` attachment carrying keys we do NOT project keeps its raw text, so nothing is silently dropped', async () => {
+    // THE CONTENT RULE: `content` is emptied only when EVERY key of the parsed
+    // record is one we lift (`mediaType`, `filename`). A record with an extra
+    // key still lifts the two fields AND keeps its text — the lossless half.
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Attachments',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              {
+                kind: 'data',
+                text: '',
+                // The extra key rides IN the metadata record, so the fixture's
+                // data arm emits it verbatim inside `content.text`.
+                dataRecord: { mediaType: 'image/png', filename: 'i', size: 123 },
+              },
+            ],
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ kind: string; content: string; name?: string; mediaType?: string }> }>
+    }
+    const parts = result.messages[0]!.parts
+    expect(parts[0]!).toMatchObject({
+      kind: 'data',
+      name: 'i',
+      mediaType: 'image/png',
+      content: '{"mediaType":"image/png","filename":"i","size":123}',
+    })
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('④n the discriminator is STRUCTURAL: only a `data` part named `file` is an attachment', async () => {
+    // The same JSON text under a different `name` is NOT an attachment. Task
+    // events (`data-compaction-anchor` on the wire) carry JSON text too, so
+    // "the text parses" is not a signal — lifting on it would turn every
+    // task event into a nameless attachment. Such a part is left COMPLETELY
+    // unchanged, and so is a `file`-named part whose text is not JSON.
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Task events',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              {
+                kind: 'data',
+                text: '',
+                name: 'data-compaction-anchor',
+                dataRecord: { mediaType: 'application/pdf', filename: 'report.pdf' },
+              },
+              { kind: 'data', name: 'file', text: 'not json at all' },
+              // JSON, `file`-named, but carries NEITHER projected key: the
+              // payload is unknown, so its text must survive untouched rather
+              // than become an empty part with no fields at all.
+              { kind: 'data', text: '', name: 'file', dataRecord: { step: 'started' } },
+              // All-null keys: EVERY key is one we lift, so the content rule
+              // alone would empty the text — but with nothing to lift the
+              // record says nothing about an attachment, and emptying its text
+              // would leave a part that describes nothing at all.
+              { kind: 'data', text: '', name: 'file', dataRecord: { filename: null } },
+            ],
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ kind: string; content: string; name?: string; mediaType?: string }> }>
+    }
+    const parts = result.messages[0]!.parts
+    // UNCHANGED: the JSON text passes through, and no field is lifted.
+    expect(parts[0]!).toEqual({
+      partId: 'm-1:0',
+      kind: 'data',
+      revision: '1001',
+      content: '{"mediaType":"application/pdf","filename":"report.pdf"}',
+    })
+    // UNCHANGED: a non-JSON text under the attachment name is not a lift
+    // candidate either — pass through, never throw.
+    expect(parts[1]!).toEqual({
+      partId: 'm-1:1',
+      kind: 'data',
+      revision: '1001',
+      content: 'not json at all',
+    })
+    // UNCHANGED: the JSON RECORD carrying neither `mediaType` nor `filename`
+    // describes no attachment, so the name label alone does not lift it — and
+    // its text must not be emptied on the way through.
+    expect(parts[2]!).toEqual({
+      partId: 'm-1:2',
+      kind: 'data',
+      revision: '1001',
+      content: '{"step":"started"}',
+    })
+    expect(parts[3]!).toEqual({
+      partId: 'm-1:3',
+      kind: 'data',
+      revision: '1001',
+      content: '{"filename":null}',
+    })
     expect(rig.fake.methodCount('agent.content.read')).toBe(0)
   })
 
