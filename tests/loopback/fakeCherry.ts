@@ -473,6 +473,12 @@ export interface FakeMessageRecord {
   revision: string
   role: 'system' | 'user' | 'assistant'
   status: 'success' | 'error' | 'pending' | 'paused'
+  /**
+   * The wire `failure` object a real desktop attaches to `status: 'error'`
+   * messages (protocol 0.5.0 `messageSchema.failure`). Passed through VERBATIM
+   * so a test can drive both the projection and its omissions.
+   */
+  failure?: Record<string, unknown>
   parts: FakePartRecord[]
 }
 
@@ -2357,6 +2363,7 @@ export class FakeCherry {
       role: message.role,
       partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
       status: message.status,
+      ...(message.failure === undefined ? {} : { failure: message.failure }),
     }))
     return this.#page(method, messages, params, this.#agent().maxMessagePageSize)
   }

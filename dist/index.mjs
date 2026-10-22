@@ -4523,6 +4523,35 @@ var ContentReadGate = class {
 };
 //#endregion
 //#region src/tools.ts
+/** `provider_unavailable`-shaped: lowercase words separated by underscores. */
+const REASON_CODE_SHAPE = /^[a-z][a-z0-9_]{1,63}$/;
+/**
+* Projects the wire's `failure` object (present on `status: 'error'` messages)
+* into {@link CherryReadFailure}, or `undefined` when there is none.
+*
+* Deliberately tolerant of a malformed payload: a peer that sends
+* `failure: { retryable: false }` with no nested record still yields a usable
+* verdict (`reasonCode: 'unknown'`, empty message) instead of failing the whole
+* read — the message's TEXT is already in hand, and losing it over a metadata
+* field would trade the content for the annotation. A degenerate object
+* (`{}`, `[]`) projects the same way: the peer DID attach a verdict, just an
+* empty one, and saying so is more honest than reporting "no verdict". Only an
+* ABSENT or non-object `failure` yields `undefined`.
+*/
+function projectMessageFailure(raw) {
+	const failure = raw["failure"];
+	if (typeof failure !== "object" || failure === null) return void 0;
+	const record = failure;
+	const nested = record["failure"];
+	const rawReason = (typeof nested === "object" && nested !== null ? nested : {})["reasonCode"];
+	const reasonCode = typeof rawReason === "string" && REASON_CODE_SHAPE.test(rawReason) ? rawReason : "unknown";
+	const rawMessage = record["message"];
+	return {
+		reasonCode,
+		retryable: record["retryable"] === true,
+		message: truncateErrorMessage(typeof rawMessage === "string" ? rawMessage : "")
+	};
+}
 /** The four terminal execution statuses the waiter predicate covers. */
 const TERMINAL_EXECUTION_STATUSES = [
 	"completed",
@@ -5794,7 +5823,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A failed message (`status: \"error\"`) may carry `failure: {reasonCode, retryable, message}` when the peer sent one — its classification, whether it judged a retry worthwhile, and a bounded summary; the peer's `source` and `context.responseBody` are never projected. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -5992,11 +6021,13 @@ var CherryToolEngine = class {
 		const partsTruncated = page.truncated ? page.truncationReason ?? "safety-bound" : void 0;
 		const unavailableParts = parts.filter((part) => part.unavailable !== void 0).length;
 		const incomplete = unavailableParts > 0 || partsTruncated !== void 0;
+		const failure = projectMessageFailure(raw);
 		return {
 			messageId,
 			revision,
 			role: String(raw["role"] ?? ""),
 			status: String(raw["status"] ?? ""),
+			...failure === void 0 ? {} : { failure },
 			parts,
 			...partsTruncated === void 0 ? {} : {
 				partsTruncated,
