@@ -52,8 +52,10 @@ export interface DeviceConnectionOptions {
    *
    * The content tier DERIVES from this value at the production ratio
    * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND),
-   * so one injected budget scales both tiers and the two stay in the same
-   * proportion the peer's allowances have.
+   * so one injected budget scales both tiers. That 8:1 ratio matches the
+   * <=2.1.6 allowances (512:64); 2.1.7 raised ONLY the shared allowance to 256,
+   * so the derived content tier is deliberately more conservative there (256
+   * against a 512 line) even at the default injection.
    */
   rateBudgetPerSecond?: number
   /** First reconnect backoff (default 1s); doubles per attempt. */

@@ -457,7 +457,7 @@ describe('① the six-entry contract difference list', () => {
   }, 20_000)
 
   // -------------------------------------------------------------------------
-  // ③ rate limiting terminates the WHOLE session
+  // ③ rate limiting: the ≤2.1.6 session close (the 2.1.7 refusal is #104)
   // -------------------------------------------------------------------------
 
   it('③ proves the LEGACY (≤2.1.6) over-limit verdict is a session close (1011)', async () => {

@@ -138,7 +138,7 @@ interface CherryHttpContext {
  *
  * WHY 32: the desktop's allowance for "other" RPCs is 64/s through 2.1.6 and
  * 256/s from 2.1.7 (`RemoteAccessService.ts`; the official client paces them at
- * 40/s, `DesktopSession.ts:242-244`). What an over-budget request does also
+ * 40/s, `DesktopSession.ts:36-37`). What an over-budget request does also
  * changed: through 2.1.6 it closes the WHOLE session (1011), while 2.1.7 (PR
  * #21687) refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps
  * the session. The generations cannot be told apart before one answers, so the
@@ -246,8 +246,10 @@ export interface CherryBridgeConfig {
    * at the 8 : 1 production ratio (`DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` /
    * `DEFAULT_RATE_BUDGET_PER_SECOND`), so the default 32 yields the 256/s
    * content tier and any other value scales both tiers together. Raising this
-   * toward the peer's own lines therefore spends BOTH tiers' safety margin —
-   * see `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the numbers.
+   * toward the peer's own lines spends safety margin: on a <=2.1.6 desktop that
+   * is BOTH tiers (64 shared / 512 content), while on 2.1.7 only the content
+   * tier tightens — the shared line there is 256. See
+   * `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the numbers.
    */
   rateBudgetPerSecond?: number;
   /**

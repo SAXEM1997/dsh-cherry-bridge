@@ -111,10 +111,10 @@ export const CONTRACT_DIFFERENCES: readonly ContractDifference[] = [
     schemaAnchor:
       'remoteLimits + peer close code 1011 (≤2.1.6) / failure data reason RATE_LIMITED + retryAfterMs (≥2.1.7); implementation values, not protocol promises',
     checklistStep:
-      'rate-limit-terminates-session: on a ≥2.1.7 desktop, drive a burst well above the smooth budget ' +
-      'and confirm ONE structured `RATE_LIMITED` rejection (carrying `retryAfterMs`) with the session ' +
-      'still live; on ≤2.1.6 confirm the 1011 close instead (session gone, state offline, backoff ' +
-      'restart).',
+      'rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an ' +
+      'unpaced probe) and drive a burst above the allowance; confirm each over-budget request is ' +
+      'refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live. On ≤2.1.6, the same ' +
+      'burst closes the socket with 1011 (state offline, backoff restart).',
   },
   {
     id: 'execution-terminal-no-interrupted',

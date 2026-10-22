@@ -1741,7 +1741,7 @@ const CONTRACT_DIFFERENCES = [
 		realPeer: "Through 2.1.6, exceeding the desktop's per-socket budget (64 req/s shared, 512 req/s content; implementation values with no negotiation channel) terminated the ENTIRE session with close code 1011. From 2.1.7 (PR #21687) the shared allowance is 256 req/s and an over-budget request is answered with ONE structured `RATE_LIMITED` failure carrying `retryAfterMs`, while the session survives.",
 		fakePeer: "The fake models the ≤2.1.6 generation: it closes the session with 1011 once `rateLimitPerSecond` is exceeded, so the client's offline→backoff→reconnect path is exercised rather than a request-level refusal.",
 		schemaAnchor: "remoteLimits + peer close code 1011 (≤2.1.6) / failure data reason RATE_LIMITED + retryAfterMs (≥2.1.7); implementation values, not protocol promises",
-		checklistStep: "rate-limit-terminates-session: on a ≥2.1.7 desktop, drive a burst well above the smooth budget and confirm ONE structured `RATE_LIMITED` rejection (carrying `retryAfterMs`) with the session still live; on ≤2.1.6 confirm the 1011 close instead (session gone, state offline, backoff restart)."
+		checklistStep: "rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an unpaced probe) and drive a burst above the allowance; confirm each over-budget request is refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live. On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart)."
 	},
 	{
 		id: "execution-terminal-no-interrupted",
@@ -2178,7 +2178,7 @@ function buildDiagnostics(sources, identity = DEFAULT_IDENTITY) {
 *
 * WHY 32: the desktop's allowance for "other" RPCs is 64/s through 2.1.6 and
 * 256/s from 2.1.7 (`RemoteAccessService.ts`; the official client paces them at
-* 40/s, `DesktopSession.ts:242-244`). What an over-budget request does also
+* 40/s, `DesktopSession.ts:36-37`). What an over-budget request does also
 * changed: through 2.1.6 it closes the WHOLE session (1011), while 2.1.7 (PR
 * #21687) refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps
 * the session. The generations cannot be told apart before one answers, so the

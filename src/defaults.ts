@@ -23,7 +23,7 @@
  *
  * WHY 32: the desktop's allowance for "other" RPCs is 64/s through 2.1.6 and
  * 256/s from 2.1.7 (`RemoteAccessService.ts`; the official client paces them at
- * 40/s, `DesktopSession.ts:242-244`). What an over-budget request does also
+ * 40/s, `DesktopSession.ts:36-37`). What an over-budget request does also
  * changed: through 2.1.6 it closes the WHOLE session (1011), while 2.1.7 (PR
  * #21687) refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps
  * the session. The generations cannot be told apart before one answers, so the

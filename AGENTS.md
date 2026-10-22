@@ -943,7 +943,7 @@ profile saw **zero changes** in that window. Notable faces:
 | 2.1.5 `agent.messages.send` requires non-empty trimmed `text` | `cherry_send` rejects blank text locally as `text-empty` |
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
-| 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | Wire-additive; our 32/s default already sits far below it |
+| 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**

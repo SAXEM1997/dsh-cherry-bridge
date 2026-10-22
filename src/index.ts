@@ -84,8 +84,10 @@ export interface CherryBridgeConfig {
    * at the 8 : 1 production ratio (`DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` /
    * `DEFAULT_RATE_BUDGET_PER_SECOND`), so the default 32 yields the 256/s
    * content tier and any other value scales both tiers together. Raising this
-   * toward the peer's own lines therefore spends BOTH tiers' safety margin —
-   * see `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the numbers.
+   * toward the peer's own lines spends safety margin: on a <=2.1.6 desktop that
+   * is BOTH tiers (64 shared / 512 content), while on 2.1.7 only the content
+   * tier tightens — the shared line there is 256. See
+   * `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the numbers.
    */
   rateBudgetPerSecond?: number
   /**
