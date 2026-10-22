@@ -137,7 +137,11 @@ subscription was lost and could not be rebuilt, so the outcome is
   desktop >= 2.1.7 rate-limit refusal (`RATE_LIMITED` + `retryAfterMs`, waited
   out within the caller's budget); **commands are never replayed** — a write
   that loses its reply is recovered by retrying with the **original
-  `commandId`**, and the desktop's command ledger replays the receipt.
+  `commandId`**, and the desktop's command ledger replays the receipt. A
+  rate-limited COMMAND is the other case: the desktop refuses it **before
+  dispatch**, so this attempt was never applied — the error text says so, names
+  the wait the peer asked for (`retryAfterMs`, omitted when it sent none), and
+  points at `rateBudgetPerSecond` (the default budget is far below the limit).
 - One externalized content is capped at 32 MiB; a larger part is marked
   `unavailable` rather than returning unverifiable partial content.
 - **Externalized-content assembly is gated process-wide**: at most 4 `{ref}`

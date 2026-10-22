@@ -1633,3 +1633,59 @@ describe('final review: the receipt status enum', () => {
     expect(result.error?.reason).toBe('CONFLICT')
   })
 })
+
+// ---------------------------------------------------------------------------
+// ⑰ issue #109 — a refused COMMAND carries the recovery advice
+// ---------------------------------------------------------------------------
+
+describe('issue #109: a rate-limited COMMAND explains itself', () => {
+  it('⑰ a RATE_LIMITED refusal says THIS attempt was not applied, and how long to wait', async () => {
+    const rig = await makeRig({
+      // The desktop's counter is PER SOCKET and counts only the methods a test
+      // limits, so restricting the cap to `agent.messages.send` keeps the
+      // handshake and the send's own idle-revision read exempt (a process-wide
+      // cap would refuse those too and prove nothing about the command path).
+      rateLimitMethods: ['agent.messages.send'],
+      rateLimitPerSecond: 0,
+      rateLimitMode: 'refuse',
+      rateLimitRetryAfterMs: 250,
+      rateLimitWindowMs: 10_000,
+      agent: { agents: [AGENT], sessions: [SESSION] },
+    })
+
+    const error = await rejectionOf(
+      rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'hello', wait: false }),
+    )
+
+    // The peer's currency survives UNTOUCHED: identity, reason and the raw data
+    // (including the delay the peer asked for) are exactly what arrived.
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error!.data as { reason?: string }).reason).toBe('RATE_LIMITED')
+    expect((error!.data as { retryAfterMs?: number }).retryAfterMs).toBe(250)
+
+    // The peer's own text stays a PREFIX: the advice is APPENDED to the message,
+    // never substituted for the peer's verdict (the ⑪b rule, one hint over).
+    expect(error!.message).toMatch(/^Request rate exceeded/)
+    // The two facts the caller cannot derive and the model cannot guess:
+    //  - a refusal happens BEFORE dispatch, so the command was never applied;
+    //  - a retry is therefore safe, and reusing the id cannot collide with the
+    //    peer's ledger (nothing was recorded under it);
+    // plus the delay the peer asked for and the knob that causes one at all.
+    expect(error!.message).toContain('this attempt was not applied')
+    expect(error!.message).toContain('SAME commandId')
+    expect(error!.message).toContain('Wait about 250 ms')
+    expect(error!.message).toContain('rateBudgetPerSecond')
+
+    // A command is NEVER replayed (its receipt is the recovery, and there is no
+    // receipt here): exactly one arrival, and nothing reached the ledger.
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(1)
+    expect(rig.fake.admittedCommands.size).toBe(0)
+
+    // The refusal is about ONE request, not the session: the very next call on
+    // the same connection still answers, so a caller can retry after the wait.
+    const sessions = (await rig.call('cherry_sessions', { device: 'dev-A' })) as { items: unknown[] }
+    expect(sessions.items).toHaveLength(1)
+
+    await rig.stop()
+  }, 20_000)
+})

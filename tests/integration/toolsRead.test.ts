@@ -2750,6 +2750,12 @@ describe('issue #104: a rate-limited content read is not degraded', () => {
     // as a "complete" snapshot whose part text is silently empty.
     expect(error).toBeInstanceOf(Error)
     expect((error as { data?: unknown }).data).toMatchObject({ reason: 'RATE_LIMITED' })
+    // The recovery advice is COMMAND-only (issue #109). A refused READ is retried
+    // by the connection and, when the replay is refused too, surfaces as itself:
+    // it must never claim "this attempt was not applied" or suggest reusing a
+    // `commandId` — a read has neither a dispatch gate nor a ledger entry.
+    expect((error as Error).message).not.toContain('this attempt was not applied')
+    expect((error as Error).message).not.toContain('SAME commandId')
     // The slice was refused and replayed exactly once; the second refusal ended it.
     expect(rig.fake.methodCount('agent.content.read')).toBe(2)
   })
