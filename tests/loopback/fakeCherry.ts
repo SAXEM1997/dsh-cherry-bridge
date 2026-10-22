@@ -89,6 +89,20 @@ export interface FakeCherryOptions {
    */
   rateLimitPerSecond?: number
   /**
+   * How an over-budget request is answered.
+   *
+   * `'close'` (default) models desktop <=2.1.6: the socket dies with 1011.
+   * `'refuse'` models >=2.1.7 (PR #21687): ONE structured `RATE_LIMITED`
+   * failure carrying `retryAfterMs`, and the session stays open. Issue #104.
+   */
+  rateLimitMode?: 'close' | 'refuse'
+  /** `retryAfterMs` on a `'refuse'` answer (default 50). */
+  rateLimitRetryAfterMs?: number
+  /** The sliding window the cap is judged over (default 1,000 ms). */
+  rateLimitWindowMs?: number
+  /** Restrict the cap to these methods (default: every method). */
+  rateLimitMethods?: readonly string[]
+  /**
    * Terminal state `pairing.get` settles on. `undefined` (default) keeps
    * answering `pending` forever, which is what a real invitation does until the
    * user acts or the invitation expires.
@@ -1693,8 +1707,6 @@ export class FakeCherry {
     // that wants to consume the frame is a `beforeNextCall`/`alwaysBeforeCall`
     // one (those return below without answering).
     this.#arrivalObservers.get(method)?.()
-    // The per-SOCKET arrival, which is the window the rate cap is judged over.
-    live.arrivals.push(Date.now())
     if (method === 'connection.hello' && Array.isArray(params?.['protocolVersions'])) {
       this.#lastHelloProtocolVersions = [...(params['protocolVersions'] as number[])]
     }
@@ -1715,7 +1727,7 @@ export class FakeCherry {
         ;(before ?? always)?.()
         return
       }
-      if (this.#rateLimited(live)) return // session terminated; nothing further to say
+      if (await this.#rateLimited(live, frame, method)) return // the refusal IS the answer
 
       if (method === 'connection.ping' && this.#dropPings) {
         // Accepted, counted, never answered: the client's silence window judges.
@@ -3168,7 +3180,7 @@ export class FakeCherry {
     live: LiveConnection,
     id: unknown,
     result: Record<string, unknown> | undefined,
-    failure?: { reason: string; message: string },
+    failure?: FakeFailure,
   ): Promise<void> {
     const frame =
       failure === undefined
@@ -3186,8 +3198,9 @@ export class FakeCherry {
   }
 
   /**
-   * Whole-session rate termination (the ≤2.1.6 face): over-budget closes the
-   * socket with 1011 and returns true. Per-connection (per-socket) counting
+   * Over-budget answer: `'close'` terminates the whole session (the <=2.1.6
+   * face), `'refuse'` answers ONE structured `RATE_LIMITED` failure and leaves
+   * the socket open (the >=2.1.7 face). Per-connection (per-socket) counting
    * only — no global scheduling, mirroring the real desktop's rate window.
    *
    * The window is over `live.arrivals`, NOT the global `#requestTimestamps`:
@@ -3196,14 +3209,33 @@ export class FakeCherry {
    * connection's traffic could terminate the first. The comment above was the
    * contract; this is the implementation matching it.
    */
-  #rateLimited(live: LiveConnection): boolean {
+  async #rateLimited(
+    live: LiveConnection,
+    frame: Record<string, unknown>,
+    method: string,
+  ): Promise<boolean> {
     const budget = this.#options.rateLimitPerSecond
     if (budget === undefined) return false
+    const limited = this.#options.rateLimitMethods
+    if (limited !== undefined && !limited.includes(method)) return false
+    const windowMs = this.#options.rateLimitWindowMs ?? 1000
     const now = Date.now()
     const arrivals = live.arrivals
+    // Only COUNTED methods enter the window: an exempt method (the handshake,
+    // or a method a test keeps out of the cap) must not consume the budget it
+    // is exempt from. This used to push every frame before the check.
+    arrivals.push(now)
     // Drop entries too old to matter, so the per-socket list stays bounded.
-    while (arrivals.length > 0 && now - arrivals[0]! >= 1000) arrivals.shift()
+    while (arrivals.length > 0 && now - arrivals[0]! >= windowMs) arrivals.shift()
     if (arrivals.length <= budget) return false
+    if (this.#options.rateLimitMode === 'refuse') {
+      await this.#reply(live, frame.id, undefined, {
+        reason: 'RATE_LIMITED',
+        message: 'Request rate exceeded',
+        retryAfterMs: this.#options.rateLimitRetryAfterMs ?? 50,
+      })
+      return true
+    }
     live.socket.close(1011, 'rate limit exceeded')
     return true
   }

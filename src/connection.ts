@@ -11,6 +11,7 @@ import {
   DEFAULT_CONTENT_READ_BUDGET_PER_SECOND,
   DEFAULT_RATE_BUDGET_PER_SECOND,
   DEFAULT_TRANSPORT_RETRY_WAIT_MS,
+  RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
 import { urlHost } from './urlHost.js'
 import type { DeviceRecord } from './deviceStore.js'
@@ -230,6 +231,31 @@ const RATE_WINDOW_MS = 1_000
 const RATE_WINDOW_MARGIN_MS = 150
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
 const DISPOSED_RE = /^JSON-RPC client disposed$/
+
+/**
+ * The peer's structured over-budget refusal (desktop >= 2.1.7), or undefined.
+ *
+ * 2.1.7 answers an over-budget request with ONE `RATE_LIMITED` failure carrying
+ * `retryAfterMs` and keeps the session; <=2.1.6 instead closed the whole socket
+ * with 1011, which is the transport-loss path and never reaches this check.
+ */
+function rateLimitRefusal(error: unknown): JsonRpcRequestError | undefined {
+  if (!(error instanceof JsonRpcRequestError)) return undefined
+  const data = error.data
+  if (typeof data !== 'object' || data === null) return undefined
+  return (data as Record<string, unknown>)['reason'] === 'RATE_LIMITED' ? error : undefined
+}
+
+/**
+ * How long a refusal asks the caller to wait, bounded by
+ * {@link RATE_LIMIT_MAX_WAIT_MS}. An absent or unusable value is 0: retry at
+ * the next pacing slot rather than invent a delay the peer never asked for.
+ */
+function rateLimitWaitMs(refusal: JsonRpcRequestError): number {
+  const raw = (refusal.data as Record<string, unknown>)['retryAfterMs']
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return 0
+  return Math.min(raw, RATE_LIMIT_MAX_WAIT_MS)
+}
 /**
  * The read methods whose transport loss may be replayed automatically.
  *
@@ -1476,6 +1502,8 @@ export class DeviceConnection {
     try {
       return await link.client.request<T>(method, params, opts)
     } catch (error) {
+      const refusal = rateLimitRefusal(error)
+      if (refusal !== undefined) return await this.#replayAfterRateLimit(refusal, method, params, opts)
       if (!this.#isTransportLoss(error)) throw error
       // Reported with the state the request DIED in ('connected'): the
       // supervisor has not necessarily observed the loss yet, and naming the
@@ -1562,6 +1590,70 @@ export class DeviceConnection {
         }
         throw error
       }
+    }
+  }
+
+  /**
+   * ONE bounded replay for a READ the peer refused because the socket is over
+   * its rate window.
+   *
+   * 2.1.7 answers that request with a structured `RATE_LIMITED` failure and a
+   * `retryAfterMs` instead of closing the session (see `rateLimitRefusal`), so
+   * the caller no longer learns it was throttled by losing its connection:
+   * without this, a transient refusal became a failed tool call whose part text
+   * the projection would even degrade.
+   *
+   * The shape mirrors the transport-loss replay, for the same reasons:
+   *
+   *  - only a READ is replayed (a command's refusal is a verdict on that
+   *    arrival, and commands are never replayed — receipts recover them);
+   *  - the wait is charged to the caller's deadline and never extends it, so a
+   *    wait answer's budget turns a refusal near its bound into a `'deadline'`
+   *    stop instead of an overrun;
+   *  - the replay takes a FRESH pacing admission: it is a new arrival at the
+   *    peer, and skipping the admission would replay into the same full window.
+   *
+   * A SECOND refusal is a real failure and propagates as itself (the fresh
+   * `retryAfterMs` is the more useful one); a link lost under the replay is
+   * reported as the classified `TransportLostError`, never as bare text.
+   */
+  async #replayAfterRateLimit<T>(
+    refusal: JsonRpcRequestError,
+    method: string,
+    params: unknown,
+    opts: JsonRpcRequestOptions | undefined,
+  ): Promise<T> {
+    if (!RETRYABLE_READ_METHODS.has(method) || !this.#running) throw refusal
+    const remaining = this.#remainingMs(opts)
+    if (remaining !== undefined && remaining <= 0) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+    const requested = rateLimitWaitMs(refusal)
+    const waitMs = Math.min(requested, remaining ?? Number.POSITIVE_INFINITY)
+    // WHICH BOUND WAS SPENT is captured BEFORE the timer, never re-derived from
+    // a clock read after it: a timer may fire a millisecond EARLY (the same race
+    // `reconnectWait`/`deadlineCapped` exists to avoid, and the reason
+    // `RequestTimeoutError.clampedByDeadline` is a flag). When the requested
+    // wait consumed the caller's whole budget, the outcome is the CALLER's
+    // deadline — throwing it here also keeps the one replay from being sent
+    // into a budget that was already spent.
+    const deadlineSpent = remaining !== undefined && requested >= remaining
+    if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs))
+    // The wait is not cancellable by `close()`; the state is re-judged instead,
+    // the same way every other parked wait in this class is.
+    if (!this.#running || this.#state !== 'connected') throw refusal
+    if (deadlineSpent || this.#deadlinePassed(opts)) {
+      throw new RpcDeadlineExceededError(this.record.deviceId, method)
+    }
+    await this.#limiter.acquire(method)
+    const link = this.#link
+    if (!this.#running || this.#state !== 'connected' || link === undefined) throw refusal
+    if (this.#deadlinePassed(opts)) throw new RpcDeadlineExceededError(this.record.deviceId, method)
+    try {
+      return await link.client.request<T>(method, params, opts)
+    } catch (error) {
+      if (this.#isTransportLoss(error)) {
+        throw new TransportLostError(this.record.deviceId, 'connected', method, { cause: error })
+      }
+      throw error
     }
   }
 

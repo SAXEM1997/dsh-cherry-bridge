@@ -87,6 +87,20 @@ export const DEFAULT_CONTENT_READ_BUDGET_PER_SECOND = 256
 export const DEFAULT_TRANSPORT_RETRY_WAIT_MS = 5_000
 
 /**
+ * The longest a READ may wait for the peer's rate window to clear before its
+ * ONE bounded replay (`RATE_LIMITED` + `retryAfterMs`, desktop >= 2.1.7).
+ *
+ * Why the peer's own window and not a separate budget: the desktop derives
+ * `retryAfterMs` from its 1 s accounting window, so a larger value cannot come
+ * from the peer, and waiting longer would hold a tool call for no reason. The
+ * caller's own deadline (`JsonRpcRequestOptions.deadline`) still clamps it, and
+ * a wait answer's `AssemblyDeadline` is what makes a refusal near the budget a
+ * `'deadline'` stop rather than an overrun. A COMMAND never takes this wait: its
+ * refusal is a verdict on that arrival, and commands are never replayed.
+ */
+export const RATE_LIMIT_MAX_WAIT_MS = 1_000
+
+/**
  * How long a DEVICE TOOL waits for an establishment attempt that is already in
  * flight (`state === 'connecting'`) before judging the device.
  *
