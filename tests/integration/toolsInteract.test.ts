@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
-import { DeviceConnection } from '../../src/connection.js'
+import { DeviceConnection, TransportLostError } from '../../src/connection.js'
 import { JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
@@ -98,6 +98,8 @@ interface RigOptions {
   skipConnect?: boolean
   /** Extra paired devices to seed, so a display-name prefix can be ambiguous. */
   extraDevices?: Array<{ deviceId: string; displayName: string }>
+  /** Shorten the reconnect backoff so a transport-loss test does not wait it out. */
+  backoffInitialMs?: number
 }
 
 async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions = {}): Promise<Rig> {
@@ -131,7 +133,13 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     if (existing !== undefined) return existing
     const stored = store.list().find((entry) => entry.deviceId === deviceId)
     if (stored === undefined) throw new Error(`no device ${deviceId}`)
-    const connection = new DeviceConnection({ identity, record: stored })
+    const connection = new DeviceConnection({
+      identity,
+      record: stored,
+      // A loopback peer is back immediately; the production backoff would make
+      // every reconnect assertion wait a second per attempt.
+      ...(rigOptions.backoffInitialMs === undefined ? {} : { backoffInitialMs: rigOptions.backoffInitialMs }),
+    })
     connections.set(deviceId, connection)
     return connection
   }
@@ -197,11 +205,14 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
 
 /** The one session every scenario drives. */
 const SESSION = {
+  // `historyRevision` doubles as the session's IDLE revision (an idle peer
+  // reports one), and the fake MUTATES the fixture it is given — so a test that
+  // moves the session hands it `{ ...SESSION }`, never this object.
+  historyRevision: '1',
   sessionId: 's-1',
   agentId: 'agent-1',
   workspaceId: 'ws-1',
   title: 'Hello',
-  historyRevision: '1',
 }
 
 const AGENT = { agentId: 'agent-1', name: 'Agent One' }
@@ -348,7 +359,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('', [
           { kind: 'text', text: 'done:' },
           { kind: 'text', text: big },
@@ -400,7 +411,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         pushInteractionOnRun: questionInteraction(),
       },
     })
@@ -526,7 +537,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         // The run has ALREADY produced a partial assistant message when the
         // window elapses: a timeout must hand that back rather than discard it.
         messages: [
@@ -631,7 +642,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         interactions: [
           questionInteraction({ interactionId: 'i-pending', status: 'pending', revision: '2' }),
           decisionInteraction({ interactionId: 'i-approved', status: 'approved', revision: '4' }),
@@ -912,7 +923,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('ok'),
         sendEnforcesIdleRevision: false,
       },
@@ -957,7 +968,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('ok'),
         sendEnforcesIdleRevision: false,
       },
@@ -978,6 +989,128 @@ describe('interactive cherry tools over a real loopback channel', () => {
     expect(rig.fake.commandCallsFor('agent.messages.send')).toHaveLength(before)
   })
 
+  it('⑪g a reply LOST ON THE WIRE is recovered by a same-id retry after the reconnect (issue #115)', async () => {
+    // THE HEADLINE SCENARIO: the peer APPLIED the command and the transport died
+    // before the reply reached us. The caller cannot tell whether it landed, so
+    // the only recovery is re-sending the ORIGINAL body under the original id
+    // and letting the ledger replay its receipt.
+    //
+    // That only works if the body was remembered BEFORE the command was issued.
+    // A reply lost on the wire is not a verdict, so nothing about the outcome is
+    // known when it happens — and by the time the caller retries the session has
+    // usually MOVED (the lost command's own run settles, or anything else writes
+    // to it). A retry that DERIVED its baseline then quotes a body the ledger
+    // never recorded.
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [AGENT],
+          sessions: [{ ...SESSION }, { ...SESSION, sessionId: 's-2' }],
+          terminalMessage: terminalMessage('only once'),
+          // The peer is faithful: it gates admission on the revision. That is
+          // what makes a DERIVED retry visible — it is refused, and all the
+          // engine can do with a refusal is its one self-heal, under a fresh
+          // uuid. A REPLAYED original body needs no heal at all.
+          sendEnforcesIdleRevision: true,
+          // The lost command's run settles a moment after the drop — while the
+          // caller is reconnecting.
+
+          // Short enough to land inside the reconnect.
+          runDelayMs: 150,
+        },
+      },
+      {
+        backoffInitialMs: 20,
+        // The revision cache holds ONE session, so the send's own snapshot of
+        // s-1 is EVICTED by the time the retry runs — it must either REPLAY the
+        // remembered body or DERIVE one from the peer.
+        engine: { cacheEntriesPerDevice: 1 },
+      },
+    )
+    // PRIME the session's subscription over the pool's live connection, so the
+    // send's own `#ensureSubscription` does not race the drop below.
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+
+    // THE REPLY IS LOST AFTER THE HANDLER RAN: the peer applies the command
+    // (its ledger records it) and the answer's frame is never written because
+    // the link dies at that instant. A hook that fired on ARRIVAL would model a
+    // command the peer never saw — nothing in the ledger, and a retry that is a
+    // plain first command.
+    rig.fake.loseNextReply('agent.messages.send', () => {
+      rig.fake.dropConnections()
+    })
+    const lost = await rig
+      .call('cherry_send', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        text: 'only once',
+        commandId: 'lost-reply-id',
+        wait: false,
+      })
+      .then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+    // A command is never replayed by the transport: the loss is the answer.
+    expect(lost).toBeInstanceOf(TransportLostError)
+    // ...and the peer really did apply it: this is a lost REPLY, not a lost
+    // request. The ledger holds the receipt the caller never saw.
+    expect(rig.fake.receiptFor('lost-reply-id')?.['status']).toBe('applied')
+
+    // The link comes back on its own (the pooled instance backs off and
+    // re-establishes); the retry is the caller's move, not the transport's.
+    await vi.waitFor(() => expect(rig.fake.connectedClients).toBe(1), { timeout: 5_000 })
+
+    // The run the lost command started SETTLES while the caller is still
+    // reconnecting: the peer's revision advances and the session returns to
+    // idle (`activeExecutionId` cleared). The caller's view went blind with the
+    // link, so nothing tells it.
+    await vi.waitFor(() => expect(rig.fake.activeExecutionId).toBeUndefined(), { timeout: 5_000 })
+    // The revision cache holds ONE session (injected above), and a SECOND
+    // session's snapshot EVICTS s-1's. The evicting write is a SEND, not merely
+    // a subscription: the session caches are sized and ordered by `#remember`,
+    // which only a snapshot-bearing tool call reaches. So s-1's cached baseline
+    // is gone when the retry arrives, and the retry must either REPLAY the
+    // remembered body or DERIVE one from the peer.
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-2', text: 'elsewhere', wait: false })
+    // ...and the peer's revision moved while the caller was not looking.
+    rig.fake.setSessionRevision('s-1', '7')
+    const before = rig.fake.commandCallsFor('agent.messages.send').length
+
+    // THE CALLER'S RETRY — same id, same text.
+    const replay = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'only once',
+      commandId: 'lost-reply-id',
+      wait: false,
+    })) as { commandId: string; status: string; executionId?: string }
+
+    // THE ORIGINAL RECEIPT, under the CALLER'S id: the ledger answered with the
+    // receipt it already had, under its original execution id.
+    expect(replay.commandId).toBe('lost-reply-id')
+    expect(replay.status).toBe('applied')
+    expect(replay.executionId).toBe(rig.fake.receiptFor('lost-reply-id')?.['executionId'])
+
+    // TWO arrivals under the CALLER'S id — the lost request, then the retry —
+    // and exactly ONE applied command: the retry replayed a body the ledger
+    // already held. (`s-2`'s eviction send above is a different id and cannot
+    // mask this.)
+    const sends = rig.fake.commandCallsFor('agent.messages.send')
+    const ours = sends.filter((send) => send['commandId'] === 'lost-reply-id')
+    expect(ours).toHaveLength(2)
+    expect(ours[1]).toEqual(ours[0])
+    expect(rig.fake.admittedCommands.size).toBe(2)
+    // NO SELF-HEAL, and therefore no second run: a retry whose body had to be
+    // DERIVED after the session moved is refused as a stale admission, and the
+    // heal's fresh-uuid attempt is the only send that would carry another id.
+    // The replayed body was the remembered one, so the ledger answered with the
+    // receipt it already had.
+    const lostRunIds = new Set(rig.fake.executionUpdates.map((entry) => entry.executionId))
+    expect(lostRunIds.size).toBe(1)
+    expect(lostRunIds.has(String(rig.fake.receiptFor('lost-reply-id')?.['executionId']))).toBe(true)
+  }, 30_000)
+
   // -------------------------------------------------------------------------
   // ⑫ wait=false
   // -------------------------------------------------------------------------
@@ -986,7 +1119,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('finished later'),
         runDelayMs: 4_000,
       },
@@ -1094,7 +1227,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         runTerminalStatus: 'interrupted',
         terminalMessage: terminalMessage('cut short'),
       },
@@ -1136,7 +1269,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         omitSendExecutionId: true,
         // The terminal message MUST already be in the session history under the
         // SAME id the terminal names: the run-scoped aggregate cuts at that id,
@@ -1178,7 +1311,7 @@ describe('interactive cherry tools over a real loopback channel', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         omitSendExecutionId: true,
         terminalMessage: terminalMessage('first run'),
         runDelayMs: 250,
@@ -1397,7 +1530,7 @@ describe('interactive tools: review regressions', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('ok'),
         runDelayMs: 50,
       },
@@ -1438,7 +1571,7 @@ describe('interactive tools: review regressions', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('ok'),
         runDelayMs: 50,
       },
@@ -1531,7 +1664,7 @@ describe('interactive tools: review regressions', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         // The session is IDLE; only an already-approved card is on record.
         interactions: [decisionInteraction({ interactionId: 'i-old', status: 'approved', executionId: 'exec-old' })],
       },
@@ -1585,7 +1718,7 @@ describe('interactive tools: review regressions', () => {
       agent: {
         agents: [AGENT],
         // The peer is IDLE. A settled card on record must not make it look busy.
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         interactions: [decisionInteraction({ interactionId: 'i-old', status: 'denied', executionId: 'exec-old' })],
       },
     })
@@ -1678,7 +1811,7 @@ describe('final review: run-scoped terminal aggregate', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('run-one-reply'),
         runDelayMs: 10,
       },
@@ -1728,7 +1861,7 @@ describe('final review: run-scoped terminal aggregate', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('run-one-reply'),
         runDelayMs: 10,
       },
@@ -1760,7 +1893,7 @@ describe('final review: the receipt status enum', () => {
     const rig = await makeRig({
       agent: {
         agents: [AGENT],
-        sessions: [SESSION],
+        sessions: [{ ...SESSION }],
         terminalMessage: terminalMessage('accepted-run-reply'),
         sendOutcome: 'accepted',
         runDelayMs: 50,

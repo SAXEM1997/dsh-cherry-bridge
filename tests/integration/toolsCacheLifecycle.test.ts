@@ -350,9 +350,14 @@ describe('v0.1.3 P3-1: the engine session caches are BOUNDED', () => {
 })
 
 describe('v0.1.3 P3-2: a pairing that the peer refused invalidates the caches', () => {
-  it('C1c the remembered send bodies are BOUNDED per device (FIFO), and a device teardown drops them', async () => {
+  it('C1c the remembered send bodies are BOUNDED per device (FIFO), and only a PAIRING teardown drops them', async () => {
     // Issue #115's memory, through the SAME two assertions every other engine
-    // cache gets: bounded, and dropped at the one invalidation seam.
+    // cache gets — bounded, and dropped at the invalidation seam — with one
+    // crucial difference. The read caches go on ANY `offline`; the send bodies
+    // go only when the PAIRING is invalidated (unpair, identity-mismatch),
+    // because what they replay against — the peer's command ledger — survives a
+    // reconnect, and the body is the only local copy of the bytes that ledger
+    // will accept.
     //
     // The entries are filled through the engine's own store path (a retry
     // window after a burst of lost replies would), and the bound is driven to
@@ -378,14 +383,31 @@ describe('v0.1.3 P3-2: a pairing that the peer refused invalidates the caches', 
     rig.rememberCommandBody('dev-A', 'cmd-2')
     expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-2', 'cmd-3'])
 
-    // AND THE MEMORY DIES WITH THE DEVICE, through the ONE invalidation seam
-    // every engine cache already shares: `#forgetDevice`, which runs on an
-    // `offline` transition. A tool call FIRST, because that is what joins the
-    // device's state channel (`#resolve` installs the watch) — the same seam
-    // C2a/C2b ride.
+    // THE WIRING: a real `cherry_send` under a CALLER-SUPPLIED commandId is what
+    // fills this memory — not only the test seam above.
+    const receipt = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'wiring',
+      commandId: 'cmd-wiring',
+      wait: false,
+    })) as { status?: string }
+    expect(receipt.status).toBe('applied')
+    expect(rig.rememberedCommandIds('dev-A')).toContain('cmd-wiring')
+
+    // AN ORDINARY `offline` (the peer drops the link; the connection goes down
+    // and comes back) drops the OTHER caches — and KEEPS these.
     await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
-    await rig.evict()
+    await rig.dropLink()
     await vi.waitFor(() => expect(rig.states()).toContain('offline'), { timeout: 5_000 })
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-3', 'cmd-wiring'])
+
+    // The bound is still in force (cmd-wiring's insert EVICTED cmd-2; cmd-3 is
+    // now the oldest of two).
+    // ...and a PAIRING teardown (`cherry_unpair`, which resolves the record
+    // before the store entry is gone) drops them.
+    const unpaired = (await rig.call('cherry_unpair', { device: 'dev-A' })) as { removed?: boolean }
+    expect(unpaired.removed).toBe(true)
     expect(rig.rememberedCommandIds('dev-A')).toEqual([])
   }, 30_000)
 

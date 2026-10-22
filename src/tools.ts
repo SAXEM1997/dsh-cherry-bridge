@@ -881,11 +881,9 @@ const MESSAGE_CACHE_BYTES_PER_DEVICE = 33_554_432
  * stored), and one revision string. 128 is "more than any live retry window
  * needs, small enough to be trivial": a caller retries a handful of command ids
  * around a lost reply, and each is recoverable while it stays in this FIFO.
- * Eviction costs a REQUEST, never correctness — an evicted id is simply unknown
- * again, so a same-id retry is REFUSED LOCALLY as a body mismatch rather than
- * replayed (see `#admitSend`), which is the conservative direction: the caller
- * is told to regenerate the id, while the peer's own ledger still holds the
- * original receipt.
+ * Eviction costs a REQUEST, never correctness — an evicted id has NO entry, so
+ * a same-id retry re-derives a fresh baseline and it is the PEER that refuses
+ * the differing body, exactly as it would without this memory.
  *
  * PER DEVICE, like every engine cache: the id is the caller's, but the peer
  * that settled it is not, and a second desktop must never be sent a body minted
@@ -1321,6 +1319,10 @@ const COMMAND_BODY_DIFFERS_MESSAGE = 'Command body differs from the recorded com
  * forwarded one would have been: a `JsonRpcRequestError` carrying
  * `{reason: 'IDEMPOTENCY_CONFLICT'}`, distinguishable only by the fact that no
  * request was ever sent.
+ *
+ * A LOCAL twin of the literal `src/rpc/jsonRpcClient.ts` documents in its own
+ * `JsonRpcRequestError` docblock: that module exports no code constant, and
+ * adding one only to name this number would widen the published surface for it.
  */
 const JSON_RPC_PROTOCOL_ERROR_CODE = 1000
 
@@ -1614,6 +1616,10 @@ export function registerCherryTools(
  * honest way to pin "bounded" and "dropped with the device" is to observe it
  * through this one seam instead of inferring it from retry outcomes that are
  * identical for an evicted entry and for one that never existed.
+ *
+ * Both this function and `export class CherryToolEngine` are SHIPPED names
+ * (`src` is published on purpose, see AGENTS.md → Build facts), so they are a
+ * compatibility commitment — which is why this seam is kept minimal.
  */
 export function registerCherryToolsWithEngine(
   ctx: CherryToolsContext,
@@ -1819,11 +1825,18 @@ export class CherryToolEngine {
    *
    * WHAT IS REMEMBERED: only CALLER-SUPPLIED ids. An auto-generated uuid is a
    * one-shot identity — nobody can retry it, so an entry for it is pure leak.
-   * The entry is written once the command has actually been ISSUED, and on ANY
-   * settled outcome: the peer's ledger settles an applied receipt and a rejected
-   * one alike, so replaying either is right.
+   * The entry is written the moment the command is ISSUED, before the reply is
+   * awaited: a reply lost on the wire must not cost the only copy of the bytes
+   * the peer's ledger will accept.
    *
-   * Bounded FIFO, per device, and dropped with the device's other caches — see
+   * Which body an id holds: the LATEST attempt issued for it — the first
+   * attempt, or the self-heal's fresh-uuid retry when one ran. After a heal, a
+   * same-id retry is therefore answered with the peer's conflict, deliberately:
+   * replaying the ledger's rejected receipt would re-run the healed admission
+   * and duplicate the run, and a conflict is the safer failure.
+   *
+   * Bounded FIFO, per device; dropped when the PAIRING is invalidated (unpair,
+   * identity-mismatch) but KEPT across an ordinary reconnect — see
    * {@link COMMAND_BODY_ENTRIES_PER_DEVICE} and
    * {@link CherryToolEngine.#forgetDevice}.
    */
@@ -3896,40 +3909,27 @@ export class CherryToolEngine {
       commandId: string,
       revisionOverride?: string,
     ): Promise<{ receipt: Record<string, unknown>; baselineSeq: number }> => {
-      // A CALLER-SUPPLIED ID REPLAYS ITS OWN BODY (issue #115). The body carries
-      // a DERIVED field — `expectedIdleRevision` — whose value moves as the
-      // session does, so deriving it again on a retry produced a DIFFERENT body
-      // under the SAME id: the peer answers IDEMPOTENCY_CONFLICT, and the
-      // lost-reply recovery the tools document becomes impossible on the one
-      // path where the caller cannot tell what already landed.
-      //
       // The memory belongs to the id it was MINTED for, so the lookup is gated
-      // on `commandId === callerId`: the stale-revision self-heal's retry runs
-      // under a FRESH uuid with a RE-BASELINED revision, and the caller's id —
-      // whose first, refused body (a rejected receipt is settled too, so it was
-      // remembered) carries exactly the baseline the peer just refused — must
-      // not ride along. Before that gate the healing retry re-quoted the stale
-      // baseline and was refused again, dead-ending the self-heal for every
-      // caller-supplied id (T1c).
-      //
-      // Equally important is what is REFUSED. A same-id call whose
-      // `sessionId`/`text` differ from the remembered body is not a retry of
-      // that command, and the conflict is already decided (the peer holds the
-      // original body), so it is answered LOCALLY — the peer's own words, no wire
-      // call at all. Only the caller's own attempt can reach that refusal: the
-      // self-heal's fresh-uuid attempt has no memory of its own.
+      // on `commandId === callerId`: the self-heal's fresh-uuid attempt derives
+      // its own baseline instead of inheriting the caller's.
       const remembered =
         callerId === undefined || commandId !== callerId
           ? undefined
           : this.#recallCommandBody(deviceId, callerId)
+      // A same-id call whose `sessionId`/`text` differ from the remembered body
+      // is not a retry of that command: the peer holds the original body, so the
+      // conflict is already decided and is answered LOCALLY, in the peer's own
+      // words, with no wire call.
       const mismatched =
         remembered !== undefined && (remembered.sessionId !== sessionId || remembered.text !== text)
       if (mismatched) {
-        throw withIdempotencyHint(
-          new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
-            reason: 'IDEMPOTENCY_CONFLICT',
-            message: COMMAND_BODY_DIFFERS_MESSAGE,
-          }),
+        throw withRateLimitHint(
+          withIdempotencyHint(
+            new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
+              reason: 'IDEMPOTENCY_CONFLICT',
+              message: COMMAND_BODY_DIFFERS_MESSAGE,
+            }),
+          ),
         )
       }
       const expectedIdleRevision =
@@ -3947,26 +3947,17 @@ export class CherryToolEngine {
       // Nothing before this point can emit this run's events: the command has
       // not been sent yet.
       const baselineSeq = this.#newestSeq(subscriptions, sessionId)
-      const body = { commandId, sessionId, text, expectedIdleRevision }
-      let receipt: Record<string, unknown>
-      try {
-        receipt = await this.#command(connection, 'agent.messages.send', body)
-      } catch (error) {
-        // A THROWN refusal is not a settled command: the peer either never
-        // reached its ledger (a schema refusal, a rate limit refused before
-        // dispatch) or the link died mid-flight (the lost-reply case). Nothing
-        // is remembered on that path, and nothing needs to be — a retry with a
-        // fresh baseline is exactly the right second attempt there, and the
-        // ledger would answer IDEMPOTENCY_CONFLICT rather than a receipt if it
-        // had recorded the body after all.
-        throw error
-      }
-      // The command is now ISSUED and settled, whatever the receipt says: the
-      // peer's ledger holds the body (an applied receipt and a rejected one
-      // alike), so replaying it is the correct recovery from here on.
+      // The body is remembered the moment it is ISSUED — a reply lost on the wire
+      // must not cost the only copy of the bytes the peer's ledger will accept.
       if (callerId !== undefined) {
         this.#rememberCommandBody(deviceId, callerId, { sessionId, text, expectedIdleRevision })
       }
+      const receipt = await this.#command(connection, 'agent.messages.send', {
+        commandId,
+        sessionId,
+        text,
+        expectedIdleRevision,
+      })
       return { receipt, baselineSeq }
     }
 
@@ -4621,7 +4612,7 @@ export class CherryToolEngine {
         // pairing's idle revisions and execution ids, and would grow the maps
         // for the lifetime of the process. The store record is untouched by
         // this — the caches are pure derived state and can always be rebuilt.
-        this.#forgetDevice(record.deviceId)
+        this.#forgetDevice(record.deviceId, { dropCommandBodies: true })
         await this.#deps.evict(record.deviceId)
         // The remove is GUARDED, not merely ordered. `#selectRecords` already
         // rejects a quarantined store before a record can be named, so reaching
@@ -4982,7 +4973,8 @@ export class CherryToolEngine {
    *    the stored credential no longer describes a valid pairing. A transient
    *    network drop ALSO lands here and clears the caches unnecessarily; that
    *    is accepted, because the cost is one round trip per session on reuse and
-   *    the alternative is keeping snapshots across an identity change.
+   *    the alternative is keeping snapshots across an identity change. (The
+   *    remembered send BODIES are the one exception: see `#forgetDevice`.)
    *  - `identity-mismatch` — the peer's pinned key changed: the pairing is over.
    *
    * {@link CherryToolEngine.#resolve} installs the watch on every tool call that
@@ -5010,7 +5002,8 @@ export class CherryToolEngine {
     this.#watchedConnections.add(connection)
     watch(deviceId, (state) => {
       if (state !== 'offline' && state !== 'identity-mismatch') return
-      this.#forgetDevice(deviceId)
+      // A plain `offline` keeps the remembered send bodies: see `#forgetDevice`.
+      this.#forgetDevice(deviceId, { dropCommandBodies: state === 'identity-mismatch' })
     })
   }
 
@@ -5023,8 +5016,16 @@ export class CherryToolEngine {
    * leaves the archive (`cherry_unpair`), so a re-paired device cannot inherit
    * the previous pairing's snapshots and a long-lived process does not
    * accumulate entries for devices that no longer exist.
+   *
+   * The remembered SEND bodies obey a NARROWER seam than the read caches:
+   * `dropCommandBodies` is passed by the callers that invalidate the PAIRING
+   * (unpair, identity-mismatch), never by an ordinary `offline`. What a body
+   * replays against — the peer's command ledger — survives a reconnect, and the
+   * body is the only local copy of the exact bytes that ledger will accept, so
+   * a link drop that emptied it would cost the recovery itself, where the read
+   * caches merely pay one re-walk.
    */
-  #forgetDevice(deviceId: string): void {
+  #forgetDevice(deviceId: string, options: { dropCommandBodies?: boolean } = {}): void {
     const prefix = `${deviceId}\u0000`
     for (const key of [...this.#revisionCache.keys()]) {
       if (key.startsWith(prefix)) this.#forget(this.#revisionCache, key)
@@ -5045,12 +5046,22 @@ export class CherryToolEngine {
     for (const key of [...this.#messageCache.keys()]) {
       if (key.startsWith(prefix)) this.#dropCachedMessage(key)
     }
-    // The remembered SEND bodies (issue #115) go with them. They are
-    // device-scoped evidence in the same sense: a body minted against one
-    // pairing — carrying that desktop's session id and idle revision — must not
-    // be replayed to whatever desktop answers under this device id next.
-    for (const key of [...this.#commandBodies.keys()]) {
-      if (key.startsWith(prefix)) this.#forget(this.#commandBodies, key)
+    // The remembered SEND bodies (issue #115) differ from every cache above:
+    // what they replay against is the peer's command LEDGER, and that survives
+    // an ordinary reconnect — so they are dropped only when the PAIRING is
+    // invalidated (`dropCommandBodies`: unpair, identity-mismatch), because a
+    // body minted against one pairing must not be replayed to whatever desktop
+    // answers under this device id next.
+    //
+    // The residual, stated rather than closed: GRANT_REVOKED also surfaces as
+    // `offline`, so a voided pairing's entries survive until the re-pair path
+    // (unpair / identity-mismatch) or the 128-entry FIFO retires them; a same-id
+    // retry across a silent re-pair replays a body the new peer admits as a NEW
+    // command — and the caller asked for that send.
+    if (options.dropCommandBodies === true) {
+      for (const key of [...this.#commandBodies.keys()]) {
+        if (key.startsWith(prefix)) this.#forget(this.#commandBodies, key)
+      }
     }
   }
 
@@ -5132,7 +5143,7 @@ export class CherryToolEngine {
         console.warn(
           `[cherry-remote] remembered send bodies for device ${deviceId} reached their ` +
             `${this.#commandBodyEntriesPerDevice}-commandId bound; evicted the oldest (a retry of ` +
-            'that commandId is now refused locally instead of being replayed)',
+            'that commandId now re-derives its body, and the peer decides whether it replays)',
         )
       }
     }
