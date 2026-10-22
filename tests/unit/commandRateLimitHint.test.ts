@@ -30,7 +30,7 @@ describe('withRateLimitHint', () => {
     expect((error.data as { reason: string }).reason).toBe('RATE_LIMITED')
     // The peer's own text stays a PREFIX: prose is appended, never substituted.
     expect(error.message).toMatch(/^Request rate exceeded — /)
-    expect(error.message).toContain('the command was NOT applied')
+    expect(error.message).toContain('this attempt was not applied')
     expect(error.message).toContain('SAME commandId')
     expect(error.message).toContain('Wait about 250 ms')
     expect(error.message).toContain('rateBudgetPerSecond')
@@ -49,12 +49,20 @@ describe('withRateLimitHint', () => {
       { reason: 'RATE_LIMITED', retryAfterMs: null },
     ]) {
       const error = withRateLimitHint(refusal(data)) as JsonRpcRequestError
-      expect(error.message).toContain('the command was NOT applied')
+      expect(error.message).toContain('this attempt was not applied')
       expect(error.message).not.toContain('Wait about')
       expect(error.message).not.toContain('undefined')
       expect(error.message).not.toContain('NaN')
       expect(error.message).not.toContain('soon')
     }
+  })
+
+  it('rounds a fractional retryAfterMs UP, never down', () => {
+    // The desktop hands back a wall-clock remainder, which is fractional in
+    // practice. Truncating it would name a delay SHORTER than the one we were
+    // asked for, i.e. advise a retry that the same window refuses again.
+    const error = withRateLimitHint(refusal({ reason: 'RATE_LIMITED', retryAfterMs: 250.4 })) as JsonRpcRequestError
+    expect(error.message).toContain('Wait about 251 ms')
   })
 
   it('leaves every other failure untouched, reason-shaped data or not', () => {
@@ -77,6 +85,6 @@ describe('withRateLimitHint', () => {
     const once = error.message
     withRateLimitHint(error)
     expect(error.message).toBe(once)
-    expect(error.message.match(/over its rate allowance/g)).toHaveLength(1)
+    expect(error.message.match(/refuses BEFORE dispatch/g)).toHaveLength(1)
   })
 })

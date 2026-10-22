@@ -1639,7 +1639,7 @@ describe('final review: the receipt status enum', () => {
 // ---------------------------------------------------------------------------
 
 describe('issue #109: a rate-limited COMMAND explains itself', () => {
-  it('⑰ a RATE_LIMITED refusal says the command was NOT applied, and how long to wait', async () => {
+  it('⑰ a RATE_LIMITED refusal says THIS attempt was not applied, and how long to wait', async () => {
     const rig = await makeRig({
       // The desktop's counter is PER SOCKET and counts only the methods a test
       // limits, so restricting the cap to `agent.messages.send` keeps the
@@ -1671,7 +1671,7 @@ describe('issue #109: a rate-limited COMMAND explains itself', () => {
     //  - a retry is therefore safe, and reusing the id cannot collide with the
     //    peer's ledger (nothing was recorded under it);
     // plus the delay the peer asked for and the knob that causes one at all.
-    expect(error!.message).toContain('the command was NOT applied')
+    expect(error!.message).toContain('this attempt was not applied')
     expect(error!.message).toContain('SAME commandId')
     expect(error!.message).toContain('Wait about 250 ms')
     expect(error!.message).toContain('rateBudgetPerSecond')

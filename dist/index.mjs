@@ -5080,7 +5080,7 @@ function withIdempotencyHint(error) {
 * with the peer's `retryAfterMs`; matching the peer's own text would match every
 * rate-limit refusal, hinted or not.
 */
-const RATE_LIMIT_HINT_MARK = "over its rate allowance";
+const RATE_LIMIT_HINT_MARK = "refuses BEFORE dispatch";
 /**
 * How long a refused COMMAND was asked to wait, or undefined when the peer sent
 * nothing a caller can act on.
@@ -5104,22 +5104,31 @@ function rateLimitedWaitMs(error) {
 *
 * Two facts decide the retry and NEITHER survives the tool boundary on its own:
 *
-*  - **The command was NOT applied.** The desktop refuses BEFORE dispatch — its
+*  - **THIS attempt was not applied.** The desktop refuses BEFORE dispatch — its
 *    gateway calls `remote.rpc.refuse(input, …)` INSTEAD of `receive(input)` —
 *    so, unlike a reply lost on a dead link, this is a certain non-outcome.
 *    That is what makes a retry safe, and it is why the SAME `commandId` may be
 *    reused: nothing reached the peer's command ledger, so no
-*    `IDEMPOTENCY_CONFLICT` is waiting for the retry.
+*    `IDEMPOTENCY_CONFLICT` is waiting for the retry. The sentence says THIS
+*    attempt, not "the command", because an earlier attempt under the same
+*    `commandId` may itself have lost its reply after dispatch: the retry advice
+*    is right in that sequence too (the ledger replays the original receipt),
+*    but "never landed" would be a claim about a run this error knows nothing
+*    of.
 *  - **How long the peer asked us to wait** — `retryAfterMs`, derived from its
-*    own 1 s window and already on the error we are holding.
+*    own 1 s window and already on the error we are holding. The wait clause
+*    comes BEFORE the retry blessing, so a skimming reader cannot take "safe to
+*    retry" and act on it without waiting.
 *
 * The cause is named because at the DEFAULT pacing this refusal is unreachable:
 * the desktop's counter is per SOCKET (locals inside its `run()` loop, one per
 * accepted connection) and we pace 32/s shared / 256/s content against its
-* 64-or-256/s shared and 512/s content lines. Seeing one at all therefore means
-* the configured budget is above the peer's allowance — the knob to look at, not
-* a transient blip — and a caller told to "retry later" without that pointer
-* would keep retrying into the same wall.
+* 64-or-256/s shared and 512/s content lines. Seeing one at all therefore
+* normally means the configured budget is above the peer's allowance — the knob
+* to look at, not a transient blip — and a caller told to "retry later" without
+* that pointer would keep retrying into the same wall. Only the 256/s figure is
+* quoted: this refusal exists only from 2.1.7, so the older 64/s line cannot be
+* the one an operator has to compare against.
 *
 * Like {@link withIdempotencyHint} this only ever EXTENDS `message`: the reason,
 * the `data` and the `JsonRpcRequestError` identity are the peer's, and one
@@ -5131,9 +5140,9 @@ function withRateLimitHint(error) {
 	if (error.message.includes(RATE_LIMIT_HINT_MARK)) return error;
 	const waitMs = rateLimitedWaitMs(error);
 	const advice = [
-		"the peer refused this command because the connection is over its rate allowance (RATE_LIMITED); the desktop refuses BEFORE dispatch, so the command was NOT applied — retrying it is safe, and it may reuse the SAME commandId",
-		...waitMs === void 0 ? [] : [`Wait about ${waitMs} ms first (the peer's retryAfterMs)`],
-		"A default budget does not reach this: check `rateBudgetPerSecond` against the peer's allowance (64/s through 2.1.6, 256/s from 2.1.7)"
+		"this attempt was not applied: the desktop refuses BEFORE dispatch, so nothing reached its command ledger",
+		waitMs === void 0 ? "A retry is safe, and it may reuse the SAME commandId" : `Wait about ${waitMs} ms first (the peer's retryAfterMs); a retry is then safe, and it may reuse the SAME commandId`,
+		"The default budget (32/s) does not come close to the desktop's allowance, so a refusal normally means `rateBudgetPerSecond` was raised too far (2.1.7+ allows 256/s shared)"
 	];
 	error.message = `${error.message} — ${advice.join(". ")}.`;
 	return error;
