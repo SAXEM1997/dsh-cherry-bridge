@@ -178,11 +178,15 @@ export declare const DEFAULT_RATE_BUDGET_PER_SECOND = 32;
  *
  * THE MARGINS ARE A DEFAULT-INJECTION CLAIM: the 2× headroom above holds at
  * the default injection (32/s), where this tier is exactly 256/s. An injected
- * budget consumes BOTH tiers' headroom in proportion — at 64/s the shared tier
- * sits on the ≤2.1.6 line (the harsher generation, where overrun still closes
- * the session) and this tier derives to 512/s, i.e. nominal saturation of both
- * allowances. The limiter's integer gap means the ACHIEVED rate stays below the
- * nominal one in that case (≤ 334/s on this tier, 55.6/s on the shared one; see
+ * budget consumes BOTH tiers' headroom up to the point where this tier reaches
+ * the PEER'S CEILING — at 64/s the shared tier sits on the ≤2.1.6 line (the
+ * harsher generation, where overrun still closes the session) and this tier
+ * derives to exactly 512/s, the content allowance BOTH generations share. Above
+ * 64/s the ratio is no longer applied: `contentBudgetFor` (issue #111) clamps
+ * this tier at 512/s, because a knob copied from 2.1.7's shared figure (256)
+ * would otherwise derive 2,048/s and spend the tier being refused. The
+ * limiter's integer gap means the ACHIEVED rate stays below the nominal one in
+ * that case (≤ 334/s on this tier, 55.6/s on the shared one; see
  * `SecondWindowRateLimiter` in `connection.ts`), which is margin by accident
  * rather than by design.
  */
@@ -245,11 +249,13 @@ export interface CherryBridgeConfig {
    * The CONTENT tier is not configurable on its own: it DERIVES from this value
    * at the 8 : 1 production ratio (`DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` /
    * `DEFAULT_RATE_BUDGET_PER_SECOND`), so the default 32 yields the 256/s
-   * content tier and any other value scales both tiers together. Raising this
-   * toward the peer's own lines spends safety margin: on a <=2.1.6 desktop that
-   * is BOTH tiers (64 shared / 512 content), while on 2.1.7 only the content
-   * tier tightens — the shared line there is 256. See
-   * `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the numbers.
+   * content tier and lowering this lowers both. UPWARD the derivation stops at
+   * the peer's 512/s content allowance (issue #111): a value above 64 no longer
+   * scales that tier, it only spends the shared tier's margin. Raising this
+   * toward the peer's own lines spends margin: on a <=2.1.6 desktop that is
+   * BOTH tiers (64 shared / 512 content), while on 2.1.7 only the shared line
+   * moves (256 there). See `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` for the
+   * numbers.
    */
   rateBudgetPerSecond?: number;
   /**
