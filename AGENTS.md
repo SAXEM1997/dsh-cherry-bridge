@@ -194,7 +194,9 @@ happens if it does.
 - The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
   widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
-  shared budget at 8:1, so lowering `rateBudgetPerSecond` lowers both.
+  shared budget at 8:1, so lowering `rateBudgetPerSecond` lowers both, and is
+  **capped at the peer's 512/s** (both generations), so a shared budget above 64
+  stops scaling it.
 - Since 2.1.6 the desktop externalizes every part over **4,096 characters**,
   making multi-slice content walks the common case — the reason the content
   tier exists (one 32/s tier bound such a walk to ~670 KiB/s).

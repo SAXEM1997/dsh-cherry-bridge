@@ -2218,11 +2218,16 @@ const DEFAULT_RATE_BUDGET_PER_SECOND = 32;
 *
 * THE MARGINS ARE A DEFAULT-INJECTION CLAIM: the 2× headroom above holds at
 * the default injection (32/s), where this tier is exactly 256/s. An injected
-* budget consumes BOTH tiers' headroom in proportion — at 64/s the shared tier
-* sits on the ≤2.1.6 line (the harsher generation, where overrun still closes
-* the session) and this tier derives to 512/s, i.e. nominal saturation of both
-* allowances. The limiter's integer gap means the ACHIEVED rate stays below the
-* nominal one in that case (≤ 334/s on this tier, 55.6/s on the shared one; see
+* budget consumes BOTH tiers' headroom up to the point where this tier reaches
+* the PEER'S CEILING — at 64/s the shared tier sits on the ≤2.1.6 line (the
+* harsher generation, where overrun still closes the session) and this tier
+* derives to exactly 512/s, the content allowance BOTH generations share. Above
+* 64/s the clamp holds it at 512/s: `contentBudgetFor` (issue #111) still
+* derives the ratio, then bounds it — because a knob copied from 2.1.7's shared
+* figure (256)
+* would otherwise derive 2,048/s and spend the tier being refused. The
+* limiter's integer gap means the ACHIEVED rate stays below the nominal one in
+* that case (≤ 334/s on this tier, 55.6/s on the shared one; see
 * `SecondWindowRateLimiter` in `connection.ts`), which is margin by accident
 * rather than by design.
 */
@@ -2685,6 +2690,27 @@ function businessWindowFor(reportedInFlightRequests) {
 	return Math.max(1, Math.min(BUSINESS_MAX_IN_FLIGHT, Math.floor(reportedInFlightRequests / 2)));
 }
 /**
+* The desktop's content-read allowance: 512/s, and the SAME in both generations
+* (`RemoteAccessService.ts` counts `agent.content.read` on its own counter,
+* 512 in v2.1.6 and v2.1.7 alike; only the shared line moved, 64 ⇒ 256).
+*
+* A CEILING on the derived tier, not a third knob. The 8 : 1 ratio exists so an
+* operator who LOWERS the shared budget lowers both tiers; upward, the ratio
+* would spend headroom the peer does not have — `rateBudgetPerSecond: 256`
+* (2.1.7's SHARED figure, an easy number to copy) derives 2,048/s, which the
+* limiter's 1 ms gap compresses to ~1,000/s against this allowance, so roughly
+* every other content read is refused. On >=2.1.7 each refusal costs up to a
+* second plus one replay and a second refusal fails the whole read; on <=2.1.6
+* an overrun closes the SESSION (1011). Because this line is
+* generation-INDEPENDENT, bounding it needs no generation detection — the one
+* bound in this file that does not.
+*
+* 512 is the ceiling and 333/s is what the limiter then ACHIEVES from it
+* (`(1,000 + 150) / 512` ceils to a 3 ms gap), so the saturated tier still
+* keeps a 1.5x margin on arrival times.
+*/
+const CONTENT_BUDGET_CEILING_PER_SECOND = 512;
+/**
 * The content-read tier's budget for a given SHARED budget.
 *
 * ONE injected knob, two tiers: an operator who lowers `rateBudgetPerSecond`
@@ -2692,9 +2718,19 @@ function businessWindowFor(reportedInFlightRequests) {
 * them rather than staying pinned at 256 while the shared tier shrinks. An
 * absent injection is the production default (which yields exactly
 * `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND`).
+*
+* Upward the ratio stops at {@link CONTENT_BUDGET_CEILING_PER_SECOND}: past a
+* shared budget of 64 the derived value would exceed an allowance that never
+* changed, so it is clamped instead of trying to pace past it.
+*
+* Exported for `tests/unit/contentBudgetCeiling.test.ts`, the same reason
+* `reconnectWait` is: the ceiling is a property of this mapping, and asserting
+* it through the limiter's timing would be a slower, flakier version of the
+* same claim.
 */
 function contentBudgetFor(sharedBudgetPerSecond) {
-	return Math.ceil((sharedBudgetPerSecond ?? 32) * 8);
+	const derived = Math.ceil((sharedBudgetPerSecond ?? 32) * 8);
+	return Math.min(CONTENT_BUDGET_CEILING_PER_SECOND, derived);
 }
 function defer() {
 	let resolve;

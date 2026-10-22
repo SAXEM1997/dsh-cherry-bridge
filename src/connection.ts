@@ -52,11 +52,14 @@ export interface DeviceConnectionOptions {
    * budget satisfies it with no cross-device scheduling.
    *
    * The content tier DERIVES from this value at the production ratio
-   * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND),
-   * so one injected budget scales both tiers. That 8:1 ratio matches the
-   * <=2.1.6 allowances (512:64); 2.1.7 raised ONLY the shared allowance to 256,
-   * so the derived content tier is deliberately more conservative there (256
-   * against a 512 line) even at the default injection.
+   * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND,
+   * i.e. 8 : 1), so LOWERING this lowers both tiers. That ratio matches the
+   * <=2.1.6 allowances (512:64) and is where the 2.1.7 story used to be
+   * conservative — but only the shared line moved (256 in 2.1.7), so the derived
+   * tier is CLAMPED at the peer's 512/s content allowance
+   * (`contentBudgetFor`, issue #111): above a shared budget of 64 the knob stops
+   * scaling it instead of deriving 2,048/s from 2.1.7's shared figure and
+   * spending the tier being refused.
    */
   rateBudgetPerSecond?: number
   /** First reconnect backoff (default 1s); doubles per attempt. */
@@ -588,6 +591,28 @@ function businessWindowFor(reportedInFlightRequests: number): number {
 }
 
 /**
+ * The desktop's content-read allowance: 512/s, and the SAME in both generations
+ * (`RemoteAccessService.ts` counts `agent.content.read` on its own counter,
+ * 512 in v2.1.6 and v2.1.7 alike; only the shared line moved, 64 ⇒ 256).
+ *
+ * A CEILING on the derived tier, not a third knob. The 8 : 1 ratio exists so an
+ * operator who LOWERS the shared budget lowers both tiers; upward, the ratio
+ * would spend headroom the peer does not have — `rateBudgetPerSecond: 256`
+ * (2.1.7's SHARED figure, an easy number to copy) derives 2,048/s, which the
+ * limiter's 1 ms gap compresses to ~1,000/s against this allowance, so roughly
+ * every other content read is refused. On >=2.1.7 each refusal costs up to a
+ * second plus one replay and a second refusal fails the whole read; on <=2.1.6
+ * an overrun closes the SESSION (1011). Because this line is
+ * generation-INDEPENDENT, bounding it needs no generation detection — the one
+ * bound in this file that does not.
+ *
+ * 512 is the ceiling and 333/s is what the limiter then ACHIEVES from it
+ * (`(1,000 + 150) / 512` ceils to a 3 ms gap), so the saturated tier still
+ * keeps a 1.5x margin on arrival times.
+ */
+const CONTENT_BUDGET_CEILING_PER_SECOND = 512
+
+/**
  * The content-read tier's budget for a given SHARED budget.
  *
  * ONE injected knob, two tiers: an operator who lowers `rateBudgetPerSecond`
@@ -595,10 +620,20 @@ function businessWindowFor(reportedInFlightRequests: number): number {
  * them rather than staying pinned at 256 while the shared tier shrinks. An
  * absent injection is the production default (which yields exactly
  * `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND`).
+ *
+ * Upward the ratio stops at {@link CONTENT_BUDGET_CEILING_PER_SECOND}: past a
+ * shared budget of 64 the derived value would exceed an allowance that never
+ * changed, so it is clamped instead of trying to pace past it.
+ *
+ * Exported for `tests/unit/contentBudgetCeiling.test.ts`, the same reason
+ * `reconnectWait` is: the ceiling is a property of this mapping, and asserting
+ * it through the limiter's timing would be a slower, flakier version of the
+ * same claim.
  */
-function contentBudgetFor(sharedBudgetPerSecond: number | undefined): number {
+export function contentBudgetFor(sharedBudgetPerSecond: number | undefined): number {
   const ratio = DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND
-  return Math.ceil((sharedBudgetPerSecond ?? DEFAULT_RATE_BUDGET_PER_SECOND) * ratio)
+  const derived = Math.ceil((sharedBudgetPerSecond ?? DEFAULT_RATE_BUDGET_PER_SECOND) * ratio)
+  return Math.min(CONTENT_BUDGET_CEILING_PER_SECOND, derived)
 }
 
 function defer<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {

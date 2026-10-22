@@ -64,11 +64,16 @@ export const DEFAULT_RATE_BUDGET_PER_SECOND = 32
  *
  * THE MARGINS ARE A DEFAULT-INJECTION CLAIM: the 2× headroom above holds at
  * the default injection (32/s), where this tier is exactly 256/s. An injected
- * budget consumes BOTH tiers' headroom in proportion — at 64/s the shared tier
- * sits on the ≤2.1.6 line (the harsher generation, where overrun still closes
- * the session) and this tier derives to 512/s, i.e. nominal saturation of both
- * allowances. The limiter's integer gap means the ACHIEVED rate stays below the
- * nominal one in that case (≤ 334/s on this tier, 55.6/s on the shared one; see
+ * budget consumes BOTH tiers' headroom up to the point where this tier reaches
+ * the PEER'S CEILING — at 64/s the shared tier sits on the ≤2.1.6 line (the
+ * harsher generation, where overrun still closes the session) and this tier
+ * derives to exactly 512/s, the content allowance BOTH generations share. Above
+ * 64/s the clamp holds it at 512/s: `contentBudgetFor` (issue #111) still
+ * derives the ratio, then bounds it — because a knob copied from 2.1.7's shared
+ * figure (256)
+ * would otherwise derive 2,048/s and spend the tier being refused. The
+ * limiter's integer gap means the ACHIEVED rate stays below the nominal one in
+ * that case (≤ 334/s on this tier, 55.6/s on the shared one; see
  * `SecondWindowRateLimiter` in `connection.ts`), which is margin by accident
  * rather than by design.
  */
