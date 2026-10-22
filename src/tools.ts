@@ -1285,6 +1285,76 @@ function withIdempotencyHint(error: unknown): unknown {
   return error
 }
 
+/**
+ * The phrase this hint leaves behind, so applying it twice reads once. A phrase
+ * from the ADVICE rather than the advice itself, because the wait clause varies
+ * with the peer's `retryAfterMs`; matching the peer's own text would match every
+ * rate-limit refusal, hinted or not.
+ */
+const RATE_LIMIT_HINT_MARK = 'over its rate allowance'
+
+/**
+ * How long a refused COMMAND was asked to wait, or undefined when the peer sent
+ * nothing a caller can act on.
+ *
+ * `<= 0` counts as absent rather than "retry immediately": a zero delay is
+ * noise in an error message, and the desktop clamps its own value to `>= 1`
+ * (`RemoteAccessService.ts`). CEILED so a fractional remainder is never
+ * reported as a delay shorter than the one the peer asked for.
+ */
+function rateLimitedWaitMs(error: Error): number | undefined {
+  if (!(error instanceof JsonRpcRequestError)) return undefined
+  const data = error.data
+  if (!isRecord(data)) return undefined
+  const raw = data['retryAfterMs']
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined
+  return Math.ceil(raw)
+}
+
+/**
+ * The recovery advice appended to a command's `RATE_LIMITED` refusal (desktop
+ * >= 2.1.7; see the transport-loss section of `connection.ts`), issue #109.
+ *
+ * Two facts decide the retry and NEITHER survives the tool boundary on its own:
+ *
+ *  - **The command was NOT applied.** The desktop refuses BEFORE dispatch — its
+ *    gateway calls `remote.rpc.refuse(input, …)` INSTEAD of `receive(input)` —
+ *    so, unlike a reply lost on a dead link, this is a certain non-outcome.
+ *    That is what makes a retry safe, and it is why the SAME `commandId` may be
+ *    reused: nothing reached the peer's command ledger, so no
+ *    `IDEMPOTENCY_CONFLICT` is waiting for the retry.
+ *  - **How long the peer asked us to wait** — `retryAfterMs`, derived from its
+ *    own 1 s window and already on the error we are holding.
+ *
+ * The cause is named because at the DEFAULT pacing this refusal is unreachable:
+ * the desktop's counter is per SOCKET (locals inside its `run()` loop, one per
+ * accepted connection) and we pace 32/s shared / 256/s content against its
+ * 64-or-256/s shared and 512/s content lines. Seeing one at all therefore means
+ * the configured budget is above the peer's allowance — the knob to look at, not
+ * a transient blip — and a caller told to "retry later" without that pointer
+ * would keep retrying into the same wall.
+ *
+ * Like {@link withIdempotencyHint} this only ever EXTENDS `message`: the reason,
+ * the `data` and the `JsonRpcRequestError` identity are the peer's, and one
+ * command is still never replayed (the advice is for the CALLER's retry).
+ */
+export function withRateLimitHint(error: unknown): unknown {
+  if (!(error instanceof Error)) return error
+  if (failureReason(error) !== 'RATE_LIMITED') return error
+  if (error.message.includes(RATE_LIMIT_HINT_MARK)) return error
+  const waitMs = rateLimitedWaitMs(error)
+  const advice = [
+    'the peer refused this command because the connection is over its rate allowance (RATE_LIMITED); ' +
+      'the desktop refuses BEFORE dispatch, so the command was NOT applied — retrying it is safe, ' +
+      'and it may reuse the SAME commandId',
+    ...(waitMs === undefined ? [] : [`Wait about ${waitMs} ms first (the peer's retryAfterMs)`]),
+    'A default budget does not reach this: check `rateBudgetPerSecond` against the peer\'s ' +
+      'allowance (64/s through 2.1.6, 256/s from 2.1.7)',
+  ]
+  error.message = `${error.message} — ${advice.join('. ')}.`
+  return error
+}
+
 function optionalString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
@@ -4416,12 +4486,12 @@ class CherryToolEngine {
    * subscription failures still reject this call: the two surfaces stay
    * distinct all the way to the caller (spec §6).
    *
-   * ONE exception, and it is a HINT rather than a translation: the peer's
+   * TWO exceptions, and both are HINTS rather than translations: the peer's
    * `IDEMPOTENCY_CONFLICT` — the same `commandId` re-used with a DIFFERENT body
-   * — carries the §6 recovery advice on the rethrown error (see
-   * {@link withIdempotencyHint}). The reason, the `data` and the failure
-   * currency are untouched; only the prose a caller reads grows the actionable
-   * half.
+   * — and its `RATE_LIMITED` refusal (desktop >= 2.1.7) each carry their
+   * recovery advice on the rethrown error (see {@link withIdempotencyHint} /
+   * {@link withRateLimitHint}). The reason, the `data` and the failure currency
+   * are untouched; only the prose a caller reads grows the actionable half.
    */
   async #command(
     connection: DeviceConnection,
@@ -4431,7 +4501,7 @@ class CherryToolEngine {
     try {
       return (await connection.rpc.request(method, params)) as Record<string, unknown>
     } catch (error) {
-      throw withIdempotencyHint(error)
+      throw withRateLimitHint(withIdempotencyHint(error))
     }
   }
 
