@@ -82,9 +82,10 @@ export interface FakeCherryOptions {
   /** Artificial per-request delay; requests stay counted as in-flight while waiting. */
   requestDelayMs?: number
   /**
-   * Server-side rate cap per second. Exceeding it closes the whole session
-   * with 1011 (the authoritative rate-termination face — NOT a per-request
-   * rejection), mirroring the real desktop's session-level enforcement.
+   * Server-side rate cap per second, modelling the ≤2.1.6 desktop: exceeding it
+   * closes the whole session with 1011 (NOT a per-request rejection). Desktop
+   * 2.1.7 answers a single `RATE_LIMITED` failure instead — issue #104 adds
+   * that mode next to this one.
    */
   rateLimitPerSecond?: number
   /**
@@ -3178,9 +3179,9 @@ export class FakeCherry {
   }
 
   /**
-   * Whole-session rate termination: over-budget closes the socket with 1011
-   * and returns true. Per-connection (per-socket) counting only — no global
-   * scheduling, mirroring the real desktop's per-connection rate window.
+   * Whole-session rate termination (the ≤2.1.6 face): over-budget closes the
+   * socket with 1011 and returns true. Per-connection (per-socket) counting
+   * only — no global scheduling, mirroring the real desktop's rate window.
    *
    * The window is over `live.arrivals`, NOT the global `#requestTimestamps`:
    * the global list is the TEST's observation surface (`requestTimestamps`), and

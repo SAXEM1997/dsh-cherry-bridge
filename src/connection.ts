@@ -1081,17 +1081,18 @@ export class DeviceConnection {
     // cannot tear down a newer link.
     //
     // ADJUDICATED WEAKENING: the close CODE is deliberately ignored here.
-    // 1011 (server error / rate termination) and 1013 (try again later, e.g.
-    // connection-count over limit) are the peer's AUTHORITATIVE session-level
-    // faces — it ends the whole session, never a single request — so every code
-    // takes the same offline → backoff → reconnect path. Differentiating them
-    // (e.g. a longer, Retry-After-aware backoff for 1013) is deliberately
-    // DEFERRED: it would need a per-code policy the protocol does not yet
-    // guarantee, and a uniform honest retry is strictly safer than guessing a
-    // longer one. The rate limiter still bounds the retry storm in the
-    // meantime, and the contract suite's `rate-limit-terminates-session` item
-    // proves the uniform transition shape: the 1011 close routes through
-    // offline → reconnect rather than surfacing a per-request refusal.
+    // 1011 (server error; rate termination through 2.1.6) and 1013 (try again
+    // later, e.g. connection-count over limit) are session-level faces — the
+    // peer ends the whole session, never a single request — so every code takes
+    // the same offline → backoff → reconnect path. Differentiating them (e.g. a
+    // longer, Retry-After-aware backoff for 1013) is deliberately DEFERRED: it
+    // would need a per-code policy the protocol does not yet guarantee, and a
+    // uniform honest retry is strictly safer than guessing a longer one. The
+    // rate limiter still bounds the retry storm in the meantime, and the
+    // contract suite's `rate-limit-terminates-session` item proves the uniform
+    // transition shape: the 1011 close routes through offline → reconnect.
+    // Since 2.1.7 an over-budget request is refused per request instead (a
+    // structured `RATE_LIMITED`, not a close), so it never reaches this path.
     ws.on('close', () => this.#onLinkLost(epoch, 'socket closed'))
     ws.on('error', () => this.#onLinkLost(epoch, 'socket error'))
 

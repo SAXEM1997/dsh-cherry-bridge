@@ -55,20 +55,17 @@
 
 ---
 
-### 3. `rate-limit-terminates-session` — Over-limit rate limiting is generation-dependent
+### 3. `rate-limit-terminates-session` — Over-limit rate limiting is generation-dependent: a whole-session 1011 close (≤2.1.6) or a per-request refusal (≥2.1.7)
 
 **真实对端行为**：≤2.1.6 超过桌面每套接字预算（64 req/s 共享、512 req/s 内容）会以 close
 code **1011 终止整条会话**；≥2.1.7（PR #21687）共享额度改为 256 req/s，超限只拒绝**该条**
 请求（`RATE_LIMITED` + `retryAfterMs`），会话存活。
 
-**手动核验步骤**（与 `CONTRACT_DIFFERENCES[2].checklistStep` 同源）：
+**手动核验步骤**（与 `CONTRACT_DIFFERENCES[2].checklistStep` 同源，逐字一致）：
 
-- [ ] rate-limit-terminates-session（≥2.1.7）: drive a burst well above the smooth budget and confirm ONE structured `RATE_LIMITED` rejection (carrying `retryAfterMs`) with the session still live.
-- [ ] rate-limit-terminates-session（≤2.1.6）: the same burst against an older desktop closes the socket with 1011 → state `offline` → backoff restart.
+- [ ] rate-limit-terminates-session: on a ≥2.1.7 desktop, drive a burst well above the smooth budget and confirm ONE structured `RATE_LIMITED` rejection (carrying `retryAfterMs`) with the session still live; on ≤2.1.6 confirm the 1011 close instead (session gone, state offline, backoff restart).
 
 **期望**：按对端版本二选一命中；两种形态都**不出现**未分类的 bare channel-closed 文本。
-
----
 
 ### 4. `execution-terminal-no-interrupted` — The real agent journal never produces an `interrupted` execution terminal
 

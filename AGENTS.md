@@ -164,7 +164,7 @@ fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 `PAGE_ITEM_BYTES`-style byte budget (62,279 bytes) to every paged `agent.*.list`
 face (`pageOf` truncates, `queryPage` re-queries a keyset page at a halved
 limit); an item that cannot fit raises `RESOURCE_EXHAUSTED`. It is **not in any
-release** as of the verified range, so deployed peers (2.1.6 and earlier) still
+release** as of the verified range, so deployed peers (2.1.7 and earlier) still
 page by count alone and the clamps stay. Byte-safe pages must not be removed
 because of that upstream commit.
 
@@ -917,20 +917,21 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 Neither reference lives in this repository.
 
 - **`/tmp/csa`** — the official Cherry Studio **app** (`CherryHQ/cherry-studio-app`
-  @ main `18329fe`, app 0.3.0). It plays the **same role we do** (protocol
+  @ v0.4.0, read 2026-10-22). It plays the **same role we do** (protocol
   *client* against the desktop's server). Its remote layer is
   `src/backend/services/remoteAgent/` (`RemoteAgentScope.ts`, `remoteContent.ts`,
   `RemoteAgentActions.ts`, `SessionSync.ts`, …). This is where "what does the
   official client do" comes from.
 - **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
-  the protocol **server** of record. The faces we depend on are
-  `src/main/services/remoteAccess/` and `packages/remote-{protocol,transport}`;
-  `RemoteAccessService.ts` carries the 512/s content-read line and the 64/s
-  general line. Gitignored; treated as read-only research.
+  read alongside v2.1.7, the protocol **server** of record. The faces we depend
+  on are `src/main/services/remoteAccess/` and
+  `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries the
+  512/s content-read line and the shared line (64/s through 2.1.6, 256/s from
+  2.1.7). Gitignored; treated as read-only research.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.6** (plus post-2.1.6 commits on `main`).
+**Verified desktop range: 2.1.4 → 2.1.7** (plus post-2.1.7 commits on `main`).
 Pairing payload, mDNS advertisement, protocol versions (`[1]`) and the Noise
 profile saw **zero changes** in that window. Notable faces:
 
@@ -942,17 +943,16 @@ profile saw **zero changes** in that window. Notable faces:
 | 2.1.5 `agent.messages.send` requires non-empty trimmed `text` | `cherry_send` rejects blank text locally as `text-empty` |
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
+| 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | Wire-additive; our 32/s default already sits far below it |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**
 
-- Its `RemoteAgentError(code, retryable)` marks `RATE_LIMITED`,
-  `TOKEN_EXPIRED`, `RESOURCE_EXHAUSTED` and `CONNECTION_LOST` as retryable, and
-  the background observation loop retries with exponential backoff
-  (`min(20 s, 1 s · 2^n)`). A `RESOURCE_EXHAUSTED` raised by the **page size**
-  (the upstream byte budget) is therefore retried forever at the same page size
-  — it can never succeed. Our answer is the byte-safe page **clamp**: never ask
-  for a page that cannot fit, instead of retrying a request that cannot.
+- Its `RemoteAgentError` marks `RATE_LIMITED`/`TOKEN_EXPIRED`/
+  `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries with
+  `min(20 s, 1 s · 2^n)` backoff, so a `RESOURCE_EXHAUSTED` from the page-size
+  budget is retried forever at the same page size. Our answer is the byte-safe
+  page **clamp**: never ask for a page that cannot fit.
 - Its read path refuses a ref whose `byteLength` is unusable; we fall back to a
   slice bound plus the cumulative arm (see above). Its 32 MiB cap is a
   pre-allocated single array; ours is three transient copies (see the memory

@@ -470,10 +470,11 @@ describe('① the six-entry contract difference list', () => {
     expect(entry.realPeer).toMatch(/retryAfterMs/)
     expect(entry.realPeer).toMatch(/2\.1\.7/)
 
-    // The fake's cap is injectable; the real desktop's is 64 req/s. Exceeding
+    // The fake's cap is injectable; this models the ≤2.1.6 desktop's 64 req/s
+    // cap (2.1.7 allows 256/s and refuses per request — issue #104). Exceeding
     // it closes the SESSION — every in-flight request dies with it — which the
-    // client now answers with a CLASSIFIED loss (and, for reads, one paced
-    // replay on the reconnected link) rather than a bare channel-closed text.
+    // client answers with a CLASSIFIED loss (and, for reads, one paced replay
+    // on the reconnected link) rather than a bare channel-closed text.
     const rig = await makeRig({ rateLimitPerSecond: 4 })
 
     // Fire well past the cap. The peer terminates the SESSION: the in-flight

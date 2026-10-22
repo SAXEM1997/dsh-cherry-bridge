@@ -1740,7 +1740,7 @@ const CONTRACT_DIFFERENCES = [
 		title: "Over-limit rate limiting is generation-dependent: a whole-session 1011 close (≤2.1.6) or a per-request refusal (≥2.1.7)",
 		realPeer: "Through 2.1.6, exceeding the desktop's per-socket budget (64 req/s shared, 512 req/s content; implementation values with no negotiation channel) terminated the ENTIRE session with close code 1011. From 2.1.7 (PR #21687) the shared allowance is 256 req/s and an over-budget request is answered with ONE structured `RATE_LIMITED` failure carrying `retryAfterMs`, while the session survives.",
 		fakePeer: "The fake models the ≤2.1.6 generation: it closes the session with 1011 once `rateLimitPerSecond` is exceeded, so the client's offline→backoff→reconnect path is exercised rather than a request-level refusal.",
-		schemaAnchor: "remoteLimits + peer close code 1011 (implementation value, not a protocol promise)",
+		schemaAnchor: "remoteLimits + peer close code 1011 (≤2.1.6) / failure data reason RATE_LIMITED + retryAfterMs (≥2.1.7); implementation values, not protocol promises",
 		checklistStep: "rate-limit-terminates-session: on a ≥2.1.7 desktop, drive a burst well above the smooth budget and confirm ONE structured `RATE_LIMITED` rejection (carrying `retryAfterMs`) with the session still live; on ≤2.1.6 confirm the 1011 close instead (session gone, state offline, backoff restart)."
 	},
 	{

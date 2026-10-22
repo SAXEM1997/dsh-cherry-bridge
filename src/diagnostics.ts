@@ -108,7 +108,8 @@ export const CONTRACT_DIFFERENCES: readonly ContractDifference[] = [
       'The fake models the ≤2.1.6 generation: it closes the session with 1011 once ' +
       '`rateLimitPerSecond` is exceeded, so the client\'s offline→backoff→reconnect path is exercised ' +
       'rather than a request-level refusal.',
-    schemaAnchor: 'remoteLimits + peer close code 1011 (implementation value, not a protocol promise)',
+    schemaAnchor:
+      'remoteLimits + peer close code 1011 (≤2.1.6) / failure data reason RATE_LIMITED + retryAfterMs (≥2.1.7); implementation values, not protocol promises',
     checklistStep:
       'rate-limit-terminates-session: on a ≥2.1.7 desktop, drive a burst well above the smooth budget ' +
       'and confirm ONE structured `RATE_LIMITED` rejection (carrying `retryAfterMs`) with the session ' +
