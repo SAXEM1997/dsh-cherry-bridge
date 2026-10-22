@@ -3903,18 +3903,28 @@ export class CherryToolEngine {
       // lost-reply recovery the tools document becomes impossible on the one
       // path where the caller cannot tell what already landed.
       //
+      // The memory belongs to the id it was MINTED for, so the lookup is gated
+      // on `commandId === callerId`: the stale-revision self-heal's retry runs
+      // under a FRESH uuid with a RE-BASELINED revision, and the caller's id —
+      // whose first, refused body (a rejected receipt is settled too, so it was
+      // remembered) carries exactly the baseline the peer just refused — must
+      // not ride along. Before that gate the healing retry re-quoted the stale
+      // baseline and was refused again, dead-ending the self-heal for every
+      // caller-supplied id (T1c).
+      //
       // Equally important is what is REFUSED. A same-id call whose
       // `sessionId`/`text` differ from the remembered body is not a retry of
       // that command, and the conflict is already decided (the peer holds the
       // original body), so it is answered LOCALLY — the peer's own words, no wire
-      // call at all. The ONE exception is the stale-revision self-heal's retry
-      // (`revisionOverride` present): it re-issues the new body under the
-      // caller's id, which is the behaviour that retry has always had, and a
-      // displaced id must not turn it into a local refusal.
-      const remembered = callerId === undefined ? undefined : this.#recallCommandBody(deviceId, callerId)
+      // call at all. Only the caller's own attempt can reach that refusal: the
+      // self-heal's fresh-uuid attempt has no memory of its own.
+      const remembered =
+        callerId === undefined || commandId !== callerId
+          ? undefined
+          : this.#recallCommandBody(deviceId, callerId)
       const mismatched =
         remembered !== undefined && (remembered.sessionId !== sessionId || remembered.text !== text)
-      if (mismatched && revisionOverride === undefined) {
+      if (mismatched) {
         throw withIdempotencyHint(
           new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
             reason: 'IDEMPOTENCY_CONFLICT',
@@ -3923,7 +3933,7 @@ export class CherryToolEngine {
         )
       }
       const expectedIdleRevision =
-        (mismatched ? undefined : remembered?.expectedIdleRevision) ??
+        remembered?.expectedIdleRevision ??
         revisionOverride ??
         (await this.#idleRevision(connection, subscriptions, deviceId, sessionId))
       // THE BASELINE IS TAKEN BEFORE THE COMMAND IS ISSUED, and that ordering

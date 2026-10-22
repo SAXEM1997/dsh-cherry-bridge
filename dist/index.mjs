@@ -6802,13 +6802,12 @@ var CherryToolEngine = class {
 		const { args, text } = request;
 		const callerId = optionalString(args["commandId"]);
 		const attempt = async (commandId, revisionOverride) => {
-			const remembered = callerId === void 0 ? void 0 : this.#recallCommandBody(deviceId, callerId);
-			const mismatched = remembered !== void 0 && (remembered.sessionId !== sessionId || remembered.text !== text);
-			if (mismatched && revisionOverride === void 0) throw withIdempotencyHint(new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
+			const remembered = callerId === void 0 || commandId !== callerId ? void 0 : this.#recallCommandBody(deviceId, callerId);
+			if (remembered !== void 0 && (remembered.sessionId !== sessionId || remembered.text !== text)) throw withIdempotencyHint(new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
 				reason: "IDEMPOTENCY_CONFLICT",
 				message: COMMAND_BODY_DIFFERS_MESSAGE
 			}));
-			const expectedIdleRevision = (mismatched ? void 0 : remembered?.expectedIdleRevision) ?? revisionOverride ?? await this.#idleRevision(connection, subscriptions, deviceId, sessionId);
+			const expectedIdleRevision = remembered?.expectedIdleRevision ?? revisionOverride ?? await this.#idleRevision(connection, subscriptions, deviceId, sessionId);
 			const baselineSeq = this.#newestSeq(subscriptions, sessionId);
 			const body = {
 				commandId,

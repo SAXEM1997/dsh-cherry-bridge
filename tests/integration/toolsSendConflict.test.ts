@@ -297,6 +297,51 @@ describe('cherry_send admission self-heals a stale expectedIdleRevision (issue #
     expect(sessionGets(rig) - before).toBe(1)
   })
 
+  it('T1c a CALLER-SUPPLIED commandId does not poison the self-heal: the remembered stale baseline must not ride the fresh-uuid retry (issue #115)', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION }],
+        terminalMessage: terminalMessage('first reply', 'm-first'),
+      },
+    })
+
+    // Establish the cache WITHOUT a caller id, so the memory this test is about
+    // starts empty (an auto-generated uuid is never remembered).
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'first' })
+
+    // The retry's run must be distinguishable from the first one's reply.
+    rig.fake.setTerminalMessage(terminalMessage('second reply', 'm-second'))
+
+    // The buffer goes blind while the peer's revision moves on.
+    rig.fake.silentIdleBump('s-1')
+
+    // The send under a CALLER-SUPPLIED id goes stale on its first attempt — and
+    // a rejected receipt is still a SETTLED one, so the engine remembers that
+    // first body (baseline 1000) for the caller's id. The self-heal's retry
+    // runs under a FRESH uuid; the remembered baseline belongs to the id it was
+    // minted for and must NOT ride along (issue #115 regression: it did, and
+    // the retry re-quoted the revision the peer had just refused).
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'second',
+      commandId: 'caller-stale-id',
+      wait: true,
+    })) as { status?: string; text?: string }
+
+    expect(result.status).toBe('completed')
+    expect(result.text).toBe('second reply')
+
+    const calls = sendsOf(rig, 'second')
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!['expectedIdleRevision']).toBe('1000')
+    // The retry carries the FRESH revision — not the remembered stale one.
+    expect(calls[1]!['expectedIdleRevision']).toBe('1001')
+    // And it is a NEW commandId, never the caller's settled one.
+    expect(String(calls[1]!['commandId'])).not.toBe('caller-stale-id')
+  })
+
   it('T2 a genuinely BUSY session is not retried: one send, the peer receipt, no second attempt', async () => {
     const rig = await makeRig({
       agent: {
