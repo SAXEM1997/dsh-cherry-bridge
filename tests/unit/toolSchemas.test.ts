@@ -182,6 +182,19 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     })
   })
 
+  it('issue #103: the failure clause is conditional and claims only what is dropped', () => {
+    // The wire `failure` is OPTIONAL even on a failed message (protocol
+    // `messageSchema.failure` is `ZodOptional`), so an unconditional "carries
+    // `failure`" is a promise a 2.1.4–2.1.6 peer breaks. And `failure.message`
+    // IS peer/provider text — only the structured `source`/`context` are ours
+    // to drop — so "the raw error body is never included" overclaimed.
+    const description = toolOf('cherry_read').description ?? ''
+    expect(description).toMatch(/may carry `failure: \{reasonCode, retryable, message\}`/i)
+    expect(description).toMatch(/when the peer sent one/i)
+    expect(description).toMatch(/`source` and `context\.responseBody` are never projected/i)
+    expect(description).not.toMatch(/raw error body is never included/i)
+  })
+
   it('issue #82: a description promises a resume token only when one can be named', () => {
     // The description IS the contract a model reads, so an unconditional promise
     // is a claim the tool then contradicts: the emitters withhold the token

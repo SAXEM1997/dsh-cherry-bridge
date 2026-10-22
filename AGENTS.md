@@ -164,9 +164,8 @@ fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 `PAGE_ITEM_BYTES`-style byte budget (62,279 bytes) to every paged `agent.*.list`
 face (`pageOf` truncates, `queryPage` re-queries a keyset page at a halved
 limit); an item that cannot fit raises `RESOURCE_EXHAUSTED`. It is **not in any
-release** as of the verified range, so deployed peers (2.1.7 and earlier) still
-page by count alone and the clamps stay. Byte-safe pages must not be removed
-because of that upstream commit.
+release** through 2.1.7, so deployed peers still page by count alone and the
+clamps stay (do not remove them because of that commit).
 
 Reviewed against the merged code (`7218842`) and followed up as
 [`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951): an item above
@@ -191,8 +190,7 @@ happens if it does.
   refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps the
   session. The generations cannot be told apart before one answers, so the
   default is sized for the harsher: 32/s is 2× under 64, 8× under 256; the
-  content tier is 2× under 512. The margins are a *default-injection* claim —
-  the derivation is in the `defaults.ts` docblock.
+  content tier is 2× under 512.
 - The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
   widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
@@ -762,6 +760,9 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   `agent.messages.list` for messages, and **each message's own revision** for
   its parts.
 - Messages are **newest-first**; `limit` drops the **oldest**.
+- A failed message may carry `failure: {reasonCode, retryable, message}`
+  (peer classification, retry-worthiness, bounded summary); only its
+  `source`/`context` are withheld.
 - Attachment parts (`kind: 'file'`, and the pre-2.1.5 `kind: 'data'` shape) are
   reported as `name`/`mediaType`/`byteLength` with an **empty** `content`, and
   no `unavailable` (nothing failed — the bytes were deliberately not fetched).
@@ -920,8 +921,7 @@ Neither reference lives in this repository.
   @ v0.4.0, read 2026-10-22). It plays the **same role we do** (protocol
   *client* against the desktop's server). Its remote layer is
   `src/backend/services/remoteAgent/` (`RemoteAgentScope.ts`, `remoteContent.ts`,
-  `RemoteAgentActions.ts`, `SessionSync.ts`, …). This is where "what does the
-  official client do" comes from.
+  …). This is where "what does the official client do" comes from.
 - **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
   read alongside v2.1.7, the protocol **server** of record. The faces we depend
   on are `src/main/services/remoteAccess/` and
@@ -932,8 +932,8 @@ Neither reference lives in this repository.
   protocol schema source of truth for what we send and decode.
 
 **Verified desktop range: 2.1.4 → 2.1.7** (plus post-2.1.7 commits on `main`).
-Pairing payload, mDNS advertisement, protocol versions (`[1]`) and the Noise
-profile saw **zero changes** in that window. Notable faces:
+Pairing, mDNS, protocol versions (`[1]`) and Noise saw **zero changes** there.
+Notable faces:
 
 | Upstream change | Impact |
 | --- | --- |

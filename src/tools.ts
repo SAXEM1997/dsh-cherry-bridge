@@ -12,6 +12,7 @@ import {
 } from './defaults.js'
 import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { ContentReadGate } from './contentGate.js'
+import { truncateErrorMessage } from './diagnostics.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
 import type { PairingErrorKind } from './pairing.js'
@@ -299,12 +300,81 @@ export interface CherryReadPart {
   byteLength?: string
 }
 
+/**
+ * The peer's verdict on a FAILED message, narrowed to what a caller can act on.
+ *
+ * The wire carries more (`failure.failure.source`, `context.responseBody`, the
+ * provider's status code); none of it is projected. `cherry_read` is a text
+ * channel for the conversation, and the provider's raw error body is neither
+ * conversation nor the caller's business — the peer already classified the
+ * cause into `reasonCode`, which is the actionable half.
+ */
+export interface CherryReadFailure {
+  /**
+   * The peer's classification (`provider_unavailable`, `rate_limit`,
+   * `context_length`, … — the protocol's versioned vocabulary).
+   *
+   * Relayed as a SHAPE-checked string rather than matched against a closed
+   * enum: the vocabulary belongs to the peer and grows with it, and relabelling
+   * a new code `'unknown'` would hide a real cause behind a value that means
+   * "the peer could not classify". Absent or unusable values become
+   * `'unknown'`, which is exactly what the contract uses for that case.
+   */
+  reasonCode: string
+  /** Whether the peer judged a retry of the same work worthwhile. */
+  retryable: boolean
+  /**
+   * The peer's one-line explanation, bounded by the diagnostics error cap
+   * (200 characters) with a `…[truncated]` marker when it was cut.
+   */
+  message: string
+}
+
+/** `provider_unavailable`-shaped: lowercase words separated by underscores. */
+const REASON_CODE_SHAPE = /^[a-z][a-z0-9_]{1,63}$/
+
+/**
+ * Projects the wire's `failure` object (present on `status: 'error'` messages)
+ * into {@link CherryReadFailure}, or `undefined` when there is none.
+ *
+ * Deliberately tolerant of a malformed payload: a peer that sends
+ * `failure: { retryable: false }` with no nested record still yields a usable
+ * verdict (`reasonCode: 'unknown'`, empty message) instead of failing the whole
+ * read — the message's TEXT is already in hand, and losing it over a metadata
+ * field would trade the content for the annotation. A degenerate object
+ * (`{}`, `[]`) projects the same way: the peer DID attach a verdict, just an
+ * empty one, and saying so is more honest than reporting "no verdict". Only an
+ * ABSENT or non-object `failure` yields `undefined`.
+ */
+export function projectMessageFailure(raw: Record<string, unknown>): CherryReadFailure | undefined {
+  const failure = raw['failure']
+  if (typeof failure !== 'object' || failure === null) return undefined
+  const record = failure as Record<string, unknown>
+  const nested = record['failure']
+  const detail = typeof nested === 'object' && nested !== null ? (nested as Record<string, unknown>) : {}
+  const rawReason = detail['reasonCode']
+  const reasonCode =
+    typeof rawReason === 'string' && REASON_CODE_SHAPE.test(rawReason) ? rawReason : 'unknown'
+  const rawMessage = record['message']
+  return {
+    reasonCode,
+    retryable: record['retryable'] === true,
+    message: truncateErrorMessage(typeof rawMessage === 'string' ? rawMessage : ''),
+  }
+}
+
 /** One message in a `cherry_read` snapshot. */
 export interface CherryReadMessage {
   messageId: string
   revision: string
   role: string
   status: string
+  /**
+   * Present exactly when the peer sent a `failure` for this message (in
+   * practice: `status: 'error'`). A successful message never carries it, so a
+   * caller can test for the key rather than compare `status` strings.
+   */
+  failure?: CherryReadFailure
   parts: CherryReadPart[]
   /**
    * Present only when this message's parts could NOT all be read: the safety
@@ -2450,7 +2520,11 @@ class CherryToolEngine {
         'are deliberately not fetched into a text channel. Messages come NEWEST-first, so the ' +
         'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
         'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
-        'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. The ' +
+        'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A ' +
+        'failed message (`status: "error"`) may carry `failure: {reasonCode, retryable, ' +
+        'message}` when the peer sent one — its classification, whether it judged a retry ' +
+        'worthwhile, and a bounded summary; the peer\'s `source` and `context.responseBody` ' +
+        'are never projected. The ' +
         'answer is ALSO bounded by an output budget: `truncated` with `truncationReason: ' +
         '"aggregate-bytes"` means the walk stopped because the result reached its size limit, ' +
         'not because `limit` was reached — raising `limit` does NOT reach the messages left out ' +
@@ -2779,11 +2853,13 @@ class CherryToolEngine {
     // stays absent rather than claiming a zero.
     const unavailableParts = parts.filter((part) => part.unavailable !== undefined).length
     const incomplete = unavailableParts > 0 || partsTruncated !== undefined
+    const failure = projectMessageFailure(raw)
     return {
       messageId,
       revision,
       role: String(raw['role'] ?? ''),
       status: String(raw['status'] ?? ''),
+      ...(failure === undefined ? {} : { failure }),
       parts,
       // A circuit-broken part list advertises itself: the caller can see that
       // this message is incomplete and that later parts are still unread, so

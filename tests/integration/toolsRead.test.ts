@@ -2642,3 +2642,74 @@ describe('issue #70: list resume tokens are compact and integrity-checked', () =
     }
   })
 })
+
+describe('issue #103: failure metadata on the shared projection', () => {
+  it('④y a failed message carries the peer verdict, and the raw provider context never leaves the peer', async () => {
+    const sentinel = 'sk-live-SENTINEL'
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Hello', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'assistant',
+            status: 'error',
+            failure: {
+              // WITHIN the cap: the omission assertions below must be about
+              // projection, never about the truncation tail.
+              message: 'Provider said no',
+              retryable: true,
+              failure: {
+                version: 1,
+                reasonCode: 'provider_unavailable',
+                source: { layer: 'provider', name: 'openai', code: sentinel },
+                context: { statusCode: 503, responseBody: sentinel },
+              },
+            },
+            parts: [{ kind: 'text', text: 'the run failed' }],
+          },
+          {
+            messageId: 'm-2',
+            revision: '1002',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'text', text: 'a healthy message' }],
+          },
+        ],
+      },
+    })
+
+    type ReadAnswer = {
+      messages: Array<{
+        messageId: string
+        failure?: { reasonCode: string; retryable: boolean; message: string }
+        parts: Array<{ content: string }>
+      }>
+    }
+
+    const read = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as ReadAnswer
+    const failed = read.messages.find((message) => message.messageId === 'm-1')!
+    // only the actionable half is projected: the classification, whether the
+    // peer judged a retry worthwhile, and its own summary
+    expect(failed.failure).toEqual({
+      reasonCode: 'provider_unavailable',
+      retryable: true,
+      message: 'Provider said no',
+    })
+    // the projection never costs the message its content
+    expect(failed.parts.map((part) => part.content)).toEqual(['the run failed'])
+    // the provider's raw source/context never reaches the tool answer
+    expect(JSON.stringify(read)).not.toContain(sentinel)
+    expect(JSON.stringify(read)).not.toContain('503')
+    // a healthy message carries no failure key at all
+    expect(read.messages.find((message) => message.messageId === 'm-2')).not.toHaveProperty('failure')
+
+    // the SAME projection rides the terminal/idle aggregate: one #projectMessage
+    const idle = (await rig.call('cherry_wait', { device: 'dev-A', sessionId: 's-1' })) as ReadAnswer
+    expect(idle.messages.find((message) => message.messageId === 'm-1')!.failure).toEqual(failed.failure)
+  })
+})
