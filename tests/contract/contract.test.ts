@@ -1716,7 +1716,8 @@ describe('③ release configuration', () => {
     // The CONTENT-READ tier (PR-F) is NOT a patch key — it has no row above and
     // no config surface — but it is exported from this same public entry
     // because it is the other half of the pacing policy: the connection derives
-    // it from `rateBudgetPerSecond` at the 8 : 1 ratio, and the pin makes a
+    // it from `rateBudgetPerSecond` at the 8 : 1 ratio (clamped at the peer's
+    // 512/s above 64 — `contentBudgetFor`, issue #111), and the pin makes a
     // change to either number a deliberate contract edit rather than drift.
     // 256 is half the desktop's 512/s content-read line
     // (`RemoteAccessService.ts:223-225`).

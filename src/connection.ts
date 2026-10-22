@@ -52,11 +52,14 @@ export interface DeviceConnectionOptions {
    * budget satisfies it with no cross-device scheduling.
    *
    * The content tier DERIVES from this value at the production ratio
-   * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND),
-   * so one injected budget scales both tiers. That 8:1 ratio matches the
-   * <=2.1.6 allowances (512:64); 2.1.7 raised ONLY the shared allowance to 256,
-   * so the derived content tier is deliberately more conservative there (256
-   * against a 512 line) even at the default injection.
+   * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND,
+   * i.e. 8 : 1), so LOWERING this lowers both tiers. That ratio matches the
+   * <=2.1.6 allowances (512:64) and is where the 2.1.7 story used to be
+   * conservative — but only the shared line moved (256 in 2.1.7), so the derived
+   * tier is CLAMPED at the peer's 512/s content allowance
+   * (`contentBudgetFor`, issue #111): above a shared budget of 64 the knob stops
+   * scaling it instead of deriving 2,048/s from 2.1.7's shared figure and
+   * spending the tier being refused.
    */
   rateBudgetPerSecond?: number
   /** First reconnect backoff (default 1s); doubles per attempt. */

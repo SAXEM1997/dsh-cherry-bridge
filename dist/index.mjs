@@ -2222,8 +2222,9 @@ const DEFAULT_RATE_BUDGET_PER_SECOND = 32;
 * the PEER'S CEILING — at 64/s the shared tier sits on the ≤2.1.6 line (the
 * harsher generation, where overrun still closes the session) and this tier
 * derives to exactly 512/s, the content allowance BOTH generations share. Above
-* 64/s the ratio is no longer applied: `contentBudgetFor` (issue #111) clamps
-* this tier at 512/s, because a knob copied from 2.1.7's shared figure (256)
+* 64/s the clamp holds it at 512/s: `contentBudgetFor` (issue #111) still
+* derives the ratio, then bounds it — because a knob copied from 2.1.7's shared
+* figure (256)
 * would otherwise derive 2,048/s and spend the tier being refused. The
 * limiter's integer gap means the ACHIEVED rate stays below the nominal one in
 * that case (≤ 334/s on this tier, 55.6/s on the shared one; see

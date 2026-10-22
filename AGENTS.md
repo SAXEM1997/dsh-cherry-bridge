@@ -194,9 +194,9 @@ happens if it does.
 - The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
   widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
-  shared budget at 8:1, so lowering `rateBudgetPerSecond` lowers both; upward it
-  is **capped at the peer's 512/s** (that allowance is generation-independent),
-  so a shared budget above 64 stops scaling it.
+  shared budget at 8:1, so lowering `rateBudgetPerSecond` lowers both, and is
+  **capped at the peer's 512/s** (both generations), so a shared budget above 64
+  stops scaling it.
 - Since 2.1.6 the desktop externalizes every part over **4,096 characters**,
   making multi-slice content walks the common case — the reason the content
   tier exists (one 32/s tier bound such a walk to ~670 KiB/s).
@@ -946,6 +946,7 @@ Notable faces:
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
 | 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |
+| `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**
 

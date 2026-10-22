@@ -16,8 +16,9 @@ import { contentBudgetFor } from '../../src/connection.js'
  * whole session with 1011.
  *
  * The default case below is deliberately asserted next to the ceiling cases: it
- * is the one datum a "cap" mutation cannot move, so a suite that passes after
- * deleting `Math.min` is not testing the cap at all.
+ * is the one datum that REMOVING or raising the cap cannot move (lowering the
+ * ceiling below 256 would move it), so a suite that stays green after deleting
+ * `Math.min` is proving the ratio, not the cap.
  */
 describe('contentBudgetFor: the content tier is capped at the peer\'s 512/s', () => {
   it('derives 8 : 1 from the shared budget at and below the ceiling', () => {
@@ -29,6 +30,9 @@ describe('contentBudgetFor: the content tier is capped at the peer\'s 512/s', ()
   })
 
   it('stops at 512 however far the shared budget is raised', () => {
+    // 65 is the first integer whose raw ratio crosses the ceiling (520): it is
+    // the boundary the docs call "above 64", pinned from the other side.
+    expect(contentBudgetFor(65)).toBe(512)
     // Every one of these derives ABOVE 512 by the raw ratio (1,024 / 1,032 /
     // 2,048 / 80,000); the desktop allows 512 in either generation.
     expect(contentBudgetFor(128)).toBe(512)
