@@ -7,7 +7,7 @@ import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { registerCherryTools } from '../../src/tools.js'
+import { registerCherryToolsWithEngine } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
@@ -130,6 +130,10 @@ interface Rig {
   dropLink(): Promise<void>
   /** How many `connection.authenticate` calls the peer has answered. */
   authenticateCount(): number
+  /** The engine's remembered send bodies for one device, as commandIds. */
+  rememberedCommandIds(deviceId: string): string[]
+  /** Fill the body memory the way a long-lived process would (no wire call). */
+  rememberCommandBody(deviceId: string, commandId: string): void
   stop(): Promise<void>
 }
 
@@ -148,7 +152,7 @@ afterEach(async () => {
 
 async function makeRig(
   options: FakeCherryOptions = {},
-  engineOptions: { cacheEntriesPerDevice?: number } = {},
+  engineOptions: { cacheEntriesPerDevice?: number; commandBodyEntriesPerDevice?: number } = {},
 ): Promise<Rig> {
   const fake = new FakeCherry({ rateLimitPerSecond: 100_000, ...options })
   const { host, port } = await fake.start()
@@ -223,7 +227,8 @@ async function makeRig(
       await connection?.close()
     },
   }
-  registerCherryTools(ctx, deps, engineOptions)
+  const { engine } = registerCherryToolsWithEngine(ctx, deps, engineOptions)
+  if (engine === undefined) throw new Error('the engine was not built')
   await connect('dev-A').connect()
 
   const tool = (name: string): CherryToolDefinition => {
@@ -253,6 +258,8 @@ async function makeRig(
       if (fake.dropConnections() === 0) throw new Error('no live socket to drop')
     },
     authenticateCount: () => fake.authenticateCount,
+    rememberedCommandIds: (deviceId) => engine.rememberedCommandIds(deviceId),
+    rememberCommandBody: (deviceId, commandId) => engine.rememberCommandBodyForTest(deviceId, commandId),
     stop: async () => {
       for (const layer of subscriptions.values()) await layer.dispose()
       for (const connection of connections.values()) await connection.close()
@@ -343,6 +350,45 @@ describe('v0.1.3 P3-1: the engine session caches are BOUNDED', () => {
 })
 
 describe('v0.1.3 P3-2: a pairing that the peer refused invalidates the caches', () => {
+  it('C1c the remembered send bodies are BOUNDED per device (FIFO), and a device teardown drops them', async () => {
+    // Issue #115's memory, through the SAME two assertions every other engine
+    // cache gets: bounded, and dropped at the one invalidation seam.
+    //
+    // The entries are filled through the engine's own store path (a retry
+    // window after a burst of lost replies would), and the bound is driven to
+    // TINY_BOUND so the arithmetic is observable.
+    const rig = await makeRig(agentOptions('100'), {
+      cacheEntriesPerDevice: TINY_BOUND,
+      commandBodyEntriesPerDevice: 2,
+    })
+
+    rig.rememberCommandBody('dev-A', 'cmd-1')
+    rig.rememberCommandBody('dev-A', 'cmd-2')
+    // At the bound, nothing has been evicted yet: the bound is reached, not
+    // exceeded.
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-1', 'cmd-2'])
+
+    // The THIRD id evicts the OLDEST (cmd-1), not some other one: FIFO over the
+    // insert order.
+    rig.rememberCommandBody('dev-A', 'cmd-3')
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-2', 'cmd-3'])
+
+    // A REFRESH keeps its insertion position — it is a rewrite, not a use — so
+    // the policy stays insert-order rather than silently becoming LRU.
+    rig.rememberCommandBody('dev-A', 'cmd-2')
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-2', 'cmd-3'])
+
+    // AND THE MEMORY DIES WITH THE DEVICE, through the ONE invalidation seam
+    // every engine cache already shares: `#forgetDevice`, which runs on an
+    // `offline` transition. A tool call FIRST, because that is what joins the
+    // device's state channel (`#resolve` installs the watch) — the same seam
+    // C2a/C2b ride.
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+    await rig.evict()
+    await vi.waitFor(() => expect(rig.states()).toContain('offline'), { timeout: 5_000 })
+    expect(rig.rememberedCommandIds('dev-A')).toEqual([])
+  }, 30_000)
+
   it('C2a a rejected authenticate (GRANT_REVOKED) clears them: the next send re-reads the desktop', async () => {
     // The window this closes: the caches survive ordinary reconnects by design,
     // so a device whose grant was revoked — and then re-paired, possibly against

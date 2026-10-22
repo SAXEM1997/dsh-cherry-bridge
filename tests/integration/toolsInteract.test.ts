@@ -812,6 +812,173 @@ describe('interactive cherry tools over a real loopback channel', () => {
   })
 
   // -------------------------------------------------------------------------
+  // ⑪c-⑪f LOST-REPLY recovery (issue #115)
+  //
+  // A command's recovery path is receipts: a reply lost on the wire is answered
+  // by re-sending under the ORIGINAL `commandId`, and the desktop's ledger
+  // replays the recorded receipt. `cherry_send` broke that promise, because its
+  // body carries a DERIVED field (`expectedIdleRevision`) whose value moves
+  // with every successful send: the retry quoted a fresh baseline, the body
+  // differed from the recorded one, and the peer answered IDEMPOTENCY_CONFLICT
+  // — on the one path where the caller cannot tell what already landed.
+  //
+  // The invariant these tests pin: a caller-supplied `commandId` replays the
+  // EXACT body it was first minted with, and genuinely different arguments are
+  // refused LOCALLY (no wire call at all) rather than laundered through it.
+  // -------------------------------------------------------------------------
+
+  it('⑪c a same-id retry after a lost reply replays the ORIGINAL receipt instead of a second message', async () => {
+    // THE LOST-REPLY SHAPE. The fixture starts the session BUSY — a run already
+    // in flight, which is the state a lost reply leaves behind — so the first
+    // send baselines its `expectedIdleRevision` from the peer's snapshot, and a
+    // second snapshot taken after the session moves (below) carries a DIFFERENT
+    // value. That is the whole mechanism of the bug: a retry that derives its
+    // own baseline cannot quote the body the first attempt sent.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION, activeExecutionId: 'exec-already-running' }],
+        terminalMessage: terminalMessage('ok'),
+        // The gate is OFF: the retry must be judged on the BODY it quotes, not
+        // pre-empted by "Session is busy".
+        sendEnforcesIdleRevision: false,
+      },
+    })
+
+    // SEND #1 — the reply that the caller is about to "lose".
+    const first = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'only once',
+      commandId: 'cmd-lost-reply',
+      wait: false,
+    })) as { commandId: string; status: string; executionId?: string }
+    expect(first.commandId).toBe('cmd-lost-reply')
+    expect(first.status).toBe('applied')
+
+    // THE SESSION MOVES ON UNDER THE REMEMBERED BODY, through a write path a
+    // caller really does drive: `cherry_cancel` publishes the peer's session
+    // snapshot, revision included (issue #1's idle-write-back). A retry that
+    // DERIVES its baseline now quotes the new value under the SAME id — a body
+    // the peer has never recorded, which this fixture's gate would ACCEPT.
+    rig.fake.setSessionRevision('s-1', '2')
+    const cancelled = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      expectedExecutionId: 'exec-not-the-cached-one',
+    })) as { error?: string }
+    // `cherry_cancel` is documented to publish the peer's snapshot revision —
+    // and here it is answered with the peer's cached execution, not a cancel.
+    expect(cancelled.error).toBe('execution-mismatch')
+
+    // THE LOST REPLY: the caller re-sends the identical command under its id.
+    const replay = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'only once',
+      commandId: 'cmd-lost-reply',
+      wait: false,
+    })) as { commandId: string; status: string; executionId?: string }
+
+    // THE ORIGINAL RECEIPT: same id and the SAME run.
+    expect(replay.commandId).toBe('cmd-lost-reply')
+    expect(replay.executionId).toBe(first.executionId)
+    expect(rig.fake.receiptFor('cmd-lost-reply')?.['executionId']).toBe(first.executionId)
+
+    // ...because the wire call was a REPLAY: the body was ASSEMBLED again — the
+    // ORIGINAL `expectedIdleRevision` included — and the ledger answered with
+    // the receipt it already had instead of applying a second command. The
+    // fixture's gate is OFF, so a drifted body would have been ACCEPTED: a
+    // second execution, a second message in the chat.
+    const sendCalls = rig.fake.commandCallsFor('agent.messages.send')
+    expect(sendCalls).toHaveLength(2)
+    expect(sendCalls[1]).toEqual(sendCalls[0])
+    expect(rig.fake.admittedCommands.size).toBe(1)
+    // No SECOND run was ever driven: the ledger's answer is the RECEIPT, the
+    // peer never reaches its handler, and the only execution it ever reports is
+    // send #1's own.
+    expect(new Set(rig.fake.executionUpdates.map((entry) => entry.executionId))).toEqual(
+      new Set([first.executionId]),
+    )
+  })
+
+  it('⑪d the same id with DIFFERENT arguments is refused locally, before any wire call', async () => {
+    // The gate is OFF on purpose: a forwarded body would be ACCEPTED by this
+    // peer, so "something reached the wire" is visible as an extra command no
+    // matter what the peer would have answered. With the gate on, both paths
+    // end in the same IDEMPOTENCY_CONFLICT and only the wire counter could tell
+    // them apart — which is still what is asserted, on a fixture where the
+    // difference is unmistakable.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('ok'),
+        sendEnforcesIdleRevision: false,
+      },
+    })
+
+    await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'the recorded body',
+      commandId: 'cmd-differs',
+      wait: false,
+    })
+    const before = rig.fake.commandCallsFor('agent.messages.send').length
+
+    const error = await rejectionOf(
+      rig.call('cherry_send', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        text: 'a GENUINELY different body',
+        commandId: 'cmd-differs',
+        wait: false,
+      }),
+    )
+
+    // The repo's existing idempotency wording, verbatim: a caller must not have
+    // to learn a second vocabulary for one condition.
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error!.data as { reason?: string }).reason).toBe('IDEMPOTENCY_CONFLICT')
+    expect(error!.message).toMatch(/^Command body differs from the recorded command/)
+    expect(error!.message.toLowerCase()).toContain('regenerate the commandid')
+    // NOTHING reached the peer.
+    expect(rig.fake.commandCallsFor('agent.messages.send')).toHaveLength(before)
+  })
+
+  it('⑪f a same-id send with the same arguments replays its body; with different ones it is refused locally', async () => {
+    // The memory is read THROUGH the peer's ledger, so what a retry replays is
+    // always a body the peer can recognise. A caller-supplied id is remembered
+    // once it has been ISSUED — a second call under the same id AND the same
+    // arguments replays the first body verbatim, one wire call, one command.
+    // A call under that id with DIFFERENT arguments is refused LOCALLY, with no
+    // wire call.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: terminalMessage('ok'),
+        sendEnforcesIdleRevision: false,
+      },
+    })
+    const sendBody = (commandId: string, text: string): Promise<unknown> =>
+      rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text, commandId, wait: false })
+
+    await sendBody('cmd-A', 'body A')
+    await sendBody('cmd-A', 'body A')
+    const remembered = rig.fake.commandCallsFor('agent.messages.send').filter((call) => call['commandId'] === 'cmd-A')
+    expect(remembered).toHaveLength(2)
+    expect(remembered[1]).toEqual(remembered[0])
+
+    // Different arguments under the same id: refused before any wire call.
+    const before = rig.fake.commandCallsFor('agent.messages.send').length
+    const refused = await rejectionOf(sendBody('cmd-A', 'a different body'))
+    expect(refused?.message).toMatch(/^Command body differs from the recorded command/)
+    expect(rig.fake.commandCallsFor('agent.messages.send')).toHaveLength(before)
+  })
+
+  // -------------------------------------------------------------------------
   // ⑫ wait=false
   // -------------------------------------------------------------------------
 
