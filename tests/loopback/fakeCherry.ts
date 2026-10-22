@@ -746,6 +746,8 @@ export class FakeCherry {
   #arrivalObservers = new Map<string, () => void>()
   /** Persistent per-method hooks (see `alwaysBeforeCall`); checked after the one-shot entry. */
   #alwaysBeforeCall = new Map<string, () => void>()
+  /** One-shot replies to LOSE after the handler ran (see `loseNextReply`). */
+  #loseNextReply = new Map<string, () => void>()
   /** Scripted pages per read-face method, served INSTEAD of the normal page. */
   #scriptedPages = new Map<string, Array<(params: Record<string, unknown>) => Record<string, unknown>>>()
   /** Externalized content bytes, keyed `<contentId>:<revision>` (the peer's pins). */
@@ -1228,6 +1230,21 @@ export class FakeCherry {
    */
   alwaysBeforeCall(method: string, hook: () => void): void {
     this.#alwaysBeforeCall.set(method, hook)
+  }
+
+  /**
+   * Lose the NEXT reply to `method` AFTER the handler has run: the peer applies
+   * the command (its ledger records it) and the frame its answer would travel in
+   * is never written, while the link is killed.
+   *
+   * The other hooks fire BEFORE the handler, so they model a command that never
+   * reached the peer at all — nothing is recorded and the caller's retry is a
+   * fresh command. This one models the LOST REPLY, the case a caller cannot
+   * distinguish from a lost request: `hook` runs at reply time, the instruction
+   * is consumed, and the hook is free to drop the link.
+   */
+  loseNextReply(method: string, hook: () => void): void {
+    this.#loseNextReply.set(method, hook)
   }
 
   /** Disarms a {@link alwaysBeforeCall} hook for `method`. */
@@ -1744,6 +1761,12 @@ export class FakeCherry {
 
       try {
         const result = await this.#handleMethod(live, method, params)
+        const lose = this.#loseNextReply.get(method)
+        if (lose !== undefined) {
+          this.#loseNextReply.delete(method)
+          lose()
+          return
+        }
         await this.#reply(live, frame.id, result)
       } catch (error) {
         const failure =

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
+import { JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
 import type {
@@ -295,6 +296,119 @@ describe('cherry_send admission self-heals a stale expectedIdleRevision (issue #
     // Exactly ONE extra read: the admission re-baseline. (A guess would have
     // needed none; a blind retry would have asked the peer and been refused.)
     expect(sessionGets(rig) - before).toBe(1)
+  })
+
+  it('T1c a CALLER-SUPPLIED commandId does not poison the self-heal: the remembered stale baseline must not ride the fresh-uuid retry (issue #115)', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION }],
+        terminalMessage: terminalMessage('first reply', 'm-first'),
+      },
+    })
+
+    // Establish the cache WITHOUT a caller id, so the memory this test is about
+    // starts empty (an auto-generated uuid is never remembered).
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'first' })
+
+    // The retry's run must be distinguishable from the first one's reply.
+    rig.fake.setTerminalMessage(terminalMessage('second reply', 'm-second'))
+
+    // The buffer goes blind while the peer's revision moves on.
+    rig.fake.silentIdleBump('s-1')
+
+    // The send under a CALLER-SUPPLIED id goes stale on its first attempt — and
+    // a rejected receipt is still a SETTLED one, so the engine remembers that
+    // first body (baseline 1000) for the caller's id. The self-heal's retry
+    // runs under a FRESH uuid; the remembered baseline belongs to the id it was
+    // minted for and must NOT ride along (issue #115 regression: it did, and
+    // the retry re-quoted the revision the peer had just refused).
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'second',
+      commandId: 'caller-stale-id',
+      wait: true,
+    })) as { status?: string; text?: string }
+
+    expect(result.status).toBe('completed')
+    expect(result.text).toBe('second reply')
+
+    const calls = sendsOf(rig, 'second')
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!['expectedIdleRevision']).toBe('1000')
+    // The retry carries the FRESH revision — not the remembered stale one.
+    expect(calls[1]!['expectedIdleRevision']).toBe('1001')
+    // And it is a NEW commandId, never the caller's settled one.
+    expect(String(calls[1]!['commandId'])).not.toBe('caller-stale-id')
+  })
+
+  it('T1d after a heal, the caller id holds the HEALED body: a third send is refused by the PEER ledger, not replayed (issue #115)', async () => {
+    // The heal issues its fresh-uuid retry with a body of its OWN, and THAT body
+    // is what the caller's id now remembers: the memory holds the LATEST attempt
+    // issued for that id. The heal also wrote its baseline into the session
+    // cache, so a third send under the caller's id derives the same revision the
+    // healed attempt quoted — and the peer's ledger still holds
+    // `caller-stale-id` with the ORIGINAL stale body (1000). The ledger is what
+    // refuses, one attempt, no self-heal.
+    //
+    // The alternative — keeping the FIRST attempt's body — is why this matters:
+    // it would replay the ledger's REJECTED receipt, the stale-revision
+    // self-heal would see it again and fire a SECOND time, and the caller's
+    // message would run twice. A conflict is the safer failure.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION }],
+        terminalMessage: terminalMessage('first reply', 'm-first'),
+      },
+    })
+    await rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: 'first' })
+    rig.fake.setTerminalMessage(terminalMessage('second reply', 'm-second'))
+    rig.fake.silentIdleBump('s-1')
+
+    const healed = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'second',
+      commandId: 'caller-stale-id',
+      wait: true,
+    })) as { status?: string; text?: string }
+    expect(healed.status).toBe('completed')
+    expect(healed.text).toBe('second reply')
+    const healedSends = sendsOf(rig, 'second')
+    expect(healedSends).toHaveLength(2)
+    // The heal completed under its OWN id; the caller's id is still the
+    // rejected command in the ledger.
+    expect(String(healedSends[1]!['commandId'])).not.toBe('caller-stale-id')
+    expect(rig.fake.receiptFor('caller-stale-id')?.['status']).toBe('rejected')
+
+    const before = sendCalls(rig).length
+    const runsBefore = rig.fake.executionUpdates.length
+    const refusal = await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'second',
+      commandId: 'caller-stale-id',
+      wait: false,
+    }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+
+    // The peer's own conflict, in the peer's own wording.
+    expect(refusal).toBeInstanceOf(JsonRpcRequestError)
+    expect(String((refusal as Error).message)).toMatch(/^Command body differs from the recorded command/)
+    // ONE attempt — the caller's id, carrying the HEALED baseline (the one the
+    // session cache now holds), not the stale one the ledger recorded.
+    const third = sendCalls(rig).slice(before)
+    expect(third).toHaveLength(1)
+    expect(third[0]!['commandId']).toBe('caller-stale-id')
+    expect(third[0]!['expectedIdleRevision']).toBe(healedSends[1]!['expectedIdleRevision'])
+    expect(third[0]!['expectedIdleRevision']).not.toBe(healedSends[0]!['expectedIdleRevision'])
+    // NO SECOND HEAL, and no second run: the ledger's conflict is the answer.
+    expect(sendsOf(rig, 'second')).toHaveLength(3)
+    expect(rig.fake.executionUpdates.length).toBe(runsBefore)
   })
 
   it('T2 a genuinely BUSY session is not retried: one send, the peer receipt, no second attempt', async () => {

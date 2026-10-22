@@ -7,7 +7,7 @@ import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { registerCherryTools } from '../../src/tools.js'
+import { registerCherryToolsWithEngine } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
@@ -130,6 +130,10 @@ interface Rig {
   dropLink(): Promise<void>
   /** How many `connection.authenticate` calls the peer has answered. */
   authenticateCount(): number
+  /** The engine's remembered send bodies for one device, as commandIds. */
+  rememberedCommandIds(deviceId: string): string[]
+  /** Fill the body memory the way a long-lived process would (no wire call). */
+  rememberCommandBody(deviceId: string, commandId: string): void
   stop(): Promise<void>
 }
 
@@ -148,7 +152,7 @@ afterEach(async () => {
 
 async function makeRig(
   options: FakeCherryOptions = {},
-  engineOptions: { cacheEntriesPerDevice?: number } = {},
+  engineOptions: { cacheEntriesPerDevice?: number; commandBodyEntriesPerDevice?: number } = {},
 ): Promise<Rig> {
   const fake = new FakeCherry({ rateLimitPerSecond: 100_000, ...options })
   const { host, port } = await fake.start()
@@ -223,7 +227,8 @@ async function makeRig(
       await connection?.close()
     },
   }
-  registerCherryTools(ctx, deps, engineOptions)
+  const { engine } = registerCherryToolsWithEngine(ctx, deps, engineOptions)
+  if (engine === undefined) throw new Error('the engine was not built')
   await connect('dev-A').connect()
 
   const tool = (name: string): CherryToolDefinition => {
@@ -253,6 +258,8 @@ async function makeRig(
       if (fake.dropConnections() === 0) throw new Error('no live socket to drop')
     },
     authenticateCount: () => fake.authenticateCount,
+    rememberedCommandIds: (deviceId) => engine.rememberedCommandIds(deviceId),
+    rememberCommandBody: (deviceId, commandId) => engine.rememberCommandBodyForTest(deviceId, commandId),
     stop: async () => {
       for (const layer of subscriptions.values()) await layer.dispose()
       for (const connection of connections.values()) await connection.close()
@@ -343,6 +350,67 @@ describe('v0.1.3 P3-1: the engine session caches are BOUNDED', () => {
 })
 
 describe('v0.1.3 P3-2: a pairing that the peer refused invalidates the caches', () => {
+  it('C1c the remembered send bodies are BOUNDED per device (FIFO), and only a PAIRING teardown drops them', async () => {
+    // Issue #115's memory, through the SAME two assertions every other engine
+    // cache gets — bounded, and dropped at the invalidation seam — with one
+    // crucial difference. The read caches go on ANY `offline`; the send bodies
+    // go only when the PAIRING is invalidated (unpair, identity-mismatch),
+    // because what they replay against — the peer's command ledger — survives a
+    // reconnect, and the body is the only local copy of the bytes that ledger
+    // will accept.
+    //
+    // The entries are filled through the engine's own store path (a retry
+    // window after a burst of lost replies would), and the bound is driven to
+    // TINY_BOUND so the arithmetic is observable.
+    const rig = await makeRig(agentOptions('100'), {
+      cacheEntriesPerDevice: TINY_BOUND,
+      commandBodyEntriesPerDevice: 2,
+    })
+
+    rig.rememberCommandBody('dev-A', 'cmd-1')
+    rig.rememberCommandBody('dev-A', 'cmd-2')
+    // At the bound, nothing has been evicted yet: the bound is reached, not
+    // exceeded.
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-1', 'cmd-2'])
+
+    // The THIRD id evicts the OLDEST (cmd-1), not some other one: FIFO over the
+    // insert order.
+    rig.rememberCommandBody('dev-A', 'cmd-3')
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-2', 'cmd-3'])
+
+    // A REFRESH keeps its insertion position — it is a rewrite, not a use — so
+    // the policy stays insert-order rather than silently becoming LRU.
+    rig.rememberCommandBody('dev-A', 'cmd-2')
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-2', 'cmd-3'])
+
+    // THE WIRING: a real `cherry_send` under a CALLER-SUPPLIED commandId is what
+    // fills this memory — not only the test seam above.
+    const receipt = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'wiring',
+      commandId: 'cmd-wiring',
+      wait: false,
+    })) as { status?: string }
+    expect(receipt.status).toBe('applied')
+    expect(rig.rememberedCommandIds('dev-A')).toContain('cmd-wiring')
+
+    // AN ORDINARY `offline` (the peer drops the link; the connection goes down
+    // and comes back) drops the OTHER caches — and KEEPS these.
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+    await rig.dropLink()
+    await vi.waitFor(() => expect(rig.states()).toContain('offline'), { timeout: 5_000 })
+    expect(rig.rememberedCommandIds('dev-A')).toEqual(['cmd-3', 'cmd-wiring'])
+
+    // The bound is still in force (cmd-wiring's insert EVICTED cmd-2; cmd-3 is
+    // now the oldest of two).
+    // ...and a PAIRING teardown (`cherry_unpair`, which resolves the record
+    // before the store entry is gone) drops them.
+    const unpaired = (await rig.call('cherry_unpair', { device: 'dev-A' })) as { removed?: boolean }
+    expect(unpaired.removed).toBe(true)
+    expect(rig.rememberedCommandIds('dev-A')).toEqual([])
+  }, 30_000)
+
   it('C2a a rejected authenticate (GRANT_REVOKED) clears them: the next send re-reads the desktop', async () => {
     // The window this closes: the caches survive ordinary reconnects by design,
     // so a device whose grant was revoked — and then re-paired, possibly against
