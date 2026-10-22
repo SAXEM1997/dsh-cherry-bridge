@@ -84,7 +84,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | --- | --- | --- | --- |
 | `dataDir` | string | `$DSH_HOME/cherry-remote`（回退 `~/.dsh/cherry-remote`） | 插件数据目录，存放 `identity.key` 与 `devices.json`（均 `0600`）。 |
 | `perSessionCacheBytes` | number | `2097152`（2 MiB） | 每个会话的**本地**订阅事件缓存上限，超出按 LRU 丢弃最旧事件并 `warn`。 |
-| `rateBudgetPerSecond` | number | `32` | 每设备平滑请求预算（请求/秒）。桌面端硬上限是 64 req/s 且无协商通道，超限会以 close `1011` 终止会话，故取保守值。 |
+| `rateBudgetPerSecond` | number | `32` | 每设备平滑请求预算（请求/秒）。桌面端共享额度在 ≤2.1.6 是 64 req/s、≥2.1.7 是 256 req/s，且只有新版本才把超限降级为单请求 `RATE_LIMITED`（旧版本直接 close `1011` 终止会话），故按更严格的一代取保守值。 |
 
 > ⚠️ `cordis.patch.yml` 的 `config` 是**整体替换**，不与默认值合并。删掉一个键得到的是
 > 插件默认值；键存在但值非法（`0`、负数、字符串）会按名 `warn` 后回落默认值。

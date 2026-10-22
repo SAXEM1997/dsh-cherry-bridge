@@ -338,8 +338,9 @@ class SecondWindowRateLimiter {
  *    ({@link DEFAULT_CONTENT_READ_BUDGET_PER_SECOND}).
  *
  * WHY TWO TIERS: the desktop paces the two against different allowances (512/s
- * for content reads, 64/s for everything else) and the official client follows
- * suit (480/s and 40/s). Sharing one 32/s tier spent content-read throughput on
+ * for content reads; 64/s for everything else through 2.1.6 and 256/s from
+ * 2.1.7) and the official client follows suit (480/s and 40/s). Sharing one
+ * 32/s tier spent content-read throughput on
  * unrelated RPCs and vice versa: a multi-slice walk of an externalized part —
  * every part over 4,096 characters on Cherry >= 2.1.6 — queued behind list
  * calls at ~36ms per slice.
@@ -350,9 +351,9 @@ type RateTier = 'shared' | 'content'
  * Which tier paces `method`. The rule is EXACT-MATCH: `agent.content.read` is
  * the only method on the content tier, and every other method — a command, a
  * list read, a different `agent.*.read` — keeps the shared tier. A prefix or
- * suffix match would silently widen the 256/s tier to methods whose peer-side
- * allowance is the 64/s one, which is a session-killing mistake (close 1011),
- * so a new content-plane method must be named here deliberately.
+ * suffix match would silently widen the content tier to methods whose peer-side
+ * allowance is the shared one — 64/s through 2.1.6, where exceeding it closes
+ * the SESSION (1011) — so a new content-plane method must be named deliberately.
  */
 function classifyRateTier(method: string): RateTier {
   return method === 'agent.content.read' ? 'content' : 'shared'

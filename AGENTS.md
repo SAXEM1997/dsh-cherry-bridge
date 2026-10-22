@@ -179,30 +179,27 @@ which our walk already follows (`tests/integration/toolsListWalkCompat.test.ts`
 T2); it must never come back **longer**, and `CherryPage.pageOverflow` is what
 happens if it does.
 
-**Pacing: two tiers against the desktop's kill lines.**
+**Pacing: two tiers against the desktop's allowances.**
 
-| Tier | Methods | Desktop allowance | Our default |
+| Tier | Methods | Desktop allowance | Default |
 | --- | --- | --- | --- |
-| `shared` | every business RPC except content reads | 64 req/s | `rateBudgetPerSecond` = **32** |
-| `content` | `agent.content.read` alone | 512 req/s | `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` = **256** |
+| `shared` | every business RPC but content reads | 64 req/s (≤2.1.6), **256 req/s** (≥2.1.7) | `rateBudgetPerSecond` = **32** |
+| `content` | `agent.content.read` alone | 512 req/s (both) | `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` = **256** |
 
-- The desktop has **no negotiation channel**; exceeding its limit terminates the
-  whole session with close `1011`. Both of our tiers sit at half the desktop
-  line, the same 2× margin.
-- The tier is chosen by `classifyRateTier`, which is an **exact match**, not a
-  prefix: widening it to another method would silently give a 64/s method the
-  256/s tier.
+- **An over-budget request's verdict is generation-dependent**: through 2.1.6
+  the desktop closes the whole session (`1011`); from 2.1.7 (PR #21687) it
+  refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps the
+  session. The generations cannot be told apart before one answers, so the
+  default is sized for the harsher: 32/s is 2× under 64, 8× under 256; the
+  content tier is 2× under 512. The margins are a *default-injection* claim —
+  the derivation is in the `defaults.ts` docblock.
+- The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
+  widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
-  shared budget at the 8:1 ratio, so lowering `rateBudgetPerSecond` lowers both.
-  A second key is deferred until a field report needs one.
-- The 2× margins are a *default-injection* claim: at an injected 64/s the
-  shared tier sits on the desktop's line and the content tier derives to 512/s
-  (nominal saturation; the limiter's per-second gap keeps the achieved rate
-  lower — margin by accident, not by design).
+  shared budget at 8:1, so lowering `rateBudgetPerSecond` lowers both.
 - Since 2.1.6 the desktop externalizes every part over **4,096 characters**,
-  which makes multi-slice content walks the common case — the reason the
-  content tier exists at all (a single 32/s tier bound such a walk to ~670 KiB/s
-  and queued it behind unrelated RPCs).
+  making multi-slice content walks the common case — the reason the content
+  tier exists (one 32/s tier bound such a walk to ~670 KiB/s).
 
 ## Design decisions and invariants
 
