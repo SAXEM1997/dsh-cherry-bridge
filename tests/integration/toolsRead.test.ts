@@ -20,7 +20,7 @@ import type {
   CherryToolsDeps,
 } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
-import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
+import type { FakeCherryOptions, FakePartRecord } from '../loopback/fakeCherry.js'
 
 /**
  * Task 8 integration suite: the six read-only `cherry_*` tools driven through
@@ -36,6 +36,13 @@ import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 const PAGE_ITEMS = 100
 const CONTENT_READ_MAX_BYTES = 24 * 1024
+/**
+ * A slice size small enough for one `{ref}` to span several slices inside the
+ * loopback peer's 32 KiB frame cap (see ④o). Only the ENGINE is told about it:
+ * the peer slices by the `maxBytes` it is asked for, so this is not a claim
+ * about the production `contentBytes`.
+ */
+const TEST_SLICE_BYTES = 1024
 
 // ---------------------------------------------------------------------------
 // Fake ctx.tools: a faithful stand-in for the host registry's `register`
@@ -1167,11 +1174,14 @@ describe('read-only cherry tools over a real loopback channel', () => {
     expect(parts[0]!.content).toBe('look at this')
   })
 
-  it('④l the pre-2.1.5 `data`-kind file projection reports the same metadata, so an upgrade never anonymizes an attachment', async () => {
-    // Cherry 2.1.4 (inside the verified range) projected the same file as a
-    // `data` part carrying `{mediaType, filename}` INSIDE `content`. The two
-    // generations must reach the caller in the same shape, or a desktop upgrade
-    // would silently turn a named attachment back into an empty part.
+  it('④l a legacy `data`-kind attachment lifts its metadata out of the JSON text, so a desktop upgrade never anonymizes an attachment', async () => {
+    // THE LIVE SHAPE (wire dump, 2026-10-22): the desktop projects a legacy
+    // attachment as `{kind: 'data', name: 'file', content: {text: '<JSON>'}}`.
+    // The metadata is SERIALIZED AS JSON in `content.text` — the old fixture's
+    // `content: {mediaType, filename}` object is schema-ILLEGAL under the
+    // pinned protocol (`content` is a strict `{text}` | `{ref}` union), so it
+    // pinned a shape no peer can produce and the lift never ran on the real
+    // one: an image upload reached the model as a JSON blob.
     const rig = await makeRig({
       agent: {
         agents: [{ agentId: 'agent-1', name: 'Agent One' }],
@@ -1191,7 +1201,7 @@ describe('read-only cherry tools over a real loopback channel', () => {
             role: 'user',
             status: 'success',
             parts: [
-              { kind: 'data', text: '', name: 'report.pdf', mediaType: 'application/pdf' },
+              { kind: 'data', text: '', filename: 'report.pdf', mediaType: 'application/pdf' },
               { kind: 'data', text: '', mediaType: 'image/jpeg' }, // filename: null — the peer's explicit "no name"
             ],
           },
@@ -1208,8 +1218,325 @@ describe('read-only cherry tools over a real loopback channel', () => {
     // a media type the peer did not state stays absent too.
     expect(parts[1]!).toMatchObject({ kind: 'data', content: '', mediaType: 'image/jpeg' })
     expect(parts[1]!).not.toHaveProperty('name')
+    // The lift is structural on BOTH sides: no `byteLength` (this shape carries
+    // none), and no content read (nothing here is a `{ref}`).
+    expect(parts[0]!).not.toHaveProperty('byteLength')
     expect(rig.fake.methodCount('agent.content.read')).toBe(0)
   })
+
+  it('④m a legacy `data` attachment carrying keys we do NOT project keeps its raw text, so nothing is silently dropped', async () => {
+    // THE CONTENT RULE: `content` is emptied only when EVERY key of the parsed
+    // record is one we lift (`mediaType`, `filename`). A record with an extra
+    // key still lifts the two fields AND keeps its text — the lossless half.
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Attachments',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [
+              {
+                kind: 'data',
+                text: '',
+                // The extra key rides IN the metadata record, so the fixture's
+                // data arm emits it verbatim inside `content.text`.
+                dataRecord: { mediaType: 'image/png', filename: 'i', size: 123 },
+              },
+            ],
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ kind: string; content: string; name?: string; mediaType?: string }> }>
+    }
+    const parts = result.messages[0]!.parts
+    expect(parts[0]!).toMatchObject({
+      kind: 'data',
+      name: 'i',
+      mediaType: 'image/png',
+      content: '{"mediaType":"image/png","filename":"i","size":123}',
+    })
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('④o an EXTERNALIZED legacy attachment lifts its metadata through exactly ONE content read, and the record outranks the ref envelope', async () => {
+    // THE LIFT ARM THE {ref} PATH HIDES. A legacy attachment's metadata is JSON
+    // text; once that record is above the peer's 4,096-character
+    // INLINE_TEXT_LIMIT the peer serves it as `{text: {ref}}`, and the lift must
+    // run on the RESOLVED text — the same text, one content walk later. The
+    // fixture is driven past the limit with a long EXTRA key (not a long
+    // filename), so the content rule also keeps the raw text: that makes "the
+    // fields were lifted" and "the text was not dropped" two separate
+    // assertions.
+    //
+    // WHY THE SLICE IS SMALLER HERE. The loopback peer's frames are capped at
+    // 32 KiB, so at the production 24 KiB slice no honest ref fits in two
+    // slices, and a walk's SECOND slice is unreachable through the fake. The
+    // wrong digest this test exists for was advertised by the ref and repeated
+    // on EVERY slice, so it surfaced on the first one — but the fix must hold
+    // for the whole walk, and only a readable slice size can prove that the
+    // ref's digest describes all of what is served.
+    //
+    // SECOND INVARIANT, in the same read: the parsed metadata is AUTHORITATIVE
+    // in this corner. A `data` part's `{ref}` is the peer's serialization
+    // ENVELOPE — its `mediaType` is the literal `'text/plain'` the envelope is
+    // labelled with, its `byteLength` the metadata's byte count — so letting
+    // either report would hand the caller `text/plain` as an image's media type
+    // and a byte count that is the JSON record's, not the file's.
+    const extraValue = 'x'.repeat(4_200)
+    const record = { mediaType: 'image/png', filename: 'holiday.png', provenance: extraValue }
+    const recordText = JSON.stringify(record)
+    expect(recordText.length).toBeGreaterThan(4096)
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Attachments',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'data', text: '', dataRecord: record }],
+          },
+        ],
+      },
+    }, { engine: { contentReadSliceBytes: TEST_SLICE_BYTES } })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{
+        parts: Array<{
+          kind: string
+          content: string
+          name?: string
+          mediaType?: string
+          byteLength?: string
+          unavailable?: string
+        }>
+      }>
+    }
+    const part = result.messages[0]!.parts[0]!
+    // No `unavailable`: nothing failed. A wrong digest on the ref fails the
+    // WHOLE read with an integrity error before this line is ever reached, which
+    // is exactly what makes this test the pin for the fixture's declaration.
+    expect(part).not.toHaveProperty('unavailable')
+    expect(part.kind).toBe('data')
+    // Fields lifted FROM THE RESOLVED RECORD.
+    expect(part.name).toBe('holiday.png')
+    // THE RECORD'S media type, never the envelope's `text/plain`...
+    expect(part.mediaType).toBe('image/png')
+    expect(part.mediaType).not.toBe('text/plain')
+    // ...and no `byteLength`: this face carries none (a ref's is the metadata
+    // record's own size, which is not the attachment's).
+    expect(part).not.toHaveProperty('byteLength')
+    // THE CONTENT RULE: an extra key means the raw text survives, losslessly.
+    expect(part.content).toBe(recordText)
+    // ONE content WALK, and it was the whole of it: every slice of the metadata
+    // was fetched exactly once (contentId `m-1:0`, offsets 0, step, 2·step, …),
+    // the walk reached `eof` on the last one, and nothing was resolved twice.
+    const contentCalls = rig.fake.readCallsFor('agent.content.read')
+    expect(rig.fake.methodCount('agent.content.read')).toBe(contentCalls.length)
+    const expectedSlices = Math.ceil(Buffer.byteLength(recordText) / TEST_SLICE_BYTES)
+    expect(expectedSlices).toBeGreaterThan(1)
+    expect(contentCalls).toHaveLength(expectedSlices)
+    expect(contentCalls.map((call) => call['contentId'])).toEqual(contentCalls.map(() => 'm-1:0'))
+    expect(contentCalls.map((call) => call['offset'])).toEqual(
+      Array.from({ length: expectedSlices }, (_unused, index) => String(index * TEST_SLICE_BYTES)),
+    )
+  })
+
+  it('④n each discriminator guard has a case of its own: the name label, the JSON parse, `isRecord`, and the projected-key test', async () => {
+    // The lift runs on EVERY `data` part of EVERY read, so its guards sit in
+    // front of the whole snapshot: the NAME label (`file`), the JSON PARSE,
+    // `isRecord` (the parse must yield an OBJECT), and — for a file-named
+    // record — at least one projected key (`mediaType`/`filename`) as a
+    // string.
+    //
+    // Each case is built so the guards it is NOT about are already satisfied by
+    // it: the name-gate case lifts into REAL fields once the gate is gone, the
+    // non-record cases make the `Object.keys`/index path throw once `isRecord`
+    // is gone, and the neither-key cases empty a text the content rule would
+    // otherwise keep (each mutation was run; see the assertions below). The
+    // first version of this test put the non-record and neither-key cases under
+    // the ATTACHMENT name, where the guards masked each other: `null` leaves at
+    // `isRecord` before the key test can run, so deleting either guard changed
+    // nothing and not one case could see it.
+    const parts: FakePartRecord[] = [
+      // 1. THE NAME GATE — a liftable record under a task event's label. Task
+      // events (`data-compaction-anchor` on the wire) carry JSON text too, so
+      // "the text parses" is not a signal: lifting on it would turn every task
+      // event into an attachment.
+      {
+        kind: 'data',
+        text: '',
+        name: 'data-compaction-anchor',
+        dataRecord: { mediaType: 'application/pdf', filename: 'report.pdf' },
+      },
+      // 2. THE PARSE, under the attachment name: not JSON, so no lift — pass
+      // through unchanged, never throw.
+      { kind: 'data', name: 'file', text: 'not json at all' },
+      // 3. `isRecord`, under the attachment name: text that parses to a
+      // NON-record. `null` and `[]` carry no media type and no filename, so
+      // this ALSO satisfies the projected-key guard — which is why these two
+      // must NOT live under the task-event label, as they did before.
+      { kind: 'data', name: 'file', text: 'null' },
+      { kind: 'data', name: 'file', text: '[]' },
+      // 4. THE PROJECTED-KEY GUARD, without the name gate in the way: a
+      // task-event-labelled `{filename:null}`. Every key is one we lift, so
+      // the content rule alone would empty it; with nothing to lift it
+      // describes no attachment, and emptying it would leave a part that says
+      // nothing at all.
+      { kind: 'data', text: '', name: 'data-compaction-anchor', dataRecord: { filename: null } },
+      // 5. The same guard with no projected key at all, under the attachment
+      // name — an unknown record. Removing only this guard keeps the text
+      // here (the content rule sees a key it does not project), so this case
+      // stands for the CONTENT half; ④n-2 pins the lift half.
+      { kind: 'data', text: '', name: 'file', dataRecord: { step: 'started' } },
+    ]
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Task events',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts,
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ kind: string; content: string; name?: string; mediaType?: string }> }>
+    }
+    const served = result.messages[0]!.parts
+    // EVERY part is UNCHANGED: the wire text passes through and no field is
+    // lifted. `toEqual` on the part object compares its OWN keys, so a lift of
+    // any field fails here — which is why the `name` label each part arrives
+    // with is asserted separately below (the projection does not echo it).
+    expect(served).toEqual(
+      [
+        '{"mediaType":"application/pdf","filename":"report.pdf"}',
+        'not json at all',
+        'null',
+        '[]',
+        '{"filename":null}',
+        '{"step":"started"}',
+      ].map((content, index) => ({
+        partId: `m-1:${index}`,
+        kind: 'data',
+        revision: '1001',
+        content,
+      })),
+    )
+    // THE LABEL SURVIVED THE PEER: a data part's `name` is a data KIND label,
+    // not attachment metadata, so it never travels in a projected part. What
+    // the wire served still carries each case's label — that is what makes the
+    // name-gate cases mean anything (see the fixture table above).
+    expect(parts.map((part) => part.name)).toEqual([
+      'data-compaction-anchor',
+      'file',
+      'file',
+      'file',
+      'data-compaction-anchor',
+      'file',
+    ])
+    // Nothing here is a `{ref}`, so an empty part would also mean an unrequested
+    // content read — never the way to "empty" a record.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  }, 60_000)
+
+  it('④n-2 a file-named `data` part whose record projects NOTHING is not lifted at all: the neither-key guard is the one that keeps its text', async () => {
+    // WHY THIS IS A SEPARATE CASE. Removing the projected-key guard does not
+    // empty a `{step:'started'}` record — the content rule sees a key it does
+    // not project and keeps the text — so ④n cannot turn red on that removal
+    // through `content` alone. It DOES change which records are treated as an
+    // attachment record at all, and the observable that separates the two
+    // verdicts is a record whose keys are all ones we LIFT but whose values
+    // are unusable: without the guard the content rule finds every key
+    // projected and empties the text. The live peer always serializes string
+    // values, so the record is injected verbatim through the peer's OWN parts
+    // page — the same wire shape, one wrong type.
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Task events',
+            historyRevision: '1000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'data', name: 'file', text: '' }],
+          },
+        ],
+      },
+    })
+    // Serve the record VERBATIM on the parts face: `mediaType` is the number
+    // 123, so the projected-key guard has nothing to lift while `isRecord` and
+    // the name gate are both satisfied.
+    const recordText = '{"mediaType":123}'
+    rig.fake.scriptListPages('agent.parts.list', [
+      {
+        items: [{ partId: 'm-1:0', revision: '1001', kind: 'data', name: 'file', content: { text: recordText } }],
+        nextCursor: null,
+      },
+    ])
+
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ kind: string; content: string; name?: string; mediaType?: string }> }>
+    }
+    // UNCHANGED, whole: the text passes through and no field is reported —
+    // the part was not recognised as an attachment at all.
+    expect(result.messages[0]!.parts[0]).toEqual({
+      partId: 'm-1:0',
+      kind: 'data',
+      revision: '1001',
+      content: recordText,
+    })
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  }, 60_000)
 
   it('⑤ cherry_read and cherry_events ensure the session subscription on first use and ack after delivery', async () => {
     const rig = await makeRig({

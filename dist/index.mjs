@@ -5458,6 +5458,12 @@ var CherryToolEngine = class {
 	*/
 	#contentGate;
 	/**
+	* The `maxBytes` one `agent.content.read` slice asks for
+	* ({@link CONTENT_READ_MAX_BYTES} in production; injectable so a test can
+	* reach a walk's second slice, see `CherryToolEngineOptions`).
+	*/
+	#contentReadSliceBytes;
+	/**
 	* The parts pages already walked, keyed `<deviceId>\0<messageId>`.
 	*
 	* WHAT IS HELD is the RESULT of `agent.parts.list` — the raw part records plus
@@ -5565,6 +5571,7 @@ var CherryToolEngine = class {
 		this.#messageCacheBytesPerDevice = Math.max(1, Math.floor(options.messageCacheBytesPerDevice ?? MESSAGE_CACHE_BYTES_PER_DEVICE));
 		this.#commandBodyEntriesPerDevice = Math.max(1, Math.floor(options.commandBodyEntriesPerDevice ?? COMMAND_BODY_ENTRIES_PER_DEVICE));
 		this.#contentGate = new ContentReadGate(options.contentReadConcurrency ?? DEFAULT_CONTENT_READ_CONCURRENCY);
+		this.#contentReadSliceBytes = Math.max(1, Math.floor(options.contentReadSliceBytes ?? CONTENT_READ_MAX_BYTES));
 	}
 	definitions() {
 		return [
@@ -6127,7 +6134,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as `kind: \"file\"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A failed message (`status: \"error\"`) may carry `failure: {reasonCode, retryable, message}` when the peer sent one — its classification, whether it judged a retry worthwhile, and a bounded summary; the peer's `source` and `context.responseBody` are never projected. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. An attachment is reported as METADATA, never as its bytes: a `kind: \"file\"` part, or a legacy `data` part named `file` (the metadata as JSON in `content.text`), comes back as `name`/`mediaType` (plus `byteLength` for the `file` kind) with `content` emptied — or kept verbatim when that record carries a key this projection does not report. The bytes are deliberately not fetched into a text channel. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A failed message (`status: \"error\"`) may carry `failure: {reasonCode, retryable, message}` when the peer sent one — its classification, whether it judged a retry worthwhile, and a bounded summary; the peer's `source` and `context.responseBody` are never projected. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -6388,38 +6395,115 @@ var CherryToolEngine = class {
 				releaseSlot?.();
 			}
 		} else text = "";
+		const legacy = this.#legacyAttachment(kind, raw, text);
 		return {
 			partId,
 			kind,
 			revision,
-			content: text,
-			...this.#attachmentFace(kind, raw, content),
+			content: legacy === void 0 ? text : legacy.remainder,
+			...legacy === void 0 ? this.#attachmentFace(kind, raw, content) : this.#attachmentFace(kind, raw, content, legacy.record),
 			...typeof raw["state"] === "string" ? { state: raw["state"] } : {},
 			...typeof raw["toolName"] === "string" ? { toolName: raw["toolName"] } : {},
 			...typeof raw["toolCallId"] === "string" ? { toolCallId: raw["toolCallId"] } : {}
 		};
 	}
 	/**
+	* The ONE place a legacy `data` part is recognised as an attachment: the
+	* structural discriminator, the JSON parse, and the lossless CONTENT rule.
+	*
+	* The legal legacy face is `{kind: 'data', name: 'file', content: {text:
+	* '{\"mediaType\":…,\"filename\":…}'}}` — the metadata SERIALIZED AS JSON in
+	* `content.text`, observed on the wire (2.1.7 desktop, image upload,
+	* 2026-10-22). An OBJECT inside `content` is not producible by a conforming
+	* peer at all: the pinned protocol 0.5.0 types `content` as a strict
+	* `{text}` | `{ref}` union, so the old documentation described a shape no
+	* peer can emit — and the real one was never lifted, which is how an image
+	* upload reached a model as a JSON blob.
+	*
+	* WHY THE NAME IS THE DISCRIMINATOR, and why it is not a heuristic: the
+	* desktop labels every `data` part with its data KIND in `name` — an
+	* attachment is `'file'`, a task event is `'data-compaction-anchor'`, an
+	* error is `'data-error'` — and the protocol types that field as an
+	* `opaqueId`. This lift therefore REQUIRES the label to be the literal
+	* `'file'` rather than ASSUMING every peer sets one: a `data` part that
+	* carries no name reads as no name, is not lifted, and passes through
+	* untouched. Several of those payloads are JSON too, so "the text parses"
+	* proves nothing; `'file'` is the one label that means "this is an
+	* attachment".
+	*
+	* NOTHING IS EVER DEGRADED: a text that does not parse, parses to a
+	* non-record, or carries neither `mediaType` nor `filename` as a string is
+	* not an attachment, and the part passes through COMPLETELY unchanged
+	* (`remainder` is the raw text, no field is lifted) — this runs on every
+	* `data` part of every read, so a throw here would take down the whole
+	* snapshot.
+	*
+	* THE CONTENT RULE: `remainder` is EMPTY when every key of the record is one
+	* this face projects (`mediaType`, `filename`) — the metadata is fully
+	* represented, and a model sees structure rather than a blob. A record
+	* carrying ANY other key keeps its raw text, so a field we do not project is
+	* never silently dropped (lossless by default). That promise is about KEYS: a
+	* key we DO project whose value is not a string (say `mediaType: 123`) is
+	* counted as represented — the key survives — and reports no field, because
+	* this face lifts strings only. Emptied text therefore means "every key was
+	* one of ours", not "every value produced a field".
+	*/
+	#legacyAttachment(kind, raw, text) {
+		if (kind !== "data" || optionalString(raw["name"]) !== "file") return void 0;
+		let parsed;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			return;
+		}
+		if (!isRecord(parsed)) return void 0;
+		if (optionalString(parsed["filename"]) === void 0 && optionalString(parsed["mediaType"]) === void 0) return;
+		const everythingLifted = Object.keys(parsed).every((key) => key === "mediaType" || key === "filename");
+		return {
+			record: parsed,
+			remainder: everythingLifted ? "" : text
+		};
+	}
+	/**
 	* The descriptive metadata of an attachment part — and deliberately NOT a
 	* way to reach its bytes.
 	*
-	* Two peer generations are covered, because both are inside the verified
-	* range and they disagree about where the metadata lives:
+	* Two legal faces are covered, because both are inside the verified range and
+	* they disagree about where the metadata lives:
 	*
 	*  - **Cherry ≥ 2.1.5** — `{kind: 'file', name, ref}`, ref at the TOP level.
-	*  - **Cherry 2.1.4** — `{kind: 'data', name, content: {mediaType, filename}}`.
+	*  - **legacy** — `{kind: 'data', name: 'file', content: {text: '<JSON>'}}`,
+	*    the metadata as JSON TEXT. {@link CherryToolEngine.#legacyAttachment}
+	*    parses it and passes the record in here.
+	*
+	* A THIRD arm — a `data` part carrying `{mediaType, filename}` as an OBJECT
+	* inside `content` — is schema-ILLEGAL under the pinned protocol (see the
+	* docblock above) and stays as a DEFENSIVE lift for a peer that violates it.
+	* It is not the 2.1.4 projection: that story was wrong, and a misbehaving
+	* peer's parts are not re-validated client-side, so the guarded arm costs
+	* nothing and covers exactly the peer it was written for.
 	*
 	* Only string fields are lifted: a null `filename` (the peer's explicit "no
 	* name") stays absent rather than becoming the string "null". Anything a
 	* caller needs beyond this — the bytes — stays behind `agent.content.read`,
 	* which this plugin does not call for a file part.
+	*
+	* WHEN A PARSED `metadata` RECORD IS PRESENT IT IS AUTHORITATIVE. A legacy
+	* attachment's record can arrive externalized as `{ref}`, and that ref is the
+	* peer's serialization ENVELOPE, not the attachment's description: its
+	* `mediaType` is the literal `'text/plain'` the envelope is labelled with and
+	* its `byteLength` is the JSON metadata's own byte count. Letting either
+	* outrank the record would report `text/plain` as an image's media type and a
+	* size that is not the file's — so the record wins the media type, and this
+	* face reports NO `byteLength` at all (a legacy `data` part carries none). The
+	* `file` arm is untouched: there the ref IS the file's own description.
 	*/
-	#attachmentFace(kind, raw, content) {
+	#attachmentFace(kind, raw, content, metadata) {
 		if (kind !== "file" && kind !== "data") return {};
 		const ref = isRecord(raw["ref"]) ? raw["ref"] : isRecord(content["ref"]) ? content["ref"] : {};
-		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(content["filename"]);
-		const mediaType = optionalString(ref["mediaType"]) ?? optionalString(content["mediaType"]);
-		const byteLength = optionalString(ref["byteLength"]);
+		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(metadata?.["filename"]) ?? optionalString(content["filename"]);
+		const mediaType = kind === "data" && metadata !== void 0 ? optionalString(metadata["mediaType"]) ?? optionalString(content["mediaType"]) : optionalString(ref["mediaType"]) ?? optionalString(metadata?.["mediaType"]) ?? optionalString(content["mediaType"]);
+		const byteLength = kind === "file" ? optionalString(ref["byteLength"]) : void 0;
 		return {
 			...name === void 0 ? {} : { name },
 			...mediaType === void 0 ? {} : { mediaType },
@@ -6507,7 +6591,7 @@ var CherryToolEngine = class {
 		const declaredBytes = Number(ref["byteLength"]);
 		const refusal = this.#externalizedRefusal(ref);
 		if (refusal !== void 0) throw refusal;
-		const maxSlices = Number.isSafeInteger(declaredBytes) ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES)) : DEFAULT_CONTENT_SLICE_BOUND;
+		const maxSlices = Number.isSafeInteger(declaredBytes) ? Math.max(1, Math.ceil(declaredBytes / this.#contentReadSliceBytes)) : DEFAULT_CONTENT_SLICE_BOUND;
 		let offset = "0";
 		let sha;
 		let complete = false;
@@ -6520,7 +6604,7 @@ var CherryToolEngine = class {
 				contentId,
 				revision,
 				offset,
-				maxBytes: CONTENT_READ_MAX_BYTES
+				maxBytes: this.#contentReadSliceBytes
 			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
 			const cap = this.#externalizedByteCap;
