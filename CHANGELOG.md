@@ -5,6 +5,54 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## v0.1.10 (2026-10-22)
+
+Alignment with desktop **2.1.7**, whose over-budget answer changed from "close
+the session" to "refuse this one request". No protocol-surface change: the tool
+INPUT schemas stay the same (the `failure` field below is additive on the output
+side), and a 0.1.9 install keeps working against both desktop generations.
+
+### Fixed
+
+- **A rate-limited READ is retried once instead of failing** (#104, PR #108).
+  Desktop >= 2.1.7 answers an over-budget request with `RATE_LIMITED` +
+  `retryAfterMs` and keeps the session, while <= 2.1.6 closed it (`1011`). A
+  read now waits `min(retryAfterMs, 1 s, deadline)` and replays **once** through
+  a fresh pacing admission; a second refusal surfaces as itself. A refused
+  `agent.content.read` slice fails the whole read instead of degrading the part
+  to `unavailable` — a rate limit is session-wide, not part-specific, and a
+  visibly degraded, empty part on a session-wide refusal was the worse answer.
+- **A rate-limited COMMAND explains itself** (#109, PR #110). Commands are never
+  replayed, so their refusal is the caller's to recover: the error text now says
+  that **this attempt** was not applied (the desktop refuses before dispatch,
+  so nothing reached its command ledger), that the SAME `commandId` may be
+  reused, how long the peer asked us to wait (`retryAfterMs`, when it sent one),
+  and the likely cause — a `rateBudgetPerSecond` raised past the peer's
+  allowance. The peer's reason, `data` and the error identity are untouched.
+- **The derived content tier is capped at the peer's 512/s** (#111, PR #112).
+  The content tier scales with `rateBudgetPerSecond` at 8 : 1, but the desktop's
+  content-read allowance is 512/s in **both** generations. A shared budget above
+  64 therefore derived a tier past a line that never moved — `256` (2.1.7's
+  sharing figure) meant a 2,048/s nominal tier, ~1,000/s achieved against the
+  512/s allowance, so roughly every other content read was refused. The
+  derivation is now clamped at 512/s (~333/s achieved), and the default 32 still
+  yields exactly 256/s nominal (200/s achieved).
+
+### Added
+
+- **A failed message's `failure` metadata is projected** (#103, PR #107).
+  `cherry_read` and the terminal/timeout/idle wait answers carry
+  `failure: {reasonCode, retryable, message}` when the peer attached one. It is
+  shape-checked rather than whitelisted, so an unfamiliar reason code is relayed
+  instead of silently dropped; the peer's `source` and `context.responseBody`
+  are never projected.
+
+### Docs
+
+- The over-budget verdict is documented per generation — <= 2.1.6 closes the
+  session with `1011`, >= 2.1.7 refuses one request — in the READMEs, the config
+  table, the pacing notes and the e2e checklist (#102, PR #106).
+
 ## v0.1.9 (2026-10-21)
 
 Two field annoyances, neither touching the protocol surface.
