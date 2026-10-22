@@ -291,9 +291,11 @@ export interface CherryReadPart {
   toolName?: string
   toolCallId?: string
   /**
-   * The DESCRIPTIVE face of a binary attachment (`kind: 'file'`): what the file
-   * is, never what it holds. `content` stays empty for such a part by design —
-   * see {@link CherryToolEngine.#attachmentFace}.
+   * The DESCRIPTIVE face of an attachment — a `kind: 'file'` part, or the
+   * legacy `kind: 'data'` part the desktop labels `name: 'file'` and whose
+   * metadata is JSON in `content.text`: what the file is, never what it holds.
+   * `content` stays empty for such a part unless its record carries a key this
+   * face does not project — see {@link CherryToolEngine.#attachmentFace}.
    */
   name?: string
   mediaType?: string
@@ -1557,6 +1559,20 @@ export interface CherryToolEngineOptions {
    * property under test ("no more than the limit at once") is the same at 1.
    */
   contentReadConcurrency?: number
+  /**
+   * The `maxBytes` every `agent.content.read` slice asks for. Omitted uses
+   * {@link CONTENT_READ_MAX_BYTES}, the protocol's `contentBytes`.
+   *
+   * TEST-ONLY, and it exists because the loopback fan-out caps a record at
+   * 32 KiB: at the production 24 KiB no honest ref fits in TWO slices (one
+   * full slice plus the `< 24 KiB` remainder), so a walk's SECOND slice — the
+   * one that proves the ref's digest describes the whole of what is served,
+   * rather than merely its first slice — is unreachable through the fake. A
+   * smaller slice size makes any multi-slice behaviour testable. Never lowered
+   * in production: the peer caps the slice anyway, and asking for less only
+   * costs round trips.
+   */
+  contentReadSliceBytes?: number
 }
 
 /**
@@ -1743,6 +1759,12 @@ export class CherryToolEngine {
    */
   readonly #contentGate: ContentReadGate
   /**
+   * The `maxBytes` one `agent.content.read` slice asks for
+   * ({@link CONTENT_READ_MAX_BYTES} in production; injectable so a test can
+   * reach a walk's second slice, see `CherryToolEngineOptions`).
+   */
+  readonly #contentReadSliceBytes: number
+  /**
    * The parts pages already walked, keyed `<deviceId>\0<messageId>`.
    *
    * WHAT IS HELD is the RESULT of `agent.parts.list` — the raw part records plus
@@ -1874,6 +1896,10 @@ export class CherryToolEngine {
       Math.floor(options.commandBodyEntriesPerDevice ?? COMMAND_BODY_ENTRIES_PER_DEVICE),
     )
     this.#contentGate = new ContentReadGate(options.contentReadConcurrency ?? DEFAULT_CONTENT_READ_CONCURRENCY)
+    this.#contentReadSliceBytes = Math.max(
+      1,
+      Math.floor(options.contentReadSliceBytes ?? CONTENT_READ_MAX_BYTES),
+    )
   }
 
   definitions(): CherryToolDefinition[] {
@@ -2726,8 +2752,11 @@ export class CherryToolEngine {
         'sha256-verified through `agent.content.read`. An unchanged message (same message ' +
         'revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a ' +
         'quiet session costs no `agent.parts.list` RPC; externalized content is still fetched ' +
-        'and sha256-verified on every read, so unverified bytes are never served from memory. A binary attachment is reported as ' +
-        '`kind: "file"` with `name`/`mediaType`/`byteLength` and an EMPTY `content` — the bytes ' +
+        'and sha256-verified on every read, so unverified bytes are never served from memory. An ' +
+        'attachment is reported as METADATA, never as its bytes: a `kind: "file"` part, or a ' +
+        'legacy `data` part named `file` (the metadata as JSON in `content.text`), comes back as ' +
+        '`name`/`mediaType` (plus `byteLength` for the `file` kind) with `content` emptied — or ' +
+        'kept verbatim when that record carries a key this projection does not report. The bytes ' +
         'are deliberately not fetched into a text channel. Messages come NEWEST-first, so the ' +
         'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
         'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
@@ -3218,12 +3247,16 @@ export class CherryToolEngine {
    * peer can emit — and the real one was never lifted, which is how an image
    * upload reached a model as a JSON blob.
    *
-   * WHY THE NAME IS THE DISCRIMINATOR, and why it is not a heuristic: a `data`
-   * part always carries a `name` (an `opaqueId`), and the desktop uses it as
-   * the data KIND label — an attachment is `'file'`, a task event is
-   * `'data-compaction-anchor'`, an error is `'data-error'`. Several of those
-   * payloads are JSON too, so "the text parses" proves nothing; `'file'` is the
-   * one label that means "this is an attachment".
+   * WHY THE NAME IS THE DISCRIMINATOR, and why it is not a heuristic: the
+   * desktop labels every `data` part with its data KIND in `name` — an
+   * attachment is `'file'`, a task event is `'data-compaction-anchor'`, an
+   * error is `'data-error'` — and the protocol types that field as an
+   * `opaqueId`. This lift therefore REQUIRES the label to be the literal
+   * `'file'` rather than ASSUMING every peer sets one: a `data` part that
+   * carries no name reads as no name, is not lifted, and passes through
+   * untouched. Several of those payloads are JSON too, so "the text parses"
+   * proves nothing; `'file'` is the one label that means "this is an
+   * attachment".
    *
    * NOTHING IS EVER DEGRADED: a text that does not parse, parses to a
    * non-record, or carries neither `mediaType` nor `filename` as a string is
@@ -3236,7 +3269,11 @@ export class CherryToolEngine {
    * this face projects (`mediaType`, `filename`) — the metadata is fully
    * represented, and a model sees structure rather than a blob. A record
    * carrying ANY other key keeps its raw text, so a field we do not project is
-   * never silently dropped (lossless by default).
+   * never silently dropped (lossless by default). That promise is about KEYS: a
+   * key we DO project whose value is not a string (say `mediaType: 123`) is
+   * counted as represented — the key survives — and reports no field, because
+   * this face lifts strings only. Emptied text therefore means "every key was
+   * one of ours", not "every value produced a field".
    */
   #legacyAttachment(
     kind: string,
@@ -3283,8 +3320,17 @@ export class CherryToolEngine {
    * Only string fields are lifted: a null `filename` (the peer's explicit "no
    * name") stays absent rather than becoming the string "null". Anything a
    * caller needs beyond this — the bytes — stays behind `agent.content.read`,
-   * which this plugin does not call for a file part. A legacy `data` part
-   * carries no `byteLength`, so none is reported for it.
+   * which this plugin does not call for a file part.
+   *
+   * WHEN A PARSED `metadata` RECORD IS PRESENT IT IS AUTHORITATIVE. A legacy
+   * attachment's record can arrive externalized as `{ref}`, and that ref is the
+   * peer's serialization ENVELOPE, not the attachment's description: its
+   * `mediaType` is the literal `'text/plain'` the envelope is labelled with and
+   * its `byteLength` is the JSON metadata's own byte count. Letting either
+   * outrank the record would report `text/plain` as an image's media type and a
+   * size that is not the file's — so the record wins the media type, and this
+   * face reports NO `byteLength` at all (a legacy `data` part carries none). The
+   * `file` arm is untouched: there the ref IS the file's own description.
    */
   #attachmentFace(
     kind: string,
@@ -3304,10 +3350,14 @@ export class CherryToolEngine {
         ? optionalString(raw['name'])
         : (optionalString(metadata?.['filename']) ?? optionalString(content['filename']))
     const mediaType =
-      optionalString(ref['mediaType']) ??
-      optionalString(metadata?.['mediaType']) ??
-      optionalString(content['mediaType'])
-    const byteLength = optionalString(ref['byteLength'])
+      kind === 'data' && metadata !== undefined
+        ? (optionalString(metadata['mediaType']) ?? optionalString(content['mediaType']))
+        : (optionalString(ref['mediaType']) ??
+          optionalString(metadata?.['mediaType']) ??
+          optionalString(content['mediaType']))
+    // A legacy `data` part carries no `byteLength`: the only ref it can have is
+    // the metadata envelope's, whose length describes the RECORD.
+    const byteLength = kind === 'file' ? optionalString(ref['byteLength']) : undefined
     return {
       ...(name === undefined ? {} : { name }),
       ...(mediaType === undefined ? {} : { mediaType }),
@@ -3418,7 +3468,7 @@ export class CherryToolEngine {
     const refusal = this.#externalizedRefusal(ref)
     if (refusal !== undefined) throw refusal
     const maxSlices = Number.isSafeInteger(declaredBytes)
-      ? Math.max(1, Math.ceil(declaredBytes / CONTENT_READ_MAX_BYTES))
+      ? Math.max(1, Math.ceil(declaredBytes / this.#contentReadSliceBytes))
       : DEFAULT_CONTENT_SLICE_BOUND
 
     let offset = '0'
@@ -3447,7 +3497,9 @@ export class CherryToolEngine {
           contentId,
           revision,
           offset,
-          maxBytes: CONTENT_READ_MAX_BYTES,
+          // The protocol's slice size in production; injectable for tests that
+          // must reach a walk's SECOND slice (see the option's docblock).
+          maxBytes: this.#contentReadSliceBytes,
         },
         deadline === undefined ? undefined : { deadline: deadline.instant },
       )) as Record<string, unknown>

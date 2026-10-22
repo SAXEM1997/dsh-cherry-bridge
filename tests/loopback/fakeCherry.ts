@@ -2523,6 +2523,15 @@ export class FakeCherry {
           this.#contentBytes.set(key, metadata)
           this.#contentDigests.set(key, metadataDigest)
         }
+        // THE ADVERTISED DIGEST DESCRIBES THE METADATA RECORD, not the fixture's
+        // `text`: `advertised` was derived from that `text`, which is EMPTY on a
+        // data fixture, so reusing it here advertised the digest of the empty
+        // string for a ref that serves the record's bytes — the first projection
+        // of an externalized metadata record then failed its digest check and
+        // took the WHOLE read down. The pin is what `agent.content.read` reports
+        // on every slice (and what a tamper moves), so the ref reports the digest
+        // THE PIN HOLDS, exactly as the normal content path above does.
+        const advertisedMetadata = this.#contentDigests.get(key) ?? metadataDigest
         return {
           partId,
           revision,
@@ -2537,7 +2546,7 @@ export class FakeCherry {
                     revision,
                     byteLength: String(this.#contentByteOverrides.get(key) ?? metadata.length),
                     mediaType: 'text/plain',
-                    sha256: advertised,
+                    sha256: advertisedMetadata,
                   },
                 },
         }
