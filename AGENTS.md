@@ -164,7 +164,7 @@ fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 `PAGE_ITEM_BYTES`-style byte budget (62,279 bytes) to every paged `agent.*.list`
 face (`pageOf` truncates, `queryPage` re-queries a keyset page at a halved
 limit); an item that cannot fit raises `RESOURCE_EXHAUSTED`. It is **not in any
-release** as of the verified range, so deployed peers (2.1.6 and earlier) still
+release** as of the verified range, so deployed peers (2.1.7 and earlier) still
 page by count alone and the clamps stay. Byte-safe pages must not be removed
 because of that upstream commit.
 
@@ -179,30 +179,27 @@ which our walk already follows (`tests/integration/toolsListWalkCompat.test.ts`
 T2); it must never come back **longer**, and `CherryPage.pageOverflow` is what
 happens if it does.
 
-**Pacing: two tiers against the desktop's kill lines.**
+**Pacing: two tiers against the desktop's allowances.**
 
-| Tier | Methods | Desktop allowance | Our default |
+| Tier | Methods | Desktop allowance | Default |
 | --- | --- | --- | --- |
-| `shared` | every business RPC except content reads | 64 req/s | `rateBudgetPerSecond` = **32** |
-| `content` | `agent.content.read` alone | 512 req/s | `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` = **256** |
+| `shared` | every business RPC but content reads | 64 req/s (≤2.1.6), **256 req/s** (≥2.1.7) | `rateBudgetPerSecond` = **32** |
+| `content` | `agent.content.read` alone | 512 req/s (both) | `DEFAULT_CONTENT_READ_BUDGET_PER_SECOND` = **256** |
 
-- The desktop has **no negotiation channel**; exceeding its limit terminates the
-  whole session with close `1011`. Both of our tiers sit at half the desktop
-  line, the same 2× margin.
-- The tier is chosen by `classifyRateTier`, which is an **exact match**, not a
-  prefix: widening it to another method would silently give a 64/s method the
-  256/s tier.
+- **An over-budget request's verdict is generation-dependent**: through 2.1.6
+  the desktop closes the whole session (`1011`); from 2.1.7 (PR #21687) it
+  refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps the
+  session. The generations cannot be told apart before one answers, so the
+  default is sized for the harsher: 32/s is 2× under 64, 8× under 256; the
+  content tier is 2× under 512. The margins are a *default-injection* claim —
+  the derivation is in the `defaults.ts` docblock.
+- The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
+  widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
-  shared budget at the 8:1 ratio, so lowering `rateBudgetPerSecond` lowers both.
-  A second key is deferred until a field report needs one.
-- The 2× margins are a *default-injection* claim: at an injected 64/s the
-  shared tier sits on the desktop's line and the content tier derives to 512/s
-  (nominal saturation; the limiter's per-second gap keeps the achieved rate
-  lower — margin by accident, not by design).
+  shared budget at 8:1, so lowering `rateBudgetPerSecond` lowers both.
 - Since 2.1.6 the desktop externalizes every part over **4,096 characters**,
-  which makes multi-slice content walks the common case — the reason the
-  content tier exists at all (a single 32/s tier bound such a walk to ~670 KiB/s
-  and queued it behind unrelated RPCs).
+  making multi-slice content walks the common case — the reason the content
+  tier exists (one 32/s tier bound such a walk to ~670 KiB/s).
 
 ## Design decisions and invariants
 
@@ -920,20 +917,21 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 Neither reference lives in this repository.
 
 - **`/tmp/csa`** — the official Cherry Studio **app** (`CherryHQ/cherry-studio-app`
-  @ main `18329fe`, app 0.3.0). It plays the **same role we do** (protocol
+  @ v0.4.0, read 2026-10-22). It plays the **same role we do** (protocol
   *client* against the desktop's server). Its remote layer is
   `src/backend/services/remoteAgent/` (`RemoteAgentScope.ts`, `remoteContent.ts`,
   `RemoteAgentActions.ts`, `SessionSync.ts`, …). This is where "what does the
   official client do" comes from.
 - **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
-  the protocol **server** of record. The faces we depend on are
-  `src/main/services/remoteAccess/` and `packages/remote-{protocol,transport}`;
-  `RemoteAccessService.ts` carries the 512/s content-read line and the 64/s
-  general line. Gitignored; treated as read-only research.
+  read alongside v2.1.7, the protocol **server** of record. The faces we depend
+  on are `src/main/services/remoteAccess/` and
+  `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries the
+  512/s content-read line and the shared line (64/s through 2.1.6, 256/s from
+  2.1.7). Gitignored; treated as read-only research.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.6** (plus post-2.1.6 commits on `main`).
+**Verified desktop range: 2.1.4 → 2.1.7** (plus post-2.1.7 commits on `main`).
 Pairing payload, mDNS advertisement, protocol versions (`[1]`) and the Noise
 profile saw **zero changes** in that window. Notable faces:
 
@@ -945,17 +943,16 @@ profile saw **zero changes** in that window. Notable faces:
 | 2.1.5 `agent.messages.send` requires non-empty trimmed `text` | `cherry_send` rejects blank text locally as `text-empty` |
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
+| 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**
 
-- Its `RemoteAgentError(code, retryable)` marks `RATE_LIMITED`,
-  `TOKEN_EXPIRED`, `RESOURCE_EXHAUSTED` and `CONNECTION_LOST` as retryable, and
-  the background observation loop retries with exponential backoff
-  (`min(20 s, 1 s · 2^n)`). A `RESOURCE_EXHAUSTED` raised by the **page size**
-  (the upstream byte budget) is therefore retried forever at the same page size
-  — it can never succeed. Our answer is the byte-safe page **clamp**: never ask
-  for a page that cannot fit, instead of retrying a request that cannot.
+- Its `RemoteAgentError` marks `RATE_LIMITED`/`TOKEN_EXPIRED`/
+  `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries with
+  `min(20 s, 1 s · 2^n)` backoff, so a `RESOURCE_EXHAUSTED` from the page-size
+  budget is retried forever at the same page size. Our answer is the byte-safe
+  page **clamp**: never ask for a page that cannot fit.
 - Its read path refuses a ref whose `byteLength` is unusable; we fall back to a
   slice bound plus the cumulative arm (see above). Its 32 MiB cap is a
   pre-allocated single array; ours is three transient copies (see the memory

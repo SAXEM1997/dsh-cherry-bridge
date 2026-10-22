@@ -55,17 +55,17 @@
 
 ---
 
-### 3. `rate-limit-terminates-session` — Over-limit rate limiting terminates the whole session (close 1011)
+### 3. `rate-limit-terminates-session` — Over-limit rate limiting is generation-dependent: a whole-session 1011 close (≤2.1.6) or a per-request refusal (≥2.1.7)
 
-**真实对端行为**：超过桌面每套接字预算（当前实现值 64 req/s，无协商通道）会以 close
-code **1011 终止整条会话**——不是可原地重试的**单请求** `RATE_LIMITED` 拒绝。
+**真实对端行为**：≤2.1.6 超过桌面每套接字预算（64 req/s 共享、512 req/s 内容）会以 close
+code **1011 终止整条会话**；≥2.1.7（PR #21687）共享额度改为 256 req/s，超限只拒绝**该条**
+请求（`RATE_LIMITED` + `retryAfterMs`），会话存活。
 
-**手动核验步骤**（与 `CONTRACT_DIFFERENCES[2].checklistStep` 同源）：
+**手动核验步骤**（与 `CONTRACT_DIFFERENCES[2].checklistStep` 同源，逐字一致）：
 
-- [ ] rate-limit-terminates-session: against a real desktop, drive a burst well above the smooth budget and confirm the socket is closed with 1011 (session gone, state offline, backoff restart) rather than a single structured per-request rejection.
+- [ ] rate-limit-terminates-session: on a ≥2.1.7 desktop, raise `rateBudgetPerSecond` (or use an unpaced probe) and drive a burst above the allowance; confirm each over-budget request is refused with `RATE_LIMITED` + `retryAfterMs` while the session stays live. On ≤2.1.6, the same burst closes the socket with 1011 (state offline, backoff restart).
 
-**期望**：套接字被 1011 关闭 → 设备状态转 `offline` → 进入退避重启；
-**不出现**「某一条请求被单独拒绝、连接仍存活」这一形态。
+**期望**：按对端版本二选一命中；两种形态都**不出现**未分类的 bare channel-closed 文本。
 
 ---
 

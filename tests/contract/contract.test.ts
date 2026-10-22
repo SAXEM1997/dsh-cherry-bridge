@@ -457,18 +457,24 @@ describe('① the six-entry contract difference list', () => {
   }, 20_000)
 
   // -------------------------------------------------------------------------
-  // ③ rate limiting terminates the WHOLE session
+  // ③ rate limiting: the ≤2.1.6 session close (the 2.1.7 refusal is #104)
   // -------------------------------------------------------------------------
 
-  it('③ proves the over-limit verdict is a session close (1011), never a per-request rejection', async () => {
+  it('③ proves the LEGACY (≤2.1.6) over-limit verdict is a session close (1011)', async () => {
     const entry = CONTRACT_DIFFERENCES.find((item) => item.id === 'rate-limit-terminates-session')!
+    // Both generations must be recorded: the client sizes its budget for the
+    // harsher one, so naming only 1011 would hide the half it must respect.
     expect(entry.realPeer).toMatch(/64/)
     expect(entry.realPeer).toMatch(/1011/)
+    expect(entry.realPeer).toMatch(/256/)
+    expect(entry.realPeer).toMatch(/retryAfterMs/)
+    expect(entry.realPeer).toMatch(/2\.1\.7/)
 
-    // The fake's cap is injectable; the real desktop's is 64 req/s. Exceeding
+    // The fake's cap is injectable; this models the ≤2.1.6 desktop's 64 req/s
+    // cap (2.1.7 allows 256/s and refuses per request — issue #104). Exceeding
     // it closes the SESSION — every in-flight request dies with it — which the
-    // client now answers with a CLASSIFIED loss (and, for reads, one paced
-    // replay on the reconnected link) rather than a bare channel-closed text.
+    // client answers with a CLASSIFIED loss (and, for reads, one paced replay
+    // on the reconnected link) rather than a bare channel-closed text.
     const rig = await makeRig({ rateLimitPerSecond: 4 })
 
     // Fire well past the cap. The peer terminates the SESSION: the in-flight

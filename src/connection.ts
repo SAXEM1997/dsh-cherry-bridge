@@ -52,8 +52,10 @@ export interface DeviceConnectionOptions {
    *
    * The content tier DERIVES from this value at the production ratio
    * (DEFAULT_CONTENT_READ_BUDGET_PER_SECOND / DEFAULT_RATE_BUDGET_PER_SECOND),
-   * so one injected budget scales both tiers and the two stay in the same
-   * proportion the peer's allowances have.
+   * so one injected budget scales both tiers. That 8:1 ratio matches the
+   * <=2.1.6 allowances (512:64); 2.1.7 raised ONLY the shared allowance to 256,
+   * so the derived content tier is deliberately more conservative there (256
+   * against a 512 line) even at the default injection.
    */
   rateBudgetPerSecond?: number
   /** First reconnect backoff (default 1s); doubles per attempt. */
@@ -338,8 +340,9 @@ class SecondWindowRateLimiter {
  *    ({@link DEFAULT_CONTENT_READ_BUDGET_PER_SECOND}).
  *
  * WHY TWO TIERS: the desktop paces the two against different allowances (512/s
- * for content reads, 64/s for everything else) and the official client follows
- * suit (480/s and 40/s). Sharing one 32/s tier spent content-read throughput on
+ * for content reads; 64/s for everything else through 2.1.6 and 256/s from
+ * 2.1.7) and the official client follows suit (480/s and 40/s). Sharing one
+ * 32/s tier spent content-read throughput on
  * unrelated RPCs and vice versa: a multi-slice walk of an externalized part —
  * every part over 4,096 characters on Cherry >= 2.1.6 — queued behind list
  * calls at ~36ms per slice.
@@ -350,9 +353,9 @@ type RateTier = 'shared' | 'content'
  * Which tier paces `method`. The rule is EXACT-MATCH: `agent.content.read` is
  * the only method on the content tier, and every other method — a command, a
  * list read, a different `agent.*.read` — keeps the shared tier. A prefix or
- * suffix match would silently widen the 256/s tier to methods whose peer-side
- * allowance is the 64/s one, which is a session-killing mistake (close 1011),
- * so a new content-plane method must be named here deliberately.
+ * suffix match would silently widen the content tier to methods whose peer-side
+ * allowance is the shared one — 64/s through 2.1.6, where exceeding it closes
+ * the SESSION (1011) — so a new content-plane method must be named deliberately.
  */
 function classifyRateTier(method: string): RateTier {
   return method === 'agent.content.read' ? 'content' : 'shared'
@@ -1080,17 +1083,18 @@ export class DeviceConnection {
     // cannot tear down a newer link.
     //
     // ADJUDICATED WEAKENING: the close CODE is deliberately ignored here.
-    // 1011 (server error / rate termination) and 1013 (try again later, e.g.
-    // connection-count over limit) are the peer's AUTHORITATIVE session-level
-    // faces — it ends the whole session, never a single request — so every code
-    // takes the same offline → backoff → reconnect path. Differentiating them
-    // (e.g. a longer, Retry-After-aware backoff for 1013) is deliberately
-    // DEFERRED: it would need a per-code policy the protocol does not yet
-    // guarantee, and a uniform honest retry is strictly safer than guessing a
-    // longer one. The rate limiter still bounds the retry storm in the
-    // meantime, and the contract suite's `rate-limit-terminates-session` item
-    // proves the uniform transition shape: the 1011 close routes through
-    // offline → reconnect rather than surfacing a per-request refusal.
+    // 1011 (server error; rate termination through 2.1.6) and 1013 (try again
+    // later, e.g. connection-count over limit) are session-level faces — the
+    // peer ends the whole session, never a single request — so every code takes
+    // the same offline → backoff → reconnect path. Differentiating them (e.g. a
+    // longer, Retry-After-aware backoff for 1013) is deliberately DEFERRED: it
+    // would need a per-code policy the protocol does not yet guarantee, and a
+    // uniform honest retry is strictly safer than guessing a longer one. The
+    // rate limiter still bounds the retry storm in the meantime, and the
+    // contract suite's `rate-limit-terminates-session` item proves the uniform
+    // transition shape: the 1011 close routes through offline → reconnect.
+    // Since 2.1.7 an over-budget request is refused per request instead (a
+    // structured `RATE_LIMITED`, not a close), so it never reaches this path.
     ws.on('close', () => this.#onLinkLost(epoch, 'socket closed'))
     ws.on('error', () => this.#onLinkLost(epoch, 'socket error'))
 

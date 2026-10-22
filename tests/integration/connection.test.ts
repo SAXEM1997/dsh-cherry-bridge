@@ -703,10 +703,11 @@ describe('DeviceConnection over a real loopback channel', () => {
     // offline → connecting → connected.
     expect(observed).toEqual(['connecting', 'connected', 'offline', 'connecting', 'connected'])
     expect(fakeInfo.fake.connectionCount).toBe(2)
-    // 1011 (rate termination) and 1013 (connection-count over limit) are the
-    // AUTHORITATIVE rate faces: the peer ends the WHOLE session, never a
+    // 1011 (rate termination through 2.1.6) and 1013 (connection-count over
+    // limit) are SESSION-level faces: the peer ends the WHOLE session, never a
     // single request — cross-referenced with Task 13's rate-termination
-    // contract item.
+    // contract item. From 2.1.7 an over-budget request is refused per request
+    // instead (issue #104), so it never reaches this transition.
   })
 
   it('⑧ smooths 100 concurrent requests so the peer never sees more than the per-second budget in any 1s window', async () => {
@@ -739,7 +740,8 @@ describe('DeviceConnection over a real loopback channel', () => {
   // PR-F: TIERED rate budget (issue #30)
   //
   // The desktop paces `agent.content.read` against its own 512/s allowance and
-  // every other business RPC against 64/s, but this client paced them together
+  // every other business RPC against the shared line (64/s through 2.1.6,
+  // 256/s from 2.1.7), but this client paced them together
   // at 32/s — which made a multi-slice externalized part walk at ~1/32 of the
   // rate the peer would have allowed, and turned long replies (the common case
   // on Cherry >= 2.1.6, where every part over 4,096 characters is a `{ref}`)
@@ -866,9 +868,9 @@ describe('DeviceConnection over a real loopback channel', () => {
   it('(F4) the content tier is EXACT-MATCH: other agent reads and look-alike method names are paced by the shared tier', async () => {
     // The tiering rule widens a 256/s budget only for the ONE method whose
     // peer-side allowance is 512/s. A prefix/suffix match on "read", on
-    // "agent.*" or on "agent.content.*" would put methods with the 64/s
-    // allowance on the fast tier, which is how a client gets its session closed
-    // (1011).
+    // "agent.*" or on "agent.content.*" would put methods with the shared
+    // allowance (64/s through 2.1.6, where overrun closes the session) on the
+    // fast tier.
     //
     // The observable face of the rule without waiting on a real pace: the fake
     // ANSWERS (`NOT_FOUND` for an unknown method, `NOT_FOUND` for an unexplored
