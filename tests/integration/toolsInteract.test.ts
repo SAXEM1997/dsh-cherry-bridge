@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection, TransportLostError } from '../../src/connection.js'
+import type { DeviceState } from '../../src/connection.js'
 import { JsonRpcRequestError } from '../../src/rpc/jsonRpcClient.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
@@ -100,6 +101,10 @@ interface RigOptions {
   extraDevices?: Array<{ deviceId: string; displayName: string }>
   /** Shorten the reconnect backoff so a transport-loss test does not wait it out. */
   backoffInitialMs?: number
+  /** Byte budget for one session's event buffer (`perSessionCacheBytes`). */
+  subscriptionCacheBytes?: number
+  /** Wire `watchDeviceState`, making `offline` run the engine's cache forget. */
+  watchDeviceState?: boolean
 }
 
 async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions = {}): Promise<Rig> {
@@ -150,6 +155,9 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     const connection = connect(deviceId)
     const created = new SessionSubscriptions(connection.rpc, {
       subscriptionsLimit: options.agent?.subscriptionLimit ?? 8,
+      ...(rigOptions.subscriptionCacheBytes === undefined
+        ? {}
+        : { perSessionCacheBytes: rigOptions.subscriptionCacheBytes }),
     })
     connection.rpc.onNotification((method, params) => created.handleNotification(method, params))
     subscriptions.set(deviceId, created)
@@ -161,6 +169,14 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     store,
     connect,
     subs,
+    // OFF by default: wiring `watchDeviceState` makes every `offline` transition
+    // run the engine's `#forgetDevice` (session/interaction caches dropped,
+    // remembered command bodies KEPT — the #117/#118 policy). ⑪i turns it on
+    // because its discrimination depends on exactly that seam; the rest of the
+    // suite predates it and stays on the historical no-watch behaviour.
+    ...(rigOptions.watchDeviceState === true
+      ? { watchDeviceState: (target: string, cb: (state: DeviceState) => void) => connections.get(target)?.onState(cb) }
+      : {}),
     pair: async () => {
       throw new Error('pairing is not exercised by the interactive suite')
     },
@@ -1173,16 +1189,28 @@ describe('interactive cherry tools over a real loopback channel', () => {
     expect(rig.fake.admittedCommands.size).toBe(1)
   })
 
-  it('⑪i a respond retry AFTER the interaction was resolved still gets the original receipt, not unknown-interaction', async () => {
-    // THE DISTINGUISHING SHAPE. The first answer settled the card; the peer's
-    // LIST no longer serves it, so the subscription cache (never primed by a
-    // stream here) cannot produce a staleness triple at all. A retry that
-    // consults the memory only AFTER the snapshot — or not at all — is answered
-    // `unknown-interaction` instead of the receipt the ledger holds.
-    //
-    // ⑪h alone could not tell that apart from a naive body replay placed after
-    // the snapshot: there the triple happens to still resolve. Here it cannot.
-    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION], interactions: [questionInteraction()] } })
+  it('⑪i a respond retry after the interaction left every cache still gets the original receipt, not unknown-interaction', async () => {
+    // THE DISTINGUISHING SHAPE: the card is gone from every place the FRESH
+    // path could re-derive a triple from, while the remembered body survives.
+    //   - the event BUFFER holds nothing for the fold (`subscriptionCacheBytes:
+    //     1` evicts every event the moment it lands, so the settle notification
+    //     never sits in the window);
+    //   - the engine's interaction CACHE is dropped by the `offline`
+    //     transition the link drop rides (`watchDeviceState: true`, wired here
+    //     exactly as the assembly wires it) — while the remembered command
+    //     BODIES survive that same transition, the #117 policy this test
+    //     therefore also pins;
+    //   - the peer's LIST no longer serves the settled card
+    //     (`removeInteraction`: gone from `list` AND `get`).
+    // A retry that consults the memory only AFTER the snapshot — or not at all —
+    // is answered `unknown-interaction`; only the EARLY consultation delivers
+    // the receipt the ledger still holds. (On a WARM cache or a LIVE buffer —
+    // ⑪h's world — the snapshot still resolves, which is exactly why this test
+    // needs all three gone.)
+    const rig = await makeRig(
+      { agent: { agents: [AGENT], sessions: [SESSION], interactions: [questionInteraction()] } },
+      { subscriptionCacheBytes: 1, watchDeviceState: true, backoffInitialMs: 10 },
+    )
     const first = (await rig.call('cherry_respond', {
       device: 'dev-A',
       sessionId: 's-1',
@@ -1192,33 +1220,37 @@ describe('interactive cherry tools over a real loopback channel', () => {
     })) as Record<string, unknown>
     expect(first['status']).toBe('applied')
 
-    // THE CACHE LOSES THE CARD, two ways at once, so a snapshot taken NOW can
-    // only fail with `unknown-interaction`:
-    //  - the peer no longer serves it at all (`removeInteraction`: gone from
-    //    `list` AND `get`), and
-    //  - the live stream that recorded it is ROTATED (a fresh epoch is a new
-    //    stream: the old buffer — and the settled `interaction.updated` sitting
-    //    in it — no longer matches the subscription and is ignored).
-    // A re-derived body would then die on the pre-check before the body was
-    // compared, or go out under a body that merely ACCIDENTALLY matches.
-    //
-    // THE RETRY ALSO REORDERS ITS ANSWERS. A settled interaction keeps its
-    // revision, execution and digest, so a re-derived triple could — for this
-    // card — come out IDENTICAL and be replayed by the peer's ledger, hiding
-    // whether the engine consulted the memory at all. The key order is what
-    // separates the two: the SAME answer, which only DEEP equality accepts and
-    // which the peer's own byte-order-sensitive digest would refuse.
+    rig.fake.dropConnections()
     rig.fake.removeInteraction('i-question')
-    rig.fake.rotateStreamEpoch()
-    const replay = (await rig.call('cherry_respond', {
-      device: 'dev-A',
-      sessionId: 's-1',
-      interactionId: 'i-question',
-      response: { kind: 'answer', answers: ANSWER_A_REORDERED },
-      commandId: 'respond-resolved',
-    })) as Record<string, unknown>
+    //
+    // THE RETRY ALSO REORDERS ITS ANSWERS. The peer digests command bodies
+    // canonically (JCS: keys sorted — the fake's ledger does the same), so key
+    // ORDER alone never changes a digest; the reorder is not the discriminator
+    // here, it is a second pin: the engine's fingerprint check must accept the
+    // reordered answers as the SAME answer (deep, order-insensitive equality —
+    // the property ⑪h pins directly) and replay the ORIGINAL body byte for
+    // byte.
+    //
+    // The retry itself waits out the reconnect: an attempt while the engine is
+    // still offline throws before anything is written or sent (no memory
+    // mutation, no wire call), so re-calling inside `vi.waitFor` is safe — and
+    // any attempt that DOES get through holds a remembered id, so it can only
+    // ever answer through the replay path.
+    let replay: Record<string, unknown> | undefined
+    await vi.waitFor(
+      async () => {
+        replay = (await rig.call('cherry_respond', {
+          device: 'dev-A',
+          sessionId: 's-1',
+          interactionId: 'i-question',
+          response: { kind: 'answer', answers: ANSWER_A_REORDERED },
+          commandId: 'respond-resolved',
+        })) as Record<string, unknown>
+        expect(replay!['error']).toBeUndefined()
+      },
+      { timeout: 5_000 },
+    )
 
-    expect(replay['error']).toBeUndefined()
     expect(replay).toEqual(first)
     const arrivals = rig.fake.commandCallsFor('agent.interactions.respond')
     expect(arrivals).toHaveLength(2)
@@ -1261,8 +1293,11 @@ describe('interactive cherry tools over a real loopback channel', () => {
     // fixture a REDERIVED body is byte-identical and this test would pass
     // without any memory. The fixture moves the ground under the derivation
     // instead, exactly as a retry window does: the cancelled run is replaced by
-    // ANOTHER live execution, so a re-derivation quotes a body the ledger never
-    // recorded and earns IDEMPOTENCY_CONFLICT — the lost-reply failure this fixes.
+    // ANOTHER live execution. A retry with no memory then dies at the LOCAL
+    // `execution-mismatch` pre-check (the supplied id no longer matches the
+    // cached active run — the pre-fix failure mode, which never even reaches a
+    // body comparison); only a replay of the original body can satisfy the
+    // ledger's recorded command and earn its receipt.
     const rig = await makeRig({
       agent: { agents: [AGENT], sessions: [{ ...SESSION, activeExecutionId: 'exec-live' }] },
     })

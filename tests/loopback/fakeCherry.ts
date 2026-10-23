@@ -1175,16 +1175,6 @@ export class FakeCherry {
   }
 
   /**
-   * Starts a NEW stream epoch: every later event is stamped with a fresh
-   * `streamEpoch`, so a client's existing subscription buffer belongs to an
-   * older stream and a fresh subscribe is the only way to see more. Models the
-   * desktop rebuilding its journal (a restart, or a re-subscribe).
-   */
-  rotateStreamEpoch(): void {
-    this.#journalEpoch = `epoch-${randomUUID().slice(0, 8)}`
-  }
-
-  /**
    * Moves the session fixture's declared `activeExecutionId` — what the peer's
    * SESSION SUMMARY reports and what `agent.executions.cancel` validates
    * against when no live run overrides it. Distinct from the live field: this

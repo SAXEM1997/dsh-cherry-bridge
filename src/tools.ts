@@ -910,8 +910,11 @@ interface RememberedCommand {
  * small enough to be trivial": a caller retries a handful of command ids around
  * a lost reply, and each is recoverable while it stays in this FIFO.
  * Eviction costs a REQUEST, never correctness — an evicted id has NO entry, so
- * a same-id retry re-derives a fresh baseline and it is the PEER that refuses
- * the differing body, exactly as it would without this memory.
+ * a same-id retry re-derives a fresh baseline. For a SEND the re-derived body
+ * reaches the peer, which refuses the differing body exactly as it would
+ * without this memory; for a RESPOND or CANCEL the retry usually dies earlier,
+ * at the LOCAL pre-checks (`unknown-interaction`, `no-active-execution`,
+ * `execution-mismatch`) — the pre-fix failure mode, which names real state.
  *
  * PER DEVICE, like every engine cache: the id is the caller's, but the peer
  * that settled it is not, and a second desktop must never be sent a body minted
@@ -4695,11 +4698,12 @@ export class CherryToolEngine {
         // retry asserting a different execution is not a retry of this cancel.
         const supplied = optionalString(args['expectedExecutionId'])
 
-        // A RETRY IS ANSWERED BEFORE THE PRE-CHECKS. `no-active-execution` and
-        // `execution-mismatch` describe the state RIGHT NOW, and a lost reply
-        // left the run the first attempt cancelled already finished — so those
-        // verdicts would eat the retry before its body was ever compared, and
-        // the ledger's receipt would never be delivered.
+        // A RETRY IS ANSWERED BEFORE THE PRE-CHECKS — the same ordering (and
+        // the same reason) as `agent.interactions.respond`'s consult above;
+        // what differs here is only which verdicts would otherwise eat the
+        // retry: `no-active-execution` and `execution-mismatch` describe the
+        // state RIGHT NOW, and a lost reply left the run the first attempt
+        // cancelled already finished.
         const remembered =
           callerId === undefined ? undefined : this.#recallCommandBody(record.deviceId, callerId)
         if (remembered !== undefined && remembered.method !== CANCEL_METHOD) throw commandBodyDiffers()
@@ -5269,7 +5273,7 @@ export class CherryToolEngine {
    *    network drop ALSO lands here and clears the caches unnecessarily; that
    *    is accepted, because the cost is one round trip per session on reuse and
    *    the alternative is keeping snapshots across an identity change. (The
-   *    remembered send BODIES are the one exception: see `#forgetDevice`.)
+   *    remembered command BODIES are the one exception: see `#forgetDevice`.)
    *  - `identity-mismatch` — the peer's pinned key changed: the pairing is over.
    *
    * {@link CherryToolEngine.#resolve} installs the watch on every tool call that
@@ -5297,7 +5301,7 @@ export class CherryToolEngine {
     this.#watchedConnections.add(connection)
     watch(deviceId, (state) => {
       if (state !== 'offline' && state !== 'identity-mismatch') return
-      // A plain `offline` keeps the remembered send bodies: see `#forgetDevice`.
+      // A plain `offline` keeps the remembered command bodies: see `#forgetDevice`.
       this.#forgetDevice(deviceId, { dropCommandBodies: state === 'identity-mismatch' })
     })
   }
@@ -5312,7 +5316,7 @@ export class CherryToolEngine {
    * the previous pairing's snapshots and a long-lived process does not
    * accumulate entries for devices that no longer exist.
    *
-   * The remembered SEND bodies obey a NARROWER seam than the read caches:
+   * The remembered command bodies obey a NARROWER seam than the read caches:
    * `dropCommandBodies` is passed by the callers that invalidate the PAIRING
    * (unpair, identity-mismatch), never by an ordinary `offline`. What a body
    * replays against — the peer's command ledger — survives a reconnect, and the
@@ -5341,7 +5345,7 @@ export class CherryToolEngine {
     for (const key of [...this.#messageCache.keys()]) {
       if (key.startsWith(prefix)) this.#dropCachedMessage(key)
     }
-    // The remembered SEND bodies (issue #115) differ from every cache above:
+    // The remembered command bodies (issues #115/#118) differ from every cache above:
     // what they replay against is the peer's command LEDGER, and that survives
     // an ordinary reconnect — so they are dropped only when the PAIRING is
     // invalidated (`dropCommandBodies`: unpair, identity-mismatch), because a
