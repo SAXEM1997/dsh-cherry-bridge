@@ -865,8 +865,27 @@ const MESSAGE_CACHE_ENTRY_BYTES = 1_048_576
 const MESSAGE_CACHE_BYTES_PER_DEVICE = 33_554_432
 
 /**
- * How many `cherry_send` bodies the engine remembers PER DEVICE, keyed by the
- * CALLER-SUPPLIED `commandId` (issue #115).
+ * One command the engine issued under a CALLER-SUPPLIED `commandId`, kept so a
+ * retry can replay it by receipt (issues #115, #118).
+ *
+ * The three fields answer the three questions a retry raises:
+ *
+ *  - `method` — is this id being replayed by the tool that minted it? An id
+ *    remembered for a send says nothing about a respond retry, and the reverse;
+ *  - `fingerprint` — did the caller ask for the SAME command? The caller-owned
+ *    arguments only, compared with {@link sameCommandValue}; the DERIVED body
+ *    fields are deliberately excluded, because they are exactly what moved;
+ *  - `body` — what the peer's ledger recorded, reproduced verbatim.
+ */
+interface RememberedCommand {
+  method: string
+  fingerprint: unknown
+  body: Record<string, unknown>
+}
+
+/**
+ * How many command bodies the engine remembers PER DEVICE, keyed by the
+ * CALLER-SUPPLIED `commandId` (issues #115, #118).
  *
  * Why a memory exists at all: a command's recovery path is RECEIPT. A reply
  * lost on the wire is answered by re-sending the ORIGINAL body under the
@@ -876,13 +895,20 @@ const MESSAGE_CACHE_BYTES_PER_DEVICE = 33_554_432
  * quoted a fresh baseline, the body differed from the recorded one, and the peer
  * answered IDEMPOTENCY_CONFLICT — on the one path where the caller cannot tell
  * what already landed. So the engine remembers the EXACT body it emitted, per
- * (device, caller id), and a same-id retry replays it verbatim.
+ * (device, caller id, method), and a same-id retry replays it verbatim. The
+ * same defect had a harder shape in `cherry_respond` / `cherry_cancel` (issue
+ * #118): their DERIVED fields were re-derived, and the retry usually met a
+ * pre-check (`unknown-interaction`, `no-active-execution`) before the body was
+ * ever compared — the memory is consulted before those, which is why it holds
+ * the whole issued body rather than a way to rebuild one.
  *
- * What an entry holds is one short body — a session id, the caller's text (at
+ * What an entry holds is one short body: a session id, the caller's text (at
  * most the protocol's 32,768 characters, pre-validated before it is ever
- * stored), and one revision string. 128 is "more than any live retry window
- * needs, small enough to be trivial": a caller retries a handful of command ids
- * around a lost reply, and each is recoverable while it stays in this FIFO.
+ * stored), one revision string — or, for respond/cancel, the interaction's
+ * staleness triple / the execution to abort, plus the caller-owned arguments
+ * the fingerprint compares. 128 is "more than any live retry window needs,
+ * small enough to be trivial": a caller retries a handful of command ids around
+ * a lost reply, and each is recoverable while it stays in this FIFO.
  * Eviction costs a REQUEST, never correctness — an evicted id has NO entry, so
  * a same-id retry re-derives a fresh baseline and it is the PEER that refuses
  * the differing body, exactly as it would without this memory.
@@ -895,6 +921,19 @@ const MESSAGE_CACHE_BYTES_PER_DEVICE = 33_554_432
  * value needs 129 live command ids before it evicts.
  */
 const COMMAND_BODY_ENTRIES_PER_DEVICE = 128
+
+/**
+ * The three command methods whose bodies the engine remembers (see
+ * {@link COMMAND_BODY_ENTRIES_PER_DEVICE}).
+ *
+ * Named once, because they are used twice each by design: as the remembered
+ * entry's `method`, and as the method the entry is compared against on lookup.
+ * Spelling them at both ends is how a lookup could start matching the wrong
+ * tool without any type noticing.
+ */
+const SEND_METHOD = 'agent.messages.send'
+const RESPOND_METHOD = 'agent.interactions.respond'
+const CANCEL_METHOD = 'agent.executions.cancel'
 
 /**
  * EMPTY-PAGE RUN limit for every aggregate walk. The desktop's pinned-list walk
@@ -1327,6 +1366,61 @@ const COMMAND_BODY_DIFFERS_MESSAGE = 'Command body differs from the recorded com
  * adding one only to name this number would widen the published surface for it.
  */
 const JSON_RPC_PROTOCOL_ERROR_CODE = 1000
+
+/**
+ * The LOCAL {@link COMMAND_BODY_DIFFERS_MESSAGE} refusal — the peer's own
+ * reason and sentence, wrapped with the same hints a forwarded conflict earns,
+ * and never sent anywhere.
+ *
+ * ONE constructor for every command that remembers its body (send, respond,
+ * cancel): the caller must not have to learn a second vocabulary for one
+ * condition, and a test matches the prefix `Command body differs` whichever
+ * tool produced it.
+ */
+function commandBodyDiffers(): Error {
+  const conflict = new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
+    reason: 'IDEMPOTENCY_CONFLICT',
+    message: COMMAND_BODY_DIFFERS_MESSAGE,
+  })
+  // The two hint helpers pass an error through UNCHANGED (they only append to
+  // a conflict's / a rate-limit's prose), so the identity is the object built
+  // above; the return type keeps the `JsonRpcRequestError` the callers branch
+  // on (the engine's command-failure currency).
+  withRateLimitHint(withIdempotencyHint(conflict))
+  return conflict
+}
+
+/**
+ * DEEP structural equality, for the caller-owned half of a remembered command
+ * body (issue #118).
+ *
+ * `cherry_respond`'s `response.answers` is a RECORD: two callers sending the
+ * same answers in a different KEY ORDER are sending the SAME answer, and a
+ * plain `!==` (or a JSON string comparison) would refuse the retry as a
+ * different body — turning the receipt recovery into a local conflict on the
+ * exact shapes it exists for. Arrays stay ORDERED: `questions` is a list, and
+ * reordering it really is a different value.
+ *
+ * Deliberately small: the values compared here are tool arguments decoded from
+ * JSON, so only JSON's two container kinds, the primitives, and `undefined`
+ * (an omitted optional argument) need to be understood.
+ */
+function sameCommandValue(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false
+    if (left.length !== right.length) return false
+    return left.every((value, index) => sameCommandValue(value, right[index]))
+  }
+  if (isRecord(left) && isRecord(right)) {
+    const leftKeys = Object.keys(left)
+    if (leftKeys.length !== Object.keys(right).length) return false
+    return leftKeys.every(
+      (key) => Object.hasOwn(right, key) && sameCommandValue(left[key], right[key]),
+    )
+  }
+  return false
+}
 
 /**
  * Passes a command failure through UNCHANGED, except that `IDEMPOTENCY_CONFLICT`
@@ -1835,15 +1929,27 @@ export class CherryToolEngine {
    */
   readonly #watchedConnections = new WeakSet<DeviceConnection>()
   /**
-   * The EXACT `agent.messages.send` body emitted for each (device, caller id),
-   * so a lost reply can be recovered by receipt (issue #115).
+   * The EXACT command body emitted for each (device, caller id, method), so a
+   * lost reply can be recovered by receipt (issues #115, #118).
    *
    * Keyed `<deviceId>\0<commandId>`, exactly like every other engine cache. The
-   * value is the body MINUS the id: the session it was sent to, the text, and
-   * the baseline it quoted. All three are needed. The baseline is what the
-   * retry must REPLAY; the session and the text are what it must MATCH — a
-   * same-id call whose arguments differ is not a retry of this command at all,
-   * and is refused locally rather than sent.
+   * value is a {@link RememberedCommand}: the METHOD it was minted for, the
+   * caller-owned FINGERPRINT a retry must match, and the BODY the retry
+   * replays verbatim. The fingerprint is what must MATCH — a same-id call whose
+   * arguments differ is not a retry of this command at all, and is refused
+   * locally rather than sent. The body is what must be REPLAYED, derived
+   * fields included: that is the whole point, because those fields are the ones
+   * a retry cannot re-derive the same way.
+   *
+   * Three tools remember: `agent.messages.send` (the baseline it quoted),
+   * `agent.interactions.respond` (the staleness triple) and
+   * `agent.executions.cancel` (the execution it was told to abort). Two of
+   * them run PRE-CHECKS before composing a body — respond's
+   * `unknown-interaction`, cancel's `no-active-execution`/`execution-mismatch` —
+   * and after a lost reply those pre-checks are usually the first thing the
+   * retry meets, because the first attempt is what SETTLED the interaction and
+   * ENDED the run. So a caller-supplied id is consulted BEFORE any derivation:
+   * a remembered retry is an answer, not a fresh call.
    *
    * WHAT IS REMEMBERED: only CALLER-SUPPLIED ids. An auto-generated uuid is a
    * one-shot identity — nobody can retry it, so an entry for it is pure leak.
@@ -1862,10 +1968,7 @@ export class CherryToolEngine {
    * {@link COMMAND_BODY_ENTRIES_PER_DEVICE} and
    * {@link CherryToolEngine.#forgetDevice}.
    */
-  readonly #commandBodies = new Map<
-    string,
-    { sessionId: string; text: string; expectedIdleRevision: string }
-  >()
+  readonly #commandBodies = new Map<string, RememberedCommand>()
   /** The per-device cap on {@link CherryToolEngine.#commandBodies}. */
   readonly #commandBodyEntriesPerDevice: number
   constructor(deps: CherryToolsDeps, options: CherryToolEngineOptions = {}) {
@@ -4047,24 +4150,23 @@ export class CherryToolEngine {
         callerId === undefined || commandId !== callerId
           ? undefined
           : this.#recallCommandBody(deviceId, callerId)
-      // A same-id call whose `sessionId`/`text` differ from the remembered body
-      // is not a retry of that command: the peer holds the original body, so the
-      // conflict is already decided and is answered LOCALLY, in the peer's own
-      // words, with no wire call.
+      // A remembered id that belongs to ANOTHER method is a mismatch, not a
+      // miss: refusing locally keeps the decision off the wire.
+      if (remembered !== undefined && remembered.method !== SEND_METHOD) throw commandBodyDiffers()
+      // A same-id call whose caller-owned arguments differ from the remembered
+      // body is not a retry of that command: the peer holds the original body,
+      // so the conflict is already decided and is answered LOCALLY, in the
+      // peer's own words, with no wire call.
+      const rememberedBody = remembered?.body
       const mismatched =
-        remembered !== undefined && (remembered.sessionId !== sessionId || remembered.text !== text)
-      if (mismatched) {
-        throw withRateLimitHint(
-          withIdempotencyHint(
-            new JsonRpcRequestError(JSON_RPC_PROTOCOL_ERROR_CODE, COMMAND_BODY_DIFFERS_MESSAGE, {
-              reason: 'IDEMPOTENCY_CONFLICT',
-              message: COMMAND_BODY_DIFFERS_MESSAGE,
-            }),
-          ),
-        )
-      }
+        remembered !== undefined &&
+        (rememberedBody?.['sessionId'] !== sessionId || rememberedBody['text'] !== text)
+      if (mismatched) throw commandBodyDiffers()
+      // THE REMEMBERED BODY IS REPLAYED, derived field included. Rebuilding it
+      // from a derived `expectedIdleRevision` instead is what #115's memory
+      // exists to stop, so the value is read back rather than recomputed.
       const expectedIdleRevision =
-        remembered?.expectedIdleRevision ??
+        optionalString(rememberedBody?.['expectedIdleRevision']) ??
         revisionOverride ??
         (await this.#idleRevision(connection, subscriptions, deviceId, sessionId))
       // THE BASELINE IS TAKEN BEFORE THE COMMAND IS ISSUED, and that ordering
@@ -4081,9 +4183,13 @@ export class CherryToolEngine {
       // The body is remembered the moment it is ISSUED — a reply lost on the wire
       // must not cost the only copy of the bytes the peer's ledger will accept.
       if (callerId !== undefined) {
-        this.#rememberCommandBody(deviceId, callerId, { sessionId, text, expectedIdleRevision })
+        this.#rememberCommandBody(deviceId, callerId, {
+          method: SEND_METHOD,
+          fingerprint: { sessionId, text },
+          body: { commandId, sessionId, text, expectedIdleRevision },
+        })
       }
-      const receipt = await this.#command(connection, 'agent.messages.send', {
+      const receipt = await this.#command(connection, SEND_METHOD, {
         commandId,
         sessionId,
         text,
@@ -4479,6 +4585,26 @@ export class CherryToolEngine {
           }
         }
 
+        const callerId = optionalString(args['commandId'])
+        const answer: Record<string, unknown> = response === undefined ? { decision } : { response }
+        // A RETRY IS ANSWERED BEFORE ANYTHING IS DERIVED. The staleness triple
+        // below is derived from what the plugin has observed, and after a lost
+        // reply that observation has MOVED (the first answer settled the card)
+        // or vanished (the peer no longer serves it). Re-deriving would either
+        // quote a body the ledger never recorded or — the usual case — stop at
+        // the `unknown-interaction` verdict below, before the body is ever
+        // compared. So a caller-supplied id is consulted FIRST: same id, same
+        // caller-owned arguments and same method replays the remembered body
+        // verbatim, and the snapshot is not asked at all.
+        const remembered =
+          callerId === undefined ? undefined : this.#recallCommandBody(record.deviceId, callerId)
+        if (remembered !== undefined && remembered.method !== RESPOND_METHOD) throw commandBodyDiffers()
+        if (remembered !== undefined) {
+          const fingerprint = { sessionId, interactionId, ...answer }
+          if (!sameCommandValue(remembered.fingerprint, fingerprint)) throw commandBodyDiffers()
+          return this.#command(connection, RESPOND_METHOD, remembered.body)
+        }
+
         await this.#ensureSubscription(record.deviceId, sessionId)
         const subscriptions = this.#deps.subs(record.deviceId)
 
@@ -4501,15 +4627,27 @@ export class CherryToolEngine {
           } satisfies Record<string, unknown>
         }
 
-        return this.#command(connection, 'agent.interactions.respond', {
-          commandId: this.#commandId(args),
+        const commandId = this.#commandId(args)
+        const body = {
+          commandId,
           sessionId,
           interactionId,
           expectedRevision: snapshot.revision,
           expectedExecutionId: snapshot.executionId,
           inputDigest: snapshot.inputDigest,
-          ...(response === undefined ? { decision } : { response }),
-        })
+          ...answer,
+        }
+        // ISSUE-TIME WRITE: the body is fully composed here, so it is remembered
+        // before the reply is awaited — a reply lost on the wire must not cost
+        // the only copy of the bytes the peer's ledger will accept.
+        if (callerId !== undefined) {
+          this.#rememberCommandBody(record.deviceId, callerId, {
+            method: RESPOND_METHOD,
+            fingerprint: { sessionId, interactionId, ...answer },
+            body,
+          })
+        }
+        return this.#command(connection, RESPOND_METHOD, body)
       },
     })
   }
@@ -4551,6 +4689,26 @@ export class CherryToolEngine {
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         const sessionId = requiredString(args, 'sessionId')
+        const callerId = optionalString(args['commandId'])
+        // The caller's own value is a PRE-CHECK, not a body field — but it is
+        // part of what the caller ASKED FOR, so it belongs in the fingerprint: a
+        // retry asserting a different execution is not a retry of this cancel.
+        const supplied = optionalString(args['expectedExecutionId'])
+
+        // A RETRY IS ANSWERED BEFORE THE PRE-CHECKS. `no-active-execution` and
+        // `execution-mismatch` describe the state RIGHT NOW, and a lost reply
+        // left the run the first attempt cancelled already finished — so those
+        // verdicts would eat the retry before its body was ever compared, and
+        // the ledger's receipt would never be delivered.
+        const remembered =
+          callerId === undefined ? undefined : this.#recallCommandBody(record.deviceId, callerId)
+        if (remembered !== undefined && remembered.method !== CANCEL_METHOD) throw commandBodyDiffers()
+        if (remembered !== undefined) {
+          if (!sameCommandValue(remembered.fingerprint, { sessionId, expectedExecutionId: supplied })) {
+            throw commandBodyDiffers()
+          }
+          return this.#command(connection, CANCEL_METHOD, remembered.body)
+        }
 
         await this.#ensureSubscription(record.deviceId, sessionId)
         const subscriptions = this.#deps.subs(record.deviceId)
@@ -4566,7 +4724,6 @@ export class CherryToolEngine {
             message: `session ${sessionId} has no in-flight execution to cancel`,
           } satisfies Record<string, unknown>
         }
-        const supplied = optionalString(args['expectedExecutionId'])
         if (supplied !== undefined && supplied !== expectedExecutionId) {
           return {
             error: 'execution-mismatch',
@@ -4578,11 +4735,18 @@ export class CherryToolEngine {
           } satisfies Record<string, unknown>
         }
 
-        return this.#command(connection, 'agent.executions.cancel', {
-          commandId: this.#commandId(args),
-          sessionId,
-          expectedExecutionId,
-        })
+        const commandId = this.#commandId(args)
+        const body = { commandId, sessionId, expectedExecutionId }
+        // ISSUE-TIME WRITE, as respond's: the derived execution id is exactly
+        // the field a retry cannot re-derive once the run has ended.
+        if (callerId !== undefined) {
+          this.#rememberCommandBody(record.deviceId, callerId, {
+            method: CANCEL_METHOD,
+            fingerprint: { sessionId, expectedExecutionId: supplied },
+            body,
+          })
+        }
+        return this.#command(connection, CANCEL_METHOD, body)
       },
     })
   }
@@ -5197,19 +5361,22 @@ export class CherryToolEngine {
   }
 
   /**
-   * The `agent.messages.send` body remembered for one caller-supplied
-   * `commandId`, keyed `<deviceId>\0<commandId>` — or `undefined` when this
-   * device has never emitted one (a first attempt, or an entry the FIFO
-   * evicted).
+   * The command remembered for one caller-supplied `commandId`, keyed
+   * `<deviceId>\0<commandId>` — or `undefined` when this device has never
+   * emitted one (a first attempt, or an entry the FIFO evicted).
    *
-   * The TEXT is held as well as the baseline: the retry is judged on whether the
-   * caller's arguments are the ONES THIS ID WAS MINTED WITH, and that is a
-   * comparison against the remembered value, not against a re-derived one.
+   * The METHOD is the caller's to judge, and it is a THREE-WAY decision, never
+   * a miss:
+   *
+   *  - no entry → a fresh call;
+   *  - an entry under the caller's own method → match the fingerprint, then
+   *    replay or refuse;
+   *  - an entry under a DIFFERENT method → a MISMATCH, refused locally. An id
+   *    minted for `agent.messages.send` is not a respond retry, and collapsing
+   *    that case into "no entry" would send a respond under a send's id and
+   *    let the PEER answer the conflict one round trip later.
    */
-  #recallCommandBody(
-    deviceId: string,
-    commandId: string,
-  ): { sessionId: string; text: string; expectedIdleRevision: string } | undefined {
+  #recallCommandBody(deviceId: string, commandId: string): RememberedCommand | undefined {
     return this.#commandBodies.get(this.#cacheKey(deviceId, commandId))
   }
 
@@ -5239,9 +5406,14 @@ export class CherryToolEngine {
    */
   rememberCommandBodyForTest(deviceId: string, commandId: string): void {
     this.#rememberCommandBody(deviceId, commandId, {
-      sessionId: 'session-for-test',
-      text: 'text-for-test',
-      expectedIdleRevision: '0',
+      method: 'agent.messages.send',
+      fingerprint: { sessionId: 'session-for-test', text: 'text-for-test' },
+      body: {
+        commandId,
+        sessionId: 'session-for-test',
+        text: 'text-for-test',
+        expectedIdleRevision: '0',
+      },
     })
   }
 
@@ -5258,7 +5430,7 @@ export class CherryToolEngine {
   #rememberCommandBody(
     deviceId: string,
     commandId: string,
-    body: { sessionId: string; text: string; expectedIdleRevision: string },
+    remembered: RememberedCommand,
   ): void {
     const key = this.#cacheKey(deviceId, commandId)
     if (!this.#commandBodies.has(key)) {
@@ -5272,13 +5444,13 @@ export class CherryToolEngine {
       if (own >= this.#commandBodyEntriesPerDevice && oldest !== undefined) {
         this.#commandBodies.delete(oldest)
         console.warn(
-          `[cherry-remote] remembered send bodies for device ${deviceId} reached their ` +
+          `[cherry-remote] remembered command bodies for device ${deviceId} reached their ` +
             `${this.#commandBodyEntriesPerDevice}-commandId bound; evicted the oldest (a retry of ` +
             'that commandId now re-derives its body, and the peer decides whether it replays)',
         )
       }
     }
-    this.#commandBodies.set(key, body)
+    this.#commandBodies.set(key, remembered)
   }
 
   /**

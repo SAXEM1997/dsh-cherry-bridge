@@ -1112,6 +1112,345 @@ describe('interactive cherry tools over a real loopback channel', () => {
   }, 30_000)
 
   // -------------------------------------------------------------------------
+  // ⑪h-⑪n LOST-REPLY recovery for cherry_respond / cherry_cancel (issue #118)
+  //
+  // The same class as ⑪c-⑪g, one step more hostile. Both bodies carry
+  // DERIVED fields: respond's staleness triple (`expectedRevision` /
+  // `expectedExecutionId` / `inputDigest`, read from the interaction snapshot)
+  // and cancel's `expectedExecutionId` (read from the active-execution cache).
+  // A same-id retry that re-derives them assembles a DIFFERENT body, and the
+  // peer answers IDEMPOTENCY_CONFLICT — on the one path where the caller cannot
+  // tell what already landed.
+  //
+  // What makes these two worse than `cherry_send` is WHERE the retry dies. Both
+  // tools run PRE-CHECKS before the command: respond refuses an interaction the
+  // snapshot no longer knows (`unknown-interaction`), and cancel refuses a
+  // session with nothing in flight (`no-active-execution`). After a lost reply
+  // the first answer has usually SETTLED the interaction and ended the run, so
+  // a retry that reaches for a fresh derivation does not even get as far as the
+  // body comparison — it is answered by the local verdict. The remembered body
+  // therefore has to be consulted BEFORE either precondition, and replayed
+  // verbatim: that is the difference ⑪i (R2) and ⑪l (C2) pin, while ⑪h (R1)
+  // and ⑪k (C1) pin the ordinary replay.
+  // -------------------------------------------------------------------------
+
+  /** The answers a retry of a question card sends — TWO keys, so their ORDER is observable. */
+  const ANSWER_A: Record<string, string> = { 'Which database?': 'postgres', 'Which region?': 'eu' }
+  /** The same two answers, keys in the other order: the SAME answer. */
+  const ANSWER_A_REORDERED: Record<string, string> = { 'Which region?': 'eu', 'Which database?': 'postgres' }
+
+  it('⑪h a lost respond reply is recovered by a same-id retry, and a REORDERED answers record is the same answer', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION], interactions: [questionInteraction()] } })
+    // A card discovered over the wire (never streamed) is the ordinary case: the
+    // snapshot falls back to ONE `agent.interactions.list`.
+    const first = (await rig.call('cherry_respond', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      interactionId: 'i-question',
+      response: { kind: 'answer', answers: ANSWER_A },
+      commandId: 'respond-once',
+    })) as Record<string, unknown>
+    expect(first['status']).toBe('applied')
+    expect(rig.fake.commandCallsFor('agent.interactions.respond')).toHaveLength(1)
+
+    // THE SAME ANSWER, answers in a different KEY ORDER. It is one record, not
+    // an ordered list, so this is a retry — and it may only be judged equal
+    // under DEEP structural equality: a key-order-sensitive (or shallow)
+    // comparison would call it a different answer and refuse it locally.
+    const replay = (await rig.call('cherry_respond', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      interactionId: 'i-question',
+      response: { kind: 'answer', answers: ANSWER_A_REORDERED },
+      commandId: 'respond-once',
+    })) as Record<string, unknown>
+
+    // THE ORIGINAL RECEIPT, replayed by the ledger under the ORIGINAL body.
+    expect(replay).toEqual(first)
+    const arrivals = rig.fake.commandCallsFor('agent.interactions.respond')
+    expect(arrivals).toHaveLength(2)
+    expect(arrivals[1]).toEqual(arrivals[0])
+    expect(rig.fake.admittedCommands.size).toBe(1)
+  })
+
+  it('⑪i a respond retry AFTER the interaction was resolved still gets the original receipt, not unknown-interaction', async () => {
+    // THE DISTINGUISHING SHAPE. The first answer settled the card; the peer's
+    // LIST no longer serves it, so the subscription cache (never primed by a
+    // stream here) cannot produce a staleness triple at all. A retry that
+    // consults the memory only AFTER the snapshot — or not at all — is answered
+    // `unknown-interaction` instead of the receipt the ledger holds.
+    //
+    // ⑪h alone could not tell that apart from a naive body replay placed after
+    // the snapshot: there the triple happens to still resolve. Here it cannot.
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION], interactions: [questionInteraction()] } })
+    const first = (await rig.call('cherry_respond', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      interactionId: 'i-question',
+      response: { kind: 'answer', answers: ANSWER_A },
+      commandId: 'respond-resolved',
+    })) as Record<string, unknown>
+    expect(first['status']).toBe('applied')
+
+    // THE CACHE LOSES THE CARD, two ways at once, so a snapshot taken NOW can
+    // only fail with `unknown-interaction`:
+    //  - the peer no longer serves it at all (`removeInteraction`: gone from
+    //    `list` AND `get`), and
+    //  - the live stream that recorded it is ROTATED (a fresh epoch is a new
+    //    stream: the old buffer — and the settled `interaction.updated` sitting
+    //    in it — no longer matches the subscription and is ignored).
+    // A re-derived body would then die on the pre-check before the body was
+    // compared, or go out under a body that merely ACCIDENTALLY matches.
+    //
+    // THE RETRY ALSO REORDERS ITS ANSWERS. A settled interaction keeps its
+    // revision, execution and digest, so a re-derived triple could — for this
+    // card — come out IDENTICAL and be replayed by the peer's ledger, hiding
+    // whether the engine consulted the memory at all. The key order is what
+    // separates the two: the SAME answer, which only DEEP equality accepts and
+    // which the peer's own byte-order-sensitive digest would refuse.
+    rig.fake.removeInteraction('i-question')
+    rig.fake.rotateStreamEpoch()
+    const replay = (await rig.call('cherry_respond', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      interactionId: 'i-question',
+      response: { kind: 'answer', answers: ANSWER_A_REORDERED },
+      commandId: 'respond-resolved',
+    })) as Record<string, unknown>
+
+    expect(replay['error']).toBeUndefined()
+    expect(replay).toEqual(first)
+    const arrivals = rig.fake.commandCallsFor('agent.interactions.respond')
+    expect(arrivals).toHaveLength(2)
+    expect(arrivals[1]).toEqual(arrivals[0])
+    expect(rig.fake.admittedCommands.size).toBe(1)
+  })
+
+  it('⑪j a respond retry under the same id with a DIFFERENT answer is refused locally, before any wire call', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION], interactions: [questionInteraction()] } })
+    await rig.call('cherry_respond', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      interactionId: 'i-question',
+      response: { kind: 'answer', answers: ANSWER_A },
+      commandId: 'respond-differs',
+    })
+    const before = rig.fake.commandCallsFor('agent.interactions.respond').length
+
+    const error = await rejectionOf(
+      rig.call('cherry_respond', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        interactionId: 'i-question',
+        response: { kind: 'answer', answers: { ...ANSWER_A, 'Which region?': 'us' } },
+        commandId: 'respond-differs',
+      }),
+    )
+
+    // The repo's existing idempotency currency, verbatim.
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error!.data as { reason?: string }).reason).toBe('IDEMPOTENCY_CONFLICT')
+    expect(error!.message).toMatch(/^Command body differs from the recorded command/)
+    // NOTHING reached the peer.
+    expect(rig.fake.commandCallsFor('agent.interactions.respond')).toHaveLength(before)
+  })
+
+  it('⑪k a lost cancel reply is recovered by a same-id retry that replays its body instead of re-deriving the execution', async () => {
+    // THE LEDGER HAS TO BE THE JUDGE. `expectedExecutionId` is derived from the
+    // cache, and a cancel does not move the run id it names, so on a quiet
+    // fixture a REDERIVED body is byte-identical and this test would pass
+    // without any memory. The fixture moves the ground under the derivation
+    // instead, exactly as a retry window does: the cancelled run is replaced by
+    // ANOTHER live execution, so a re-derivation quotes a body the ledger never
+    // recorded and earns IDEMPOTENCY_CONFLICT — the lost-reply failure this fixes.
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [{ ...SESSION, activeExecutionId: 'exec-live' }] },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+
+    const first = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      expectedExecutionId: 'exec-live',
+      commandId: 'cancel-once',
+    })) as Record<string, unknown>
+    expect(first['status']).toBe('applied')
+    expect(first['executionId']).toBe('exec-live')
+
+    // Between the lost reply and the retry: the cancelled run settles and a
+    // NEW run starts. The cache's live source now names `exec-next`, so a
+    // re-derived body differs from the remembered one.
+    rig.fake.setSessionActiveExecution('s-1', 'exec-next')
+    // The live peer snapshot is the cache's lowest-priority source but the one
+    // a fresh cancel call reaches (`agent.sessions.get`), so this is what a
+    // re-deriving retry would quote.
+    const replay = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      expectedExecutionId: 'exec-live',
+      commandId: 'cancel-once',
+    })) as Record<string, unknown>
+
+    expect(replay).toEqual(first)
+    const arrivals = rig.fake.commandCallsFor('agent.executions.cancel')
+    expect(arrivals).toHaveLength(2)
+    // THE REAPPLIED BODY IS THE ORIGINAL — the ledger's own recorded execution,
+    // not the fresh one the cache now holds.
+    expect(arrivals[1]).toEqual(arrivals[0])
+    expect(arrivals[1]!['expectedExecutionId']).toBe('exec-live')
+    expect(rig.fake.admittedCommands.size).toBe(1)
+  })
+
+  it('⑪l a cancel retry AFTER the run ended gets the original receipt, not no-active-execution', async () => {
+    // THE DISTINGUISHING SHAPE for cancel. With no run in flight the cache has
+    // nothing to derive a body from at all: the tool's OWN `no-active-execution`
+    // verdict answers before any body is composed. ⑪k cannot see that guard —
+    // there a fresh execution is always available — so this test is the ONE that
+    // proves the memory is consulted BEFORE the pre-check and not merely
+    // replayed somewhere after it.
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [{ ...SESSION, activeExecutionId: 'exec-live' }] },
+    })
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-1' })
+    const first = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      expectedExecutionId: 'exec-live',
+      commandId: 'cancel-ended',
+    })) as Record<string, unknown>
+    expect(first['status']).toBe('applied')
+
+    // The run is over as far as the peer is concerned — the cache clears it.
+    // The settle event is delivered on the subscription the priming call above
+    // opened, so the clear is the LIVE stream's verdict and not merely the
+    // snapshot's; either way a fresh call derives nothing.
+    await vi.waitFor(() => expect(rig.fake.activeExecutionId).toBeUndefined(), { timeout: 5_000 })
+    // ...and the session summary says so too: both sources of the derived id
+    // are now silent, so the pre-check is the ONLY verdict a fresh call can
+    // reach.
+    rig.fake.setSessionActiveExecution('s-1', undefined)
+    const replay = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      expectedExecutionId: 'exec-live',
+      commandId: 'cancel-ended',
+    })) as Record<string, unknown>
+
+    expect(replay['error']).toBeUndefined()
+    expect(replay).toEqual(first)
+    const arrivals = rig.fake.commandCallsFor('agent.executions.cancel')
+    expect(arrivals).toHaveLength(2)
+    expect(arrivals[1]).toEqual(arrivals[0])
+    expect(rig.fake.admittedCommands.size).toBe(1)
+  })
+
+  it('⑪n a cancel retry with DIFFERENT arguments is refused locally, before any wire call', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [
+          { ...SESSION, activeExecutionId: 'exec-live' },
+          { ...SESSION, sessionId: 's-2', activeExecutionId: 'exec-2' },
+        ],
+      },
+    })
+    // The first cancel's run stays live in the MATCHED session, so both refusals
+    // below are judged on the memory alone — never on a missing execution.
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: 's-2' })
+    const first = (await rig.call('cherry_cancel', {
+      device: 'dev-A',
+      sessionId: 's-2',
+      expectedExecutionId: 'exec-2',
+      commandId: 'cancel-args',
+    })) as Record<string, unknown>
+    expect(first['status']).toBe('applied')
+    const before = rig.fake.commandCallsFor('agent.executions.cancel').length
+
+    // (1) The SAME id in a DIFFERENT session.
+    const otherSession = await rejectionOf(
+      rig.call('cherry_cancel', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        expectedExecutionId: 'exec-live',
+        commandId: 'cancel-args',
+      }),
+    )
+    expect(otherSession).toBeInstanceOf(JsonRpcRequestError)
+    expect((otherSession!.data as { reason?: string }).reason).toBe('IDEMPOTENCY_CONFLICT')
+    expect(otherSession!.message).toMatch(/^Command body differs from the recorded command/)
+
+    // (2) The SAME id and session, with a DIFFERENT supplied execution: the
+    // caller is asserting another run, which is not a retry of this cancel.
+    const otherExecution = await rejectionOf(
+      rig.call('cherry_cancel', {
+        device: 'dev-A',
+        sessionId: 's-2',
+        expectedExecutionId: 'exec-other',
+        commandId: 'cancel-args',
+      }),
+    )
+    expect(otherExecution).toBeInstanceOf(JsonRpcRequestError)
+    expect(otherExecution!.message).toMatch(/^Command body differs from the recorded command/)
+    expect(rig.fake.commandCallsFor('agent.executions.cancel')).toHaveLength(before)
+  })
+
+  it('⑪m an id remembered for cherry_send replays a send and is refused on cherry_respond', async () => {
+    // A `commandId` is remembered PER METHOD as well as per device: a body
+    // minted for `agent.messages.send` says nothing about a respond retry, and
+    // a lookup that ignored the method would replay a SEND body onto the
+    // respond slot — or, with a fingerprint comparison alone, refuse a
+    // legitimate send retry because some other tool once used the id.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        interactions: [questionInteraction()],
+        terminalMessage: terminalMessage('sent'),
+        sendEnforcesIdleRevision: false,
+      },
+    })
+    const sendBody = (commandId: string): Record<string, unknown> => ({
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'a message',
+      commandId,
+      wait: false,
+    })
+    await rig.call('cherry_send', sendBody('one-id'))
+    // The send retry is still a send: the entry belongs to its own method.
+    const resent = (await rig.call('cherry_send', sendBody('one-id'))) as { status?: string }
+    expect(resent.status).toBe('applied')
+    const sends = rig.fake.commandCallsFor('agent.messages.send')
+    expect(sends).toHaveLength(2)
+    expect(sends[1]).toEqual(sends[0])
+
+    // A RESPOND under that id: the memory holds a send entry for it, and the
+    // refusal is local (zero respond arrivals). WHICH guard fires is masked,
+    // deliberately: a send fingerprint ({sessionId, text}) and a respond
+    // fingerprint ({sessionId, interactionId, response|decision}) have
+    // DISJOINT key sets, so their deep equality is false by construction and
+    // no caller input can make the method check the load-bearing difference —
+    // deleting the method check alone leaves this test green (the fingerprint
+    // comparison refuses anyway), which is why the method guard is
+    // defense-in-depth against a future fingerprint shape converging, and the
+    // red that pins THIS behaviour comes from deleting the replay block
+    // outright (then the respond reaches the wire and the peer refuses it).
+    const respondsBefore = rig.fake.commandCallsFor('agent.interactions.respond').length
+    const respond = await rejectionOf(
+      rig.call('cherry_respond', {
+        device: 'dev-A',
+        sessionId: 's-1',
+        interactionId: 'i-question',
+        decision: 'deny',
+        commandId: 'one-id',
+      }),
+    )
+    expect(respond).toBeInstanceOf(JsonRpcRequestError)
+    expect(respond!.message).toMatch(/^Command body differs from the recorded command/)
+    expect(rig.fake.commandCallsFor('agent.interactions.respond')).toHaveLength(respondsBefore)
+  })
+
+  // -------------------------------------------------------------------------
   // ⑫ wait=false
   // -------------------------------------------------------------------------
 

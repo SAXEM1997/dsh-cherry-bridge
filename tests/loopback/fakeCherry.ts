@@ -798,6 +798,8 @@ export class FakeCherry {
   #interactions: FakeInteractionRecord[]
   /** The execution id the peer reports as active for the session. */
   #activeExecutionId: string | undefined
+  /** Interactions the peer no longer serves at all (see `removeInteraction`). */
+  readonly #removedInteractions = new Set<string>()
   /** Every execution status the peer emitted as `execution.updated`, in order. */
   #executionUpdates: Array<{ executionId: string; status: string; messageId?: string }> = []
   /** Monotonic counter behind the fake's own interaction revisions. */
@@ -1157,6 +1159,42 @@ export class FakeCherry {
     const interaction = this.#interactions.find((entry) => entry.interactionId === interactionId)
     if (interaction === undefined) throw new Error(`no interaction ${interactionId}`)
     interaction.status = status
+  }
+
+  /**
+   * Drops one interaction from what the peer SERVES (list and get), as a peer
+   * that expired and forgot it does: a client's snapshot can no longer name it
+   * at all. Distinct from {@link setInteractionStatus}, which keeps the record
+   * served in a settled state.
+   */
+  removeInteraction(interactionId: string): void {
+    if (!this.#interactions.some((entry) => entry.interactionId === interactionId)) {
+      throw new Error(`no interaction ${interactionId}`)
+    }
+    this.#removedInteractions.add(interactionId)
+  }
+
+  /**
+   * Starts a NEW stream epoch: every later event is stamped with a fresh
+   * `streamEpoch`, so a client's existing subscription buffer belongs to an
+   * older stream and a fresh subscribe is the only way to see more. Models the
+   * desktop rebuilding its journal (a restart, or a re-subscribe).
+   */
+  rotateStreamEpoch(): void {
+    this.#journalEpoch = `epoch-${randomUUID().slice(0, 8)}`
+  }
+
+  /**
+   * Moves the session fixture's declared `activeExecutionId` — what the peer's
+   * SESSION SUMMARY reports and what `agent.executions.cancel` validates
+   * against when no live run overrides it. Distinct from the live field: this
+   * is the value a client's `agent.sessions.get` observes.
+   */
+  setSessionActiveExecution(sessionId: string, executionId: string | undefined): void {
+    const session = (this.#agent().sessions ?? []).find((entry) => entry.sessionId === sessionId)
+    if (session === undefined) throw new Error(`no session ${sessionId}`)
+    if (executionId === undefined) delete session.activeExecutionId
+    else session.activeExecutionId = executionId
   }
 
   // -------------------------------------------------------------------------
@@ -3217,7 +3255,13 @@ export class FakeCherry {
 
   /** Every interaction, in the wire view the real `interactionsOf` serves. */
   #interactionViews(): FakeInteractionView[] {
-    return this.#interactions.map((interaction) => this.#interactionView(interaction))
+    // A REMOVED interaction is not served at all — by the list OR by `get`.
+    // Settling one (`setInteractionStatus`) is a different fact: a settled card
+    // is still served, which is what makes "the retry's snapshot still
+    // resolves" the ordinary shape and removal the one that does not.
+    return this.#interactions
+      .filter((interaction) => !this.#removedInteractions.has(interaction.interactionId))
+      .map((interaction) => this.#interactionView(interaction))
   }
 
   #interactionView(interaction: FakeInteractionRecord): Record<string, unknown> {
