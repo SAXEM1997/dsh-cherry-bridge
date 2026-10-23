@@ -275,6 +275,13 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
       - [ ] 桌面端为 2.1.5+ 且会话里有**来自手机上传的附件**时：该 part 为 `kind:"file"`
             并带 `name`/`mediaType`/`byteLength`，`content` 为空，且**没有**任何
             `agent.content.read` 调用（一次都不该有——那些字节是文件，不是文本）。
+      - [ ] 桌面端为 2.1.7+ 且会话里有**未上传的附件**（如粘贴的图片）时：该 part 为
+            `kind:"data"` 且 `name:"file"`，元数据以 JSON 形式放在 `content.text` 里
+            （`{"mediaType":…,"filename":…}`）→ 读取报告 `name`（来自 `filename`，
+            为 `null` 时不报）与 `mediaType`；该对象的每个键都是这两个上报字段时
+            `content` 为空，带其他键时保留原始文本；inline（≤4,096 字符）时没有任何
+            `agent.content.read` 调用，超过时恰有一次内容读取。其他 `name` 的
+            `data` part（任务事件等）不是附件，原样透传。
       - [ ] `cherry_send` 传空白文本（如 `"   "`）→ 本地返回 `text-empty`，对端未收到
             `agent.messages.send`。
       - [ ] 桌面端广播了本插件不认识的支持字段时，`cherry_devices` 的 limits 投影仍只有
