@@ -5,6 +5,67 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## v0.1.11 (2026-10-23)
+
+Receipt recovery for all three command tools, and a legacy attachment face.
+No protocol-surface change: the tool input/output schemas stay as 0.1.10 had
+them — what changed is which local retry the desktop's command ledger
+recognises, and what an attachment read reports.
+
+### Fixed
+
+- **`cherry_send` under a retried `commandId` replays the original body, so
+  the desktop replays the recorded receipt** (#115, PR #117). A command
+  whose reply was lost mid-wire stays uncertain, and its only recovery is a
+  retry with the SAME id and the SAME body — but send's body carries a
+  DERIVED field (`expectedIdleRevision`, read from the session cache at call
+  time), so a retry after the session moved composed a different body and
+  the peer answered `IDEMPOTENCY_CONFLICT`, with advice that most likely
+  sends the message a second time. The engine now remembers the exact body
+  it issued for each caller-supplied `commandId` (written at issue time,
+  before the reply is awaited — the lost-reply path is the one it exists
+  for; bounded FIFO, 128 ids per device) and replays it verbatim on a
+  same-id retry. A same-id call with different `sessionId`/`text` is
+  refused LOCALLY, no wire call, in the peer's own wording. The memory
+  survives an ordinary reconnect — the ledger it replays against does too —
+  and is dropped only by `cherry_unpair` and `identity-mismatch`.
+- **`cherry_respond` and `cherry_cancel` recover the same way** (#118,
+  PR #122). Their bodies carry even more call-time state (respond's
+  expected triple from the interaction snapshot, cancel's
+  `expectedExecutionId` from the cached active execution), and their
+  retries usually died BEFORE the body was compared — at
+  `unknown-interaction` / `no-active-execution` once the card or run had
+  moved on. The remembered entry generalizes to `{method, fingerprint,
+  body}` and both tools consult it FIRST, before the snapshot and the
+  pre-check verdicts: a same-id retry with deep-equal arguments (key order
+  ignored) replays the exact body verbatim; differing arguments, or an id
+  minted for another method, are refused locally with zero wire calls. The
+  send self-heal keeps its own fresh-uuid attempt, and the caller id
+  afterwards holds the healed body — a later same-id retry meets the peer's
+  conflict rather than replaying a rejected receipt that would duplicate
+  the run.
+- **A legacy `data` attachment's metadata is lifted out of its JSON text**
+  (#114, PR #119). A 2.1.7 desktop returns an attachment it did not upload
+  as `{kind:'data', name:'file'}` whose `content.text` is a JSON
+  `{mediaType, filename}` string — which the read path presented as the
+  attachment's text, with no `name`/`mediaType` of its own. The projection
+  now lifts those two fields exactly like the uploaded face: the
+  DISCRIMINATOR is the part's `name` (`file` = attachment;
+  `data-compaction-anchor`, `data-error` and every other label pass through
+  untouched), `filename`→`name` (absent when null), no `byteLength`, and
+  `content` is emptied only when every key of the parsed record is one of
+  the two reported fields — an extra key keeps the raw text, so nothing
+  unprojected is silently dropped. An externalized record (past the peer's
+  4,096-character inline limit) resolves through exactly one content walk,
+  and the parsed record outranks the serialization envelope (`text/plain`
+  never wins).
+
+### Docs
+
+- The e2e checklist's attachment step verifies BOTH faces by hand — the
+  uploaded `kind:"file"` face and the legacy data-named-`file` face that
+  produced #114 — mirroring the projection guarantee (#120, PR #121).
+
 ## v0.1.10 (2026-10-22)
 
 Alignment with desktop **2.1.7**, whose over-budget answer changed from "close
