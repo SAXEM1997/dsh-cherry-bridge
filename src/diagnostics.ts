@@ -201,8 +201,10 @@ export interface DiagnosticsDevice {
    * Its own field, not a fifth key inside `limits`: it is a VERSION, not a
    * count, and `limits` is documented as the four numeric caps. Present only
    * when a LIVE connection reported it (the same rule as `limits`: the endpoint
-   * never dials to find out). ABSENT means "not advertised" — every desktop
-   * through 2.1.7 — so one `curl` against `GET /cherry-remote/api/diagnostics`
+   * never dials to find out). ABSENT therefore means "not advertised **or** not
+   * connected" — every desktop through 2.1.7, and any device whose link is
+   * down at the moment of the call. One `curl` against
+   * `GET /cherry-remote/api/diagnostics` **while the device is connected**
    * answers "does this desktop speak paged summaries?" without a packet capture.
    */
   messageSummaries?: number
@@ -870,4 +872,5 @@ export const DIAGNOSTICS_DEVICE_KEYS: readonly string[] = [
   'port',
   'desktopIdentity',
   'limits',
+  'messageSummaries',
 ]

@@ -346,6 +346,10 @@ describe('issue #105 ⑮: partsMode is gated on the hello capability', () => {
     expect(error).toBeInstanceOf(Error)
     expect(error.message).toMatch(/RESOURCE_EXHAUSTED|byte budget/)
     expect(error.message).toMatch(/retrying the same request cannot help/i)
+    // The ITEM_TOO_LARGE shape gets the item-level advice (review P3-3 on
+    // PR #129): one item over the per-item budget fits no page size, so the
+    // message must not recommend a smaller limit.
+    expect(error.message).toMatch(/no page size or request shape can fetch it/)
     // A permanent refusal is not retried by the walk: one page, one verdict.
     expect(messageListRequests(rig)).toHaveLength(1)
   })

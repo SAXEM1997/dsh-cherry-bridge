@@ -288,6 +288,8 @@ export interface FakeAgentOptions {
    * not accept them is a PROTOCOL fault, not a generation the client should
    * paper over: the client may not silently retry without `partsMode`, because
    * that would hide a broken capability bit for the life of the connection.
+   * The refusal is hand-written in `listMessages` (`INVALID_ARGUMENT`); the
+   * pinned schema cannot produce it — see the `parseParams` deviation note.
    */
   refusePartsMode?: boolean
   /**
@@ -295,7 +297,7 @@ export interface FakeAgentOptions {
    * JSON exceeds {@link FakeCherryOptions.itemBudgetBytes} (bytes estimated as
    * the serialized page's length) answers `RESOURCE_EXHAUSTED` with
    * `details: { kind: 'ITEM_TOO_LARGE', itemBytes, budgetBytes, retryable:
-   * false }` — the desktop's `PAGE_ITEM_BYTES` shape (62 279 server-side).
+   * false }` — the desktop's `PAGE_ITEM_BYTES` shape (62,279 server-side).
    * Undefined means no budget, which is every desktop through 2.1.7.
    */
   itemBudgetBytes?: number
@@ -679,15 +681,14 @@ const methodSchemas = {
 /**
  * Where the strictness comes from, which matters for issue #105.
  *
- * Against the PINNED protocol (`@cherrystudio/remote-protocol@0.7.0`, what
- * desktop 2.1.8 ships) the schema ACCEPTS `partsMode: 'paged'`: a 2.1.8 peer
- * serves summaries and answers them. Modelled independently of the pin, a
- * pre-2.1.8 desktop's 0.5.0-era params schema is a STRICT object with no such
- * key, and it refuses the field rather than ignoring it — so a 2.1.8 schema that
- * says yes to this peer must still be refused when the capability was NOT
- * advertised (and when `refusePartsMode` is set). Handling that at the schema
- * seam keeps the wire contract truthful: the refusal is the peer's own
- * INVALID_CONNECTION_STATE, exactly what a strict object produces there.
+ * DEVIATION FROM THE PIN, disclosed here: the pinned 0.7.0 schema ACCEPTS
+ * `partsMode: 'paged'` (desktop 2.1.8 serves summaries), so the code below
+ * STRIPS the key before `safeParse` and the schema never judges it. The
+ * pre-2.1.8 strictness (a 0.5.0-era STRICT params object refusing the field)
+ * is NOT modelled at the schema seam — it is modelled behaviourally by the
+ * `refusePartsMode` arm in `listMessages` (`INVALID_ARGUMENT`, hand-written:
+ * the pinned schema cannot produce that refusal) and, on the client side, by
+ * the capability gate that never sends the field to a non-advertising peer.
  */
 function parseParams(method: string, params: unknown): Record<string, unknown> | undefined {
   const schema = methodSchemas[method]
@@ -2532,14 +2533,6 @@ export class FakeCherry {
     if (partsMode !== undefined) {
       if (partsMode !== 'paged') {
         throw new FakeRpcError({ reason: 'INVALID_ARGUMENT', message: 'partsMode must be "paged"' })
-      }
-      // A 0.5.0-era params schema is STRICT and has no `partsMode` key: asking
-      // one for it is a protocol violation, refused by name here.
-      if (false) {
-        throw new FakeRpcError({
-          reason: 'INVALID_ARGUMENT',
-          message: 'params.partsMode is not a recognised field (agentMessageSummariesVersion not advertised)',
-        })
       }
       if (this.#agent().refusePartsMode === true) {
         throw new FakeRpcError({ reason: 'INVALID_ARGUMENT', message: 'partsMode is not accepted on this peer' })

@@ -4740,22 +4740,26 @@ const PAGE_ITEMS_FALLBACK = 100;
 * record cannot hold and the transport kills the connection (`defaults.ts`).
 * What `partsMode: 'paged'` returns is `AgentMessageSummary`: identity,
 * revision, role, status and optional usage/model/failure, and NO `partIds`.
-* A summary row is metadata-sized — well under 1 KiB even with a 256-character
-* id pair, a model name, a usage block and a bounded failure summary — so the
-* old clamp no longer bounds anything the summary arm can answer.
+*
+* WHY THE PAGE BOUND IS THE PEER'S, NOT OURS: the ONLY verified advertiser of
+* the capability (desktop 2.1.8) budgets the ACCUMULATED page — `pageOf`
+* prefix-truncates at `PAGE_ITEM_BYTES` = 62,279 bytes and `queryPage` re-asks
+* at a halved limit, so its reply records stay under `recordBytes` = 65,536
+* whatever our `limit` says, answering with a SHORT page + `nextCursor` (the
+* shape our walk already tolerates) instead of a killed link. The single-item
+* `RESOURCE_EXHAUSTED {ITEM_TOO_LARGE, retryable: false}` refusal is the
+* exception arm, and a schema-valid summary row cannot reach it: measured
+* against the 0.7.0 schema, the worst row (ids at 256 units, `model` fields at
+* 2,048 chars each, 32 `costs` entries, `failure` refined to ≤4,096 bytes) is
+* ≈37 KB — under the 62,279 budget, so the refusal exists for full
+* `partIds`-bearing rows, not summaries.
 *
 * 100 is the protocol's own `pageItems` cap, i.e. the ceiling a walk can use at
 * all: `#aggregate` still intersects this with the peer's NEGOTIATED
-* `pageItems`, so a peer advertising less keeps its size. Why 100 and not
-* something smaller: the desktop's byte budget (`PAGE_ITEM_BYTES` = 62,279, the
-* 2.1.8 `[21854]` line) bounds ONE ITEM, not the page, and the page's own
-* record bound is `remoteLimits.recordBytes` = 65,536 bytes. 100 summary rows at
-* < 1 KiB each stay under 100 KiB — above ONE record — so the desktop remains
-* the only party that can decide by BUDGET, and it answers a page it cannot fit
-* with a `RESOURCE_EXHAUSTED` refusal (`details.retryable: false`) rather than
-* a killed link. Our own safety net is therefore the clamp intersection with
-* `pageItems`: a peer that pages smaller is never over-asked, and a peer that
-* pages by count alone keeps the byte-safe clamp above (the arm below).
+* `pageItems`, so a peer advertising less keeps its size. Residual exposure —
+* a hypothetical peer advertising the capability WITHOUT a page budget —
+* contains no verified desktop (≤2.1.7 never advertises and keeps the clamp),
+* the same "pragmatic, not provable" class `defaults.ts` already scopes.
 *
 * The PARTS walk keeps {@link PARTS_LIST_PAGE_CLAMP} unconditionally: nothing
 * in protocol 0.7.0 proves `agent.parts.list` is byte-aware, and a part is the
@@ -5246,8 +5250,10 @@ function withPeerRefusalHint(error) {
 	const data = error.data;
 	if (!isRecord(data) || !isRecord(data["details"]) || data["details"]["retryable"] !== false) return error;
 	if (error.message.includes(PEER_REFUSAL_FINAL_MARK)) return error;
-	const cause = optionalString(data["details"]["kind"]) === "ITEM_TOO_LARGE" ? "an ITEM_TOO_LARGE page item over its byte budget" : "the same item";
-	error.message = `${error.message} — the peer marked this refusal permanent (\`details.retryable: false\`: ${cause}); retrying the same request cannot help — ask for FEWER items per page (a smaller \`limit\`), which is the only change that can fit the budget`;
+	const kind = optionalString(data["details"]["kind"]);
+	const cause = kind === "ITEM_TOO_LARGE" ? "an ITEM_TOO_LARGE page item over its byte budget" : "the same item";
+	const tail = kind === "ITEM_TOO_LARGE" ? "the item ITSELF exceeds the peer’s per-item budget, so no page size or request shape can fetch it (nor the items behind it — upstream #21951)" : "ask for FEWER items per page (a smaller `limit`), which is the only change that can fit the budget";
+	error.message = `${error.message} — the peer marked this refusal permanent (\`details.retryable: false\`: ${cause}); retrying the same request cannot help — ${tail}`;
 	return error;
 }
 /**

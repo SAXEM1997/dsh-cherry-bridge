@@ -5,10 +5,13 @@ import { withPeerRefusalHint } from '../../src/tools.js'
 /**
  * Issue #105 ⑰: a `RESOURCE_EXHAUSTED` refusal carrying
  * `details: { kind: 'ITEM_TOO_LARGE', …, retryable: false }` (the desktop's
- * per-item byte budget, `PAGE_ITEM_BYTES` = 62 279) is a PERMANENT verdict on
+ * per-item byte budget, `PAGE_ITEM_BYTES` = 62,279) is a PERMANENT verdict on
  * that request. The official app's trap is to mark it retryable and re-ask at
  * the same page size forever; the surfaced sentence must say the opposite, and
  * every other refusal's text must stay exactly as it was.
+ *
+ * Numbering note: ⑰ here is LOCAL to this file; the ⑰a–i in
+ * `tests/integration/toolsRead.test.ts` is the unrelated list-token series.
  */
 
 function refusal(data: Record<string, unknown>, message = 'Page item exceeds the response byte budget'): JsonRpcRequestError {
@@ -58,5 +61,23 @@ describe('withPeerRefusalHint', () => {
     const once = error.message
     withPeerRefusalHint(error)
     expect(error.message).toBe(once)
+  })
+
+  it('⑰d the two permanent shapes get OPPOSITE advice (review P3-3 on PR #129)', () => {
+    // ITEM_TOO_LARGE means ONE item alone exceeds the per-item budget: no
+    // page size fits it (the upstream #21951 dead-end), so the message must
+    // NOT recommend a smaller limit — a model following that advice burns
+    // round trips and learns nothing.
+    const item = refusal(TOO_LARGE)
+    const itemResult = withPeerRefusalHint(item) as JsonRpcRequestError
+    expect(itemResult.message).toMatch(/no page size or request shape can fetch it/)
+    expect(itemResult.message).not.toMatch(/FEWER items/)
+
+    // A permanent refusal WITHOUT the ITEM_TOO_LARGE kind may still be a page
+    // that cannot fit — there the smaller-limit advice is the honest remedy.
+    const page = refusal({ reason: 'RESOURCE_EXHAUSTED', details: { retryable: false } })
+    const pageResult = withPeerRefusalHint(page) as JsonRpcRequestError
+    expect(pageResult.message).toMatch(/FEWER items per page/)
+    expect(pageResult.message).not.toMatch(/no page size or request shape/)
   })
 })
