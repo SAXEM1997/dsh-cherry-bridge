@@ -37,7 +37,7 @@ are process records, and they stay in `docs/superpowers/**` (not published).
   is run **once by the integrator before merge**, not on every iteration.
   `tests/unit/artifactFreshness.test.ts` is the exception to "skip the slow
   stuff": it only matters when source comments or build config changed, and it
-  is cheap enough to run then (see below).
+  is cheap enough to run then.
 - **No source change without its artifact.** `src/`/`ui/` edits and their
   rebuilt `dist/`/`lib/` go in the **same commit** (see [Build facts](#build-facts)).
 - **Scope discipline.** Change what the issue names. Adjacent discoveries go
@@ -134,15 +134,16 @@ Pinned at **exact versions**, no `^`, with contract assertions on the pins:
 
 | Package | Version |
 | --- | --- |
-| `@cherrystudio/remote-protocol` | `0.5.0` |
-| `@cherrystudio/remote-transport` | `0.2.1` |
+| `@cherrystudio/remote-protocol` | `0.7.0` |
+| `@cherrystudio/remote-transport` | `0.2.5` |
 | `ws` | `8.22.0` |
 | `zod` | `4.3.4` |
 
-These are the same versions the official Cherry Studio app uses. Upgrading
-either protocol package means re-running `tests/contract/contract.test.ts`
-against schema drift — the suite models the **six behavioral differences**
-between our loopback fake peer and a real desktop, each mapped to a manual step
+These are the versions Cherry Studio **desktop 2.1.8** ships (verified at
+tag `v2.1.8`). Upgrading either protocol package means re-running
+`tests/contract/contract.test.ts` against schema drift — the suite models the
+**six behavioral differences** between our loopback fake peer and a real
+desktop, each mapped to a manual step
 in [`docs/e2e-checklist.md`](docs/e2e-checklist.md).
 
 **Wire budget (from `remoteLimits` in the protocol package):**
@@ -153,19 +154,20 @@ in [`docs/e2e-checklist.md`](docs/e2e-checklist.md).
 | `contentBytes` | 24,576 (24 KiB) | the slice size for one `agent.content.read` |
 | `pageItems` | 100 | the protocol's single-page hard cap; `hello` may negotiate smaller |
 
-The desktop's `pageOf` pages by **count alone**, so asking for `pageItems: 100`
-fat parts produced a record the transport had to kill — reading a complex
-session reset the connection deterministically. Our byte-safe per-page clamps
+The desktop's `pageOf` pages by **count alone** through 2.1.7, so asking for
+`pageItems: 100` fat parts produced a record the transport had to kill —
+reading a complex session reset the connection deterministically. Our byte-safe
+per-page clamps
 (`defaults.ts`, derived from a strict 4-bytes-per-character UTF-8 worst case and
 the peer's `INLINE_TEXT_LIMIT` of 4,096 characters, with a 2 KiB margin) are the
 fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 
-**Upstream context (#21854, merged but unreleased).** Upstream added a
-`PAGE_ITEM_BYTES`-style byte budget (62,279 bytes) to every paged `agent.*.list`
-face (`pageOf` truncates, `queryPage` re-queries a keyset page at a halved
-limit); an item that cannot fit raises `RESOURCE_EXHAUSTED`. It is **not in any
-release** through 2.1.7, so deployed peers still page by count alone and the
-clamps stay (do not remove them because of that commit).
+**Upstream context (#21854, shipped in 2.1.8).** Upstream added a
+`PAGE_ITEM_BYTES` byte budget (62,279) to every paged `agent.*.list` face
+(`pageOf` truncates, `queryPage` re-queries a keyset page at a halved limit);
+an item that cannot fit raises `RESOURCE_EXHAUSTED`. No release through 2.1.7
+carries it, so most deployed peers still page by count alone and the clamps
+stay (do not remove them).
 
 Reviewed against the merged code (`7218842`) and followed up as
 [`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951): an item above
@@ -230,7 +232,7 @@ These are load-bearing; the code comments are the long version.
   attempt, bounded by `DEVICE_SETTLE_WAIT_MS` = 5 s: the wait ends on the first
   transition out of `connecting`, or on the bound with the state it finds, so the
   error face is the same — just later, after the attempt had its chance. It
-  precedes a wait answer's `AssemblyDeadline`, so it is outside that window.
+  precedes a wait answer's `AssemblyDeadline` — outside that window.
 - **Only `connecting` is waited on.** `offline` (parked in backoff), `disabled`
   and `identity-mismatch` answer at once: no wait can change them, and a
   powered-off desktop would pay the bound on every call. Nothing here starts a
@@ -311,8 +313,8 @@ verifies every byte it hands back.
   message to keep that promise; that refusal (and the `CherryReadPart.fromRef`
   marker and `#publicMessage` that existed only to support it) is gone.
 - **Never cached**: a row whose revision is EMPTY (no fence to trust —
-  defensive only: the protocol's `messageRevision` is a strict decimal, so no
-  test can drive it), a TRUNCATED parts page (the walk stopped early — the
+  defensive only: `messageRevision` is a strict decimal, so no test drives it),
+  a TRUNCATED parts page (the walk stopped early — the
   circuit breaker, or a wait answer's deadline — so the list is short; a
   transient fault must be retried, never remembered; the refusal is
   reason-blind so a future reason cannot reintroduce the bug), and a page above
@@ -334,8 +336,7 @@ verifies every byte it hands back.
   4,096-character `INLINE_TEXT_LIMIT` per part — so "descriptors" understates
   the inline case, and a message with a few hundred fat inline parts can reach
   `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB). That is an argument, not a measurement:
-  the bound is set so one entry cannot evict the device's working set, and real
-  traffic is expected to stay far below it.
+  the bound is set so one entry cannot evict the device's working set.
   `MESSAGE_CACHE_BYTES_PER_DEVICE` = 32 MiB — deliberately far more headroom
   than that bound needs.
 - **Two bounds, both per device, and they judge independently.** An entry is
@@ -357,9 +358,9 @@ verifies every byte it hands back.
   (replacing it IS this call — self-evicting it would move it to the back and
   break insert-order). Eviction warns once per insert that dropped anything:
   device and count only, never a message id.
-- **A hit hands the PAGE out BY REFERENCE**, which is safe because it is a list
-  of records: the projection loop only reads it and builds new part objects
-  from it. A future reader that mutates a cached page must copy first.
+- **A hit hands the PAGE out BY REFERENCE** — safe: the projection loop only
+  reads the records and builds new part objects. A future reader that mutates
+  must copy first.
 - **Invalidation** rides the existing seam: `#forgetDevice` drops the device's
   entries with its three session caches, and `#watchConnection` already routes
   `offline` / `identity-mismatch` there. Note what that seam covers: an ordinary
@@ -378,7 +379,7 @@ verifies every byte it hands back.
   page it loses a whole page silently — on a terminal page even as
   `truncated: false`. The throw names the shape it got (`missing`, `null`,
   `string`, …) and never the payload, and it sits **before** the dropped-item
-  bookkeeping, because with no array there is no drop count to report.
+  bookkeeping (no array, no drop count to report).
 - **Cursors.** A cursor that does not advance is refused, and so is a cursor
   that **loops back** to one already served (a `seen` set per walk) — never spun
   on. `MAX_AGGREGATE_PAGES` (10,000) is the backstop for every other
@@ -475,9 +476,9 @@ requests could absorb that wait — a 1 s window answering ~150 s later, the sha
   succeeded must not leave the walk with nothing, so the two phases are bounded
   separately (a pathological call can spend both).
 
-What this is NOT: a global time budget for `cherry_read` or the list tools. They
-have no deadline argument, so nothing above applies to them — their bounds are
-`limit`, the safety breaker and the byte budgets.
+What this is NOT: a global time budget for `cherry_read` or the list tools —
+they have no deadline argument; their bounds are `limit`, the safety breaker
+and the byte budgets.
 
 ### Stop-point cursors (the teaching case)
 
@@ -506,9 +507,8 @@ Three `truncationReason` values mean different things:
 
 Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
 `limit`" was a field defect: a caller raised `limit` repeatedly, paid for every
-round trip, and still never saw the cut-off history. Leaving the marker with no
-consumer at all was the second half of that defect: the loss was stated and
-nothing could act on it.
+round trip, and still never saw the cut-off history. The second half was a
+marker with no consumer: the loss stated, nothing able to act on it.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -529,8 +529,7 @@ therefore self-describing, and every token we accept must carry one of our two
 prefixes; anything else is refused **before any device work**. This is not
 pedantry: a malformed cursor handed to the real desktop is **silently swallowed**
 (it falls back to the newest page), so a forwarded foreign string would come
-back as the newest page presented as "continued history". A refusal that costs
-no dial and names both accepted forms is the only honest answer.
+back as the newest page presented as "continued history".
 
 **An anchor the walk cannot find is loud.** If the peer's terminal page arrives
 with the anchor still unfound, the read throws naming the message id (it is
@@ -686,8 +685,8 @@ with `JSON.stringify(...).length` as a cheap approximation of wire cost). Two
 faces share it and one vocabulary:
 
 - the terminal/timeout/idle aggregate returned by `cherry_send(wait: true)` /
-  `cherry_wait` (with a message ceiling of 20, `TERMINAL_AGGREGATE_MESSAGES` —
-  ten runs' worth of slack for reading a run's own messages newest-first), and
+  `cherry_wait` (message ceiling 20, `TERMINAL_AGGREGATE_MESSAGES` — ten runs'
+  slack, newest-first), and
 - `cherry_read`.
 
 The constraint that failed in the field is the **MCP output boundary**: it does
@@ -824,9 +823,9 @@ listener, no LAN exposure, no separate credentials**:
 | `GET /diagnostics` | Operations report (below). |
 
 > The minimal `pairing-progress` frame shape is `{stage, detail?}`; this plugin
-> **additionally** attaches the optional `claimId` (a verdict extension for
-> cross-run isolation, not part of the minimal field set) — consumers must
-> tolerate its absence. The heartbeat is a payload-free comment line.
+> **additionally** attaches the optional `claimId` (a cross-run isolation
+> verdict extension, not in the minimal set) — consumers must tolerate its
+> absence. The heartbeat is a payload-free comment line.
 
 `GET /scope` returns ONE body: `scope` (the document's `mode`/`workspaceIds`/
 `revision` — `version`/`updatedAt` stay behind), `workspaces` (the registry
@@ -877,9 +876,9 @@ the error message).
   depends on someone updating a deny-list. `limits` is re-projected from its
   same four keys: a whitelist inside the whitelist.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
-  RPC requests — request counting belongs to the transport, and publishing a
-  same-named metric would be misread. Counters and the error ring are zeroed on
-  every `apply`: the statistics describe **only** the current assembly.
+  RPC requests — those belong to the transport; a same-named metric would be
+  misread. Counters and the error ring are zeroed on every `apply`: the
+  statistics describe **only** the current assembly.
 
 ### Logging: levels, identifiers, and what never appears
 
@@ -890,10 +889,9 @@ device-state transitions. Info logs the **stage name and identifiers only**
 (`deviceId`, `sessionId`, pairing stage) — never payloads. Sensitive fields
 (tokens, `invitationSecret`, `accessToken`, message and part text) **never
 enter any log**; `deviceId`, the `desktopIdentity` digest and `sessionId` may.
-The contract suite still holds both sides of this over a full pair → connect →
-send → interact flow, asserting sentinel strings from the message and reply do
-not appear in any console channel (`tests/contract/contract.test.ts`, “leaks no
-secret to the log”).
+The contract suite holds both sides over a full pair → connect → send →
+interact flow, asserting sentinel message/reply strings never reach a console
+channel (`contract.test.ts`, “leaks no secret to the log”).
 
 ### Trust fence
 
@@ -933,8 +931,9 @@ Neither reference lives in this repository.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.7** (plus post-2.1.7 commits on `main`).
-Pairing, mDNS, protocol versions (`[1]`) and Noise saw **zero changes** there.
+**Verified desktop range: 2.1.4 → 2.1.8** (plus post-2.1.8 commits on `main`).
+mDNS, protocol versions (`[1]`) and Noise saw **zero changes** there; pairing
+changed only by ADDING the v3 QR arm (below).
 Notable faces:
 
 | Upstream change | Impact |
@@ -946,24 +945,23 @@ Notable faces:
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
 | 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |
+| 2.1.8: v3 pairing QR (`bc570d2b9`, PR #21387) — `pairingQrSchema` v2|v3 with custom host/port/security `endpoints`, http(s) direct acceptance, tightened IPv6; paged message summaries (`54736dc9`/`8bf2fe28d`, PR #21992) advertised by the `agentMessageSummariesVersion` hello capability; server `PAGE_ITEM_BYTES = 62_279` per-item budget | Pairing consumes the published union (#124); consuming summaries is #105 — no `partsMode`, no tool change; a byte-budgeted page may come back SHORTER, which our walk already follows |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**
 
 - Its `RemoteAgentError` marks `RATE_LIMITED`/`TOKEN_EXPIRED`/
-  `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries with
-  `min(20 s, 1 s · 2^n)` backoff, so a `RESOURCE_EXHAUSTED` from the page-size
-  budget is retried forever at the same page size. Our answer is the byte-safe
-  page **clamp**: never ask for a page that cannot fit.
+  `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries forever at the
+  same page size (`min(20 s, 1 s · 2^n)`), so a `RESOURCE_EXHAUSTED` from the
+  byte budget never converges. Our answer is the byte-safe page **clamp**: never
+  ask for a page that cannot fit.
 - Its read path refuses a ref whose `byteLength` is unusable; we fall back to a
-  slice bound plus the cumulative arm (see above). Its 32 MiB cap is a
-  pre-allocated single array; ours is three transient copies (see the memory
-  contract).
+  slice bound plus the cumulative arm. Its 32 MiB cap is a pre-allocated single
+  array; ours is three transient copies.
 - Its read path never replays a read; we replay reads **once** (deliberate
   enhancement) while both sides keep commands receipt-recovered.
-- Its command journal is the recovery mechanism for commands — the reason our
-  commands are never replayed and recovery is a caller retry with the original
-  `commandId`.
+- Its command journal backs command recovery — the reason our commands are
+  never replayed; recovery is a caller retry with the original `commandId`.
 
 ## Release
 
@@ -1002,15 +1000,15 @@ attach the notes to the GitHub release.
    equals the npm tarball's: without the asset the download URL 404s for every
    catalog user (0.1.5 did exactly that).
 
-The catalog needs no PR for a new version: the entry is already merged and the
-index picks the npm package up on its next nightly probe (02:23 UTC) once
-`package.json`'s `repository` points back at this repo.
+The catalog needs no PR for a new version: the merged entry is picked up by the
+index's nightly probe (02:23 UTC) once `package.json`'s `repository` points
+back at this repo.
 
-Notes on documentary labels: `Task N`, `spec §x`, `controller ruling`,
-`UltraReview` in code comments and docs point at this project's internal SDD
-process records under `docs/superpowers/**` — **not published** with the package.
-They stay where the rule is, as provenance. `tests/loopback/fakeCherry.ts` is an
-in-test loopback fake peer, not a shipped artifact.
+Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
+ruling`, `UltraReview` — point at this project's internal SDD process records
+under `docs/superpowers/**`, **not published** with the package; they stay
+where the rule is, as provenance. `tests/loopback/fakeCherry.ts` is an in-test
+loopback fake peer, not a shipped artifact.
 
 ## Agent skills
 

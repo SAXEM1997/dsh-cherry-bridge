@@ -489,7 +489,7 @@ export interface FakeMessageRecord {
   status: 'success' | 'error' | 'pending' | 'paused'
   /**
    * The wire `failure` object a real desktop attaches to `status: 'error'`
-   * messages (protocol 0.5.0 `messageSchema.failure`). Passed through VERBATIM
+   * messages (protocol 0.7.0 `messageSchema.failure`). Passed through VERBATIM
    * so a test can drive both the projection and its omissions.
    */
   failure?: Record<string, unknown>

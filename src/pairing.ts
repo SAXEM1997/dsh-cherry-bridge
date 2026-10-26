@@ -2,7 +2,8 @@ import { hostname } from 'node:os'
 import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
-import { remoteConnectPath } from '@cherrystudio/remote-protocol'
+import type { z } from 'zod'
+import { directEndpointUrl, pairingQrSchema } from '@cherrystudio/remote-protocol'
 import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
@@ -57,21 +58,31 @@ export interface PairWithPayloadOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Payload validation (spec §3.3 step 1, ruling 1).
+// Payload validation (spec §3.3 step 1, ruling 1; widened to the v3 custom-
+// address QR by issue #124 — upstream `bc570d2b9`, desktop 2.1.8).
 //
-// Field caps mirror the protocol package's `values.ts`: `opaqueId` is a
-// non-empty unicode string of at most 256 code units, and the claim's
-// `deviceName` is capped at 64. A payload field over its cap would be rejected
-// by the peer's strict schema anyway, so rejecting it here is the same verdict
-// one round-trip earlier, with a message the user can act on.
+// The FIELD CHECKS are the pinned protocol package's own `pairingQrSchema`: a
+// v2|v3 discriminated union whose v2 arm is `ips` (IP LITERALS only — the
+// package's fixture calls a hostname there "DNS masquerading as IP") + `port`,
+// and whose v3 arm is complete `endpoints` (`host`, `port`, `security`).
+// Hand-rolling the checks is what made a 2.1.8 invitation refuse
+// `invalid-payload` for the whole life of the 0.5.0 pin; consuming the schema
+// means the next widening ships with the pin, not with a parser edit. Three
+// local rules stay, and none of them is a field check:
+//   - the raw size cap (an oversized blob must not be parsed at all),
+//   - v2's bracketed-IPv6 NORMALIZATION (ruling 2) — the published v2 arm
+//     validates BARE literals, so brackets are stripped before the parse and
+//     the archive keeps the bare form the connection layer re-brackets, and
+//   - the `unicodeText` (lone-surrogate) rule on the three id fields: the
+//     protocol values face enforces it, the pairing QR arm does not, and
+//     refusing here keeps the v2 error face identical one round trip earlier.
+// The error face is `invalid-payload` naming the failing FIELD PATHS only:
+// zod issues carry the `input`, so values never enter the message — an
+// `invitationSecret` must not surface in a user-visible error.
 // ---------------------------------------------------------------------------
 
-const PAYLOAD_TYPE = 'cherry-studio-pair'
-const PAYLOAD_VERSION = 2
 /** Overall payload ceiling: a QR code never approaches this. */
 const MAX_PAYLOAD_BYTES = 10 * 1024
-/** `opaqueId` cap for invitationId/invitationSecret/desktopIdentity. */
-const OPAQUE_ID_MAX = 256
 /** The claim's deviceName cap; a hostname may reach 253, so it is truncated. */
 const DEVICE_NAME_MAX = 64
 /** Bounds a single candidate host string (IPv6 literals are ~45). */
@@ -79,21 +90,33 @@ const HOST_MAX = 256
 /** Matches the protocol's unicodeText: no lone UTF-16 surrogates. */
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
 
-/** Fields the implementation consumes; everything else in the payload is ignored. */
-const KNOWN_FIELDS = new Set([
+/**
+ * The keys `pairingQrSchema` consumes. A payload field outside this set is
+ * ignored (with a warning) — the desktop names hosts the design does not use.
+ */
+const SCHEMA_KEYS = new Set([
   'v',
   't',
-  'port',
+  'name',
   'ips',
+  'port',
+  'endpoints',
   'invitationId',
   'invitationSecret',
   'desktopIdentity',
   'protocolVersions',
 ])
 
-interface PairingPayload {
-  hosts: string[]
+/** One dial candidate; a v3 endpoint carries its OWN port and scheme. */
+interface PairCandidate {
+  host: string
   port: number
+  security: 'ws' | 'wss'
+}
+
+interface PairingPayload {
+  /** Ordered dial candidates — every entry is attempted before `unreachable`. */
+  candidates: PairCandidate[]
   invitationId: string
   invitationSecret: string
   desktopIdentity: string
@@ -119,12 +142,11 @@ function isUnicodeText(value: string): boolean {
   return !LONE_SURROGATE_RE.test(value)
 }
 
-function checkString(value: unknown, field: string, max: number): string {
-  if (typeof value !== 'string') invalid(`payload field "${field}" must be a string`)
-  if (value.length === 0) invalid(`payload field "${field}" must not be empty`)
-  if (value.length > max) invalid(`payload field "${field}" exceeds ${max} characters`)
-  if (!isUnicodeText(value)) invalid(`payload field "${field}" is not valid unicode text`)
-  return value
+/** Rejections quote issue PATHS (deduplicated, sorted), never issue inputs. */
+function schemaIssuePaths(error: z.ZodError): string {
+  return [...new Set(error.issues.map((issue) => issue.path.join('.') || 'payload'))]
+    .sort()
+    .join(', ')
 }
 
 /**
@@ -152,9 +174,9 @@ function normalizeHost(raw: string): string {
 }
 
 /**
- * Parses and validates the pairing payload. Unknown fields are ignored (with a
- * warning) — the payload carries host naming the design does not consume — but
- * the fields on the manifest are judged against their protocol caps.
+ * Parses and validates the pairing payload against the published
+ * `pairingQrSchema` (v2 or v3). Unknown fields are ignored (with a warning);
+ * every field judgement is the schema's, capped by the local size rule.
  */
 function parsePayload(payload: string): PairingPayload {
   // Size is judged on the raw string first: an oversized blob must not be
@@ -174,47 +196,51 @@ function parsePayload(payload: string): PairingPayload {
   }
 
   const raw = parsed as Record<string, unknown>
-  if (raw['v'] !== PAYLOAD_VERSION) {
-    invalid(`payload version must be ${PAYLOAD_VERSION}`)
-  }
-  if (raw['t'] !== PAYLOAD_TYPE) {
-    invalid(`payload type must be "${PAYLOAD_TYPE}"`)
-  }
-
-  const ignored = Object.keys(raw).filter((key) => !KNOWN_FIELDS.has(key))
+  const ignored = Object.keys(raw).filter((key) => !SCHEMA_KEYS.has(key))
   if (ignored.length > 0) {
     console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(', ')}`)
   }
 
-  const port = raw['port']
-  if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65_535) {
-    invalid('payload field "port" must be an integer in 1..65535')
-  }
-
+  // Normalize v2 bracketed IPv6 entries BEFORE the schema sees them;
+  // non-string entries pass through for the schema to judge (the published
+  // arm rejects them with the same `invalid-payload` verdict).
   const ips = raw['ips']
-  if (!Array.isArray(ips) || ips.length === 0) {
-    invalid('payload field "ips" must be a non-empty array')
+  const input = Array.isArray(ips)
+    ? {
+        ...raw,
+        ips: ips.map((entry) => (typeof entry === 'string' ? normalizeHost(entry) : entry)),
+      }
+    : raw
+
+  const result = pairingQrSchema.safeParse(input)
+  if (!result.success) {
+    invalid(`payload rejected by the pairing QR schema (v2 or v3): ${schemaIssuePaths(result.error)}`)
   }
-  const hosts = ips.map((entry, index) =>
-    normalizeHost(checkString(entry, `ips[${index}]`, HOST_MAX)),
-  )
+  const qr = result.data
 
-  const invitationId = checkString(raw['invitationId'], 'invitationId', OPAQUE_ID_MAX)
-  const invitationSecret = checkString(raw['invitationSecret'], 'invitationSecret', OPAQUE_ID_MAX)
-  const desktopIdentity = checkString(raw['desktopIdentity'], 'desktopIdentity', OPAQUE_ID_MAX)
+  const candidates: PairCandidate[] =
+    qr.v === 2
+      ? qr.ips.map((host) => ({ host, port: qr.port, security: 'ws' as const }))
+      : qr.endpoints.map((endpoint) => ({
+          host: endpoint.host,
+          port: endpoint.port,
+          security: endpoint.security,
+        }))
 
-  const versions = raw['protocolVersions']
-  if (!Array.isArray(versions) || versions.length === 0) {
-    invalid('payload field "protocolVersions" must be a non-empty array')
+  // The lone-surrogate rule is ours (see the header): the claim RPC would
+  // carry such a value to the peer's unicodeText params face and be refused
+  // there; naming the field now is the same verdict one round trip earlier.
+  for (const field of ['invitationId', 'invitationSecret', 'desktopIdentity'] as const) {
+    if (!isUnicodeText(qr[field])) invalid(`payload field "${field}" is not valid unicode text`)
   }
-  const protocolVersions = versions.map((version) => {
-    if (typeof version !== 'number' || !Number.isInteger(version)) {
-      invalid('payload field "protocolVersions" must contain integers')
-    }
-    return version
-  })
 
-  return { hosts, port, invitationId, invitationSecret, desktopIdentity, protocolVersions }
+  return {
+    candidates,
+    invitationId: qr.invitationId,
+    invitationSecret: qr.invitationSecret,
+    desktopIdentity: qr.desktopIdentity,
+    protocolVersions: qr.protocolVersions,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +290,10 @@ export { urlHost } from './urlHost.js'
 
 /** Dials one candidate address and completes the Noise handshake.
  *
+ * The URL is the published `directEndpointUrl` — it brackets IPv6 literals,
+ * appends the fixed `/v1/remote/connect` path, and selects `ws:` or `wss:`
+ * from the candidate's own `security` (v3 TLS-proxy endpoints dial TLS).
+ *
  * Both halves start concurrently (`Promise.all`): the peer's accept half is
  * already running on its side, so a sequential dial would deadlock the
  * prelude.
@@ -276,14 +306,14 @@ export { urlHost } from './urlHost.js'
  * instead of being pinned as the desktop.
  */
 async function dial(
-  host: string,
-  port: number,
+  candidate: PairCandidate,
   identity: Uint8Array,
   desktopIdentity: string,
   protocolVersions: readonly number[],
   timeoutMs: number,
 ): Promise<TempChannel> {
-  const ws = new WebSocket(`ws://${urlHost(host)}:${port}${remoteConnectPath}`)
+  const { host, port } = candidate
+  const ws = new WebSocket(directEndpointUrl(candidate))
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<never>((_, reject) => {
@@ -388,7 +418,9 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   // recorded — never `invitationSecret`, the claim's verification code, or any
   // token (those are exactly what the sanitization contract forbids).
   const report = (stage: string): void => {
-    console.info(`[cherry-remote] pairing stage ${stage} (hosts: ${payload.hosts.join(', ')})`)
+    console.info(
+      `[cherry-remote] pairing stage ${stage} (hosts: ${payload.candidates.map((candidate) => candidate.host).join(', ')})`,
+    )
     onStatus(stage)
   }
   report('validate')
@@ -403,23 +435,23 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   report('connect')
 
   const failures: string[] = []
-  for (const host of payload.hosts) {
+  for (const candidate of payload.candidates) {
+    const label = `${candidate.host}:${candidate.port}`
     let temp: TempChannel
     try {
       temp = await dial(
-        host,
-        payload.port,
+        candidate,
         opts.identity,
         payload.desktopIdentity,
         offered,
         connectTimeoutMs,
       )
     } catch (error) {
-      failures.push(`${host}: ${error instanceof Error ? error.message : String(error)}`)
+      failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`)
       continue
     }
     try {
-      const record = await claimAndAwait(temp.client, payload, offered, opts, report)
+      const record = await claimAndAwait(temp.client, payload, offered, opts, report, candidate)
       destroy(temp)
       // `DeviceStore.upsert` persists and returns nothing, so the call returns
       // the very record it handed over — the persisted archive entry, not a
@@ -438,7 +470,7 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
       // peer `rejected` on the SECOND surfaces as `rejected`, not `unreachable`.
       // That is deliberate: the peer's answer about the invitation outranks our
       // own transport trouble, and it is the one the user can act on.
-      failures.push(`${host}: ${error instanceof Error ? error.message : String(error)}`)
+      failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
@@ -460,6 +492,7 @@ async function claimAndAwait(
   protocolVersions: readonly number[],
   opts: PairWithPayloadOptions,
   onStatus: (stage: string) => void,
+  candidate: PairCandidate,
 ): Promise<DeviceRecord> {
   const deviceName = (opts.name ?? hostname()).slice(0, DEVICE_NAME_MAX)
 
@@ -525,7 +558,7 @@ async function claimAndAwait(
       )
     }
     if (result.status === 'approved') {
-      return recordFrom(payload, result, deviceName)
+      return recordFrom(payload, result, deviceName, candidate)
     }
     // `pending`: the user has not acted yet. The local deadline is race
     // protection for a peer that never reaches a terminal state; the normal
@@ -547,11 +580,23 @@ async function claimAndAwait(
  * `displayName` is the name the claim actually carried — the record must not
  * disagree with what the desktop shows for this device, and re-deriving it
  * here would lose the 64-char truncation.
+ *
+ * The address projection: every candidate host is kept (the v2 record always
+ * did, and reconnect re-walks them), and the persisted `port` is the one the
+ * pairing actually completed on. The two only diverge for a MIXED-PORT v3
+ * payload; the 2.1.8 generation side emits one endpoint per custom-address
+ * invitation (`ApiGatewayService.getRemoteEndpoint`:
+ * `advertisedEndpoint ? [advertisedEndpoint] : …`), so every real v3 record is
+ * faithful. `security` is NOT persisted — `DeviceRecord` schemaVersion 2 has no
+ * such field — which means a paired **wss** endpoint reconnects on `ws://`
+ * (the steady-state dial, src/connection.ts); making that device reachable
+ * after pairing is separate follow-up work, not part of issue #124.
  */
 function recordFrom(
   payload: PairingPayload,
   approved: Extract<GetResult, { status: 'approved' }>,
   deviceName: string,
+  winner: PairCandidate,
 ): DeviceRecord {
   const grants = (approved.authorization?.grants ?? [])
     .map((grant) => grant.domain)
@@ -583,8 +628,8 @@ function recordFrom(
     schemaVersion: 2,
     deviceId: approved.deviceId,
     displayName: deviceName,
-    hosts: [...payload.hosts],
-    port: payload.port,
+    hosts: payload.candidates.map((candidate) => candidate.host),
+    port: winner.port,
     desktopIdentity: payload.desktopIdentity,
     grants,
     accessToken: approved.accessToken,
