@@ -89,6 +89,28 @@ function payloadFor(fakeInfo: FakeInfo, overrides: Record<string, unknown> = {})
   })
 }
 
+/**
+ * The 2.1.8 custom-address invitation (upstream `bc570d2b9`, PR #21387): v3
+ * replaces `ips`+`port` with a complete `endpoints` list (host, port,
+ * security). The generation side emits exactly ONE endpoint when the user
+ * configures an advertised address (2.1.8 `ApiGatewayService.getRemoteEndpoint`
+ * — `advertisedEndpoint ? [advertisedEndpoint] : …`), so these payloads carry
+ * one endpoint too.
+ */
+function v3PayloadFor(fakeInfo: FakeInfo, overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    v: 3,
+    t: 'cherry-studio-pair',
+    name: 'cherry-host',
+    desktopIdentity: fakeInfo.desktopIdentity,
+    invitationId: 'inv-1',
+    invitationSecret: 'secret-1',
+    protocolVersions: [1],
+    endpoints: [{ host: fakeInfo.host, port: fakeInfo.port, security: 'ws' }],
+    ...overrides,
+  })
+}
+
 interface PairOptions {
   identity: Uint8Array
   store: DeviceStore
@@ -391,7 +413,7 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(store.list()).toEqual([])
   }, 15_000)
 
-  it('⑤ ignores payload fields outside the consumed manifest (e.g. name) and warns about them', async () => {
+  it('⑤ ignores payload fields outside the schema (e.g. futureField) and warns about them', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeApprovingFake()
     const store = await makeStore()
@@ -402,15 +424,38 @@ describe('pairWithPayload over a real loopback channel', () => {
       payload: payloadFor(fakeInfo, { name: 'some-other-host', futureField: { nested: true } }),
     })
 
-    // The ignored payload `name` (the desktop's own hostname) never becomes
-    // the record's display name — that is THIS machine's claimed device name.
-    // `name` is not on the consumed manifest (spec §3.3 step 1).
+    // The payload `name` is a SCHEMA field since 0.7.0's `pairingQrSchema`
+    // (required, the desktop's own hostname) — no longer an unknown field, and
+    // still never THIS record's display name: that is the name we claimed with
+    // (spec §3.3 step 1). Only genuinely unknown keys are warned about.
     expect(record.displayName).toBe(hostname().slice(0, 64))
     expect(record.displayName).not.toBe('some-other-host')
     expect(record).not.toHaveProperty('futureField')
     const warned = consoleWarn.mock.calls.flat().map(String).join('\n')
-    expect(warned).toContain('name')
     expect(warned).toContain('futureField')
+    expect(warned).not.toContain('name')
+  }, 15_000)
+
+  it('⑤b warns about a field from the OTHER arm (v2 payload carrying a spurious endpoints key)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    // The ignored-key judgement is ARM-AWARE (V2_KEYS/V3_KEYS, matched by the
+    // parsed `v`): one union set would swallow a v2 payload carrying a v3
+    // field without a word — the pre-schema behavior warned, and this keeps
+    // that promise. The schema itself is loose, so the pair still succeeds;
+    // the warning is the whole claim. Deleting the arm split (judging against
+    // the union) turns exactly this test green-silent.
+    const record = await pair({
+      identity,
+      store,
+      payload: payloadFor(fakeInfo, { endpoints: [{ host: '10.9.9.9', port: 23_456, security: 'ws' }] }),
+    })
+
+    expect(record).toBeTruthy()
+    const warned = consoleWarn.mock.calls.flat().map(String).join('\n')
+    expect(warned).toContain('endpoints')
   }, 15_000)
 
   it('⑥ fails as unreachable when the payload version set and the local support set do not intersect', async () => {
@@ -542,4 +587,185 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(message).toContain('6-digit')
     expect(message).toContain('code')
   }, 15_000)
+
+  // -------------------------------------------------------------------------
+  // v3 pairing QR (issue #124): a 2.1.8 custom-address invitation carries
+  // `endpoints` (host, port, security) instead of `ips` + `port`. The hand-
+  // rolled v2-only field check refused it `invalid-payload` before the bump.
+  // -------------------------------------------------------------------------
+
+  it('⑪ accepts a v3 endpoint payload and pairs end to end against the loopback peer', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    const record = await pair({ identity, store, payload: v3PayloadFor(fakeInfo) })
+
+    expect(record.deviceId).toBe(fakeInfo.fake.approvedDeviceId)
+    // The endpoint's host/port are what the walk dialed and what the record
+    // carries: v3 has no ips array, the endpoints ARE the candidates.
+    expect(record.hosts).toEqual([fakeInfo.host])
+    expect(record.port).toBe(fakeInfo.port)
+    expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(1)
+  }, 15_000)
+
+  it('⑪b dials a bare IPv6 v3 endpoint (bracketed on the URL, bare in the archive)', async () => {
+    const identity = await createDeviceIdentity()
+    // The fake listens on IPv6 loopback; `host` is the BARE `::1` the v3
+    // schema admits (hostSchema rejects brackets — the dial side re-brackets).
+    const fakeInfo = await makeFake({
+      bindHost: '::1',
+      pairingDecision: 'approved',
+      pairingGetPendingPolls: APPROVE_AFTER_POLLS,
+    })
+    const store = await makeStore()
+
+    const record = await pair({ identity, store, payload: v3PayloadFor(fakeInfo) })
+
+    expect(record.hosts).toEqual(['::1'])
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+    expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(1)
+  }, 15_000)
+
+  it('⑪c a wss v3 endpoint is ACCEPTED (validation) — the fault is the dial, not the payload', async () => {
+    const identity = await createDeviceIdentity()
+    // A plain-ws fake behind the address: the TLS dial cannot complete, but
+    // the payload itself is schema-valid, so the run must reach the dial and
+    // fail `unreachable` — never refuse the invitation as `invalid-payload`.
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        connectTimeoutMs: 1_500,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: [{ host: fakeInfo.host, port: fakeInfo.port, security: 'wss' }],
+        }),
+      }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    expect(store.list()).toEqual([])
+    // No Noise channel ever completed and no pairing RPC ran.
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(0)
+  }, 15_000)
+
+  it('⑪d rejects a v3 payload whose endpoints list is empty as invalid-payload', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    const error = await pairingError(
+      pair({ identity, store, payload: v3PayloadFor(fakeInfo, { endpoints: [] }) }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+    expect(store.list()).toEqual([])
+  })
+
+  it('⑪e rejects a v3 endpoint host that is not a clean IP/hostname (credentials) as invalid-payload', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // The published `pairingQrSchema` v3 arm (the `user@host/path` fixture in
+    // the package's own fixtures/pairing-qr.json) — consuming it, not
+    // hand-rolling the field check, is what makes this verdict the schema's.
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: [{ host: 'user@evil.example/path', port: 443, security: 'wss' }],
+        }),
+      }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+    expect(store.list()).toEqual([])
+  })
+
+  it('⑪f an invalid v3 payload refuses without echoing the invitation secret into the message', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // The rejection must name the failing SHAPE, never the values: the schema
+    // error surface carries `input` echoings, and a naive error builder that
+    // dumps issue inputs puts the secret into a user-visible error message.
+    const SECRET = 'INVITATION-SENTINEL-3f9c'
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, { invitationSecret: SECRET, endpoints: [] }),
+      }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    // Two discriminating claims: the secret never appears, AND the message
+    // still names a failing FIELD PATH — a rejection builder that went silent
+    // (no paths at all) would fail the second, not silently pass the first.
+    expect(error.message).not.toContain(SECRET)
+    expect(error.message).toContain('endpoints')
+  })
+
+  it('⑪g a v2 payload with a DOMAIN in ips is now refused by the schema arm (IPs only in v2)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // PRE-BUMP BEHAVIOR ACCEPTED ANY STRING: the hand-rolled check only tested
+    // character caps. The published schema's v2 arm is `z.ipv4()|z.ipv6()`
+    // (the fixtures name this "DNS must not masquerade as IP") — a 2.1.8
+    // custom HOSTNAME invitation is therefore v3, and a v2 that carries one
+    // is a malformed payload, refused before any dial.
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { ips: ['desktop.example.com'] }) }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+  })
+
+  it('⑫ refuses a lone surrogate in an id field (the unicodeText rule survives the schema switch)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // The published `pairingQrSchema` bounds these fields by LENGTH only;
+    // the lone-surrogate refusal is OUR rule (the peer enforces it on the
+    // claim params face). After the pre-bump checks were replaced by schema
+    // consumption, nothing but this loop kept the rule — this test is what
+    // makes deleting it a red build rather than a wire-side surprise.
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { invitationId: '\ud800x' }) }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+  })
+
+  it('⑫b refuses a lone surrogate in desktopIdentity too (the loop pins its whole field list)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // ⑫ drives invitationId only; this is the OTHER end of the loop's field
+    // list. desktopIdentity reaches the wire as the claim's remoteIdentity
+    // face (an opaqueId, which enforces unicodeText) — deleting the local
+    // loop would push this refusal one round trip later, onto the claim RPC,
+    // and ⑫ alone would never show it.
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { desktopIdentity: 'x\ud800' }) }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+  })
 })

@@ -3348,7 +3348,7 @@ export class CherryToolEngine {
    * '{\"mediaType\":…,\"filename\":…}'}}` — the metadata SERIALIZED AS JSON in
    * `content.text`, observed on the wire (2.1.7 desktop, image upload,
    * 2026-10-22). An OBJECT inside `content` is not producible by a conforming
-   * peer at all: the pinned protocol 0.5.0 types `content` as a strict
+   * peer at all: the pinned protocol 0.7.0 types `content` as a strict
    * `{text}` | `{ref}` union, so the old documentation described a shape no
    * peer can emit — and the real one was never lifted, which is how an image
    * upload reached a model as a JSON blob.
