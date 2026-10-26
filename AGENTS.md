@@ -152,14 +152,12 @@ in [`docs/e2e-checklist.md`](docs/e2e-checklist.md).
 | `contentBytes` | 24,576 (24 KiB) | the slice size for one `agent.content.read` |
 | `pageItems` | 100 | the protocol's single-page hard cap; `hello` may negotiate smaller |
 
-The desktop's `pageOf` pages by **count alone** through 2.1.7 (2.1.8's byte
-budget aside, still count-paged), so asking for
-`pageItems: 100` fat parts produced a record the transport had to kill —
-reading a complex session reset the connection deterministically. Our byte-safe
-per-page clamps
-(`defaults.ts`, from a 4-bytes-per-char UTF-8 worst case and the peer's
-4,096-char `INLINE_TEXT_LIMIT`, plus a 2 KiB margin) are the
-fix, and the effective page size is `min(negotiated pageItems, clamp)`.
+Through 2.1.7 the desktop's `pageOf` pages by **count alone** (2.1.8's byte
+budget aside, still count-paged): `pageItems: 100` fat parts produced a record
+the transport killed — reading a complex session reset the connection. The
+byte-safe clamps (`defaults.ts`: a 4-bytes-per-char worst case over the peer's
+4,096-char `INLINE_TEXT_LIMIT`, +2 KiB margin) fix it; the effective page size
+is `min(negotiated pageItems, clamp)`.
 
 **Upstream context (#21854, shipped in 2.1.8).** Upstream added a
 `PAGE_ITEM_BYTES` byte budget (62,279) to every paged `agent.*.list` face
@@ -167,24 +165,21 @@ fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 an item that cannot fit raises `RESOURCE_EXHAUSTED`. No release through 2.1.7
 carries it, so deployed peers mostly page by count alone and the clamps stay.
 
-Reviewed against the merged code (`7218842`) and followed up as
-[`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951): an item above
-the budget **dead-ends the cursor**, so it and everything behind it become
-unreachable (reachable through a schema-valid record — `partIds` has no bound),
+Follow-up [`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951):
+an item above the budget **dead-ends the cursor** — it and everything behind it
+become unreachable via a schema-valid record (`partIds` has no bound) —
 `RESOURCE_EXHAUSTED` presents that permanent condition as retryable, and
-`queryPage`'s halving leaves up to half the budget unused. A peer may therefore
+`queryPage`'s halving wastes up to half the budget. A peer may therefore
 come back with a page **shorter** than requested while still promising more,
-which our walk already follows (`tests/integration/toolsListWalkCompat.test.ts`
-T2); it must never come back **longer**, and `CherryPage.pageOverflow` is what
-happens if it does.
+which our walk already follows (`toolsListWalkCompat.test.ts` T2); it must
+never come back **longer** (`CherryPage.pageOverflow`).
 
-**Paged summaries (issue #105).** The `agentMessageSummariesVersion: 1` hello
-capability is stored beside `limits` on EVERY hello (absent when not
-advertised, so no reconnect inherits it); `messageListRequest` is the one helper
-both message walks use, sending `partsMode: 'paged'` only at exactly `1`.
-Clamps stay: parts keep `PARTS_LIST_PAGE_CLAMP`; only the message page widens,
-to the negotiated `pageItems`. A `RESOURCE_EXHAUSTED` with
-`details.retryable: false` says retrying cannot help.
+**Paged summaries (#105).** The hello `agentMessageSummariesVersion` bit is
+stored beside `limits` per hello (absent when unadvertised — no reconnect
+inherits it); ONE helper (`messageListRequest`) serves both message walks and
+sends `partsMode: 'paged'` only at exactly `1`. Parts keep their clamp; only
+the message page widens (to the negotiated `pageItems`); a
+`RESOURCE_EXHAUSTED` with `details.retryable: false` says retrying cannot help.
 
 **Pacing: two tiers against the desktop's allowances.**
 
@@ -237,8 +232,8 @@ These are load-bearing; the code comments are the long version.
   their own paths) and `cherry_devices`' rows wait for that
   attempt, bounded by `DEVICE_SETTLE_WAIT_MS` = 5 s: the wait ends on the first
   transition out of `connecting`, or on the bound with the state it finds, so the
-  error face is the same — just later, after the attempt had its chance. It
-  precedes a wait answer's `AssemblyDeadline` — outside that window.
+  error face is the same — just later, after the attempt had its chance (before
+  any wait answer's `AssemblyDeadline`).
 - **Only `connecting` is waited on.** `offline` (parked in backoff), `disabled`
   and `identity-mismatch` answer at once: no wait can change them, and a
   powered-off desktop would pay the bound on every call. Nothing here starts a
@@ -261,10 +256,9 @@ These are load-bearing; the code comments are the long version.
   the official client's read-concurrency policy. The whole engine — every tool
   call, every device — shares it, so the ASSEMBLY peak is
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
-  `4 × 3 × (the declared size)`. It bounds the COUNT, not the bytes: a byte
-  budget would have to reserve each ref's declared size (optimistic — a peer may
-  serve more) or its cap when the size is unusable (serializing everything
-  behind one slot), so it is deliberately not what landed.
+  `4 × 3 × (the declared size)`. It bounds the COUNT, not bytes: a byte budget
+  must reserve each ref's declared size (optimistic) or its cap when unusable
+  (serializing all behind one slot) — deliberately not what landed.
   It bounds what is being ASSEMBLED, not everything resident: content an answer
   has already finished assembling is retained by its caller OUTSIDE this
   product — up to one whole message per concurrent read, because
@@ -341,8 +335,8 @@ verifies every byte it hands back.
   multi-megabyte half; what it INCLUDES is inline part text, up to the peer's
   4,096-character `INLINE_TEXT_LIMIT` per part — so "descriptors" understates
   the inline case, and a message with a few hundred fat inline parts can reach
-  `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB). That is an argument, not a measurement:
-  the bound is set so one entry cannot evict the device's working set.
+  `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB). The bound is set so one entry cannot
+  evict the device's working set.
   `MESSAGE_CACHE_BYTES_PER_DEVICE` = 32 MiB — deliberately far more headroom
   than that bound needs.
 - **Two bounds, both per device, and they judge independently.** An entry is
@@ -963,8 +957,7 @@ Notable faces:
   byte budget never converges. Our answer is the byte-safe page **clamp**: never
   ask for a page that cannot fit.
 - Its read path refuses a ref whose `byteLength` is unusable; we fall back to a
-  slice bound plus the cumulative arm. Its 32 MiB cap is a pre-allocated single
-  array; ours is three transient copies.
+  slice bound plus the cumulative arm.
 - Its read path never replays a read; we replay reads **once** (deliberate
   enhancement) while both sides keep commands receipt-recovered.
 - Its command journal backs command recovery — the reason our commands are
