@@ -154,20 +154,20 @@ in [`docs/e2e-checklist.md`](docs/e2e-checklist.md).
 | `contentBytes` | 24,576 (24 KiB) | the slice size for one `agent.content.read` |
 | `pageItems` | 100 | the protocol's single-page hard cap; `hello` may negotiate smaller |
 
-The desktop's `pageOf` pages by **count alone** through 2.1.7, so asking for
+The desktop's `pageOf` pages by **count alone** through 2.1.7 (2.1.8's byte
+budget aside, still count-paged), so asking for
 `pageItems: 100` fat parts produced a record the transport had to kill —
 reading a complex session reset the connection deterministically. Our byte-safe
 per-page clamps
-(`defaults.ts`, derived from a strict 4-bytes-per-character UTF-8 worst case and
-the peer's `INLINE_TEXT_LIMIT` of 4,096 characters, with a 2 KiB margin) are the
+(`defaults.ts`, from a 4-bytes-per-char UTF-8 worst case and the peer's
+4,096-char `INLINE_TEXT_LIMIT`, plus a 2 KiB margin) are the
 fix, and the effective page size is `min(negotiated pageItems, clamp)`.
 
 **Upstream context (#21854, shipped in 2.1.8).** Upstream added a
 `PAGE_ITEM_BYTES` byte budget (62,279) to every paged `agent.*.list` face
 (`pageOf` truncates, `queryPage` re-queries a keyset page at a halved limit);
 an item that cannot fit raises `RESOURCE_EXHAUSTED`. No release through 2.1.7
-carries it, so most deployed peers still page by count alone and the clamps
-stay (do not remove them).
+carries it, so deployed peers mostly page by count alone and the clamps stay.
 
 Reviewed against the merged code (`7218842`) and followed up as
 [`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951): an item above
@@ -945,7 +945,7 @@ Notable faces:
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
 | 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |
-| 2.1.8: v3 pairing QR (`bc570d2b9`, PR #21387) — `pairingQrSchema` v2|v3 with custom host/port/security `endpoints`, http(s) direct acceptance, tightened IPv6; paged message summaries (`54736dc9`/`8bf2fe28d`, PR #21992) advertised by the `agentMessageSummariesVersion` hello capability; server `PAGE_ITEM_BYTES = 62_279` per-item budget | Pairing consumes the published union (#124); consuming summaries is #105 — no `partsMode`, no tool change; a byte-budgeted page may come back SHORTER, which our walk already follows |
+| 2.1.8: v3 pairing QR (`bc570d2b9`, PR #21387) — `pairingQrSchema` v2|v3 with custom host/port/security `endpoints`, tightened IPv6; paged message summaries (`54736dc9`/`8bf2fe28d`, PR #21992) advertised by the `agentMessageSummariesVersion` hello capability; server `PAGE_ITEM_BYTES = 62_279` per-item budget | Pairing consumes the published union (#124); consuming summaries is #105 — no `partsMode`, no tool change; a byte-budgeted page may come back SHORTER, which our walk already follows |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**

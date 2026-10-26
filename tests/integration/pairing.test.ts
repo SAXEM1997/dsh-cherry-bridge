@@ -413,24 +413,6 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(store.list()).toEqual([])
   }, 15_000)
 
-  it('⑫ refuses a lone surrogate in an id field (the unicodeText rule survives the schema switch)', async () => {
-    const identity = await createDeviceIdentity()
-    const fakeInfo = await makeFake()
-    const store = await makeStore()
-
-    // The published `pairingQrSchema` bounds these fields by LENGTH only;
-    // the lone-surrogate refusal is OUR rule (the peer enforces it on the
-    // claim params face). After the pre-bump checks were replaced by schema
-    // consumption, nothing but this loop kept the rule — this test is what
-    // makes deleting it a red build rather than a wire-side surprise.
-    const error = await pairingError(
-      pair({ identity, store, payload: payloadFor(fakeInfo, { invitationId: '\ud800x' }) }),
-    )
-
-    expect(error.kind).toBe('invalid-payload')
-    expect(fakeInfo.fake.socketCount).toBe(0)
-  })
-
   it('⑤ ignores payload fields outside the schema (e.g. futureField) and warns about them', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeApprovingFake()
@@ -452,6 +434,28 @@ describe('pairWithPayload over a real loopback channel', () => {
     const warned = consoleWarn.mock.calls.flat().map(String).join('\n')
     expect(warned).toContain('futureField')
     expect(warned).not.toContain('name')
+  }, 15_000)
+
+  it('⑤b warns about a field from the OTHER arm (v2 payload carrying a spurious endpoints key)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    // The ignored-key judgement is ARM-AWARE (V2_KEYS/V3_KEYS, matched by the
+    // parsed `v`): one union set would swallow a v2 payload carrying a v3
+    // field without a word — the pre-schema behavior warned, and this keeps
+    // that promise. The schema itself is loose, so the pair still succeeds;
+    // the warning is the whole claim. Deleting the arm split (judging against
+    // the union) turns exactly this test green-silent.
+    const record = await pair({
+      identity,
+      store,
+      payload: payloadFor(fakeInfo, { endpoints: [{ host: '10.9.9.9', port: 23_456, security: 'ws' }] }),
+    })
+
+    expect(record).toBeTruthy()
+    const warned = consoleWarn.mock.calls.flat().map(String).join('\n')
+    expect(warned).toContain('endpoints')
   }, 15_000)
 
   it('⑥ fails as unreachable when the payload version set and the local support set do not intersect', async () => {
@@ -704,7 +708,11 @@ describe('pairWithPayload over a real loopback channel', () => {
     )
 
     expect(error.kind).toBe('invalid-payload')
+    // Two discriminating claims: the secret never appears, AND the message
+    // still names a failing FIELD PATH — a rejection builder that went silent
+    // (no paths at all) would fail the second, not silently pass the first.
     expect(error.message).not.toContain(SECRET)
+    expect(error.message).toContain('endpoints')
   })
 
   it('⑪g a v2 payload with a DOMAIN in ips is now refused by the schema arm (IPs only in v2)', async () => {
@@ -719,6 +727,42 @@ describe('pairWithPayload over a real loopback channel', () => {
     // is a malformed payload, refused before any dial.
     const error = await pairingError(
       pair({ identity, store, payload: payloadFor(fakeInfo, { ips: ['desktop.example.com'] }) }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+  })
+
+  it('⑫ refuses a lone surrogate in an id field (the unicodeText rule survives the schema switch)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // The published `pairingQrSchema` bounds these fields by LENGTH only;
+    // the lone-surrogate refusal is OUR rule (the peer enforces it on the
+    // claim params face). After the pre-bump checks were replaced by schema
+    // consumption, nothing but this loop kept the rule — this test is what
+    // makes deleting it a red build rather than a wire-side surprise.
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { invitationId: '\ud800x' }) }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+  })
+
+  it('⑫b refuses a lone surrogate in desktopIdentity too (the loop pins its whole field list)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // ⑫ drives invitationId only; this is the OTHER end of the loop's field
+    // list. desktopIdentity reaches the wire as the claim's remoteIdentity
+    // face (an opaqueId, which enforces unicodeText) — deleting the local
+    // loop would push this refusal one round trip later, onto the claim RPC,
+    // and ⑫ alone would never show it.
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { desktopIdentity: 'x\ud800' }) }),
     )
 
     expect(error.kind).toBe('invalid-payload')

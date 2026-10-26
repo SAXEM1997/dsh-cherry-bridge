@@ -3507,15 +3507,27 @@ const HOST_MAX$1 = 256;
 /** Matches the protocol's unicodeText: no lone UTF-16 surrogates. */
 const LONE_SURROGATE_RE$1 = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 /**
-* The keys `pairingQrSchema` consumes. A payload field outside this set is
-* ignored (with a warning) — the desktop names hosts the design does not use.
+* The keys each QR ARM consumes (selected by `v`). A payload field outside
+* the MATCHED arm's set is ignored with a warning — the desktop names hosts
+* the design does not use. One union set would silently swallow a v2 payload
+* carrying a spurious `endpoints` (or v3 carrying `ips`/`port`); the arm
+* split keeps the pre-schema warning behavior.
 */
-const SCHEMA_KEYS = /* @__PURE__ */ new Set([
+const V2_KEYS = /* @__PURE__ */ new Set([
 	"v",
 	"t",
 	"name",
 	"ips",
 	"port",
+	"invitationId",
+	"invitationSecret",
+	"desktopIdentity",
+	"protocolVersions"
+]);
+const V3_KEYS = /* @__PURE__ */ new Set([
+	"v",
+	"t",
+	"name",
 	"endpoints",
 	"invitationId",
 	"invitationSecret",
@@ -3538,7 +3550,10 @@ function invalid(message) {
 function isUnicodeText(value) {
 	return !LONE_SURROGATE_RE$1.test(value);
 }
-/** Rejections quote issue PATHS (deduplicated, sorted), never issue inputs. */
+/** Rejections quote issue PATHS (deduplicated, sorted). The "never inputs"
+* promise is the CALL SITE's property — only `issue.path` is read here; an
+* editor reaching for `issue.message` or `String(error)` must re-check what
+* zod embeds there before keeping that promise. */
 function schemaIssuePaths(error) {
 	return [...new Set(error.issues.map((issue) => issue.path.join(".") || "payload"))].sort().join(", ");
 }
@@ -3578,8 +3593,6 @@ function parsePayload(payload) {
 	}
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) invalid("payload must be a JSON object");
 	const raw = parsed;
-	const ignored = Object.keys(raw).filter((key) => !SCHEMA_KEYS.has(key));
-	if (ignored.length > 0) console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(", ")}`);
 	const ips = raw["ips"];
 	const input = Array.isArray(ips) ? {
 		...raw,
@@ -3588,6 +3601,8 @@ function parsePayload(payload) {
 	const result = pairingQrSchema.safeParse(input);
 	if (!result.success) invalid(`payload rejected by the pairing QR schema (v2 or v3): ${schemaIssuePaths(result.error)}`);
 	const qr = result.data;
+	const ignored = Object.keys(raw).filter((key) => !(qr.v === 2 ? V2_KEYS : V3_KEYS).has(key));
+	if (ignored.length > 0) console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(", ")}`);
 	const candidates = qr.v === 2 ? qr.ips.map((host) => ({
 		host,
 		port: qr.port,

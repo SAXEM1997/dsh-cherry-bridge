@@ -73,9 +73,10 @@ export interface PairWithPayloadOptions {
 //   - v2's bracketed-IPv6 NORMALIZATION (ruling 2) — the published v2 arm
 //     validates BARE literals, so brackets are stripped before the parse and
 //     the archive keeps the bare form the connection layer re-brackets, and
-//   - the `unicodeText` (lone-surrogate) rule on the three id fields: the
-//     protocol values face enforces it, the pairing QR arm does not, and
-//     refusing here keeps the v2 error face identical one round trip earlier.
+//   - the `unicodeText` (lone-surrogate) rule on `invitationId` /
+//     `invitationSecret` / `desktopIdentity`: the protocol values face
+//     enforces it, the pairing QR arm does not, and refusing here keeps the
+//     v2 error face identical one round trip earlier.
 // The error face is `invalid-payload` naming the failing FIELD PATHS only:
 // zod issues carry the `input`, so values never enter the message — an
 // `invitationSecret` must not surface in a user-visible error.
@@ -91,15 +92,27 @@ const HOST_MAX = 256
 const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
 
 /**
- * The keys `pairingQrSchema` consumes. A payload field outside this set is
- * ignored (with a warning) — the desktop names hosts the design does not use.
+ * The keys each QR ARM consumes (selected by `v`). A payload field outside
+ * the MATCHED arm's set is ignored with a warning — the desktop names hosts
+ * the design does not use. One union set would silently swallow a v2 payload
+ * carrying a spurious `endpoints` (or v3 carrying `ips`/`port`); the arm
+ * split keeps the pre-schema warning behavior.
  */
-const SCHEMA_KEYS = new Set([
+const V2_KEYS = new Set([
   'v',
   't',
   'name',
   'ips',
   'port',
+  'invitationId',
+  'invitationSecret',
+  'desktopIdentity',
+  'protocolVersions',
+])
+const V3_KEYS = new Set([
+  'v',
+  't',
+  'name',
   'endpoints',
   'invitationId',
   'invitationSecret',
@@ -142,7 +155,10 @@ function isUnicodeText(value: string): boolean {
   return !LONE_SURROGATE_RE.test(value)
 }
 
-/** Rejections quote issue PATHS (deduplicated, sorted), never issue inputs. */
+/** Rejections quote issue PATHS (deduplicated, sorted). The "never inputs"
+ * promise is the CALL SITE's property — only `issue.path` is read here; an
+ * editor reaching for `issue.message` or `String(error)` must re-check what
+ * zod embeds there before keeping that promise. */
 function schemaIssuePaths(error: z.ZodError): string {
   return [...new Set(error.issues.map((issue) => issue.path.join('.') || 'payload'))]
     .sort()
@@ -196,10 +212,6 @@ function parsePayload(payload: string): PairingPayload {
   }
 
   const raw = parsed as Record<string, unknown>
-  const ignored = Object.keys(raw).filter((key) => !SCHEMA_KEYS.has(key))
-  if (ignored.length > 0) {
-    console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(', ')}`)
-  }
 
   // Normalize v2 bracketed IPv6 entries BEFORE the schema sees them;
   // non-string entries pass through for the schema to judge (the published
@@ -217,6 +229,14 @@ function parsePayload(payload: string): PairingPayload {
     invalid(`payload rejected by the pairing QR schema (v2 or v3): ${schemaIssuePaths(result.error)}`)
   }
   const qr = result.data
+
+  // Unknown-key warning, judged against the MATCHED arm's keys (see the
+  // V2_KEYS/V3_KEYS docblock): after the parse, so a payload that fails the
+  // schema is never warned-and-then-rejected — its verdict is the rejection.
+  const ignored = Object.keys(raw).filter((key) => !(qr.v === 2 ? V2_KEYS : V3_KEYS).has(key))
+  if (ignored.length > 0) {
+    console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(', ')}`)
+  }
 
   const candidates: PairCandidate[] =
     qr.v === 2
