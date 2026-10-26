@@ -68,6 +68,7 @@ describe('F2-6c: the device whitelist describes the shape sanitizeDevice really 
       subscriptions: 8,
       pageItems: 100,
       inFlightRequests: 8,
+      messageSummaries: 1,
     })
 
     // The whitelist is a statement about what MAY appear. A field the projection

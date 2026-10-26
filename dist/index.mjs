@@ -1887,12 +1887,15 @@ function sanitizeDevice(record, state, limits) {
 		hosts: [...record.hosts],
 		port: record.port,
 		desktopIdentity: digestIdentity(record.desktopIdentity),
-		...limits === void 0 ? {} : { limits: {
-			heartbeatMs: limits.heartbeatMs,
-			subscriptions: limits.subscriptions,
-			pageItems: limits.pageItems,
-			inFlightRequests: limits.inFlightRequests
-		} }
+		...limits === void 0 ? {} : {
+			limits: {
+				heartbeatMs: limits.heartbeatMs,
+				subscriptions: limits.subscriptions,
+				pageItems: limits.pageItems,
+				inFlightRequests: limits.inFlightRequests
+			},
+			...limits.messageSummaries === void 0 ? {} : { messageSummaries: limits.messageSummaries }
+		}
 	};
 }
 /** Narrows an unknown bag to the report's own shapes, dropping everything else. */
@@ -1907,8 +1910,18 @@ function projectDevice(raw) {
 		hosts: Array.isArray(value["hosts"]) ? value["hosts"].map((host) => String(host)) : [],
 		port: typeof value["port"] === "number" ? value["port"] : 0,
 		desktopIdentity: desktopIdentity === "unknown" || /^[0-9a-f]{12}$/.test(desktopIdentity) ? desktopIdentity : digestIdentity(desktopIdentity),
-		...projectLimits(value["limits"])
+		...projectLimits(value["limits"]),
+		...projectMessageSummaries(value["messageSummaries"])
 	};
+}
+/**
+* Re-projects the ONE capability field, dropping anything that is not a finite
+* number: a version this report cannot read is reported as absent (not
+* advertised), which is the safe side — the field only ever amplifies what the
+* peer's hello said.
+*/
+function projectMessageSummaries(raw) {
+	return typeof raw === "number" && Number.isFinite(raw) ? { messageSummaries: raw } : {};
 }
 /**
 * Re-projects the four numeric limit keys, dropping any foreign key that a
@@ -3133,7 +3146,8 @@ var DeviceConnection = class {
 			heartbeatMs: positive$2(hello.heartbeatMs) ?? FALLBACK_LIMITS.heartbeatMs,
 			subscriptions: positive$2(hello.limits?.["subscriptions"]) ?? FALLBACK_LIMITS.subscriptions,
 			pageItems: positive$2(hello.limits?.["pageItems"]) ?? FALLBACK_LIMITS.pageItems,
-			inFlightRequests: positive$2(hello.limits?.["inFlightRequests"]) ?? FALLBACK_LIMITS.inFlightRequests
+			inFlightRequests: positive$2(hello.limits?.["inFlightRequests"]) ?? FALLBACK_LIMITS.inFlightRequests,
+			...typeof hello.agentMessageSummariesVersion === "number" ? { messageSummaries: hello.agentMessageSummariesVersion } : {}
 		};
 		link.client.updateMaxInFlight(businessWindowFor(this.#limits.inFlightRequests));
 		let auth;
@@ -4716,6 +4730,42 @@ const TERMINAL_EXECUTION_STATUSES = [
 ];
 /** The protocol's single-page hard cap, used only as the pre-hello ceiling. */
 const PAGE_ITEMS_FALLBACK = 100;
+/**
+* The page this bridge asks for when the peer's hello advertised
+* `agentMessageSummariesVersion: 1` (issue #105).
+*
+* WHY IT IS NOT {@link LIST_PAGE_CLAMP} (16): that clamp is metadata-BLIND. It
+* exists because `AgentMessage` carries `partIds` — up to 4,096 entries of
+* schema-capped ids each — so a count-only peer can answer a page the 65,536-byte
+* record cannot hold and the transport kills the connection (`defaults.ts`).
+* What `partsMode: 'paged'` returns is `AgentMessageSummary`: identity,
+* revision, role, status and optional usage/model/failure, and NO `partIds`.
+*
+* WHY THE PAGE BOUND IS THE PEER'S, NOT OURS: the ONLY verified advertiser of
+* the capability (desktop 2.1.8) budgets the ACCUMULATED page — `pageOf`
+* prefix-truncates at `PAGE_ITEM_BYTES` = 62,279 bytes and `queryPage` re-asks
+* at a halved limit, so its reply records stay under `recordBytes` = 65,536
+* whatever our `limit` says, answering with a SHORT page + `nextCursor` (the
+* shape our walk already tolerates) instead of a killed link. The single-item
+* `RESOURCE_EXHAUSTED {ITEM_TOO_LARGE, retryable: false}` refusal is the
+* exception arm, and a schema-valid summary row cannot reach it: measured
+* against the 0.7.0 schema, the worst row (ids at 256 units, `model` fields at
+* 2,048 chars each, 32 `costs` entries, `failure` refined to ≤4,096 bytes) is
+* ≈37 KB — under the 62,279 budget, so the refusal exists for full
+* `partIds`-bearing rows, not summaries.
+*
+* 100 is the protocol's own `pageItems` cap, i.e. the ceiling a walk can use at
+* all: `#aggregate` still intersects this with the peer's NEGOTIATED
+* `pageItems`, so a peer advertising less keeps its size. Residual exposure —
+* a hypothetical peer advertising the capability WITHOUT a page budget —
+* contains no verified desktop (≤2.1.7 never advertises and keeps the clamp),
+* the same "pragmatic, not provable" class `defaults.ts` already scopes.
+*
+* The PARTS walk keeps {@link PARTS_LIST_PAGE_CLAMP} unconditionally: nothing
+* in protocol 0.7.0 proves `agent.parts.list` is byte-aware, and a part is the
+* fattest item there is.
+*/
+const MESSAGE_SUMMARIES_PAGE_ITEMS = PAGE_ITEMS_FALLBACK;
 /** The largest MESSAGE aggregate a caller may ask for; the per-page clamp still applies. */
 const MAX_AGGREGATE_LIMIT = 1e3;
 /**
@@ -4804,6 +4854,33 @@ const DEFAULT_PARTS_SAFETY_BOUND = 1e4;
 * returning a partial (or empty) result as though it were complete.
 */
 const MAX_AGGREGATE_PAGES = 1e4;
+/**
+* The `agent.messages.list` request for ONE message walk, and the page size to
+* ask for — the ONE place the paged-summaries dialect is decided (issue #105).
+*
+* THE INVARIANT: `partsMode` is sent ONLY to a peer whose own hello advertised
+* `agentMessageSummariesVersion: 1`. 0.5.0's params schema — what every desktop
+* through 2.1.7 ships — is a STRICT object with no such key, so sending it
+* there is a protocol violation, not a wasted field. Both message-walk faces
+* (`cherry_read` and the terminal/timeout/idle aggregate) come through HERE for
+* the same reason the resume token has one helper: two call sites spelling the
+* dialect would eventually disagree about which peer may hear it.
+*
+* With the capability, the page size is {@link MESSAGE_SUMMARIES_PAGE_ITEMS} —
+* summary rows are metadata, so the byte-safe clamp no longer bounds anything
+* they can carry. Without it, the clamp stays exactly as it was: the
+* count-paged peer still returns `partIds`-bearing rows.
+*/
+function messageListRequest(connection) {
+	if (connection.limits.messageSummaries === 1) return {
+		params: { partsMode: "paged" },
+		maxPerPage: MESSAGE_SUMMARIES_PAGE_ITEMS
+	};
+	return {
+		params: {},
+		maxPerPage: 16
+	};
+}
 /** Token prefix for a peer page position; the one `#aggregate` can send back. */
 const RESUME_CURSOR_PREFIX = "cursor:";
 /** Token prefix for "strictly older than this message id". */
@@ -5140,6 +5217,44 @@ function failureReason(error) {
 	if (!(error instanceof JsonRpcRequestError)) return void 0;
 	const data = error.data;
 	if (isRecord(data) && typeof data["reason"] === "string") return data["reason"];
+}
+/**
+* The phrase this hint leaves behind, so applying it twice reads once.
+*/
+const PEER_REFUSAL_FINAL_MARK = "retrying the same request cannot help";
+/**
+* The recovery advice a PERMANENT peer refusal grows — `RESOURCE_EXHAUSTED`
+* carrying `details.retryable === false`, which is the desktop's per-item byte
+* budget (`PAGE_ITEM_BYTES` = 62,279; `details.kind` is `ITEM_TOO_LARGE` with
+* `itemBytes` / `budgetBytes`), issue #105.
+*
+* WHY THE WARNING HAS TO BE ADDED: the official client marks every
+* `RESOURCE_EXHAUSTED` RETRYABLE and re-asks at the same page size on an
+* exponential backoff, so a byte-budget refusal never converges — and the
+* condition really is permanent: the same item over the same budget will be
+* over it again. A caller (or a model reading the error) that retries learns
+* nothing but spends the peer's rate window.
+*
+* The sentence is deliberately narrower than the reason: only the
+* `retryable === false` shape grows it. Every other `RESOURCE_EXHAUSTED` —
+* the upload window, the subscription cap, a legacy refusal with no `details` —
+* keeps its own text, because some of those ARE worth a later retry.
+*
+* Like {@link withIdempotencyHint} this EXTENDS `message` only: the reason, the
+* structured `data` and the {@link JsonRpcRequestError} identity stay the
+* peer's, so branching callers see exactly what it sent.
+*/
+function withPeerRefusalHint(error) {
+	if (!(error instanceof JsonRpcRequestError)) return error;
+	if (failureReason(error) !== "RESOURCE_EXHAUSTED") return error;
+	const data = error.data;
+	if (!isRecord(data) || !isRecord(data["details"]) || data["details"]["retryable"] !== false) return error;
+	if (error.message.includes(PEER_REFUSAL_FINAL_MARK)) return error;
+	const kind = optionalString(data["details"]["kind"]);
+	const cause = kind === "ITEM_TOO_LARGE" ? "an ITEM_TOO_LARGE page item over its byte budget" : "the same item";
+	const tail = kind === "ITEM_TOO_LARGE" ? "the item ITSELF exceeds the peer’s per-item budget, so no page size or request shape can fetch it (nor the items behind it — upstream #21951)" : "ask for FEWER items per page (a smaller `limit`), which is the only change that can fit the budget";
+	error.message = `${error.message} — the peer marked this refusal permanent (\`details.retryable: false\`: ${cause}); retrying the same request cannot help — ${tail}`;
+	return error;
 }
 /**
 * One `{ref}`'s content could not be TRUSTED: the bytes served do not match the
@@ -5938,7 +6053,7 @@ var CherryToolEngine = class {
 				result = await connection.rpc.request(method, request, deadline === void 0 ? void 0 : { deadline: deadline.instant });
 			} catch (error) {
 				if (deadline !== void 0 && deadlineExhaustion(error)) return this.#truncated(items, "deadline", cursor);
-				throw error;
+				throw withPeerRefusalHint(error);
 			}
 			const extracted = extract(result);
 			if (extracted.notAnArray !== void 0) throw new Error(`${method}: peer answered a page whose \`items\` is not an array (\`items\` is ${extracted.notAnArray}) for ${JSON.stringify(params)}; refusing a silently short result — every page of a paged list must carry an items array`);
@@ -6349,16 +6464,18 @@ var CherryToolEngine = class {
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
 		const historyRevision = session["historyRevision"];
 		if (typeof historyRevision !== "string") throw new Error(`agent.sessions.get returned no historyRevision for session ${sessionId}`);
+		const messageList = messageListRequest(connection);
 		const page = await this.#aggregate(connection, "agent.messages.list", {
 			sessionId,
-			historyRevision
+			historyRevision,
+			...messageList.params
 		}, (result) => ({
 			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
 		}), {
 			limit,
 			safetyBound: MAX_AGGREGATE_LIMIT,
-			maxPerPage: 16,
+			maxPerPage: messageList.maxPerPage,
 			resume: resume === void 0 ? void 0 : resume.kind === "cursor" ? {
 				kind: "cursor",
 				cursor: resume.cursor
@@ -8691,15 +8808,18 @@ var CherryToolEngine = class {
 	async #readTerminalMessages(connection, sessionId, session, deadline) {
 		const historyRevision = optionalString(session["historyRevision"]);
 		if (historyRevision === void 0) return { messages: [] };
+		const messageList = messageListRequest(connection);
 		const page = await this.#aggregate(connection, "agent.messages.list", {
 			sessionId,
-			historyRevision
+			historyRevision,
+			...messageList.params
 		}, (result) => ({
 			...arrayOf(result["items"]),
 			nextCursor: result["nextCursor"]
 		}), {
 			limit: TERMINAL_AGGREGATE_MESSAGES,
-			deadline
+			deadline,
+			maxPerPage: messageList.maxPerPage
 		});
 		const messages = [];
 		let projectedBytes = 0;

@@ -193,6 +193,21 @@ export interface DiagnosticsDevice {
    */
   desktopIdentity: string
   limits?: EffectiveLimits
+  /**
+   * The peer's hello-advertised `agentMessageSummariesVersion` (issue #105) —
+   * the capability bit that decides whether `agent.messages.list` may carry
+   * `partsMode: 'paged'`.
+   *
+   * Its own field, not a fifth key inside `limits`: it is a VERSION, not a
+   * count, and `limits` is documented as the four numeric caps. Present only
+   * when a LIVE connection reported it (the same rule as `limits`: the endpoint
+   * never dials to find out). ABSENT therefore means "not advertised **or** not
+   * connected" — every desktop through 2.1.7, and any device whose link is
+   * down at the moment of the call. One `curl` against
+   * `GET /cherry-remote/api/diagnostics` **while the device is connected**
+   * answers "does this desktop speak paged summaries?" without a packet capture.
+   */
+  messageSummaries?: number
 }
 
 /** One session's LOCAL subscription bookkeeping. */
@@ -500,6 +515,9 @@ export function sanitizeDevice(
             pageItems: limits.pageItems,
             inFlightRequests: limits.inFlightRequests,
           },
+          // Own field, own whitelist entry: a single number copied out of the
+          // hello, never the reply itself.
+          ...(limits.messageSummaries === undefined ? {} : { messageSummaries: limits.messageSummaries }),
         }),
   }
 }
@@ -522,7 +540,18 @@ function projectDevice(raw: unknown): DiagnosticsDevice {
         ? desktopIdentity
         : digestIdentity(desktopIdentity),
     ...projectLimits(value['limits']),
+    ...projectMessageSummaries(value['messageSummaries']),
   }
+}
+
+/**
+ * Re-projects the ONE capability field, dropping anything that is not a finite
+ * number: a version this report cannot read is reported as absent (not
+ * advertised), which is the safe side — the field only ever amplifies what the
+ * peer's hello said.
+ */
+function projectMessageSummaries(raw: unknown): { messageSummaries?: number } {
+  return typeof raw === 'number' && Number.isFinite(raw) ? { messageSummaries: raw } : {}
 }
 
 /**
@@ -843,4 +872,5 @@ export const DIAGNOSTICS_DEVICE_KEYS: readonly string[] = [
   'port',
   'desktopIdentity',
   'limits',
+  'messageSummaries',
 ]
