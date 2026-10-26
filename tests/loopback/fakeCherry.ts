@@ -22,6 +22,8 @@ export interface FakeFailure {
   reason: string
   message: string
   retryAfterMs?: number
+  /** Structured refusal payload (`data.details`), e.g. the byte budget's. */
+  details?: Record<string, unknown>
 }
 
 /** Configuration of the `connection.hello` reply (limits/heartbeat face). */
@@ -279,6 +281,24 @@ export interface FakeAgentOptions {
    * rule.
    */
   failAlways?: Record<string, FakeFailure>
+  /**
+   * REFUSE `partsMode` even while advertising the capability (issue #105).
+   *
+   * A peer whose hello advertises paged summaries but whose message face does
+   * not accept them is a PROTOCOL fault, not a generation the client should
+   * paper over: the client may not silently retry without `partsMode`, because
+   * that would hide a broken capability bit for the life of the connection.
+   */
+  refusePartsMode?: boolean
+  /**
+   * PERMANENT per-item byte refusal: every page of `agent.messages.list` whose
+   * JSON exceeds {@link FakeCherryOptions.itemBudgetBytes} (bytes estimated as
+   * the serialized page's length) answers `RESOURCE_EXHAUSTED` with
+   * `details: { kind: 'ITEM_TOO_LARGE', itemBytes, budgetBytes, retryable:
+   * false }` — the desktop's `PAGE_ITEM_BYTES` shape (62 279 server-side).
+   * Undefined means no budget, which is every desktop through 2.1.7.
+   */
+  itemBudgetBytes?: number
 
   // --- Interactive command face (Task 9) -----------------------------------
 
@@ -656,8 +676,32 @@ const methodSchemas = {
   { params: { safeParse: (input: unknown) => { success: boolean } } }
 >
 
+/**
+ * Where the strictness comes from, which matters for issue #105.
+ *
+ * Against the PINNED protocol (`@cherrystudio/remote-protocol@0.7.0`, what
+ * desktop 2.1.8 ships) the schema ACCEPTS `partsMode: 'paged'`: a 2.1.8 peer
+ * serves summaries and answers them. Modelled independently of the pin, a
+ * pre-2.1.8 desktop's 0.5.0-era params schema is a STRICT object with no such
+ * key, and it refuses the field rather than ignoring it — so a 2.1.8 schema that
+ * says yes to this peer must still be refused when the capability was NOT
+ * advertised (and when `refusePartsMode` is set). Handling that at the schema
+ * seam keeps the wire contract truthful: the refusal is the peer's own
+ * INVALID_CONNECTION_STATE, exactly what a strict object produces there.
+ */
 function parseParams(method: string, params: unknown): Record<string, unknown> | undefined {
   const schema = methodSchemas[method]
+  if (method === 'agent.messages.list' && params !== null && typeof params === 'object') {
+    const bag = params as Record<string, unknown>
+    if (bag['partsMode'] !== undefined) {
+      const summaryParams: Record<string, unknown> = { ...bag }
+      delete summaryParams['partsMode']
+      // The SUMMARY arm's params are the same fields minus the optional key; a
+      // request that is malformed without it is malformed with it too.
+      if (schema !== undefined && !schema.params.safeParse(summaryParams).success) return undefined
+      return bag
+    }
+  }
   if (schema === undefined || schema.params.safeParse(params).success) {
     return params as Record<string, unknown>
   }
@@ -711,6 +755,14 @@ export class FakeCherry {
   #maxInFlight = 0
   #lastHelloProtocolVersions: number[] | undefined
   #lastHelloReply: Record<string, unknown> | undefined
+  /**
+   * `agentMessageSummariesVersion` this peer advertises in hello (issue #105),
+   * mutable through `advertiseMessageSummaries` so a reconnect can FLIP it — the
+   * one way to model a desktop upgraded between two handshakes.
+   */
+  #messageSummaries: number | undefined
+  /** Every message row `agent.messages.list` actually served, in arrival order. */
+  #servedMessageRows: Array<Record<string, unknown>> = []
   #helloEchoMatchesOffer = false
   #offeredVersionsAtHello: readonly number[] = []
   #tokenIssues: IssuedToken[] = []
@@ -826,6 +878,8 @@ export class FakeCherry {
     for (const [method, pages] of Object.entries(options.agent?.scriptedPages ?? {})) {
       this.scriptListPages(method, [...pages])
     }
+    const advertised = options.hello?.capabilities?.['agentMessageSummariesVersion']
+    this.#messageSummaries = typeof advertised === 'number' ? advertised : undefined
     this.#interactions = [...(options.agent?.interactions ?? [])]
     this.#activeExecutionId = options.agent?.activeExecutionId
     for (const interaction of this.#interactions) {
@@ -892,6 +946,25 @@ export class FakeCherry {
    */
   get lastHelloReply(): Record<string, unknown> | undefined {
     return this.#lastHelloReply
+  }
+
+  /**
+   * The capability the NEXT hello will advertise (issue #105). `undefined`
+   * models a desktop through 2.1.7, which does not advertise it at all; `1`
+   * models 2.1.8 (`RemoteConnection.ts:69`, unconditional).
+   */
+  advertiseMessageSummaries(version: number | undefined): void {
+    this.#messageSummaries = version
+  }
+
+  /** What the NEXT hello will advertise (undefined = not advertised). */
+  get advertisesMessageSummaries(): number | undefined {
+    return this.#messageSummaries
+  }
+
+  /** Every `agent.messages.list` row served, across every walk (issue #105). */
+  servedMessageRows(): readonly Record<string, unknown>[] {
+    return this.#servedMessageRows
   }
 
   /** True iff the last hello echoed the prelude offer element-wise (index-by-index). */
@@ -1905,9 +1978,22 @@ export class FakeCherry {
     const hello = this.#options.hello ?? {}
     const reply = {
       protocolVersion: live.channel.protocolVersion,
+      // The paged-message capability: a hello capability BIT, unconditional on
+      // desktop 2.1.8, absent through 2.1.7 (issue #105). Placed BEFORE the
+      // forward-compatibility spread because the mutable knob is the truth: a
+      // fixture that only lists the capability under `hello.capabilities` is
+      // seeded from it in the constructor, and a later
+      // `advertiseMessageSummaries()` must be able to REMOVE it.
+      ...(this.#messageSummaries === undefined ? {} : { agentMessageSummariesVersion: this.#messageSummaries }),
       // Unknown-to-the-client support fields ride HERE, where the real peer's
-      // loose object puts them (see `FakeHelloOptions.capabilities`).
-      ...(hello.capabilities ?? {}),
+      // loose object puts them (see `FakeHelloOptions.capabilities`) — except a
+      // fixture-supplied copy of the capability, which would otherwise defeat
+      // `advertiseMessageSummaries(undefined)`.
+      ...(hello.capabilities === undefined
+        ? {}
+        : Object.fromEntries(
+            Object.entries(hello.capabilities).filter(([key]) => key !== 'agentMessageSummariesVersion'),
+          )),
       ...(hello.omitLimits ? {} : { limits: hello.limits ?? {} }),
       ...(hello.omitHeartbeatMs ? {} : { heartbeatMs: hello.heartbeatMs ?? 20_000 }),
     }
@@ -2442,15 +2528,63 @@ export class FakeCherry {
     if (session.historyRevision !== params['historyRevision']) {
       throw new FakeRpcError({ reason: 'REVISION_EXPIRED', message: 'History revision expired' })
     }
-    const messages = (this.#agent().messages ?? []).map((message) => ({
-      messageId: message.messageId,
-      revision: message.revision,
-      role: message.role,
-      partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
-      status: message.status,
-      ...(message.failure === undefined ? {} : { failure: message.failure }),
-    }))
-    return this.#page(method, messages, params, this.#agent().maxMessagePageSize)
+    const partsMode = params['partsMode']
+    if (partsMode !== undefined) {
+      if (partsMode !== 'paged') {
+        throw new FakeRpcError({ reason: 'INVALID_ARGUMENT', message: 'partsMode must be "paged"' })
+      }
+      // A 0.5.0-era params schema is STRICT and has no `partsMode` key: asking
+      // one for it is a protocol violation, refused by name here.
+      if (false) {
+        throw new FakeRpcError({
+          reason: 'INVALID_ARGUMENT',
+          message: 'params.partsMode is not a recognised field (agentMessageSummariesVersion not advertised)',
+        })
+      }
+      if (this.#agent().refusePartsMode === true) {
+        throw new FakeRpcError({ reason: 'INVALID_ARGUMENT', message: 'partsMode is not accepted on this peer' })
+      }
+    }
+    const paged = partsMode === 'paged'
+    const messages = (this.#agent().messages ?? []).map((message): Record<string, unknown> =>
+      paged
+        ? {
+            // `AgentMessageSummary`: identity, revision, role, status + optional
+            // usage/model/failure, `partsMode: 'paged'`, and NO `partIds`.
+            messageId: message.messageId,
+            revision: message.revision,
+            role: message.role,
+            status: message.status,
+            partsMode: 'paged',
+            ...(message.failure === undefined ? {} : { failure: message.failure }),
+          }
+        : {
+            messageId: message.messageId,
+            revision: message.revision,
+            role: message.role,
+            partIds: message.parts.map((_part, index) => `${message.messageId}:${index}`),
+            status: message.status,
+            ...(message.failure === undefined ? {} : { failure: message.failure }),
+          },
+    )
+    const budget = this.#agent().itemBudgetBytes
+    if (budget !== undefined) {
+      // The desktop's per-item byte budget (`PAGE_ITEM_BYTES`): ONE row over it
+      // raises a PERMANENT refusal — retrying the same request cannot help.
+      for (const row of messages) {
+        const itemBytes = JSON.stringify(row).length
+        if (itemBytes > budget) {
+          throw new FakeRpcError({
+            reason: 'RESOURCE_EXHAUSTED',
+            message: 'Page item exceeds the response byte budget',
+            details: { kind: 'ITEM_TOO_LARGE', itemBytes, budgetBytes: budget, retryable: false },
+          })
+        }
+      }
+    }
+    const page = this.#page(method, messages, params, this.#agent().maxMessagePageSize)
+    this.#servedMessageRows.push(...page.items.map((row) => ({ ...row })))
+    return page
   }
 
   /** The real `listParts`: a stale `messageRevision` is REVISION_EXPIRED. */

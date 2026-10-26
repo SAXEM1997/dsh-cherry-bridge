@@ -36,6 +36,23 @@ export interface EffectiveLimits {
   subscriptions: number
   pageItems: number
   inFlightRequests: number
+  /**
+   * The peer's hello-advertised `agentMessageSummariesVersion` (issue #105),
+   * stored BESIDE the limits because it is re-read by that same handshake.
+   *
+   * ABSENT, never defaulted: through desktop 2.1.7 the field does not exist,
+   * and 0.5.0's `agent.messages.list` params are a STRICT object with no
+   * `partsMode` — sending it to such a peer is a protocol violation, so absence
+   * has to be distinguishable from every number. `1` (2.1.8, where
+   * `RemoteConnection.ts:69` sets it unconditionally) is the only version that
+   * means "the summary arm is available"; any other number is stored verbatim
+   * and read as not-yet-known, because a version this client cannot speak is
+   * not evidence that it speaks 1.
+   *
+   * Re-read on EVERY hello, so a desktop upgraded between two handshakes is
+   * picked up on the reconnect that follows.
+   */
+  messageSummaries?: number
 }
 
 export interface DeviceConnectionOptions {
@@ -544,6 +561,8 @@ interface HelloResult {
   protocolVersion?: number
   limits?: Record<string, number>
   heartbeatMs?: number
+  /** The paged-message-summaries capability (issue #105), when advertised. */
+  agentMessageSummariesVersion?: number
 }
 
 interface AuthResult {
@@ -1207,11 +1226,18 @@ export class DeviceConnection {
       throw error instanceof Error ? error : new Error(String(error))
     }
 
+    // REBUILT, never patched: the object is replaced on every hello, so a
+    // reconnect to a peer that no longer advertises the capability (or a
+    // downgrade) cannot inherit a stale `messageSummaries` from the previous
+    // link — the exact failure mode that would send `partsMode` to a 2.1.7 peer.
     this.#limits = {
       heartbeatMs: positive(hello.heartbeatMs) ?? FALLBACK_LIMITS.heartbeatMs,
       subscriptions: positive(hello.limits?.['subscriptions']) ?? FALLBACK_LIMITS.subscriptions,
       pageItems: positive(hello.limits?.['pageItems']) ?? FALLBACK_LIMITS.pageItems,
       inFlightRequests: positive(hello.limits?.['inFlightRequests']) ?? FALLBACK_LIMITS.inFlightRequests,
+      ...(typeof hello.agentMessageSummariesVersion === 'number'
+        ? { messageSummaries: hello.agentMessageSummariesVersion }
+        : {}),
     }
 
     // Size the admission window from the peer's OWN concurrency budget now that

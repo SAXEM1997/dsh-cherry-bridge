@@ -606,6 +606,38 @@ export interface CherryCreateResult {
 
 /** The protocol's single-page hard cap, used only as the pre-hello ceiling. */
 const PAGE_ITEMS_FALLBACK = 100
+/**
+ * The page this bridge asks for when the peer's hello advertised
+ * `agentMessageSummariesVersion: 1` (issue #105).
+ *
+ * WHY IT IS NOT {@link LIST_PAGE_CLAMP} (16): that clamp is metadata-BLIND. It
+ * exists because `AgentMessage` carries `partIds` — up to 4,096 entries of
+ * schema-capped ids each — so a count-only peer can answer a page the 65,536-byte
+ * record cannot hold and the transport kills the connection (`defaults.ts`).
+ * What `partsMode: 'paged'` returns is `AgentMessageSummary`: identity,
+ * revision, role, status and optional usage/model/failure, and NO `partIds`.
+ * A summary row is metadata-sized — well under 1 KiB even with a 256-character
+ * id pair, a model name, a usage block and a bounded failure summary — so the
+ * old clamp no longer bounds anything the summary arm can answer.
+ *
+ * 100 is the protocol's own `pageItems` cap, i.e. the ceiling a walk can use at
+ * all: `#aggregate` still intersects this with the peer's NEGOTIATED
+ * `pageItems`, so a peer advertising less keeps its size. Why 100 and not
+ * something smaller: the desktop's byte budget (`PAGE_ITEM_BYTES` = 62,279, the
+ * 2.1.8 `[21854]` line) bounds ONE ITEM, not the page, and the page's own
+ * record bound is `remoteLimits.recordBytes` = 65,536 bytes. 100 summary rows at
+ * < 1 KiB each stay under 100 KiB — above ONE record — so the desktop remains
+ * the only party that can decide by BUDGET, and it answers a page it cannot fit
+ * with a `RESOURCE_EXHAUSTED` refusal (`details.retryable: false`) rather than
+ * a killed link. Our own safety net is therefore the clamp intersection with
+ * `pageItems`: a peer that pages smaller is never over-asked, and a peer that
+ * pages by count alone keeps the byte-safe clamp above (the arm below).
+ *
+ * The PARTS walk keeps {@link PARTS_LIST_PAGE_CLAMP} unconditionally: nothing
+ * in protocol 0.7.0 proves `agent.parts.list` is byte-aware, and a part is the
+ * fattest item there is.
+ */
+const MESSAGE_SUMMARIES_PAGE_ITEMS = PAGE_ITEMS_FALLBACK
 /** The largest MESSAGE aggregate a caller may ask for; the per-page clamp still applies. */
 const MAX_AGGREGATE_LIMIT = 1000
 /**
@@ -749,6 +781,33 @@ interface AggregateWalk<T> {
   resume?: AggregateResume<T>
   /** The answer's own time budget (issue #21) — see `AssemblyDeadline`. */
   deadline?: AssemblyDeadline
+}
+
+/**
+ * The `agent.messages.list` request for ONE message walk, and the page size to
+ * ask for — the ONE place the paged-summaries dialect is decided (issue #105).
+ *
+ * THE INVARIANT: `partsMode` is sent ONLY to a peer whose own hello advertised
+ * `agentMessageSummariesVersion: 1`. 0.5.0's params schema — what every desktop
+ * through 2.1.7 ships — is a STRICT object with no such key, so sending it
+ * there is a protocol violation, not a wasted field. Both message-walk faces
+ * (`cherry_read` and the terminal/timeout/idle aggregate) come through HERE for
+ * the same reason the resume token has one helper: two call sites spelling the
+ * dialect would eventually disagree about which peer may hear it.
+ *
+ * With the capability, the page size is {@link MESSAGE_SUMMARIES_PAGE_ITEMS} —
+ * summary rows are metadata, so the byte-safe clamp no longer bounds anything
+ * they can carry. Without it, the clamp stays exactly as it was: the
+ * count-paged peer still returns `partIds`-bearing rows.
+ */
+function messageListRequest(connection: DeviceConnection): {
+  params: Record<string, unknown>
+  maxPerPage: number
+} {
+  if (connection.limits.messageSummaries === 1) {
+    return { params: { partsMode: 'paged' }, maxPerPage: MESSAGE_SUMMARIES_PAGE_ITEMS }
+  }
+  return { params: {}, maxPerPage: LIST_PAGE_CLAMP }
 }
 
 /** Token prefix for a peer page position; the one `#aggregate` can send back. */
@@ -1293,6 +1352,48 @@ function failureReason(error: unknown): string | undefined {
   const data = error.data
   if (isRecord(data) && typeof data['reason'] === 'string') return data['reason']
   return undefined
+}
+
+/**
+ * The phrase this hint leaves behind, so applying it twice reads once.
+ */
+const PEER_REFUSAL_FINAL_MARK = 'retrying the same request cannot help'
+
+/**
+ * The recovery advice a PERMANENT peer refusal grows — `RESOURCE_EXHAUSTED`
+ * carrying `details.retryable === false`, which is the desktop's per-item byte
+ * budget (`PAGE_ITEM_BYTES` = 62,279; `details.kind` is `ITEM_TOO_LARGE` with
+ * `itemBytes` / `budgetBytes`), issue #105.
+ *
+ * WHY THE WARNING HAS TO BE ADDED: the official client marks every
+ * `RESOURCE_EXHAUSTED` RETRYABLE and re-asks at the same page size on an
+ * exponential backoff, so a byte-budget refusal never converges — and the
+ * condition really is permanent: the same item over the same budget will be
+ * over it again. A caller (or a model reading the error) that retries learns
+ * nothing but spends the peer's rate window.
+ *
+ * The sentence is deliberately narrower than the reason: only the
+ * `retryable === false` shape grows it. Every other `RESOURCE_EXHAUSTED` —
+ * the upload window, the subscription cap, a legacy refusal with no `details` —
+ * keeps its own text, because some of those ARE worth a later retry.
+ *
+ * Like {@link withIdempotencyHint} this EXTENDS `message` only: the reason, the
+ * structured `data` and the {@link JsonRpcRequestError} identity stay the
+ * peer's, so branching callers see exactly what it sent.
+ */
+export function withPeerRefusalHint(error: unknown): unknown {
+  if (!(error instanceof JsonRpcRequestError)) return error
+  if (failureReason(error) !== 'RESOURCE_EXHAUSTED') return error
+  const data = error.data
+  if (!isRecord(data) || !isRecord(data['details']) || data['details']['retryable'] !== false) return error
+  if (error.message.includes(PEER_REFUSAL_FINAL_MARK)) return error
+  const kind = optionalString(data['details']['kind'])
+  const cause = kind === 'ITEM_TOO_LARGE' ? 'an ITEM_TOO_LARGE page item over its byte budget' : 'the same item'
+  error.message =
+    `${error.message} — the peer marked this refusal permanent (\`details.retryable: false\`: ${cause}); ` +
+    `retrying the same request cannot help — ask for FEWER items per page (a smaller \`limit\`), which is ` +
+    'the only change that can fit the budget'
+  return error
 }
 
 /**
@@ -2399,7 +2500,12 @@ export class CherryToolEngine {
         if (deadline !== undefined && deadlineExhaustion(error)) {
           return this.#truncated(items, 'deadline', cursor)
         }
-        throw error
+        // A PERMANENT peer refusal (issue #105) grows its advice HERE, at the
+        // one seam every paged walk's refusals pass through, and ONLY the
+        // `details.retryable: false` shape: a walk has no retry of its own to
+        // reason about, and the caller is the party that must change the
+        // request. The error object, its reason and its `data` are unchanged.
+        throw withPeerRefusalHint(error)
       }
       const extracted = extract(result)
       // THE PAGE'S OWN SHAPE (issue #46), judged on EVERY page — terminal or
@@ -3018,15 +3124,18 @@ export class CherryToolEngine {
       throw new Error(`agent.sessions.get returned no historyRevision for session ${sessionId}`)
     }
 
+    // The paged-summaries dialect (issue #105) from the ONE helper both message
+    // faces share: `partsMode` only for a peer whose hello advertised it.
+    const messageList = messageListRequest(connection)
     const page = await this.#aggregate(
       connection,
       'agent.messages.list',
-      { sessionId, historyRevision },
+      { sessionId, historyRevision, ...messageList.params },
       (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
       {
         limit,
         safetyBound: MAX_AGGREGATE_LIMIT,
-        maxPerPage: LIST_PAGE_CLAMP,
+        maxPerPage: messageList.maxPerPage,
         resume:
           resume === undefined
             ? undefined
@@ -6681,12 +6790,14 @@ export class CherryToolEngine {
     const historyRevision = optionalString(session['historyRevision'])
     if (historyRevision === undefined) return { messages: [] }
 
+    // The SAME dialect `cherry_read` sends, from the same helper (issue #105).
+    const messageList = messageListRequest(connection)
     const page = await this.#aggregate(
       connection,
       'agent.messages.list',
-      { sessionId, historyRevision },
+      { sessionId, historyRevision, ...messageList.params },
       (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-      { limit: TERMINAL_AGGREGATE_MESSAGES, deadline },
+      { limit: TERMINAL_AGGREGATE_MESSAGES, deadline, maxPerPage: messageList.maxPerPage },
     )
 
     const messages: CherryReadMessage[] = []
