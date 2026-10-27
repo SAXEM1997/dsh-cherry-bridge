@@ -817,6 +817,11 @@ export class FakeCherry {
    * consumed by the call, not by success (see `refuseAcks`).
    */
   #ackFailure: FakeFailure | undefined
+  /**
+   * When set, EVERY `agent.subscriptions.close` is refused with this failure —
+   * recorded, then failed (see `refuseClose`).
+   */
+  #closeFailure: FakeFailure | undefined
   #closeCalls: Array<{ subscriptionId: string; sessionId: string | undefined }> = []
   /** Per-subscription prepared-lease deadline (ms since epoch). */
   #leaseDeadlines = new Map<string, number>()
@@ -2396,6 +2401,22 @@ export class FakeCherry {
     this.#ackFailure = failure
   }
 
+  /**
+   * Refuses every subsequent `agent.subscriptions.close` with `failure`, or
+   * stops refusing when called with `undefined`.
+   *
+   * Added for issue #161: the close is BEST-EFFORT on the client (a failed
+   * close must not stop the replacement subscription), so its catch is the only
+   * place the refusal is visible, and a long `message` is the only way to prove
+   * that line bounds what it renders. The call is still RECORDED before the
+   * refusal, so the peer's ledger keeps proving the request arrived. Nothing
+   * else about the handler moves: with the failure unset the answer is
+   * byte-identical.
+   */
+  refuseClose(failure: FakeFailure | undefined): void {
+    this.#closeFailure = failure
+  }
+
   /** `agent.subscriptions.ack`: only an ACTIVE subscription, within the window. */
   #handleAck(params: Record<string, unknown>): Record<string, unknown> {
     const subscriptionId = params['subscriptionId'] as string
@@ -2426,6 +2447,8 @@ export class FakeCherry {
     const subscriptionId = params['subscriptionId'] as string
     const subscription = this.#subscriptions.get(subscriptionId)
     this.#closeCalls.push({ subscriptionId, sessionId: subscription?.sessionId })
+    const injected = this.#closeFailure
+    if (injected !== undefined) throw new FakeRpcError(injected)
     if (subscription !== undefined) {
       subscription.phase = 'reset'
       this.#subscriptionPhases.push('reset')

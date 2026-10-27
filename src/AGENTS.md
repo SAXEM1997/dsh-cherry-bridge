@@ -780,6 +780,18 @@ clipped where it is RENDERED**: `clipText` (one detail, `… (+N chars)`) or
 `deviceId` is exempt, and `bounded()` is the frame-drop path's older
 count-less form.
 
+**A CAUGHT failure renders as ONE bounded string** — `failureText` (the message,
+`LOG_TEXT_MAX`) — in every catch that PEER traffic reaches: the notification
+router, a background re-ensure, an ack, a best-effort close, the connect
+rejection. Never hand the error OBJECT to `console.*`: it prints the name, the
+message and the whole stack (own properties too, once a devtools inspect
+expands it), so peer text arrives unbounded. A purely LOCAL catch keeps the
+object print on purpose — no peer text can reach it and the stack is the useful
+part: an fs quarantine, the host registry, our own listener/settle fan-out, a
+REST route's synchronous construction. `failureText` cannot throw, because it
+runs inside those catches. A TOOL RESULT is deliberately NOT bounded: it is the
+model's signal, and the peer is the user's own Noise-authenticated desktop.
+
 ### Trust fence
 
 Every `/cherry-remote/api` route re-checks same-origin before acting, in order:

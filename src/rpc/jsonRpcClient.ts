@@ -5,7 +5,7 @@ import {
   remoteFailureSchema,
 } from '@cherrystudio/remote-protocol'
 import type { SecureChannel } from '@cherrystudio/remote-transport'
-import { clipText, LOG_TEXT_MAX } from '../text.js'
+import { failureText } from '../text.js'
 
 /** Default cap on business requests in flight on a single connection. */
 const DEFAULT_MAX_IN_FLIGHT = 8
@@ -559,22 +559,23 @@ export class JsonRpcClient {
         try {
           handler(method, params)
         } catch (error) {
-          // BOUNDED, and ONE STRING (issue #155). The old form passed the error
-          // OBJECT as a second argument, so the console chose the rendering:
-          // the stack plus every own property, with nothing bounding it. A
-          // handler failure is not a payload, so the line carries what an
-          // operator needs and nothing else — the METHOD and the MESSAGE under
+          // BOUNDED, and ONE STRING (issue #155; rendered by the shared
+          // `failureText`, issue #161). The old form passed the error OBJECT as
+          // a second argument, so the console chose the rendering: the stack
+          // plus every own property, with nothing bounding it. A handler
+          // failure is not a payload, so the line carries what an operator
+          // needs and nothing else — the METHOD and the MESSAGE under
           // LOG_TEXT_MAX. The method is already bounded twice over, without
           // clipText: the notification schema caps `method` at 128 characters
-          // and `bounded()` (the frame-drop path's older, count-less form, left
-          // as it is — unifying the two is a separate ticket) clips to 120 + an
+          // and `bounded()` (the frame-drop path's older, count-less form,
+          // deliberately kept: folding it into clipText would change its bare
+          // `…` marker and the caller's asserted text) clips to 120 + an
           // ellipsis.
           // Ceiling: `[cherry-remote] notification handler for "` (42) +
           // bounded method (≤ 121: FRAME_FIELD_LIMIT 120 + the ellipsis) +
           // `" threw: ` (9) + LOG_TEXT_MAX (240) = 412.
           console.warn(
-            `[cherry-remote] notification handler for "${bounded(method)}" threw: ` +
-              clipText(error instanceof Error ? error.message : String(error), LOG_TEXT_MAX),
+            `[cherry-remote] notification handler for "${bounded(method)}" threw: ${failureText(error)}`,
           )
         }
       }

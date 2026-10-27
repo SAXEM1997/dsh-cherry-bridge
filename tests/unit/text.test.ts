@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { boundedJoin, clipText } from '../../src/text.js'
+import { boundedJoin, clipText, failureText, LOG_TEXT_MAX } from '../../src/text.js'
 
 /**
  * The ONE bounded-rendering helper (issue #155). Every face that interpolates
@@ -117,5 +117,67 @@ describe('boundedJoin', () => {
     // the named text never has to absorb its length.
     const text = boundedJoin(items, { max: 10, itemMax: 8 })
     expect(text.slice(0, -' (+3 more)'.length).length).toBeLessThanOrEqual(10)
+  })
+})
+
+/**
+ * The ONE renderer for a caught failure in a PEER-TRIGGERED catch (issue #161).
+ * This does NOT pass the error to the console: it is a pure string transform,
+ * so its shape is pinned here for every converted call site.
+ */
+describe('failureText', () => {
+  it('renders an Error as its message under LOG_TEXT_MAX', () => {
+    const message = 'x'.repeat(1_000)
+    const rendered = failureText(new Error(message))
+    // The MESSAGE is the half an operator needs; the class name and the stack
+    // are exactly what the old object print added unboundedly.
+    expect(rendered).toBe(clipText(message, LOG_TEXT_MAX))
+    expect(rendered.length).toBe(LOG_TEXT_MAX)
+    expect(rendered).toMatch(/… \(\+\d+ chars\)$/)
+    expect(rendered).not.toContain('Error')
+  })
+
+  it('passes a short message through byte for byte, with no marker', () => {
+    // A marker on an untouched message would read as a truncation that never
+    // happened, and an operator learns to ignore it.
+    expect(failureText(new Error('boom'))).toBe('boom')
+    expect(failureText(new Error(''))).toBe('')
+  })
+
+  it('stringifies a non-Error with String(), not the console representation', () => {
+    expect(failureText('plain text')).toBe('plain text')
+    expect(failureText(7)).toBe('7')
+    expect(failureText(undefined)).toBe('undefined')
+    // A plain object becomes `[object Object]`, where the console (`util.inspect`)
+    // would show its fields. That is deliberate: the VALUE cannot carry a stack
+    // or own properties any more, and a peer failure is an Error in practice.
+    expect(failureText({ message: 'not an error' })).toBe('[object Object]')
+  })
+
+  it('is TOTAL: a hostile toString or message getter cannot escape the catch', () => {
+    const hostileValue = {
+      toString() {
+        throw new Error('toString exploded')
+      },
+    }
+    // It runs INSIDE catch blocks; a throw here would escape the catch and, at
+    // the notification router, the frame-dispatch loop. The fixed token admits
+    // the loss instead.
+    expect(failureText(hostileValue)).toBe('<unrenderable failure>')
+
+    const hostileMessage = new Error('placeholder')
+    Object.defineProperty(hostileMessage, 'message', {
+      configurable: true,
+      get() {
+        throw new Error('message getter exploded')
+      },
+    })
+    expect(failureText(hostileMessage)).toBe('<unrenderable failure>')
+  })
+
+  it('bounds a non-Error WHOLE string too, not just an Error message', () => {
+    const rendered = failureText('y'.repeat(900))
+    expect(rendered.length).toBe(LOG_TEXT_MAX)
+    expect(rendered).toMatch(/… \(\+\d+ chars\)$/)
   })
 })

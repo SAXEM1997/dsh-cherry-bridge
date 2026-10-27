@@ -1863,6 +1863,9 @@ export class DeviceConnection {
       try {
         cb(next)
       } catch (error) {
+        // LOCAL observer fan-out (our own listeners), so no peer text can reach
+        // this error: the object print keeps the stack, which is the useful
+        // part here (issue #161's boundary).
         console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}`, error)
       }
     }
@@ -1870,6 +1873,8 @@ export class DeviceConnection {
       try {
         cb(next)
       } catch (error) {
+        // LOCAL: `waitForSettled`'s internal closure, no peer text — the object
+        // print (and its stack) is deliberate (issue #161's boundary).
         console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}`, error)
       }
     }

@@ -784,6 +784,8 @@ export class DeviceStore {
       // `list`/`resolve` keep working (RF4's spirit — a corrupt archive never
       // takes the plugin down), but nothing may write over the evidence.
       this.#quarantine = error.withCorruptPath(quarantine(error.file))
+      // LOCAL fs/parse cause, never peer text (issue #161 audit): the object
+      // print keeps the cause's stack, which is the useful part here.
       console.warn(
         `device archive ${this.#file} is unreadable and was quarantined; serving an empty ` +
           `read-only archive and refusing all writes until the bad file is moved aside:`,

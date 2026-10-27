@@ -8,6 +8,7 @@ import { DeviceConnection } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
+import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
@@ -36,6 +37,13 @@ interface Rig {
   /** The subscription layer behind the tools, for buffer-level waits. */
   subs(): SessionSubscriptions
   call(name: string, args?: Record<string, unknown>): Promise<unknown>
+  /**
+   * Test seam for the background re-ensure's ACCESSOR arm (issue #161): let the
+   * next `accesses` calls through, then make the following one throw. The tool
+   * face resolves its layer through this accessor, so the counting is the only
+   * way to aim a fault at the re-ensure rather than at the tool call itself.
+   */
+  failSubsAfter(accesses: number, error: unknown): void
   stop(): Promise<void>
 }
 
@@ -106,7 +114,17 @@ async function makeRig(options: FakeCherryOptions = {}): Promise<Rig> {
     rateBudgetPerSecond: 10_000,
   })
   const subscriptions = new Map<string, SessionSubscriptions>()
+  let subsFault: { remaining: number; error: unknown } | undefined
   const subs = (deviceId: string): SessionSubscriptions => {
+    if (subsFault !== undefined) {
+      if (subsFault.remaining > 0) {
+        subsFault.remaining -= 1
+      } else {
+        const { error } = subsFault
+        subsFault = undefined
+        throw error
+      }
+    }
     const existing = subscriptions.get(deviceId)
     if (existing !== undefined) return existing
     const created = new SessionSubscriptions(connection.rpc, {
@@ -150,6 +168,9 @@ async function makeRig(options: FakeCherryOptions = {}): Promise<Rig> {
       const found = definitions.find((definition) => definition.name === name)
       if (found === undefined) throw new Error(`tool ${name} is not registered`)
       return found.execute(args)
+    },
+    failSubsAfter: (accesses, error) => {
+      subsFault = { remaining: accesses, error }
     },
     stop: async () => {
       for (const created of subscriptions.values()) await created.dispose()
@@ -286,5 +307,117 @@ describe('issue #2: a baseline cursor handed out by the tools is servable by che
     })) as { error?: string; windowStart?: { seq: string } }
     expect(result.error).toBe('cursor-out-of-window')
     expect(result.windowStart?.seq).toBe('0')
+  })
+})
+
+/**
+ * The three failure warps of the ack/re-ensure path (issue #161), driven
+ * through the REAL tool registration against a real loopback peer. Each used to
+ * hand the error OBJECT to `console.warn`, so the console chose the rendering;
+ * each must now be ONE bounded string, and the peer's own ledger must still show
+ * the WORK (a logged line is not evidence that a recovery was attempted).
+ */
+describe('log text is bounded: ack and background re-ensure (issue #161)', () => {
+  /** The shared shape every converted line must satisfy. */
+  function oneBoundedLine(prefix: string, longText: string): string {
+    const call = vi
+      .mocked(console.warn)
+      .mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
+    expect(call, `the warning "${prefix}" must be logged`).toBeDefined()
+    // ONE STRING: a second argument is what let the console render the object.
+    expect(call!).toHaveLength(1)
+    const line = String(call![0])
+    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX)
+    expect(line).toMatch(/… \(\+\d+ chars\)$/)
+    const detail = line.slice(prefix.length)
+    const kept = detail.indexOf('…')
+    expect(kept).toBeGreaterThan(0)
+    expect(kept + detail.slice(kept).length).toBe(LOG_TEXT_MAX)
+    expect(detail).toBe(longText.slice(0, kept) + `… (+${longText.length - kept} chars)`)
+    expect(line).not.toContain(longText)
+    return line
+  }
+
+  it('⑱a renders the failed ACK as ONE bounded string, then re-ensures in the background', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: SESSION.sessionId })
+    const subscribesBefore = rig.fake.subscribeCalls.length
+    const longMessage = 'a'.repeat(512)
+    // The cursor the tool will ACK: no event arrives between this read and the
+    // call, so this is also the `nextCursor` the tool reports and acks.
+    const baseline = rig.subs().read(SESSION.sessionId)
+    if (!('events' in baseline)) throw new Error('expected events')
+    rig.fake.refuseAcks({ reason: 'CONFLICT', message: longMessage })
+    vi.mocked(console.warn).mockClear()
+
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: SESSION.sessionId })
+
+    // WORK PIN: the failed ack must actually drive a background re-ensure, or
+    // the log line would be describing a recovery that never ran.
+    await waitFor(
+      () => rig.fake.subscribeCalls.length > subscribesBefore,
+      3_000,
+      'the background re-subscribe the failed ack triggers',
+    )
+    expect(rig.fake.subscribeCalls.at(-1)!.sessionId).toBe(SESSION.sessionId)
+    oneBoundedLine(
+      `[cherry-remote] acknowledging session ${SESSION.sessionId} at ${baseline.nextCursor.seq} failed: `,
+      longMessage,
+    )
+  })
+
+  it('⑱b renders the background RE-ENSURE failure as ONE bounded string', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: SESSION.sessionId })
+    // The PEER refuses the replacement subscription. Its message is
+    // `Subscribe refused (<reason>)`, so a 300-char reason puts the line far
+    // above LOG_TEXT_MAX while the failure stays a peer JSON-RPC error.
+    const longReason = 'e'.repeat(300)
+    rig.fake.refuseAcks({ reason: 'CONFLICT', message: 'ack refused by the peer' })
+    rig.fake.refuseSubscriptions(longReason)
+    vi.mocked(console.warn).mockClear()
+
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: SESSION.sessionId })
+
+    const prefix = `[cherry-remote] re-ensuring session ${SESSION.sessionId} of dev-A failed: `
+    await vi.waitFor(
+      () => {
+        expect(
+          vi.mocked(console.warn).mock.calls.some((entry) => String(entry[0]).startsWith(prefix)),
+        ).toBe(true)
+      },
+      3_000,
+    )
+    // The peer's ledger shows the refused attempt: the recovery ran and its
+    // failure was logged, not invented by the log line.
+    expect(
+      rig.fake.subscribeCalls.some(
+        (call) => call.sessionId === SESSION.sessionId && call.mode === 'error',
+      ),
+    ).toBe(true)
+    oneBoundedLine(prefix, `Subscribe refused (${longReason})`)
+  })
+
+  it('⑱c renders a throwing subs ACCESSOR in the re-ensure as ONE bounded string', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: SESSION.sessionId })
+    const subscribesBefore = rig.fake.subscribeCalls.length
+    rig.fake.refuseAcks({ reason: 'CONFLICT', message: 'ack refused by the peer' })
+    // `cherry_events` resolves the layer TWICE before the ack (the tool's own
+    // read and `#ensureSubscription`); the THIRD access is the background
+    // re-ensure. The accessor's throw is LOCAL (no device / unloaded identity),
+    // and this is the only way to drive that defensive arm.
+    const longMessage = 'z'.repeat(3_000)
+    rig.failSubsAfter(2, new Error(longMessage))
+    vi.mocked(console.warn).mockClear()
+
+    await rig.call('cherry_events', { device: 'dev-A', sessionId: SESSION.sessionId })
+
+    const prefix = `[cherry-remote] could not re-ensure session ${SESSION.sessionId} of dev-A: `
+    oneBoundedLine(prefix, longMessage)
+    // The accessor threw BEFORE `ensure` was reached, so the peer must NOT have
+    // seen a re-subscribe attempt — that is what makes this arm its own branch
+    // rather than a duplicate of ⑱b.
+    expect(rig.fake.subscribeCalls.length).toBe(subscribesBefore)
   })
 })

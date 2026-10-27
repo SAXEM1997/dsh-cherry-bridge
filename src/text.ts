@@ -18,6 +18,18 @@
  * until a log line or a verdict makes it text), name the amount removed with
  * the `… (+N chars)` marker, and never drop a list ENTRY silently (the
  * `(+K more)` count is explicit).
+ *
+ * Issue #161 swept the SAME SHAPE at the sites #155 did not name — a catch
+ * handing an error OBJECT to `console.warn`'s second argument — on the paths
+ * PEER traffic reaches. One renderer states the answer there, {@link
+ * failureText}: the message alone, bounded. A purely LOCAL catch keeps the
+ * object print, deliberately: its stack is the useful part and no peer text
+ * can reach it (fs quarantine, the host registry, our own listener / settle
+ * fan-out, a REST route's synchronous construction). The two earlier forms it
+ * did NOT absorb — `truncateErrorMessage` (the diagnostics digest) and
+ * `bounded()` (the frame-drop path) — are left alone: each emits a different
+ * marker (`…[truncated]`, a bare `…`) that callers and docs depend on, so
+ * folding would change output rather than converge on the rule.
  */
 
 /**
@@ -98,18 +110,49 @@ export function boundedJoin(
  * `pairing hello failed` label — 20 characters — plus its `': '`) and often
  * less. Same number, different quantity: this one is the detail alone.
  *
- * Call sites (all render peer-controlled text through {@link clipText} with
- * this value):
+ * Call sites. Two shapes are rendered with it:
  *
- *  - `src/connection.ts` — the protocol-version console.error (the cause is the
- *    peer's own hello-echo text) and the transient-failure console.warn (the
- *    transport's own message).
- *  - `src/rpc/jsonRpcClient.ts` — the notification-handler console.warn: the
- *    thrown error's message, never the error object (console would print its
- *    stack and every own property).
+ *  - peer-controlled DETAIL through {@link clipText}: `src/connection.ts`'s
+ *    protocol-version console.error (the cause is the peer's own hello-echo
+ *    text) and transient-failure console.warn (the transport's own message).
+ *  - a caught FAILURE through {@link failureText} (issue #161), on the catches
+ *    peer traffic reaches: `src/index.ts`'s notification routing and
+ *    subscription recovery, `src/tools.ts`'s ack and both background re-ensure
+ *    arms plus its `#assemblyFailed` log line, `src/subscriptions.ts`'s
+ *    subscription-close catch, `src/httpApi.ts`'s `warnConnect` rejection, and
+ *    the JSON-RPC notification-handler catch in `src/rpc/jsonRpcClient.ts`
+ *    (#155). None of them passes the error object.
  *
  * Other bounded faces state their own value beside the line they bound
  * (`UNKNOWN_FIELDS_MAX` / `RECOVERY_SESSIONS_MAX`), because what they bound is
  * a rendered LIST or a joined field, not one detail.
  */
 export const LOG_TEXT_MAX = 240
+
+/**
+ * Renders ONE caught failure for a log line: the message alone, clipped to
+ * {@link LOG_TEXT_MAX}.
+ *
+ * This is the ONE form a caught failure takes in a PEER-TRIGGERED catch (issue
+ * #161): a catch reached from peer traffic or a peer-triggered callback. The
+ * old shape — `console.warn(prefix, error)` — handed the console the OBJECT.
+ * On Node the console prints the error's name, message and stack (own
+ * properties only when inspected), so the peer-controlled message and the
+ * stack were both unbounded; for a defensive catch the stack is the noise.
+ *
+ * A caught failure from a purely LOCAL path (an fs copy, the host registry, our
+ * own observers) keeps the object print: its stack is the useful part and no
+ * peer text can reach it.
+ *
+ * TOTAL by construction: it runs INSIDE catch blocks, so a captured value whose
+ * `toString` (or an Error subclass whose `message` getter) throws must not
+ * escape the catch. The extraction is guarded and falls back to the fixed token
+ * `<unrenderable failure>`.
+ */
+export function failureText(error: unknown): string {
+  try {
+    return clipText(error instanceof Error ? error.message : String(error), LOG_TEXT_MAX)
+  } catch {
+    return '<unrenderable failure>'
+  }
+}
