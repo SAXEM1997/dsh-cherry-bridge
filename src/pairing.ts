@@ -276,6 +276,11 @@ function parsePayload(payload: string): PairingPayload {
       invalid(`payload endpoint "${candidate.host}": port must be an integer in 1..65535`)
     }
     if (seenHosts.has(candidate.host)) {
+      // One host, one port: `DeviceRecord` v4 stores `ports` per host, so a
+      // same-host/two-port invitation cannot be represented — refuse it by
+      // name instead of silently keeping one port. (The desktop's v2 builder
+      // publishes one shared port per address; a v3 builder emitting one host
+      // twice was not observed upstream, so this refusal is ours.)
       invalid(`payload endpoints must not repeat host "${candidate.host}"`)
     }
     seenHosts.add(candidate.host)
