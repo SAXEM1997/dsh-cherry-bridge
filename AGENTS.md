@@ -30,12 +30,11 @@ are process records, and they stay in `docs/superpowers/**` (not published).
   break the implementation deliberately (invert the branch, delete the guard,
   return the old value) and confirm the test turns red. A test that passes
   against both the old and new code is not a test.
-- **Sub-task test strategy.** While working, run only the fast subset —
-  `npx vitest run tests/<area>/<file>.test.ts` plus `npm run typecheck` when
-  types moved. The **full** suite (`npm test`, contract tests
-  included) is run **once by the integrator before merge**, not per iteration.
-  `tests/unit/artifactFreshness.test.ts` is the exception: it matters when
-  source comments or build config changed, and is cheap enough to run then.
+- **Sub-task test strategy.** While working, run only `npx vitest run
+  tests/<area>/<file>.test.ts` plus `npm run typecheck` when types moved; the
+  **full** suite (`npm test`) runs **once, by the integrator before merge**.
+  `artifactFreshness` is the exception: it matters when source comments or
+  build config changed.
 - **No source change without its artifact.** `src/`/`ui/` edits and their
   rebuilt `dist/`/`lib/` go in the **same commit** (see [Build facts](#build-facts)).
 - **Scope discipline.** Change what the issue names. Adjacent discoveries go
@@ -124,10 +123,10 @@ their keys (there is a contract assertion for exactly that).
   transport's own dependency — contract-asserted) exists for ONE thing: the pin
   decode in Pairing.
 - **TypeScript is pinned `~7.0.2`** (patch digit only). Accepted risk:
-  tsdown's dts output rides TS 7's experimental declaration API, which may move
-  across minors; the patch-only range means it cannot move silently. An upgrade
-  is an explicit `package.json` edit plus `npm run build` plus the full suite —
-  a bad one shows in the byte gate immediately, not downstream.
+  tsdown's dts output rides TS 7's experimental declaration API, which may
+  move across minors; the patch-only range means it cannot move silently. An
+  upgrade is an explicit edit plus a build plus the full suite; a bad one
+  shows in the byte gate at once.
 
 ## Protocol basis
 
@@ -772,8 +771,8 @@ Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
 `<label>: <detail>` (marker `… (+N chars)` included), so 32 candidates join to
 ≤ 7,742 characters.
 The progress line is bounded (first host always, 160 chars of host names,
-`(+K more)`); a stage-failure verdict is ONE error, not a join, bounded only by
-the record cap.
+`(+K more)`); a stage-failure verdict is ONE error, not a join, capped at
+`FAILURE_SEGMENT_MAX`.
 
 ### Device selector
 
@@ -884,16 +883,20 @@ the error message).
 
 ### Logging: levels, identifiers, and what never appears
 
-Level convention: **error** = connection failure / authentication failure /
-protocol errors; **warn** = reconnect backoff / cache eviction / subscription
-LRU eviction; **info** = pairing progress / subscription establish & recovery /
-device-state transitions. Info logs the **stage name and identifiers only**
-(`deviceId`, `sessionId`, pairing stage) — never payloads. Sensitive fields
-(tokens, `invitationSecret`, `accessToken`, message and part text) **never
-enter any log**; `deviceId`, the `desktopIdentity` digest and `sessionId` may.
-The contract suite holds both sides over a full pair → connect → send →
-interact flow, asserting sentinel message/reply strings never reach a console
-channel (`contract.test.ts`, “leaks no secret to the log”).
+Levels: **error** = connection / authentication / protocol failure; **warn** =
+reconnect backoff / cache eviction / subscription LRU eviction; **info** =
+pairing progress / subscription establish & recovery / device-state
+transitions. Info logs the **stage name and identifiers only** (`deviceId`,
+`sessionId`, pairing stage) — never payloads. Sensitive fields (tokens,
+`invitationSecret`, `accessToken`, message and part text) **never enter any
+log**; `deviceId`, the `desktopIdentity` digest and `sessionId` may. A
+contract test drives pair → connect → send → interact and asserts sentinel
+strings never reach a console channel (`contract.test.ts` — “leaks no secret
+to the log”). **Peer-controlled text in a log line or a pairing verdict is
+clipped where it is RENDERED**: `clipText` (one detail, `… (+N chars)`) or
+`boundedJoin` (a list, `(+K more)`) in `src/text.ts`, per-site ceilings;
+`deviceId` is exempt, and `bounded()` is the frame-drop path's older
+count-less form.
 
 ### Trust fence
 
@@ -1010,18 +1013,8 @@ loopback fake peer, not a shipped artifact.
 
 ## Agent skills
 
-### Issue tracker
-
-Issues live in this repo's GitHub Issues, via the `gh` CLI (`origin` is a GitLab
-mirror; issues are on GitHub only). See `docs/agents/issue-tracker.md`.
-
-### Triage labels
-
-The five canonical triage labels, unchanged from the defaults (`needs-triage`,
-`needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See
-`docs/agents/triage-labels.md`.
-
-### Domain docs
-
-single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root, both
-created lazily. See `docs/agents/domain.md`.
+Issue tracker: GitHub Issues via the `gh` CLI (`origin` is a GitLab mirror;
+issues are on GitHub only). Triage labels: the five canonical defaults
+(`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`,
+`wontfix`). Domain docs: single-context — one `GLOSSARY.md` and one `docs/adr/`
+at the repo root, both created lazily. Each has a file in `docs/agents/`.
