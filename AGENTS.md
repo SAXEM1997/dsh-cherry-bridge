@@ -59,9 +59,14 @@ what loads it.
   into a new issue, not into the diff. A doc-only change touches only docs.
 - **Review tier follows weight.** A code change of substance gets INDEPENDENT
   reviewers (two axes, read-only, evidence and coverage boundaries); a small
-  fix (a number, a comment, a renumbering) and a docs-only change are reviewed
-  by the integrator itself. The tier decides WHO looks, never WHAT is checked:
-  the same evidence and mutation standard applies at every tier.
+  fix (a number, a comment, a renumbering), a docs-only change, and the RELEASE
+  commit itself (the version bump, the README pins and the changelog section)
+  are reviewed by the integrator. At that tier the release notes are still
+  checked claim by claim against the code and the history — every constant,
+  every quoted string, every issue/PR number — because the changelog section
+  ships verbatim as the GitHub release body. The tier decides WHO looks, never
+  WHAT is checked: the same evidence and mutation standard applies at every
+  tier.
 - **The READMEs are a pair.** `README.md` (简体中文) and `README.en.md` (English)
   are expected to say the same thing; an edit to one is an edit to both.
 - **Every AGENTS.md lives under a byte budget.** The workspace-instruction
