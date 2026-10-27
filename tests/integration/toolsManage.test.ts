@@ -777,9 +777,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
    * rendering — stack plus every own property, unbounded.
    */
   function expectBoundedWarn(prefix: string, longText: string): string {
-    const call = vi
-      .mocked(console.warn)
-      .mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
+    const call = consoleWarn.mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
     expect(call, `the warning "${prefix}" must be logged`).toBeDefined()
     expect(call!).toHaveLength(1)
     const line = String(call![0])
@@ -1662,13 +1660,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         throw new Error(longMessage)
       })
     try {
-      const warn = vi.mocked(console.warn)
-      warn.mockClear()
+      consoleWarn.mockClear()
       fakeInfo.fake.pushNotification('agent.totallyUnknown', { whatever: true })
       const prefix = '[cherry-remote] notification "agent.totallyUnknown" for dev-A failed: '
       await vi.waitFor(
         () => {
-          expect(warn.mock.calls.some((entry) => String(entry[0]).startsWith(prefix))).toBe(true)
+          expect(consoleWarn.mock.calls.some((entry) => String(entry[0]).startsWith(prefix))).toBe(true)
         },
         5_000,
       )
@@ -1707,14 +1704,14 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     // above LOG_TEXT_MAX while the failure stays a JSON-RPC error.
     const longReason = 's'.repeat(300)
     fakeInfo.fake.refuseSubscriptions(longReason)
-    vi.mocked(console.warn).mockClear()
+    consoleWarn.mockClear()
     expect(fakeInfo.fake.dropConnections()).toBe(1)
 
     const prefix = `[cherry-remote] re-subscribing session ${session.sessionId} of dev-A failed: `
     await vi.waitFor(
       () => {
         expect(
-          vi.mocked(console.warn).mock.calls.some((entry) => String(entry[0]).startsWith(prefix)),
+          consoleWarn.mock.calls.some((entry) => String(entry[0]).startsWith(prefix)),
         ).toBe(true)
       },
       20_000,

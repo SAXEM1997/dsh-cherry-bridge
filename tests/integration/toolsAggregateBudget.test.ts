@@ -738,8 +738,9 @@ describe('issue #3 T3: a failed content assembly degrades to a stub receipt inst
       .mocked(console.warn)
       .mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
     expect(call, 'the assembly failure must be logged').toBeDefined()
-    // ONE STRING, with the peer's text clipped inside it. Before #161, the raw
-    // 512-char message made this line ~600 characters.
+    // ONE STRING, with the peer's text clipped inside it. Before #161 the raw
+    // 512-char message made this line 654 characters for this fixture: an
+    // 83-character fixed prefix + 512 + a 59-character suffix.
     expect(call!).toHaveLength(1)
     const line = String(call![0])
     expect(line.endsWith(suffix)).toBe(true)

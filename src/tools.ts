@@ -1873,11 +1873,14 @@ export function registerCherryToolsWithEngine(
 /**
  * One tool declaration, in the exact shape the host registry consumes.
  *
- * DELIBERATELY no result wrapper and no bound on result text (issue #161): a
- * tool result is the MODEL's signal, and the peer is the user's own
- * Noise-authenticated desktop, so shortening the peer's explanation costs the
- * caller the text it acts on. The decision is the opposite of the LOG face,
- * where boundedness is required (`failureText` / `clipText` in `src/text.ts`):
+ * This helper adds no result WRAPPER and this ticket adds no result-side
+ * truncation (issue #161): a tool result is the MODEL's signal, and the peer is
+ * the user's own Noise-authenticated desktop, so shortening the peer's
+ * explanation costs the caller the text it acts on. The two result-text clamps
+ * that DO exist are per-field product choices, not a log rule — `aggregateError`
+ * (`message.slice(0, 200)` in `#assemblyFailed`) and `truncateErrorMessage`'s
+ * 200-character diagnostics digest used by `projectMessageFailure`. The LOG
+ * face is where boundedness is required (`failureText` / `clipText` in `src/text.ts`);
  * this ticket's sweep does not change tool output.
  */
 function defineCherryTool(definition: {
@@ -6725,9 +6728,10 @@ export class CherryToolEngine {
    * string through {@link failureText} (issue #161). An assembly failure is
    * usually a peer RPC refusal — its `error.message` is the peer's own text,
    * capped at 512 characters by the failure schema — and the old line
-   * interpolated it whole, so one refusal could become a ~640-character log
-   * line. The RESULT keeps the raw message's first 200 characters; a bound on
-   * the log does not change what the model receives.
+   * interpolated it whole: one 512-char refusal made a 654-character line for
+   * the `timeout` / `s-1` fixture (83 fixed prefix + 512 + 59 suffix). The
+   * RESULT keeps the raw message's first 200 characters; a bound on the log
+   * does not change what the model receives.
    */
   #assemblyFailed(identity: Record<string, unknown>, error: unknown): Record<string, unknown> {
     const message = error instanceof Error ? error.message : String(error)

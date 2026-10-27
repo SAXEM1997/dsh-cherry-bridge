@@ -1239,9 +1239,9 @@ describe('⑤ disable/enable flow', () => {
   })
 
   /**
-   * Bounded log text for the two re-enable failure arms (issue #161). The old
-   * form passed the error OBJECT as `console.warn`'s second argument, so the
-   * console chose the rendering: the stack plus every own property, unbounded.
+   * Bounded log text for the re-enable lifecycle rejection (issue #161). The
+   * old form passed the error OBJECT as `console.warn`'s second argument, so
+   * the console chose the rendering: the name, message and stack, unbounded.
    */
   function boundedWarnCall(prefix: string, longMessage: string) {
     const warn = vi.mocked(console.warn)
@@ -1261,33 +1261,11 @@ describe('⑤ disable/enable flow', () => {
     return line
   }
 
-  it('⑤c renders a SYNCHRONOUS reconnect failure as ONE bounded string (#161)', async () => {
+  it('⑤a renders the REJECTED reconnect as ONE bounded string (#161)', async () => {
     const longMessage = 'r'.repeat(3_000)
-    let calls = 0
-    mount({
-      // The first call is the re-enable's rebuild (`connect(deviceId).connect()`);
-      // the second is `projectState` rendering the response.
-      connect: () => {
-        calls += 1
-        if (calls === 1) throw new Error(longMessage)
-        return fakeConnection('offline') as never
-      },
-    })
-    store.upsert(record({ enabled: false }))
-
-    const res = await call('/devices/dev-1', {
-      method: 'PATCH',
-      body: JSON.stringify({ enabled: true }),
-    })
-    expect(res.status).toBe(200)
-    boundedWarnCall('[cherry-remote] device dev-1 reconnect failed: ', longMessage)
-  })
-
-  it('⑤d renders a REJECTED reconnect as ONE bounded string (#161)', async () => {
-    const longMessage = 'r'.repeat(3_000)
-    // This is the arm a real peer reaches: `connect()` rejects with the
-    // establishment failure, whose message embeds the peer's own text
-    // (`AllHostsUnreachableError` wraps `last: <peer message>`).
+    // This is the arm that carries peer text: `connect()` rejects with the
+    // establishment failure, whose message embeds the last per-host error
+    // (`AllHostsUnreachableError` wraps `last: <message>`).
     const dev = fakeConnection('offline')
     const rejecting = { ...dev, connect: () => Promise.reject(new Error(longMessage)) }
     mount({ connect: () => rejecting as never })

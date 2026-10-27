@@ -18,7 +18,6 @@ import {
   TransportLostError,
 } from '../../src/connection.js'
 import type { DeviceState, EffectiveLimits, WsDialOptions } from '../../src/connection.js'
-import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry, maxRequestsInAnyOneSecondWindow } from '../loopback/fakeCherry.js'
 import { makeDualPeer, insecureTlsOptions, type DualPeer } from '../helpers/tls/dualPeer.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
@@ -2313,111 +2312,5 @@ describe('log text is bounded (issue #155)', () => {
     expect(line).not.toContain('a'.repeat(1_000))
     // The actionable half survives: the device, the state and the retry cadence.
     expect(line).toContain('reconnecting in ')
-  }, 15_000)
-})
-
-describe('log text is bounded, error objects included (issue #161)', () => {
-  it('(#161a) renders a throwing STATE LISTENER as ONE bounded string', async () => {
-    const identity = await createDeviceIdentity()
-    const fakeInfo = await makeFake()
-    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
-    const longMessage = 'x'.repeat(3_000)
-    // `onState` is public and the listener is ours, so this is the real seam:
-    // the catch around the fan-out must turn the throw into ONE string.
-    connection.onState(() => {
-      throw new Error(longMessage)
-    })
-
-    // `connect()` moves offline → connecting SYNCHRONOUSLY (the async
-    // `#establish` runs up to its first `await` before returning), so the
-    // listener has already thrown when `connect()` hands its promise back.
-    const connected = connection.connect()
-    const prefix = '[cherry-remote] state listener threw for dev-test: '
-    const call = consoleWarn.mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
-    expect(call, 'the listener failure must be logged').toBeDefined()
-    // ONE STRING. The old form was `console.warn(prefix, error)`: the console
-    // chose the rendering — the stack plus every own property, unbounded.
-    expect(call!).toHaveLength(1)
-    const line = String(call![0])
-    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX)
-    expect(line).toMatch(/… \(\+\d+ chars\)$/)
-    // The kept prefix and the marker share the 240-char budget: 3,000 → kept
-    // 225, `… (+2775 chars)` 15 characters, 225 + 15 = 240.
-    const detail = line.slice(prefix.length)
-    const kept = detail.indexOf('…')
-    expect(kept).toBeGreaterThan(0)
-    expect(kept + detail.slice(kept).length).toBe(LOG_TEXT_MAX)
-    expect(detail).toBe('x'.repeat(kept) + `… (+${3_000 - kept} chars)`)
-    // The error's tail is gone; OUR identifying prefix survives.
-    expect(line).not.toContain(longMessage)
-    expect(line).toContain('dev-test')
-
-    // Settle the attempt the test started, then close the connection: the
-    // throwing listener sees those transitions too, which is harmless.
-    await connected
-    await connection.close()
-  }, 15_000)
-
-  it('(#161b) renders a throwing SETTLE WAITER as ONE bounded string', async () => {
-    const identity = await createDeviceIdentity()
-    const fakeInfo = await makeFake()
-    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
-    const longMessage = 'w'.repeat(3_000)
-
-    // `waitForSettled` registers an INTERNAL closure (there is no public way to
-    // hand it a callback), and its only throwing operations are `clearTimeout`,
-    // `Set.delete` and `resolve` — all provided by the runtime. So the only
-    // injection that both reaches the catch AND leaves the returned promise
-    // settled is a resolver that resolves first and then throws: that is what
-    // the stub below installs. `waitForSettled`'s inner `new Promise` takes the
-    // global binding, so the window is one synchronous call.
-    const connected = connection.connect()
-    expect(connection.state).toBe('connecting')
-    class ThrowingResolver<T> extends Promise<T> {
-      constructor(
-        executor: (
-          resolve: (value: T | PromiseLike<T>) => void,
-          reject: (reason?: unknown) => void,
-        ) => void,
-      ) {
-        super((resolve, reject) => {
-          executor((value) => {
-            resolve(value)
-            throw new Error(longMessage)
-          }, reject)
-        })
-      }
-    }
-    let parked: Promise<DeviceState>
-    vi.stubGlobal('Promise', ThrowingResolver)
-    try {
-      parked = connection.waitForSettled(5_000)
-    } finally {
-      vi.unstubAllGlobals()
-    }
-
-    // Closing moves `connecting` → `offline`, which is the settle waiter's
-    // answer: the loop calls the closure, the resolver throws, and the catch
-    // must log ONE bounded string. The promise was resolved before the throw.
-    await connection.close()
-    await parked
-
-    const prefix = '[cherry-remote] settle waiter threw for dev-test: '
-    const call = consoleWarn.mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
-    expect(call, 'the settle-waiter failure must be logged').toBeDefined()
-    // ONE STRING: the old form was `console.warn(prefix, error)`.
-    expect(call!).toHaveLength(1)
-    const line = String(call![0])
-    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX)
-    expect(line).toMatch(/… \(\+\d+ chars\)$/)
-    const detail = line.slice(prefix.length)
-    const kept = detail.indexOf('…')
-    expect(kept).toBeGreaterThan(0)
-    expect(kept + detail.slice(kept).length).toBe(LOG_TEXT_MAX)
-    expect(detail).toBe('w'.repeat(kept) + `… (+${3_000 - kept} chars)`)
-    expect(line).not.toContain(longMessage)
-
-    // The attempt the test started still settles: close() rejects the cycle.
-    await connected.catch(() => undefined)
   }, 15_000)
 })

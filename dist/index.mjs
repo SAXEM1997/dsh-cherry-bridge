@@ -607,14 +607,17 @@ async function generateIdentity(dataDir, path) {
 * the `… (+N chars)` marker, and never drop a list ENTRY silently (the
 * `(+K more)` count is explicit).
 *
-* Issue #161 finished the class the same review left behind: the SAME SHAPE at
-* sites #155 did not name — a catch handing an error OBJECT to `console.warn`
-* as its second argument. One renderer now states the answer for all of them,
-* {@link failureText}: the message alone, bounded. The two earlier forms it did
-* NOT absorb — `truncateErrorMessage` (the diagnostics digest) and `bounded()`
-* (the frame-drop path) — are deliberately left alone: each emits a different
-* marker (`…[truncated]`, a bare `…`) and its callers/tests assert that exact
-* text, so folding would change output rather than converge on the rule.
+* Issue #161 swept the SAME SHAPE at the sites #155 did not name — a catch
+* handing an error OBJECT to `console.warn`'s second argument — on the paths
+* PEER traffic reaches. One renderer states the answer there, {@link
+* failureText}: the message alone, bounded. A purely LOCAL catch keeps the
+* object print, deliberately: its stack is the useful part and no peer text
+* can reach it (fs quarantine, the host registry, our own listener / settle
+* fan-out, a REST route's synchronous construction). The two earlier forms it
+* did NOT absorb — `truncateErrorMessage` (the diagnostics digest) and
+* `bounded()` (the frame-drop path) — are left alone: each emits a different
+* marker (`…[truncated]`, a bare `…`) that callers and docs depend on, so
+* folding would change output rather than converge on the rule.
 */
 /**
 * Clips `text` into `max` characters, the `… (+N chars)` marker included in
@@ -676,16 +679,28 @@ function boundedJoin(items, limits) {
 * Renders ONE caught failure for a log line: the message alone, clipped to
 * {@link LOG_TEXT_MAX}.
 *
-* This is the ONE form a caught failure takes in a log line (issue #161). The
-* old shape — `console.warn(prefix, error)` — handed the console the OBJECT, so
-* the console chose the rendering: the stack plus every own property, with
-* nothing bounding it. These catches are defensive (a listener, a background
-* recovery or a best-effort close whose own failure must not escape), so what
-* an operator needs is the message and nothing else; a non-`Error` value is
-* stringified exactly as the console would have rendered it.
+* This is the ONE form a caught failure takes in a PEER-TRIGGERED catch (issue
+* #161): a catch reached from peer traffic or a peer-triggered callback. The
+* old shape — `console.warn(prefix, error)` — handed the console the OBJECT.
+* On Node the console prints the error's name, message and stack (own
+* properties only when inspected), so the peer-controlled message and the
+* stack were both unbounded; for a defensive catch the stack is the noise.
+*
+* A caught failure from a purely LOCAL path (an fs copy, the host registry, our
+* own observers) keeps the object print: its stack is the useful part and no
+* peer text can reach it.
+*
+* TOTAL by construction: it runs INSIDE catch blocks, so a captured value whose
+* `toString` (or an Error subclass whose `message` getter) throws must not
+* escape the catch. The extraction is guarded and falls back to the fixed token
+* `<unrenderable failure>`.
 */
 function failureText(error) {
-	return clipText(error instanceof Error ? error.message : String(error), 240);
+	try {
+		return clipText(error instanceof Error ? error.message : String(error), 240);
+	} catch {
+		return "<unrenderable failure>";
+	}
 }
 //#endregion
 //#region src/rpc/jsonRpcClient.ts
@@ -3706,12 +3721,12 @@ var DeviceConnection = class {
 		for (const cb of [...this.#stateListeners]) try {
 			cb(next);
 		} catch (error) {
-			console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}: ${failureText(error)}`);
+			console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}`, error);
 		}
 		for (const cb of [...this.#settleWaiters]) try {
 			cb(next);
 		} catch (error) {
-			console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}: ${failureText(error)}`);
+			console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}`, error);
 		}
 	}
 };
@@ -6001,11 +6016,14 @@ function registerCherryToolsWithEngine(ctx, deps, options = {}) {
 /**
 * One tool declaration, in the exact shape the host registry consumes.
 *
-* DELIBERATELY no result wrapper and no bound on result text (issue #161): a
-* tool result is the MODEL's signal, and the peer is the user's own
-* Noise-authenticated desktop, so shortening the peer's explanation costs the
-* caller the text it acts on. The decision is the opposite of the LOG face,
-* where boundedness is required (`failureText` / `clipText` in `src/text.ts`):
+* This helper adds no result WRAPPER and this ticket adds no result-side
+* truncation (issue #161): a tool result is the MODEL's signal, and the peer is
+* the user's own Noise-authenticated desktop, so shortening the peer's
+* explanation costs the caller the text it acts on. The two result-text clamps
+* that DO exist are per-field product choices, not a log rule — `aggregateError`
+* (`message.slice(0, 200)` in `#assemblyFailed`) and `truncateErrorMessage`'s
+* 200-character diagnostics digest used by `projectMessageFailure`. The LOG
+* face is where boundedness is required (`failureText` / `clipText` in `src/text.ts`);
 * this ticket's sweep does not change tool output.
 */
 function defineCherryTool(definition) {
@@ -9154,9 +9172,10 @@ var CherryToolEngine = class {
 	* string through {@link failureText} (issue #161). An assembly failure is
 	* usually a peer RPC refusal — its `error.message` is the peer's own text,
 	* capped at 512 characters by the failure schema — and the old line
-	* interpolated it whole, so one refusal could become a ~640-character log
-	* line. The RESULT keeps the raw message's first 200 characters; a bound on
-	* the log does not change what the model receives.
+	* interpolated it whole: one 512-char refusal made a 654-character line for
+	* the `timeout` / `s-1` fixture (83 fixed prefix + 512 + 59 suffix). The
+	* RESULT keeps the raw message's first 200 characters; a bound on the log
+	* does not change what the model receives.
 	*/
 	#assemblyFailed(identity, error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -11536,7 +11555,7 @@ async function patchDevice(req, res, route, deviceId) {
 	if (enabledChanged && patch.enabled) try {
 		track(route.deps.connect(deviceId).connect(), warnConnect(deviceId));
 	} catch (error) {
-		console.warn(`[cherry-remote] device ${deviceId} reconnect failed: ${failureText(error)}`);
+		console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error);
 	}
 	const state = projectState(next, route.deps.connect);
 	if (patch.enabled !== void 0 && patch.enabled !== previousEnabled) route.hub.publish("device-state", {

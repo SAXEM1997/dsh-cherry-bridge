@@ -437,6 +437,9 @@ function writeQuarantineRefusal(res: HttpResponseLike, route: RouteContext, erro
   try {
     route.deps.onArchiveQuarantined?.(error)
   } catch (reportError) {
+    // LOCAL observer catch (issue #161 audit): the diagnostics ring is ours, so
+    // no peer text can reach this error — the object print (with its stack) is
+    // deliberate.
     console.warn('[cherry-remote] reporting the quarantined archive failed', reportError)
   }
   writeJson(res, 503, {
@@ -1459,14 +1462,12 @@ async function patchDevice(
     try {
       track(route.deps.connect(deviceId).connect(), warnConnect(deviceId))
     } catch (error) {
-      // ONE bounded STRING (issue #161): the old form passed the error OBJECT,
-      // so the console printed the stack plus every own property unbounded.
-      // This synchronous arm sees only the connection's construction failure
+      // LOCAL: only the synchronous construction failure lands here
       // (`connectionFor` cannot find the record, or the identity failed to
-      // load), i.e. LOCAL text; the DIAL's rejection lands in `warnConnect`
-      // below. Ceiling: `[cherry-remote] device ` (23) + deviceId +
-      // ` reconnect failed: ` (19) + LOG_TEXT_MAX (240).
-      console.warn(`[cherry-remote] device ${deviceId} reconnect failed: ${failureText(error)}`)
+      // load). The DIAL's rejection carries peer text and is rendered by
+      // `warnConnect` below; this arm keeps the object print and its stack
+      // (issue #161's boundary).
+      console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error)
     }
   }
 
@@ -1492,14 +1493,15 @@ async function patchDevice(
 
 function warnConnect(deviceId: string): (error: unknown) => void {
   return (error: unknown) => {
-    // ONE bounded STRING (issue #161). This is the arm that actually receives
-    // the lifecycle rejection: `connect()` rejects with the establishment
-    // failure, whose message embeds the peer's own text (`AllHostsUnreachableError`
-    // wraps `last: <peer message>`, and a hello/authenticate refusal is the
-    // peer's `error.message` verbatim, capped at 512 by the failure schema).
-    // The old form handed the error OBJECT to the console. Ceiling:
-    // `[cherry-remote] device ` (23) + deviceId + ` lifecycle change failed: `
-    // (26) + LOG_TEXT_MAX (240).
+    // ONE bounded STRING (issue #161). This is the arm that receives the
+    // lifecycle rejection. The common case is `AllHostsUnreachableError`, whose
+    // message embeds the last per-host error as `last: <message>` — a `ws` /
+    // channel failure, or an RPC refusal's peer message (capped at 512 by the
+    // failure schema). The terminal arms add only local wrappers (`identity
+    // mismatch`, `protocol version incompatible`, `authenticate rejected
+    // (<reason>)` — an enum). The old form handed the error OBJECT to the
+    // console. Ceiling: `[cherry-remote] device ` (23) + deviceId +
+    // ` lifecycle change failed: ` (26) + LOG_TEXT_MAX (240).
     console.warn(`[cherry-remote] device ${deviceId} lifecycle change failed: ${failureText(error)}`)
   }
 }
@@ -1672,6 +1674,8 @@ async function startPairing(req: HttpRequestLike, res: HttpResponseLike, route: 
         try {
           route.deps.onArchiveQuarantined?.(error)
         } catch (reportError) {
+          // LOCAL observer catch (issue #161 audit): same ring as the PATCH
+          // route's, no peer text — the object print is deliberate.
           console.warn('[cherry-remote] reporting the quarantined archive failed', reportError)
         }
         // The shared instruction VERBATIM, with only the two contextual paths
