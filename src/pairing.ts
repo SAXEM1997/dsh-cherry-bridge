@@ -9,7 +9,6 @@ import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
-import { urlHost } from './urlHost.js'
 
 /**
  * The pairing half of the bridge (spec §3.3): turn the desktop's pairing
@@ -309,11 +308,6 @@ interface TempChannel {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
-
-// urlHost() moved to its shared home (./urlHost): both dial sites — pairing's
-// candidate dial and DeviceConnection's per-device dial — bracket IPv6 the
-// same way. Re-exported here to keep this module's original public surface.
-export { urlHost } from './urlHost.js'
 
 /** Dials one candidate address and completes the Noise handshake.
  *
