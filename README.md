@@ -26,7 +26,7 @@ flowchart TB
 ```
 
 - 包名：`dsh-cherry-bridge`，插件 id：`cherry-remote`
-- 传输：`ws://` + Noise XX（加密由 Noise 记录层提供，不依赖 TLS 终止）
+- 传输：默认 `ws://` + Noise XX（加密由 Noise 记录层提供）；桌面端位于 TLS 前置之后时拨 `wss://`，私有 CA 的信任由 `wsTls` 提供
 - 工具面：14 个 `cherry_*` 工具，**按工作区**启用，默认**谁都没有**（见「启用范围」）
 - 设置页与 HTTP 面：宿主 Web 服务器上的同源前缀 `/cherry-remote/api`
 
@@ -85,6 +85,9 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | `dataDir` | string | `$DSH_HOME/cherry-remote`（回退 `~/.dsh/cherry-remote`） | 插件数据目录，存放 `identity.key` 与 `devices.json`（均 `0600`）。 |
 | `perSessionCacheBytes` | number | `2097152`（2 MiB） | 每个会话的**本地**订阅事件缓存上限，超出按 LRU 丢弃最旧事件并 `warn`。 |
 | `rateBudgetPerSecond` | number | `32` | 每设备平滑请求预算（请求/秒）。桌面端共享额度在 ≤2.1.6 是 64 req/s、≥2.1.7 是 256 req/s，且只有新版本才把超限降级为单请求 `RATE_LIMITED`（旧版本直接 close `1011` 终止会话），故按更严格的一代取保守值。内容读取（`agent.content.read`）按 8:1 派生独立一档，且**封顶 512/s**（该额度两代一致）。 |
+| `wsTls` | object | — | 每次 `wss` 拨号的**扁平** `tls.connect` 选项（只接受 `rejectUnauthorized` / `ca`），供桌面端位于私有 CA 或自签 TLS 前置之后时由运维提供信任；配对与重连**两个拨号点**共用。**不写入设备档案、不写日志、不进诊断报告。** 整个对象要么按原样生效、要么整体忽略：未知键或不可用值按名 `warn` 后回退 Node 默认信任库（不部分应用）。 |
+
+> `wsTls.ca` 是 **PEM 内容**（证书文本本身），不是文件路径。
 
 > ⚠️ `cordis.patch.yml` 的 `config` 是**整体替换**，不与默认值合并。删掉一个键得到的是
 > 插件默认值；键存在但值非法（`0`、负数、字符串）会按名 `warn` 后回落默认值。
@@ -155,7 +158,8 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   idle 回答的历史走查仍从那一刻起算自己的预算（慢但成功的快照不会把走查挤成零）；
   代价是两段预算**分开计**，病态调用可能把两段都花掉。
 - **已知限制**：`cherry_respond` 让 DSH agent 可代替用户批准 Cherry 端审批卡（MVP 不加拦截层，
-  信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；仅 `ws://`（Noise 加密），不做 TLS 直连。
+  信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；传输默认 `ws://`，
+  `wss://` 要求桌面端位于 TLS 前置之后（本插件不做 TLS 终止；私有 CA 的信任由 `wsTls` 提供）。
 
 > 传输重放、32 MiB/≈3× 内存、空页与游标容忍、完整性语义等工程细节见 [`AGENTS.md`](AGENTS.md)。
 

@@ -30,9 +30,9 @@ are process records, and they stay in `docs/superpowers/**` (not published).
   break the implementation deliberately (invert the branch, delete the guard,
   return the old value) and confirm the test turns red. A test that passes
   against both the old and new code is not a test.
-- **Sub-task test strategy.** While working, run only the fast, relevant
-  subset — `npx vitest run tests/<area>/<file>.test.ts` plus `npm run
-  typecheck` when types moved. The **full** suite (`npm test`, contract tests
+- **Sub-task test strategy.** While working, run only the fast subset —
+  `npx vitest run tests/<area>/<file>.test.ts` plus `npm run typecheck` when
+  types moved. The **full** suite (`npm test`, contract tests
   included) is run **once by the integrator before merge**, not per iteration.
   `tests/unit/artifactFreshness.test.ts` is the exception: it matters when
   source comments or build config changed, and is cheap enough to run then.
@@ -44,14 +44,14 @@ are process records, and they stay in `docs/superpowers/**` (not published).
   are expected to say the same thing; an edit to one is an edit to both.
 - **AGENTS.md lives under a byte budget.** The workspace-instruction budget is
   65,536 bytes, and the harness **silently truncates the tail** past what fits
-  — observed when this file stood at 65,302 bytes (reported "truncated … to
-  65,143"): rules at the file's end vanished from context. Keep the file
+  — observed when this file stood past the budget: rules at the file's end
+  vanished from context. Keep the file
   **≤ 64,512 bytes** (64 KiB − 1 KiB safety; check `wc -c AGENTS.md`); an
   addition needs a compensating trim in the same change.
 - **Every promise a test starts settles INSIDE the test.** A request or
   `connect()` nobody awaits still holds its caller for `DEFAULT_TIMEOUT_MS`
   when the answer never comes; `void ... .catch(() => {})` hides that, and the
-  next afterEach that awaits the dangling set turns it into a stalled suite.
+  next afterEach that awaits it turns it into a stalled suite.
   Produce the settlement (usually `close()`) and **assert** the verdict — issue
   #43 is the two sites that were masked this way.
 - **Commit messages** are English, imperative, `type(scope): summary` —
@@ -87,8 +87,8 @@ their keys (there is a contract assertion for exactly that).
 - **tsdown preserves JSDoc into `dist/index.mjs`.** Therefore a change that
   only touches `src/**` **comments** still changes the artifact bytes. If you
   edit an exported declaration's doc comment, rebuild `dist` in the same commit
-  — `tests/unit/artifactFreshness.test.ts` rebuilds from source into a temp dir
-  and compares **byte for byte** against the committed files. A missing rebuild
+  — `tests/unit/artifactFreshness.test.ts` rebuilds into a temp dir and compares
+  **byte for byte** against the committed files. A missing rebuild
   is a red test, not a style nit.
 - **`prepublishOnly` vs `artifactFreshness` — two different gates.**
   - `prepublishOnly` =
@@ -105,9 +105,8 @@ their keys (there is a contract assertion for exactly that).
     It only sees *existence*, never bytes.
 - **There is deliberately no `prepare` hook.** `prepare` also runs on
   `npm install`, where `--omit=dev` prunes devDependencies first — the hook then
-  dies (exit 127) looking for `tsdown`/`vite` and takes the whole install down.
-  Committing the artifacts is what makes git installs, `--omit=dev` and packing
-  a bare clone work with zero build steps.
+  dies (exit 127) looking for `tsdown`/`vite`. Committing the artifacts makes
+  git installs, `--omit=dev` and packing a bare clone work with zero build steps.
 - **The publish surface** (`package.json` `files`): `lib`, `dist`, `src`, `ui`,
   `locale`, `docs/e2e-checklist.md`, `cordis.patch.yml`, `README.md`,
   `README.en.md`, `static`.
@@ -265,11 +264,10 @@ These are load-bearing; the code comments are the long version.
   `4 × 3 × (the declared size)`. It bounds the COUNT, not bytes: a byte budget
   must reserve each ref's declared size (optimistic) or its cap when unusable
   (serializing all behind one slot) — deliberately not what landed.
-  It bounds what is being ASSEMBLED, not everything resident: content an answer
-  has already finished assembling is retained by its caller OUTSIDE this
-  product — up to one whole message per concurrent read, because
-  `AGGREGATE_BYTES` is judged only between messages — and the parts cache adds
-  its own budgeted bytes (32 MiB per device) on top.
+  It bounds what is being ASSEMBLED, not everything resident: finished content
+  is retained by its caller OUTSIDE this product (up to one whole message per
+  concurrent read, because `AGGREGATE_BYTES` is judged only between messages),
+  plus the parts cache's own budgeted bytes (32 MiB per device).
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
   (`ContentGateTimeoutError`, which the projection degrades to one part's
@@ -330,7 +328,7 @@ part over 4,096 characters, so a hit is not a zero-RPC read.
   (self-eviction would reorder it). A drop warns once per insert that dropped
   anything: device and count only, never a message id.
 - **A hit hands the PAGE out BY REFERENCE** — safe while projection only reads
-  the records; a future mutator must copy first.
+  it; a future mutator must copy first.
 - **Invalidation** rides `#forgetDevice` with the three session caches;
   `#watchConnection` routes `offline` / `identity-mismatch` there. An ordinary
   link loss also publishes `offline`, so a reconnect drops the cache — one
@@ -383,8 +381,8 @@ The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
 timeout and idle faces) runs AFTER — or at the end of — the caller's wait
 window, so the window cannot bound it. It used to have no time bound at all:
 since #12 a read whose link dies waits up to `transportRetryWaitMs` (5 s) for a
-reconnect before replaying, so under a flapping link each of the walk's ~30
-requests could absorb that wait — a 1 s window answering ~150 s later, the shape
+reconnect, so under a flapping link each of the walk's ~30 requests could
+absorb that wait — a 1 s window answering ~150 s later, the shape
 #3 fixed with a message ceiling and a byte budget (issue #21).
 
 - **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
@@ -492,8 +490,8 @@ marker with no consumer: the loss stated, nothing able to act on it.
   it has met the anchor (discarding pages whole), and returns what follows it.
 
 **The peer's cursor format is never parsed or validated.** The real desktop's is
-an opaque keyset token (`<createdAt-ms>:<messageId>`), the loopback peer's is a
-numeric offset, and a future desktop may change it. Every token we emit is
+an opaque keyset token, the loopback peer's is a numeric offset, and a future
+desktop may change it. Every token we emit is
 therefore self-describing, and every token we accept must carry one of our two
 prefixes; anything else is refused **before any device work**. This is not
 pedantry: a malformed cursor handed to the real desktop is **silently swallowed**
@@ -556,7 +554,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   position by serving its FIRST page — the silent "newest page as older history"
   again. Each face now refuses the other's prefix with a message naming the
   mistake where the prefix identifies the other face (a bare `after:` on a list
-  tool gets the generic "must be a `list:` token" verdict, and that is enough).
+  tool gets the generic "must be a `list:` token" verdict).
   The two exceptions are about OUR OWN retired formats, never about the peer's:
   a v1 list token is recognised by DECODING it (it lived under `cursor:` and its
   payload is colon-free base64url, so the message face would otherwise forward
@@ -752,6 +750,11 @@ ordinary atomic persist; a lost scheme would downgrade a TLS proxy to a dial
 that can never connect, and an edit that re-types a host keeps its scheme
 (`securityFor`). `GET /devices` reports the map; it is an address, not a
 credential — `cherry_devices` and the diagnostics report do not carry it yet.
+TLS trust is operator config (`wsTls`, FLAT `tls.connect` options — only
+`rejectUnauthorized` / `ca`), forwarded to BOTH dial sites (pool and pairing).
+`resolveBridgeConfig` validates it: an unknown key or unusable value warns by
+FIELD NAME and the WHOLE object is ignored (half-applied trust would reach some
+peers and not others). Never persisted, logged or reported — a `ca` is PEM text.
 
 ### Device selector
 
@@ -805,8 +808,8 @@ listener, no LAN exposure, no separate credentials**:
 
 > The minimal `pairing-progress` frame shape is `{stage, detail?}`; this plugin
 > **additionally** attaches the optional `claimId` (a cross-run isolation
-> verdict extension, not in the minimal set) — consumers must tolerate its
-> absence. The heartbeat is a payload-free comment line.
+> extension, not in the minimal set) — consumers must tolerate its absence.
+> The heartbeat is a payload-free comment line.
 
 `GET /scope` returns ONE body: `scope` (the document's `mode`/`workspaceIds`/
 `revision` — `version`/`updatedAt` stay behind), `workspaces` (the registry
@@ -900,10 +903,10 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 Neither reference lives in this repository.
 
 - **`/tmp/csa`** — the official Cherry Studio **app** (`CherryHQ/cherry-studio-app`
-  @ v0.4.0, read 2026-10-22). It plays the **same role we do** (protocol
-  *client* against the desktop's server). Its remote layer is
-  `src/backend/services/remoteAgent/` (`RemoteAgentScope.ts`, `remoteContent.ts`,
-  …). This is where "what does the official client do" comes from.
+  @ v0.4.0, read 2026-10-22), the **same role we play** (protocol *client*
+  against the desktop's server). Its remote layer is
+  `src/backend/services/remoteAgent/`; "what the official client does" comes
+  from there.
 - **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
   read alongside v2.1.7, the protocol **server** of record. The faces we depend
   on are `src/main/services/remoteAccess/` and
@@ -934,9 +937,9 @@ Notable faces:
 
 - Its `RemoteAgentError` marks `RATE_LIMITED`/`TOKEN_EXPIRED`/
   `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries forever at the
-  same page size (`min(20 s, 1 s · 2^n)`), so a `RESOURCE_EXHAUSTED` from the
-  byte budget never converges. Our answer is the byte-safe page **clamp**: never
-  ask for a page that cannot fit.
+  same page size, so a `RESOURCE_EXHAUSTED` from the byte budget never
+  converges. Our answer is the byte-safe page **clamp**: never ask for a page
+  that cannot fit.
 - Its read path refuses a ref whose `byteLength` is unusable; we fall back to a
   slice bound plus the cumulative arm.
 - Its read path never replays a read; we replay reads **once** (deliberate
@@ -962,10 +965,10 @@ attach the notes to the GitHub release.
    `NPM_CONFIG_CACHE=/workspace/dsh/.superpowers/npm-cache npx npm@11 stage publish --registry=https://registry.npmjs.org/ --access public --tag latest`
    (add `--ignore-scripts` only when `prepublishOnly` just passed on this exact
    clean tree), then approve the printed stage id on npmjs.com →
-   **Staged Packages**. `npm stage approve` answered `404 staged version … not
-   found` with every token tried here (stage-only and publish-capable, with and
-   without `--otp`), while the same token's `GET /-/stage/<id>` returned 200 —
-   so the web approval is the one that works. Check the result with
+   **Staged Packages**. `npm stage approve` answers `404 staged version … not
+   found` here (every token tried, incl. publish-capable and `--otp`), while
+   `GET /-/stage/<id>` returns 200 — so the web approval is the one that works.
+   Check the result with
    `npm view dsh-cherry-bridge dist-tags`: an unapproved stage is silent.
    A first publish also leaves a public `0.0.0-stage` placeholder in
    `versions` (0.1.5 did); approving moves `latest` to the real version.
@@ -986,8 +989,8 @@ index's nightly probe (02:23 UTC) once `package.json`'s `repository` points
 back at this repo.
 
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
-ruling`, `UltraReview` — point at this project's internal SDD process records
-under `docs/superpowers/**`, **not published** with the package; they stay
+ruling`, `UltraReview` — point at internal SDD process records under
+`docs/superpowers/**`, **not published** with the package; they stay
 where the rule is, as provenance. `tests/loopback/fakeCherry.ts` is an in-test
 loopback fake peer, not a shipped artifact.
 

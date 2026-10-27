@@ -1,5 +1,18 @@
 import { connectSecureChannel } from "@cherrystudio/remote-transport";
 import "@cherrystudio/remote-protocol/agent";
+//#region src/connection.d.ts
+/**
+ * Options handed to every `WebSocket` dial (issue #126).
+ *
+ * FLAT `tls.connect` options — `ws` forwards its own option bag straight to
+ * `tls.connect`, so `{ rejectUnauthorized: false }` or `{ ca: <pem> }` belong
+ * at the top level rather than under a `tls:` key.
+ */
+type WsDialOptions = {
+  rejectUnauthorized?: boolean;
+  ca?: string | Buffer | Array<string | Buffer>;
+};
+//#endregion
 //#region src/tools.d.ts
 /**
  * The plugin's tool face: the complete fourteen-tool `cherry_*` family — six
@@ -264,10 +277,24 @@ export interface CherryBridgeConfig {
    * (not a protocol value). Omitted uses {@link DEFAULT_PER_SESSION_CACHE_BYTES}.
    */
   perSessionCacheBytes?: number;
+  /**
+   * FLAT `tls.connect` options for every `wss` dial (issue #133): the operator's
+   * TLS trust for a desktop behind a private CA or a self-signed TLS front.
+   * `ws` forwards this bag straight to Node's TLS layer, so `{ ca: <pem> }` and
+   * `{ rejectUnauthorized: false }` belong at the TOP level — the `{ tls: {…} }`
+   * shape (`https`' wrapper) is not recognised by `ws` and is refused here.
+   * Applied to BOTH dial sites: the steady-state pool and pairing.
+   *
+   * NEVER persisted in the record, never logged, never reported: a `ca` is PEM
+   * CONTENT, and trust is a grant the operator makes, not a fact the desktop
+   * asserts about itself.
+   */
+  wsTls?: WsDialOptions;
 }
 /**
- * The two config values that reach constructor arguments, with their defaults
- * applied.
+ * The plugin-config values that reach constructor arguments, resolved once: the
+ * two numeric budgets with their defaults applied, and the validated TLS trust
+ * bag (see {@link dialOptions}).
  *
  * Resolved ONCE per `apply` and threaded explicitly, rather than re-read at each
  * construction site: a config surface that can change between two constructions
@@ -276,8 +303,9 @@ export interface CherryBridgeConfig {
 export interface ResolvedBridgeConfig {
   rateBudgetPerSecond: number;
   perSessionCacheBytes: number;
+  wsTls: WsDialOptions | undefined;
 }
-/** Applies the documented fallbacks to the plugin config's numeric keys. */
+/** Applies the documented fallbacks and validates the plugin config's keys. */
 export declare function resolveBridgeConfig(config?: CherryBridgeConfig): ResolvedBridgeConfig;
 /** The context slice `apply` touches beyond the HTTP face's own services. */
 export interface CherryBridgeContext extends CherryHttpContext, CherryToolsContext {

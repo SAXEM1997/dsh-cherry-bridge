@@ -28,7 +28,7 @@ flowchart TB
 ```
 
 - Package: `dsh-cherry-bridge`, plugin id: `cherry-remote`
-- Transport: `ws://` + Noise XX (encryption lives in the Noise record layer; no TLS termination required)
+- Transport: `ws://` + Noise XX by default (encryption lives in the Noise record layer); a desktop behind a TLS front is reached over `wss://`, with `wsTls` supplying the private-CA trust
 - Tool face: 14 `cherry_*` tools, enabled **per workspace**, and by default **nobody has them** (see “Scope”)
 - Settings page and HTTP face: the same-origin prefix `/cherry-remote/api` on the host web server
 
@@ -93,6 +93,9 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | `dataDir` | string | `$DSH_HOME/cherry-remote` (fallback `~/.dsh/cherry-remote`) | Plugin data directory holding `identity.key` and `devices.json` (both `0600`). |
 | `perSessionCacheBytes` | number | `2097152` (2 MiB) | Per-session cap on the **local** subscription event cache; beyond it the oldest events are dropped LRU-style with a `warn`. |
 | `rateBudgetPerSecond` | number | `32` | Per-device smoothed request budget (req/s). The desktop's shared allowance is 64 req/s through 2.1.6 and 256 req/s from 2.1.7, and only the newer generation downgrades an overrun to a single `RATE_LIMITED` refusal (the older one terminates the session with close `1011`) — hence a value sized for the harsher generation. Content reads (`agent.content.read`) derive their own tier at 8:1, **capped at 512/s** (that allowance is the same in both generations). |
+| `wsTls` | object | — | **Flat** `tls.connect` options for every `wss` dial (`rejectUnauthorized` / `ca` only): operator-supplied trust for a desktop behind a private CA or a self-signed TLS front. Applied to BOTH dial sites — pairing and reconnect. **Never written to the device archive, never logged, never in diagnostics.** The whole object applies as written or is ignored entirely: an unknown key or unusable value warns by name and falls back to Node's default trust store (no partial application). |
+
+> `wsTls.ca` is **PEM CONTENT** (the certificate text itself), not a file path.
 
 > ⚠️ `cordis.patch.yml`'s `config` is **whole-replace**, not merged with the
 > defaults. Removing a key gets you the plugin default; a key that exists but is
@@ -200,7 +203,9 @@ subscription was lost and could not be rebuilt, so the outcome is
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is
-  requested per device; `ws://` only (Noise encryption), no direct TLS.
+  requested per device; transport is `ws://` by default, and `wss://` requires a
+  TLS front in front of the desktop (this plugin never terminates TLS; `wsTls`
+  carries the private-CA trust).
 
 > Engineering detail — replay rules, the 32 MiB/≈3× memory contract, empty-page
 > and cursor tolerance, integrity semantics — lives in [`AGENTS.md`](AGENTS.md).

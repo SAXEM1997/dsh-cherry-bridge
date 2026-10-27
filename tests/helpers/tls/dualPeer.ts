@@ -58,6 +58,15 @@ const TLS_OPTIONS = {
  */
 export const insecureTlsOptions = { rejectUnauthorized: false }
 
+/**
+ * The TLS front's own certificate as PEM CONTENT — the `ca`-only trust bag a
+ * private-CA deployment configures (the production shape), not a file path.
+ * The fixture's SANs are `127.0.0.1`, `::1` and `localhost`, so hostname
+ * verification passes under Node's default `rejectUnauthorized`. The bytes are
+ * exactly the certificate {@link makeDualPeer}'s front serves.
+ */
+export const testTlsCaPem = TLS_OPTIONS.cert.toString('utf8')
+
 export async function makeDualPeer(options: DualPeerOptions = {}): Promise<DualPeer> {
   const bindHost = options.bindHost ?? '127.0.0.1'
   const desktop = new FakeCherry({ ...options.desktop, bindHost })
