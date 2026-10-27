@@ -1491,6 +1491,116 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     expect(consoleWarn).toHaveBeenCalled()
     await waitForIdentity(dataDir)
   })
+
+  // -------------------------------------------------------------------------
+  // The recovery line's id list is bounded locally (issue #155). Its ENTRY
+  // COUNT is bounded only by the peer-advertised hello `subscriptions` — a
+  // number the peer chooses — and each session id is the protocol's `opaqueId`
+  // (≤ 256 chars), so the old `sessions.join(', ')` could write
+  // `subscriptions × 258` characters in ONE info line: the protocol's own cap
+  // of 8 still allows ~2 KB, and a peer advertising more grows it without
+  // limit. The test advertises 20 (and enforces 20 on subscribe) so 15
+  // sessions are live at once — the attack shape, in the assembly's own
+  // harness.
+  // -------------------------------------------------------------------------
+  it('③u bounds the link-recovery line\'s session-id list and names the count it left out', async () => {
+    const index = await import('../../src/index.js')
+    // 48-char ids: schema-valid `opaqueId`s, and long enough that 15 of them
+    // cannot fit the 320-char list budget.
+    const sessions = Array.from({ length: 15 }, (_, position) => ({
+      sessionId: `sess-${String(position).padStart(2, '0')}-${'x'.repeat(40)}`,
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      title: `S${position}`,
+      historyRevision: '1',
+    }))
+    expect(sessions.every((session) => session.sessionId.length === 48)).toBe(true)
+    expect(new Set(sessions.map((session) => session.sessionId)).size).toBe(15)
+
+    const fakeInfo = await makeFake({
+      // BOTH faces: the peer ADVERTISES 20 subscriptions in its hello (what the
+      // assembly's local cap reads) and enforces the same 20 on
+      // `agent.sessions.subscribe`, so all 15 stay live.
+      hello: { limits: { subscriptions: 20, pageItems: 100, inFlightRequests: 8 } },
+      agent: { subscriptionLimit: 20, sessions },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    await connectPool(ctx, fakeInfo)
+
+    // A `cherry_read` of a distinct id is the cheapest way to join the
+    // subscription pool (spec §3.5); 15 distinct ids leave 15 ACTIVE sessions.
+    const read = ctx.tools.definitions.find((definition) => definition.name === 'cherry_read')!
+    for (const session of sessions) {
+      await read.execute({ device: 'dev-A', sessionId: session.sessionId })
+    }
+    expect(fakeInfo.fake.subscriptions).toHaveLength(15)
+
+    // The peer's own subscribe ledger is the WORK pin for this test: the
+    // post-drop slice must contain a successful subscribe for every session.
+    // The log bound must not shrink the work — a run that recovered three
+    // sessions and clipped the line anyway would pass every log assertion.
+    const subscribesBeforeDrop = fakeInfo.fake.subscribeCalls.length
+
+    // The `console.info` spy from the shared beforeEach is the capture point:
+    // clearing it makes the NEXT recovery line the one this drop produced.
+    const info = vi.mocked(console.info)
+    info.mockClear()
+    expect(fakeInfo.fake.dropConnections()).toBe(1)
+
+    const prefix = `[cherry-remote] recovering ${sessions.length} subscription(s) for dev-A: `
+    const recovery = (): string | undefined =>
+      info.mock.calls
+        .flat()
+        .map(String)
+        .find((line) => line.startsWith(prefix))
+    await vi.waitFor(
+      () => {
+        expect(recovery(), 'the recovery line must be logged after the link returns').toBeDefined()
+      },
+      20_000,
+    )
+    const line = recovery()!
+
+    // The TRUE total is still announced by the count prefix, and the id list
+    // under it is bounded with the omission COUNTED (never dropped silently).
+    const rendered = line.slice(prefix.length)
+    const marker = / \(\+(\d+) more\)$/.exec(rendered)
+    expect(marker, 'a clipped list must carry its `(+K more)` marker').not.toBeNull()
+    const named = rendered.slice(0, marker!.index).split(', ')
+    // Six 48-char ids fit: 6 × 48 + 5 × 2 = 298; a seventh would make 348.
+    expect(named).toHaveLength(6)
+    expect(Number(marker![1])).toBe(sessions.length - named.length)
+    // Every NAMED entry is a real, unclipped session id, in pool order.
+    expect(named).toEqual(sessions.slice(0, named.length).map((session) => session.sessionId))
+    // CEILING: RECOVERY_SESSIONS_MAX = 320 for the joined ids; the marker rides
+    // on top, so `320 + ' (+99 more)'.length` is the stated ceiling. Unbounded,
+    // these 15 ids render as 15 × 48 + 14 × 2 = 748 characters.
+    expect(rendered.length).toBeLessThanOrEqual(320 + ' (+99 more)'.length)
+    // The tail genuinely is not on the line.
+    expect(line).not.toContain(sessions[sessions.length - 1]!.sessionId)
+    // The recovery itself still covered EVERY session: a bound on the log, not
+    // on the work. Asserted on the PEER's subscribe record, not on the info
+    // lines — a failure warn (`re-subscribing session <id> … failed`) also
+    // contains the id, so log text cannot distinguish "recovered" from "tried
+    // and failed".
+    await vi.waitFor(
+      () => {
+        const afterDrop = fakeInfo.fake.subscribeCalls.slice(subscribesBeforeDrop)
+        const recovered = new Set(
+          afterDrop.filter((call) => call.mode !== 'error').map((call) => call.sessionId),
+        )
+        for (const session of sessions) {
+          expect(recovered.has(session.sessionId), `no post-recovery subscribe for ${session.sessionId}`).toBe(true)
+        }
+      },
+      20_000,
+    )
+  }, 30_000)
 })
 
 /** A minimal valid record for the store-level assertions. */

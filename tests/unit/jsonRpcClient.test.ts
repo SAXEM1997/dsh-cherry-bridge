@@ -677,6 +677,61 @@ describe('JsonRpcClient', () => {
     expect(line).not.toContain(HUGE_METHOD)
   })
 
+  // -------------------------------------------------------------------------
+  // Bounded log text (issue #155). A notification handler that throws used to
+  // be logged as `console.warn(..., error)` — the ERROR OBJECT — so the
+  // console chose the rendering: the stack and every own property, with
+  // nothing bounding it. The line is now ONE string: the method through the
+  // frame-drop path's own `bounded()` and the message under LOG_TEXT_MAX.
+  // -------------------------------------------------------------------------
+  it('⑫ (issue #155) renders a throwing notification handler as ONE bounded string, never the error object', async () => {
+    const { client, peer } = await openLoopback()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    // The protocol caps a method at 128 characters (`envelope.method =
+    // z.string().min(1).max(128)`), so a hostile peer cannot make the METHOD
+    // long — but `bounded()`'s 120-char field limit still clips the tail here,
+    // and the HANDLER's own Error is entirely unbounded.
+    const method = `future.${'m'.repeat(120)}`
+    expect(method.length).toBe(127)
+    const longMessage = `handler exploded ${'z'.repeat(5_000)}`
+    client.onNotification(() => {
+      throw new Error(longMessage)
+    })
+
+    await peer.write({ jsonrpc: '2.0', method, params: {} })
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalled()
+    })
+
+    const calls = warn.mock.calls.filter((call) => String(call[0]).includes('notification handler for'))
+    expect(calls, 'the handler failure must be logged exactly once').toHaveLength(1)
+    const call = calls[0]!
+    // ONE argument, and it is a STRING: the error object never reaches the
+    // console, so no stack and no own property can be printed.
+    expect(call).toHaveLength(1)
+    expect(typeof call[0]).toBe('string')
+    const line = String(call[0])
+    // CEILING: `[cherry-remote] notification handler for "` (42) + the method
+    // clipped by `bounded()` to 120 + `…` (121) + `" threw: ` (9) +
+    // LOG_TEXT_MAX (240) = 412. The old form printed ~5,100 characters of
+    // stack/message beyond this line.
+    expect(line.length).toBeLessThanOrEqual(412)
+    // The method is still NAMED (its head, with the clip marker): it is the
+    // classification an operator routes the report by.
+    expect(line).toContain('notification handler for "')
+    expect(line).toContain(`${method.slice(0, 120)}…`)
+    expect(line).not.toContain(method)
+    // The handler's message is bounded and its removal is counted.
+    expect(line).toMatch(/… \(\+\d+ chars\)$/)
+    const removed = Number(/… \(\+(\d+) chars\)$/.exec(line)![1])
+    expect(removed).toBeGreaterThan(4_000)
+    expect(line).not.toContain(longMessage)
+    expect(line).not.toContain('z'.repeat(1_000))
+    // Never a multi-line rendering: a stack would carry newlines.
+    expect(line).not.toContain('\n')
+  })
+
   it('⑩ (F4) updateMaxInFlight resizes admissions without touching pending requests', async () => {
     const { client, peer } = await openLoopback({ maxInFlight: 4 })
     const harness = new PeerHarness(peer)

@@ -2203,3 +2203,114 @@ describe('issue #104: a RATE_LIMITED refusal (desktop >= 2.1.7)', () => {
     expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
   }, 10_000)
 })
+
+describe('log text is bounded (issue #155)', () => {
+  // ---------------------------------------------------------------------------
+  // Bounded LOG text (issue #155). Two connection log lines interpolate text
+  // the PEER controls: the protocol-version console.error (its cause is the
+  // peer's own hello-failure text) and the transient-failure console.warn (an
+  // RPC failure's message is the peer's, verbatim). Both were bounded only by
+  // the 64 KiB record budget, so one record could become one log line.
+  // ---------------------------------------------------------------------------
+
+  it('(#155a) bounds the protocol-version console.error text the peer controls', async () => {
+    const identity = await createDeviceIdentity()
+    // 512 characters — the protocol failure schema's message CAP
+    // (`remoteFailureSchema.message = z.string().max(512)`). At the cap the
+    // client still parses the failure `data`, so the reason is readable and the
+    // line takes the `ProtocolVersionError` arm. The detail it interpolates is
+    // `protocol version confirmation rejected: ` + `JsonRpcRequestError: ` +
+    // this message = 573 characters, before #155 all of it in ONE log line.
+    const longMessage = 'h'.repeat(512)
+    const fakeInfo = await makeFake({
+      helloFailure: { reason: 'INVALID_CONNECTION_STATE', message: longMessage },
+    })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    await expect(connection.connect()).rejects.toThrow()
+    expect(connection.state).toBe('offline')
+
+    const line = consoleError.mock.calls
+      .flat()
+      .map(String)
+      .find((entry) => entry.includes('protocol version incompatible'))
+    expect(line, 'the protocol-version error line must be logged').toBeDefined()
+    const prefix = '[cherry-remote] device dev-test: protocol version incompatible ('
+    const suffix = '); upgrade Cherry Studio / the plugin'
+    expect(line!.startsWith(prefix)).toBe(true)
+    expect(line!.endsWith(suffix)).toBe(true)
+    // CEILING, per the deviceId's length: 56 fixed characters + id + LOG_TEXT_MAX
+    // (240, marker included) + the 37-char suffix. The 8-char fixture id gives
+    // 341; a 36-char UUID gives 369; the schema worst case (`opaqueId` ≤ 256)
+    // gives 589. `deviceId` is deliberately NOT clipped (a whitelisted
+    // identifier an operator correlates on), so the bound moves with it.
+    // Unbounded, this line was 64 + 573 + 37 = 674 characters with the fixture
+    // id.
+    expect(line!.length).toBeLessThanOrEqual(prefix.length + 240 + suffix.length)
+    expect(line!).toMatch(/… \(\+\d+ chars\)/)
+    // The kept prefix and the marker are charged to the SAME 240-char budget:
+    // derive both from the rendered detail instead of hardcoding a marker
+    // width, so a marker whose own digit count changes cannot slip through.
+    const renderedDetail = line!.slice(prefix.length, line!.length - suffix.length)
+    const kept = renderedDetail.indexOf('…')
+    expect(kept).toBeGreaterThan(0)
+    const marker = renderedDetail.slice(kept)
+    expect(kept + marker.length).toBe(240)
+    // The 573-char detail kept 226 and removed 347; `… (+347 chars)` is 14
+    // characters, and 226 + 14 = 240.
+    expect(marker).toBe(`… (+${573 - kept} chars)`)
+    expect(573 - kept).toBe(347)
+    // The peer's raw text is gone; OUR wording (and the remediation hint) stays.
+    expect(line).not.toContain(longMessage)
+    expect(line).not.toContain('h'.repeat(300))
+    expect(line).toContain('upgrade Cherry Studio / the plugin')
+  }, 15_000)
+
+  it('(#155b) bounds the transient-failure console.warn text the peer controls', async () => {
+    const identity = await createDeviceIdentity()
+    // An authenticate refusal with a NON-terminal reason. Its failure message is
+    // far above the 512-char schema cap, so the client discards `data` and the
+    // reason is unreadable — the failure stays transient, every candidate host
+    // "fails", and the warn's detail is `AllHostsUnreachableError`'s wrapper
+    // text, which embeds the peer's message as `last: <peer text>`. Before #155
+    // that produced ONE ~5.2 KB console.warn line.
+    const longMessage = `authenticate rejected because ${'a'.repeat(5_000)}`
+    const fakeInfo = await makeFake({
+      authenticateFailure: { reason: 'INTERNAL', message: longMessage },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 30,
+    })
+
+    await expect(connection.connect()).rejects.toThrow()
+    expect(connection.state).toBe('offline')
+
+    const prefix = '[cherry-remote] device dev-test offline ('
+    const line = consoleWarn.mock.calls
+      .flat()
+      .map(String)
+      .find((entry) => entry.startsWith(prefix))
+    expect(line, 'the transient-failure warning must be logged').toBeDefined()
+    // CEILING, per the deviceId's length: 33 fixed characters + id + LOG_TEXT_MAX
+    // (240, marker included) + `); reconnecting in <delay>ms` (26 at the 60,000 ms
+    // backoff CAP — this test's first delay is 30 ms, so the real line is far
+    // shorter) + the all-hosts hint (125). The 8-char fixture id gives 432; a
+    // 36-char UUID gives 460; the schema worst case (`opaqueId` ≤ 256) gives
+    // 680. Unclipped, this line was 5,259 characters.
+    const hint =
+      ' — all candidate addresses were unreachable; if the desktop moved, update ' +
+      'them via the device card 地址维护 (address maintenance)'
+    expect(line!.length).toBeLessThanOrEqual(
+      prefix.length + 240 + '); reconnecting in 60000ms'.length + hint.length,
+    )
+    expect(line!).toMatch(/… \(\+\d+ chars\)/)
+    const removed = Number(/… \(\+(\d+) chars\)/.exec(line!)![1])
+    expect(removed).toBeGreaterThan(4_000)
+    expect(line).not.toContain(longMessage)
+    expect(line).not.toContain('a'.repeat(1_000))
+    // The actionable half survives: the device, the state and the retry cadence.
+    expect(line).toContain('reconnecting in ')
+  }, 15_000)
+})

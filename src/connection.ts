@@ -14,6 +14,7 @@ import {
   RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
 import type { DeviceRecord } from './deviceStore.js'
+import { clipText, LOG_TEXT_MAX } from './text.js'
 
 /**
  * Per-device persistent connection: the M1 capstone that owns the WebSocket,
@@ -1017,6 +1018,10 @@ export class DeviceConnection {
     if (error instanceof IdentityMismatchError) {
       this.#running = false
       this.#setState('identity-mismatch')
+      // DELIBERATELY not clipped: this message is a COMPILE-TIME LITERAL
+      // ("peer static key does not match the pinned desktopIdentity") with no
+      // peer bytes in it, so there is nothing here to bound. The other two
+      // error lines below interpolate text the peer controls.
       console.error(
         `[cherry-remote] device ${this.record.deviceId}: ${error.message}; ` +
           'marked identity-mismatch and disconnected — re-pair the device',
@@ -1028,9 +1033,19 @@ export class DeviceConnection {
     if (error instanceof ProtocolVersionError) {
       this.#running = false
       this.#setState('offline')
+      // BOUNDED (issue #155): the `cause` is the peer's OWN hello-echo text —
+      // `ProtocolVersionError` is built from `String(<the peer's RPC failure>)`
+      // — so the message can carry up to a whole 64 KiB record of peer text.
+      // Ceiling: 56 fixed characters + the `deviceId` + LOG_TEXT_MAX (240,
+      // marker included) + the 37-character upgrade suffix. The id is
+      // deliberately NOT clipped (a whitelisted identifier an operator
+      // correlates on), and it is peer-assigned (`pairing.get`'s approved
+      // result, `opaqueId` ≤ 256), so the bound moves with it: 8-character
+      // fixture id → 341; a 36-char UUID → 369; the schema worst case (256) →
+      // 589.
       console.error(
         `[cherry-remote] device ${this.record.deviceId}: protocol version incompatible ` +
-          `(${error.message}); upgrade Cherry Studio / the plugin`,
+          `(${clipText(error.message, LOG_TEXT_MAX)}); upgrade Cherry Studio / the plugin`,
       )
       this.#cycle.reject(new Error(`device ${this.record.deviceId}: protocol version incompatible`))
       return
@@ -1064,9 +1079,19 @@ export class DeviceConnection {
         ? ' — all candidate addresses were unreachable; if the desktop moved, update ' +
           'them via the device card 地址维护 (address maintenance)'
         : ''
+    const detail = error instanceof Error ? error.message : String(error)
     console.warn(
       `[cherry-remote] device ${this.record.deviceId} offline ` +
-        `(${error instanceof Error ? error.message : String(error)}); reconnecting in ${delay}ms${hint}`,
+        // BOUNDED (issue #155): this text is peer-influenced — an RPC failure
+        // carries the peer's own `error.message` verbatim (an authenticate
+        // refusal, a hello fault), and a transport error carries the system's.
+        // Only the 64 KiB record budget bounded it before. Ceiling: 33 fixed
+        // characters + the `deviceId` + LOG_TEXT_MAX (240, marker included) +
+        // `); reconnecting in <delay>ms` (26 at the 60,000 ms backoff cap) +
+        // the all-hosts hint (125). The id is NOT clipped (same decision as
+        // above), so a 36-char UUID gives 460 and the schema worst case (256)
+        // gives 680, against 432 for the 8-character fixture id.
+        `(${clipText(detail, LOG_TEXT_MAX)}); reconnecting in ${delay}ms${hint}`,
     )
     this.#setTimer('backoff', setTimeout(() => this.#tryEstablish(), delay))
   }

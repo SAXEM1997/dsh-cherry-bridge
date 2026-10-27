@@ -10,6 +10,7 @@ import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
+import { boundedJoin, clipText } from './text.js'
 
 /**
  * The pairing half of the bridge (spec §3.3): turn the desktop's pairing
@@ -104,6 +105,25 @@ export interface PairWithPayloadOptions {
 
 /** Overall payload ceiling: a QR code never approaches this. */
 const MAX_PAYLOAD_BYTES = 10 * 1024
+/**
+ * Bounds the unknown-key WARNING (issue #155). The keys in that warning are
+ * payload-CONTROLLED NAMES, and `MAX_PAYLOAD_BYTES` is no bound at all on the
+ * line: a 10 KiB payload carrying 32 unknown keys of ~256 characters used to
+ * join into ~8.2 KB of attacker-chosen text (the measured fixture is 8,192
+ * characters of keys and an 8,312-character line) on the operator's log.
+ *
+ * `UNKNOWN_FIELDS_MAX` is the joined list's budget — the same 240-character
+ * working budget as `LOG_TEXT_MAX`, so "one bounded peer detail" means one
+ * number for one detail-sized face (pairing's `FAILURE_SEGMENT_MAX` is the
+ * same NUMBER bounding a different quantity: a whole `<label>: <detail>`).
+ * `UNKNOWN_FIELD_MAX` clips ONE
+ * key: 64 characters is longer than any field name the protocol defines, so a
+ * clipped key is always a malformed or hostile payload, never a real typo the
+ * operator needs whole. A list that stops early names the count (`(+K more)`);
+ * entries are never dropped silently.
+ */
+const UNKNOWN_FIELDS_MAX = 240
+const UNKNOWN_FIELD_MAX = 64
 /** The claim's deviceName cap; a hostname may reach 253, so it is truncated. */
 const DEVICE_NAME_MAX = 64
 /** Bounds a single candidate host string (IPv6 literals are ~45). */
@@ -255,7 +275,12 @@ function parsePayload(payload: string): PairingPayload {
   // schema is never warned-and-then-rejected — its verdict is the rejection.
   const ignored = Object.keys(raw).filter((key) => !(qr.v === 2 ? V2_KEYS : V3_KEYS).has(key))
   if (ignored.length > 0) {
-    console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(', ')}`)
+    console.warn(
+      `[cherry-remote] pairing payload ignored unknown field(s): ${boundedJoin(ignored, {
+        max: UNKNOWN_FIELDS_MAX,
+        itemMax: UNKNOWN_FIELD_MAX,
+      })}`,
+    )
   }
 
   const candidates: PairCandidate[] =
@@ -439,6 +464,10 @@ function channelFailure(error: Error): Error {
  * one arm (budget-exhausted, dial failure, claim fall-through) and fail on
  * another. A short label and a short detail are returned BYTE FOR BYTE; the
  * enforcement is never a rewrite of ordinary text.
+ *
+ * The detail goes through the SHARED {@link clipText} (issue #155), the same
+ * `… (+N chars)` form every other peer-controlled log detail uses; the clip
+ * point is no longer private to pairing.
  */
 function failureSegment(label: string, detail: string): string {
   const boundedLabel = clipFailureLabel(label)
@@ -447,7 +476,7 @@ function failureSegment(label: string, detail: string): string {
   // SEGMENT bound is independent of the label cap: a removed label cap cuts
   // the label into the segment instead of letting the segment overflow.
   if (room <= 0) return boundedLabel.slice(0, FAILURE_SEGMENT_MAX)
-  return `${boundedLabel}: ${clipFailureDetail(detail, room)}`
+  return `${boundedLabel}: ${clipText(detail, room)}`
 }
 
 /**
@@ -466,41 +495,6 @@ function clipFailureLabel(label: string): string {
   const suffix = `…${label.slice(colon)}` // `…` + `:<port>`
   const hostRoom = FAILURE_LABEL_MAX - suffix.length
   return hostRoom > 0 ? `${label.slice(0, hostRoom)}${suffix}` : suffix.slice(0, FAILURE_LABEL_MAX)
-}
-
-/**
- * Clips the detail into `room` characters, `… (+N chars)` included in the
- * count. `kept` is a fixed point — the number of removed characters sets the
- * marker's own digits — and it is the LARGEST prefix that fits, so the segment
- * uses its budget without ever exceeding it.
- *
- * The final guard never ends the kept prefix between a UTF-16 surrogate pair: a
- * clip there would emit a lone surrogate, which is not valid unicode text (the
- * peer's `unicodeText` params face refuses it) and would travel in a
- * user-visible verdict. Dropping one char pays for a marker that can grow by
- * one digit at a 9→10 boundary, and the marker is re-derived from the new
- * dropped count. DEFENSIVE BRANCH, no committed test: the clip point is
- * private, so a fixture would have to reconstruct `room`; a throwaway probe
- * holds `kept + marker length <= room` and "no lone surrogate" for several
- * rooms instead.
- */
-function clipFailureDetail(detail: string, room: number): string {
-  if (detail.length <= room) return detail
-  let kept = room
-  for (;;) {
-    const next = room - `… (+${detail.length - kept} chars)`.length
-    if (next === kept) break
-    // A room too small for the marker cannot carry both; admit the loss with
-    // the bare ellipsis rather than overrun the segment bound.
-    if (next < 0) return '…'.slice(0, room)
-    kept = next
-  }
-  const before = detail.charCodeAt(kept - 1)
-  const after = detail.charCodeAt(kept)
-  if (kept > 0 && before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
-    kept -= 1
-  }
-  return `${detail.slice(0, kept)}… (+${detail.length - kept} chars)`
 }
 
 /** Dials one candidate address and completes the Noise handshake.
@@ -995,8 +989,16 @@ function asPairingError(error: unknown, stage: 'hello' | 'claim' | 'poll'): Pair
   if (reason !== undefined) {
     return new PairingError('rejected', `the desktop refused the pairing ${stage} (${reason})`)
   }
+  // The peer's message rides the SAME segment shaping as one candidate failure
+  // (issue #155): this verdict used to pass it through whole, bounded only by
+  // the 64 KiB record budget, and `cherry_pair` hands the message to the model
+  // verbatim. `unreachable` keeps the `pairing <stage> failed: <detail>` label,
+  // so the STAGE is still named; a detail that fits comes back byte for byte.
   return new PairingError(
     'unreachable',
-    `pairing ${stage} failed: ${error instanceof Error ? error.message : String(error)}`,
+    failureSegment(
+      `pairing ${stage} failed`,
+      error instanceof Error ? error.message : String(error),
+    ),
   )
 }
