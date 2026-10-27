@@ -6,6 +6,7 @@ import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceI
 import { createHash, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema } from "@cherrystudio/remote-protocol";
+import { peerIdFromString } from "@libp2p/peer-id";
 const FILE_MODE = 384;
 /**
 * Version-to-version migrations, keyed by the version they upgrade from.
@@ -3747,6 +3748,11 @@ function parsePayload(payload) {
 		"invitationSecret",
 		"desktopIdentity"
 	]) if (!isUnicodeText(qr[field])) invalid(`payload field "${field}" is not valid unicode text`);
+	try {
+		peerIdFromString(qr.desktopIdentity);
+	} catch {
+		invalid("payload field \"desktopIdentity\" is not a peer id");
+	}
 	return {
 		candidates,
 		invitationId: qr.invitationId,
