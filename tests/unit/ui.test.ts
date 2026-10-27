@@ -34,6 +34,7 @@ import type { ComponentProps, ComponentType } from 'react'
 import type { DeviceSummary, EventSourceLike } from '../../ui/src/types'
 import { App } from '../../ui/src/App'
 import { DeviceCard } from '../../ui/src/DeviceCard'
+import { dictionaries } from '../../ui/src/i18n'
 import { inject, apply, SETTINGS_NAMESPACE, SETTINGS_SLOT } from '../../ui/src/main'
 import type { SlotRegistration, SlotsService } from '../../ui/src/main'
 import { STAGE_LABELS } from '../../ui/src/types'
@@ -671,6 +672,11 @@ describe('device card actions', () => {
     ])
 
     fireEvent.click(screen.getByRole('button', { name: '地址维护' }))
+    // A UNIFORM record still shows the read-only map inside the open form: it
+    // is context for the one port field, not part of the mixed-port warning.
+    const form = screen.getByLabelText('端口').closest('form') as HTMLElement
+    expect(within(form).getByText('192.168.1.10:4343')).toBeTruthy()
+
     fireEvent.change(screen.getByLabelText('主机地址'), { target: { value: '10.0.0.5, 10.0.0.6' } })
     fireEvent.change(screen.getByLabelText('端口'), { target: { value: '5555' } })
     fireEvent.click(screen.getByRole('button', { name: '保存地址' }))
@@ -724,7 +730,10 @@ describe('device card per-host ports', () => {
     ports: { 'a.local': 65001, 'b.local': 65002 },
   }
 
-  const mixedHint = '各候选地址使用不同端口；在「地址维护」里改动端口会把所有候选地址改为同一端口。'
+  const mixedHint = '部分候选地址的端口与上方的端口不同；在「地址维护」里改动端口会把所有候选地址改为同一端口。'
+
+  /** The row label is the dictionary's, so a copy edit cannot leave ①b vacuous. */
+  const portsLabel = dictionaries.zh['device.field.ports']!
 
   /**
    * Renders the page for ONE record, the same opening move as the status-light
@@ -745,7 +754,7 @@ describe('device card per-host ports', () => {
   it('①a shows every candidate address port and says the ports differ', async () => {
     await renderRecord(mixed)
 
-    expect(screen.getByText('每地址端口')).toBeTruthy()
+    expect(screen.getByText(portsLabel)).toBeTruthy()
     expect(screen.getByText('a.local:65001, b.local:65002')).toBeTruthy()
     expect(screen.getByText(mixedHint)).toBeTruthy()
   })
@@ -753,14 +762,44 @@ describe('device card per-host ports', () => {
   it('①b hides the per-address row and the hint when every host dials the record port', async () => {
     await renderRecord({ ...mixed, ports: { 'a.local': 65001, 'b.local': 65001 } })
 
-    expect(screen.queryByText('每地址端口')).toBeNull()
+    expect(screen.queryByText(portsLabel)).toBeNull()
     expect(screen.queryByText(mixedHint)).toBeNull()
   })
 
   it('①c falls back to the record port for a host the map does not carry', async () => {
+    // A map missing one of the record's hosts is not a wire shape: the store's
+    // `assertValidPorts` rejects it on read, so the only way this record can
+    // exist in the page is `ui/src/api.ts`'s unvalidated `as DeviceSummary`
+    // cast. The case pins the card's defensive fallback arm, not a stored v4
+    // record (`GET /devices` always emits an entry for every host).
     await renderRecord({ ...mixed, ports: { 'a.local': 65002 } })
 
     expect(screen.getByText('a.local:65002, b.local:65001')).toBeTruthy()
+  })
+
+  it('①e still warns when the record port matches no listed host', async () => {
+    // Reachable through the card itself: open 地址维护 on a mixed record,
+    // delete the host that owned the record port, save. The one remaining host
+    // dials its own port, so the single port row is now wrong for EVERY
+    // address on the card — the shape a "the hosts disagree with each other"
+    // predicate would let through silently.
+    await renderRecord({ ...mixed, hosts: ['b.local'], ports: { 'b.local': 65002 } })
+
+    expect(screen.getByText(portsLabel)).toBeTruthy()
+    expect(screen.getByText('b.local:65002')).toBeTruthy()
+    expect(screen.getByText(mixedHint)).toBeTruthy()
+  })
+
+  it('①f brackets an IPv6 candidate so its port stays readable', async () => {
+    // Stored hosts are BARE IPv6 literals (`normalizeHost` strips the
+    // brackets), so `fe80::1:65001` would read as one ambiguous address.
+    await renderRecord({
+      ...mixed,
+      hosts: ['fe80::1', 'b.local'],
+      ports: { 'fe80::1': 65001, 'b.local': 65002 },
+    })
+
+    expect(screen.getByText('[fe80::1]:65001, b.local:65002')).toBeTruthy()
   })
 
   it('①d shows the current map in the editor, and an unchanged port keeps the map', async () => {

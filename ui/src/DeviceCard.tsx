@@ -47,6 +47,17 @@ function dialPort(device: DeviceSummary, host: string): number {
   return device.ports?.[host] ?? device.port
 }
 
+/**
+ * `host:port` as one readable address.
+ *
+ * An IPv6 literal contains colons, so `fe80::1:4343` reads as an ambiguous
+ * host; stored hosts are bare (`normalizeHost` strips the brackets), so the
+ * brackets are added here, for display only.
+ */
+function formatAddress(host: string, port: number): string {
+  return host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`
+}
+
 export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProps): ReturnType<typeof Object> {
   const t = useT()
   const [editor, setEditor] = useState<Editor>('none')
@@ -151,7 +162,7 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
   // card has anything to say beyond that single number; `addressList` is the
   // per-host truth (map value, record port as the fallback).
   const mixedPorts = device.hosts.some((host) => dialPort(device, host) !== device.port)
-  const addressList = device.hosts.map((host) => `${host}:${dialPort(device, host)}`).join(', ')
+  const addressList = device.hosts.map((host) => formatAddress(host, dialPort(device, host))).join(', ')
 
   // `?? state` keeps an unknown future state transparent — the enum is the only
   // honest thing left to show for one this build has no copy for — while every
