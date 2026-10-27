@@ -3769,6 +3769,23 @@ const DEFAULT_POLL_TIMEOUT_MS = 12e4;
 const VERIFICATION_CODE_RE = /^[0-9]{6}$/;
 /** Bounds the close frame's reason text quoted into a candidate failure. */
 const CLOSE_REASON_MAX = 200;
+/**
+* Bounds ONE candidate failure segment of the joined `unreachable` verdict
+* (issue #148). Unbounded, a v3 QR's 32 endpoints × a 253-char host — repeated
+* again inside the dial error — reached ~17-18 KB in one tool result that
+* `cherry_pair` passes through whole. The bound is per SEGMENT, never a
+* "first N + and M more" cut: issue #141's contract is that every candidate,
+* attempted or not, is NAMED.
+*
+* `FAILURE_LABEL_MAX` clips an over-long `host:port` in the HOST and keeps the
+* PORT (`<host prefix>…:<port>`) — a prefix without its port names no address.
+* `FAILURE_SEGMENT_MAX` bounds the whole `<label>: <detail>`: the detail is
+* clipped to the room the label leaves, and the `… (+N chars)` marker's own
+* length is charged to the bound. 32 candidates then join to at most
+* 32 × 240 + 31 × 2 = 7,742 characters.
+*/
+const FAILURE_LABEL_MAX = 128;
+const FAILURE_SEGMENT_MAX = 240;
 const noop = () => {};
 /** A callable silent libp2p logger (same shape as the connection layer's). */
 function makeSilentLogger() {
@@ -3811,6 +3828,66 @@ function webSocketFailure(error) {
 */
 function channelFailure(error) {
 	return /* @__PURE__ */ new Error(`channel: ${error.message}`);
+}
+/**
+* The ONE text form of a candidate failure (issue #148). All three
+* `failures.push` sites render through it, so the segment bound cannot hold on
+* one arm (budget-exhausted, dial failure, claim fall-through) and fail on
+* another. A short label and a short detail are returned BYTE FOR BYTE; the
+* enforcement is never a rewrite of ordinary text.
+*/
+function failureSegment(label, detail) {
+	const boundedLabel = clipFailureLabel(label);
+	const room = FAILURE_SEGMENT_MAX - boundedLabel.length - 2;
+	if (room <= 0) return boundedLabel.slice(0, FAILURE_SEGMENT_MAX);
+	return `${boundedLabel}: ${clipFailureDetail(detail, room)}`;
+}
+/**
+* Clips a `host:port` label in the HOST, keeping the port (see
+* {@link FAILURE_LABEL_MAX}).
+*
+* Identification here is PREFIX + PORT, not uniqueness: two schema-distinct
+* 253-char hosts that agree on their first ~121 characters AND on the port clip
+* to identical labels (ports may repeat — only hosts are deduped). Each still
+* contributes its own segment, so #141's per-candidate count is intact.
+*/
+function clipFailureLabel(label) {
+	if (label.length <= FAILURE_LABEL_MAX) return label;
+	const colon = label.lastIndexOf(":");
+	if (colon < 0) return `${label.slice(0, 127)}…`;
+	const suffix = `…${label.slice(colon)}`;
+	const hostRoom = FAILURE_LABEL_MAX - suffix.length;
+	return hostRoom > 0 ? `${label.slice(0, hostRoom)}${suffix}` : suffix.slice(0, FAILURE_LABEL_MAX);
+}
+/**
+* Clips the detail into `room` characters, `… (+N chars)` included in the
+* count. `kept` is a fixed point — the number of removed characters sets the
+* marker's own digits — and it is the LARGEST prefix that fits, so the segment
+* uses its budget without ever exceeding it.
+*
+* The final guard never ends the kept prefix between a UTF-16 surrogate pair: a
+* clip there would emit a lone surrogate, which is not valid unicode text (the
+* peer's `unicodeText` params face refuses it) and would travel in a
+* user-visible verdict. Dropping one char pays for a marker that can grow by
+* one digit at a 9→10 boundary, and the marker is re-derived from the new
+* dropped count. DEFENSIVE BRANCH, no committed test: the clip point is
+* private, so a fixture would have to reconstruct `room`; a throwaway probe
+* holds `kept + marker length <= room` and "no lone surrogate" for several
+* rooms instead.
+*/
+function clipFailureDetail(detail, room) {
+	if (detail.length <= room) return detail;
+	let kept = room;
+	for (;;) {
+		const next = room - `… (+${detail.length - kept} chars)`.length;
+		if (next === kept) break;
+		if (next < 0) return "…".slice(0, room);
+		kept = next;
+	}
+	const before = detail.charCodeAt(kept - 1);
+	const after = detail.charCodeAt(kept);
+	if (kept > 0 && before >= 55296 && before <= 56319 && after >= 56320 && after <= 57343) kept -= 1;
+	return `${detail.slice(0, kept)}… (+${detail.length - kept} chars)`;
 }
 /** Dials one candidate address and completes the Noise handshake.
 *
@@ -3944,14 +4021,14 @@ async function pairWithPayload(opts) {
 		const label = `${candidate.host}:${candidate.port}`;
 		const remaining = dialDeadline - performance.now();
 		if (remaining <= 0) {
-			failures.push(`${label}: not attempted (the ${dialBudgetMs} ms dial budget was exhausted before this candidate)`);
+			failures.push(failureSegment(label, `not attempted (the ${dialBudgetMs} ms dial budget was exhausted before this candidate)`));
 			continue;
 		}
 		let temp;
 		try {
 			temp = await dial(candidate, opts.identity, payload.desktopIdentity, offered, Math.min(connectTimeoutMs, remaining), opts.wsOptions);
 		} catch (error) {
-			failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+			failures.push(failureSegment(label, error instanceof Error ? error.message : String(error)));
 			continue;
 		}
 		try {
@@ -3961,7 +4038,7 @@ async function pairWithPayload(opts) {
 		} catch (error) {
 			destroy(temp);
 			if (error instanceof PairingError) throw error;
-			failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+			failures.push(failureSegment(label, error instanceof Error ? error.message : String(error)));
 		}
 	}
 	if (approved === void 0) throw new PairingError("unreachable", `no candidate address could complete pairing (${failures.join("; ")})`);
