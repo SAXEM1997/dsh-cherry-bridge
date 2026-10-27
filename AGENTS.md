@@ -908,25 +908,25 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 
 ## Upstream references
 
-Neither reference lives in this repository.
+Neither reference is published with this repository.
 
-- **`/tmp/csa`** — the official Cherry Studio **app** (`CherryHQ/cherry-studio-app`
-  @ v0.4.0, read 2026-10-22), the **same role we play** (protocol *client*
-  against the desktop's server). Its remote layer is
+- **`.scratch-csa`** (gitignored) — the official Cherry Studio **app**
+  (`CherryHQ/cherry-studio-app` @ v0.5.0, read 2026-10-27), the **same role we
+  play** (protocol *client* against the desktop's server). Its remote layer is
   `src/backend/services/remoteAgent/`; "what the official client does" comes
-  from there.
+  from there. v0.5.0 moved onto our pins (0.7.0 / 0.2.5), whose one behavioural
+  change is the versioned pairing QR.
 - **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
   read alongside v2.1.7, the protocol **server** of record. The faces we depend
   on are `src/main/services/remoteAccess/` and
-  `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries the
-  512/s content-read line and the shared line (64/s through 2.1.6, 256/s from
-  2.1.7). Gitignored; treated as read-only research.
+  `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries both
+  rate lines. Gitignored; treated as read-only research.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.8** (plus post-2.1.8 `main` commits).
-mDNS, protocol versions (`[1]`) and Noise saw **zero changes**; pairing only
-ADDED the v3 QR arm (below). Notable faces:
+**Verified desktop range: 2.1.4 → 2.1.8.** mDNS, protocol versions (`[1]`) and
+Noise saw **zero changes**; pairing only ADDED the v3 QR arm (below). Notable
+faces:
 
 | Upstream change | Impact |
 | --- | --- |
@@ -942,9 +942,9 @@ ADDED the v3 QR arm (below). Notable faces:
 
 **Traps in the official app (a cautionary list, not a spec).**
 
-- Its `RemoteAgentError` marks `RATE_LIMITED`/`TOKEN_EXPIRED`/
-  `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries forever at the
-  same page size, so a byte-budget `RESOURCE_EXHAUSTED` never converges. Our
+- Its `RemoteAgentError` marks those four retryable, but its scope layer DOES
+  honour `details.retryable: false`; it has no adaptive page size, so a
+  byte-budget `RESOURCE_EXHAUSTED` still does not converge at a fixed limit. Our
   answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
 - Its read path refuses an unusable `byteLength`; we fall back to a slice bound
   plus the cumulative arm.
