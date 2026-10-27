@@ -3879,16 +3879,16 @@ async function pairWithPayload(opts) {
 	const supported = opts.supportedProtocolVersions ?? DEFAULT_SUPPORTED_PROTOCOL_VERSIONS;
 	const offered = payload.protocolVersions.filter((version) => supported.includes(version));
 	const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
-	const dialBudgetMs = opts.dialBudgetMs ?? DEFAULT_DIAL_BUDGET_MS;
-	const dialDeadline = Date.now() + dialBudgetMs;
+	const dialBudgetMs = typeof opts.dialBudgetMs === "number" && Number.isFinite(opts.dialBudgetMs) ? opts.dialBudgetMs : DEFAULT_DIAL_BUDGET_MS;
+	const dialDeadline = performance.now() + dialBudgetMs;
 	report("connect");
 	const failures = [];
 	let approved;
 	for (const candidate of payload.candidates) {
 		const label = `${candidate.host}:${candidate.port}`;
-		const remaining = dialDeadline - Date.now();
+		const remaining = dialDeadline - performance.now();
 		if (remaining <= 0) {
-			failures.push(`${label}: not attempted (the ${dialBudgetMs} ms dial budget was spent on earlier candidates)`);
+			failures.push(`${label}: not attempted (the ${dialBudgetMs} ms dial budget was exhausted before this candidate)`);
 			continue;
 		}
 		let temp;

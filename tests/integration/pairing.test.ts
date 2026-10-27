@@ -577,19 +577,20 @@ describe('pairWithPayload over a real loopback channel', () => {
     )
 
     expect(error.kind).toBe('unreachable')
-    expect(error.message).toContain('the 0 ms dial budget')
-    // EVERY candidate is named, and named as UNATTEMPTED: a skipped candidate
-    // that vanishes from the diagnosis leaves the caller nothing to act on.
+    // EVERY candidate is named, and named as UNATTEMPTED — and each appears
+    // EXACTLY ONCE. Dropping the branch's `continue` lets the fall-through dial
+    // fail and push a SECOND segment naming the same address (the dial error
+    // already carries the candidate's `host:port`), so this duplicate — not any
+    // particular dial wording — is the wording-independent mutant detector.
     for (const endpoint of endpoints) {
-      expect(error.message).toContain(`${endpoint.host}:${endpoint.port}: not attempted`)
+      const label = `${endpoint.host}:${endpoint.port}`
+      expect(error.message, `not attempted for ${label}`).toContain(`${label}: not attempted`)
+      expect(error.message.split(label).length - 1, `occurrences of ${label}`).toBe(1)
     }
+    expect(error.message.match(/not attempted/g) ?? []).toHaveLength(endpoints.length)
     // Budget 0 means not one dial was even started — against a live peer.
     expect(fakeInfo.fake.connectionCount).toBe(0)
     expect(fakeInfo.fake.socketCount).toBe(0)
-    // …and "not attempted" must be the ONLY verdict: dropping the branch's
-    // `continue` (falling through into a dial) appends a dial error instead of
-    // ending the candidate's story at the budget, which this pins.
-    expect(error.message).not.toContain('timed out')
     expect(store.list()).toEqual([])
   }, 15_000)
 
@@ -600,28 +601,28 @@ describe('pairWithPayload over a real loopback channel', () => {
     // ends this dial. Without the clamp the dial would sit the full
     // `connectTimeoutMs` (10 s) and the elapsed assertion — not the 15 s test
     // timeout — is what catches it. A plain live peer would instead complete
-    // the handshake inside the 10 ms clamp, making the test a race.
+    // the handshake inside the clamp, making the test a race.
     const fakeInfo = await makeFake({
       pairingDecision: 'approved',
       pairingGetPendingPolls: APPROVE_AFTER_POLLS,
       handshakeDelayMs: 11_000,
     })
     const store = await makeStore()
-    const startedAt = Date.now()
+    const startedAt = performance.now()
 
     const error = await pairingError(
       pair({
         identity,
         store,
-        dialBudgetMs: 10,
-        // A per-attempt bound 1000x the budget: WITHOUT the clamp this would
+        dialBudgetMs: 250,
+        // A per-attempt bound 40x the budget: WITHOUT the clamp this would
         // sit here for ten seconds after the budget is gone.
         connectTimeoutMs: 10_000,
         payload: v3PayloadFor(fakeInfo),
       }),
     )
 
-    const elapsed = Date.now() - startedAt
+    const elapsed = performance.now() - startedAt
     expect(error.kind).toBe('unreachable')
     expect(error.message).toContain('timed out')
     // The assertion the un-clamped mutant fails. The 15 s test timeout above
@@ -639,6 +640,27 @@ describe('pairWithPayload over a real loopback channel', () => {
       identity,
       store,
       dialBudgetMs: 5_000,
+      payload: v3PayloadFor(fakeInfo),
+    })
+
+    expect(record.deviceId).toBe(fakeInfo.fake.approvedDeviceId)
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+    expect(store.list()).toEqual([record])
+  }, 15_000)
+
+  it('⑦d a non-finite budget falls back to the default instead of disabling the bound', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    // `NaN` must not become the deadline: `performance.now() + NaN` makes every
+    // `remaining` NaN, the `<= 0` early branch never fires and the per-dial
+    // clamp yields a ~1 ms timeout — every live candidate would "fail". The
+    // default (30 s) has to apply instead, so the happy path still completes.
+    const record = await pair({
+      identity,
+      store,
+      dialBudgetMs: Number.NaN,
       payload: v3PayloadFor(fakeInfo),
     })
 

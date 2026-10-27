@@ -56,8 +56,8 @@ export interface PairWithPayloadOptions {
   /**
    * Aggregate budget for the candidate DIAL walk (default 30s). It bounds the
    * SUM of dial attempts, never a single attempt (that is `connectTimeoutMs`),
-   * and it does not cover the claim/poll phase, which keeps its own
-   * invitation-bound deadline (`pollTimeoutMs`).
+   * and it does not cover the claim/poll phase, which keeps its own fresh,
+   * claim-anchored race guard (`pollTimeoutMs`).
    */
   dialBudgetMs?: number
   /** Locally supported protocol versions (default [1]). */
@@ -491,10 +491,18 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   // ONE deadline for the whole candidate walk (issue #141). The per-attempt
   // bound stays `connectTimeoutMs`, but no candidate may START after this
   // instant and the last dial is clamped to what is left of it. The CLAIM/POLL
-  // phase below is deliberately outside it: that phase keeps its own
-  // invitation-bound deadline (`pollTimeoutMs`).
-  const dialBudgetMs = opts.dialBudgetMs ?? DEFAULT_DIAL_BUDGET_MS
-  const dialDeadline = Date.now() + dialBudgetMs
+  // phase below is deliberately outside it: that phase keeps its own FRESH
+  // race guard anchored at the claim (`pollTimeoutMs`), not the invitation's
+  // birth — the peer's own `expired` is the real bound there.
+  //
+  // The deadline rides the MONOTONIC clock: a backward wall-clock step would
+  // GROW `remaining` and re-open the unbounded walk (the per-dial clamp cannot
+  // bound a walk whose deadline moved).
+  const dialBudgetMs =
+    typeof opts.dialBudgetMs === 'number' && Number.isFinite(opts.dialBudgetMs)
+      ? opts.dialBudgetMs
+      : DEFAULT_DIAL_BUDGET_MS
+  const dialDeadline = performance.now() + dialBudgetMs
   report('connect')
 
   const failures: string[] = []
@@ -502,10 +510,10 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   let approved: DeviceRecord | undefined
   for (const candidate of payload.candidates) {
     const label = `${candidate.host}:${candidate.port}`
-    const remaining = dialDeadline - Date.now()
+    const remaining = dialDeadline - performance.now()
     if (remaining <= 0) {
       failures.push(
-        `${label}: not attempted (the ${dialBudgetMs} ms dial budget was spent on earlier candidates)`,
+        `${label}: not attempted (the ${dialBudgetMs} ms dial budget was exhausted before this candidate)`,
       )
       continue
     }
