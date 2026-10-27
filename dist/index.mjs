@@ -585,6 +585,80 @@ async function generateIdentity(dataDir, path) {
 	return parseIdentity(key);
 }
 //#endregion
+//#region src/text.ts
+/**
+* Bounded rendering for peer- and payload-controlled text (issue #155).
+*
+* ONE helper for every face that interpolates text a REMOTE peer controls — or
+* that a pairing payload the operator scanned controls — into a log line or a
+* user-visible verdict. The audit behind #155 found four such sites in three
+* files, each left unbounded for a different "why not" (a 10 KiB payload cap, a
+* hello-advertised field, the 64 KiB record budget), which is exactly how the
+* class of defect recurs: each site answered the question for itself.
+*
+* The rule these helpers establish is stated once, here: bound the text where
+* it is RENDERED (never where it is carried — an error message is a value
+* until a log line or a verdict makes it text), name the amount removed with
+* the `… (+N chars)` marker, and never drop a list ENTRY silently (the
+* `(+K more)` count is explicit).
+*/
+/**
+* Clips `text` into `max` characters, the `… (+N chars)` marker included in
+* the count. `kept` is a fixed point — the number of removed characters sets
+* the marker's own digits — and it is the LARGEST prefix that fits, so a
+* caller's ceiling is used without ever being exceeded.
+*
+* The final guard never ends the kept prefix between a UTF-16 surrogate pair: a
+* clip there would emit a lone surrogate, which is not valid unicode text (the
+* peer's `unicodeText` params face refuses it) and would travel in a
+* user-visible verdict. Dropping one char pays for a marker that can grow by
+* one digit at a 9→10 boundary, and the marker is re-derived from the new
+* dropped count. Pinned by `tests/unit/text.test.ts` — the branch used to be a
+* declared coverage gap while the clip point was private to pairing.
+*/
+function clipText(text, max) {
+	if (text.length <= max) return text;
+	let kept = max;
+	for (;;) {
+		const next = max - `… (+${text.length - kept} chars)`.length;
+		if (next === kept) break;
+		if (next < 0) return "…".slice(0, max);
+		kept = next;
+	}
+	const before = text.charCodeAt(kept - 1);
+	const after = text.charCodeAt(kept);
+	if (kept > 0 && before >= 55296 && before <= 56319 && after >= 56320 && after <= 57343) kept -= 1;
+	return `${text.slice(0, kept)}… (+${text.length - kept} chars)`;
+}
+/**
+* Renders `items` as a comma-joined list under `limits.max`, each item clipped
+* to `limits.itemMax` FIRST. When anything is left out the list says so:
+* ` (+K more)` where K is the number of items NOT named.
+*
+* Caller contract: `itemMax <= max`, so the first item always fits and a list
+* carrying a single over-long entry never renders an empty one. The marker
+* rides ON TOP of `limits.max` — it is a count, not an item, so the named text
+* never has to absorb its length. `[]` renders as `''`.
+*
+* Pairing's progress line (`stageHosts`) deliberately does NOT use this helper:
+* it always shows the FIRST host in full even above its own budget, because
+* that host is the run's identity. That is not an oversight, and it is not a
+* reason to weaken the contract here.
+*/
+function boundedJoin(items, limits) {
+	const rendered = items.map((item) => clipText(item, limits.itemMax));
+	const first = rendered[0];
+	if (first === void 0) return "";
+	let text = first;
+	let shown = 1;
+	for (; shown < rendered.length; shown += 1) {
+		if (text.length + 2 + rendered[shown].length > limits.max) break;
+		text += `, ${rendered[shown]}`;
+	}
+	const omitted = items.length - shown;
+	return omitted > 0 ? `${text} (+${omitted} more)` : text;
+}
+//#endregion
 //#region src/rpc/jsonRpcClient.ts
 /** Default cap on business requests in flight on a single connection. */
 const DEFAULT_MAX_IN_FLIGHT = 8;
@@ -1010,7 +1084,7 @@ var JsonRpcClient = class {
 			for (const handler of [...this.handlers]) try {
 				handler(method, params);
 			} catch (error) {
-				console.warn(`[cherry-remote] notification handler for "${method}" threw`, error);
+				console.warn(`[cherry-remote] notification handler for "${bounded(method)}" threw: ` + clipText(error instanceof Error ? error.message : String(error), 240));
 			}
 			return;
 		}
@@ -3111,7 +3185,7 @@ var DeviceConnection = class {
 		if (error instanceof ProtocolVersionError) {
 			this.#running = false;
 			this.#setState("offline");
-			console.error(`[cherry-remote] device ${this.record.deviceId}: protocol version incompatible (${error.message}); upgrade Cherry Studio / the plugin`);
+			console.error(`[cherry-remote] device ${this.record.deviceId}: protocol version incompatible (${clipText(error.message, 240)}); upgrade Cherry Studio / the plugin`);
 			this.#cycle.reject(/* @__PURE__ */ new Error(`device ${this.record.deviceId}: protocol version incompatible`));
 			return;
 		}
@@ -3129,7 +3203,8 @@ var DeviceConnection = class {
 		if (!this.#running) return;
 		const delay = this.#backoffDelay();
 		const hint = isAllHostsUnreachable(error) ? " — all candidate addresses were unreachable; if the desktop moved, update them via the device card 地址维护 (address maintenance)" : "";
-		console.warn(`[cherry-remote] device ${this.record.deviceId} offline (${error instanceof Error ? error.message : String(error)}); reconnecting in ${delay}ms${hint}`);
+		const detail = error instanceof Error ? error.message : String(error);
+		console.warn(`[cherry-remote] device ${this.record.deviceId} offline (${clipText(detail, 240)}); reconnecting in ${delay}ms${hint}`);
 		this.#setTimer("backoff", setTimeout(() => this.#tryEstablish(), delay));
 	}
 	#backoffDelay() {
@@ -3625,6 +3700,23 @@ var PairingError = class extends Error {
 };
 /** Overall payload ceiling: a QR code never approaches this. */
 const MAX_PAYLOAD_BYTES = 10240;
+/**
+* Bounds the unknown-key WARNING (issue #155). The keys in that warning are
+* payload-CONTROLLED NAMES, and `MAX_PAYLOAD_BYTES` is no bound at all on the
+* line: a 10 KiB payload carrying 32 unknown keys of ~256 characters used to
+* join into ~5-7 KB of attacker-chosen text on the operator's log (the
+* measured fixture is 8.2 KB of keys, 8.3 KB of line).
+*
+* `UNKNOWN_FIELDS_MAX` is the joined list's budget — the same 240-character
+* working ceiling as `LOG_TEXT_MAX` / `FAILURE_SEGMENT_MAX`, so "one bounded
+* peer detail" means one number on every face. `UNKNOWN_FIELD_MAX` clips ONE
+* key: 64 characters is longer than any field name the protocol defines, so a
+* clipped key is always a malformed or hostile payload, never a real typo the
+* operator needs whole. A list that stops early names the count (`(+K more)`);
+* entries are never dropped silently.
+*/
+const UNKNOWN_FIELDS_MAX = 240;
+const UNKNOWN_FIELD_MAX = 64;
 /** The claim's deviceName cap; a hostname may reach 253, so it is truncated. */
 const DEVICE_NAME_MAX = 64;
 /** Bounds a single candidate host string (IPv6 literals are ~45). */
@@ -3727,7 +3819,10 @@ function parsePayload(payload) {
 	if (!result.success) invalid(`payload rejected by the pairing QR schema (v2 or v3): ${schemaIssuePaths(result.error)}`);
 	const qr = result.data;
 	const ignored = Object.keys(raw).filter((key) => !(qr.v === 2 ? V2_KEYS : V3_KEYS).has(key));
-	if (ignored.length > 0) console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${ignored.join(", ")}`);
+	if (ignored.length > 0) console.warn(`[cherry-remote] pairing payload ignored unknown field(s): ${boundedJoin(ignored, {
+		max: UNKNOWN_FIELDS_MAX,
+		itemMax: UNKNOWN_FIELD_MAX
+	})}`);
 	const candidates = qr.v === 2 ? qr.ips.map((host) => ({
 		host,
 		port: qr.port,
@@ -3858,12 +3953,16 @@ function channelFailure(error) {
 * one arm (budget-exhausted, dial failure, claim fall-through) and fail on
 * another. A short label and a short detail are returned BYTE FOR BYTE; the
 * enforcement is never a rewrite of ordinary text.
+*
+* The detail goes through the SHARED {@link clipText} (issue #155), the same
+* `… (+N chars)` form every other peer-controlled log detail uses; the clip
+* point is no longer private to pairing.
 */
 function failureSegment(label, detail) {
 	const boundedLabel = clipFailureLabel(label);
 	const room = FAILURE_SEGMENT_MAX - boundedLabel.length - 2;
 	if (room <= 0) return boundedLabel.slice(0, FAILURE_SEGMENT_MAX);
-	return `${boundedLabel}: ${clipFailureDetail(detail, room)}`;
+	return `${boundedLabel}: ${clipText(detail, room)}`;
 }
 /**
 * Clips a `host:port` label in the HOST, keeping the port (see
@@ -3881,36 +3980,6 @@ function clipFailureLabel(label) {
 	const suffix = `…${label.slice(colon)}`;
 	const hostRoom = FAILURE_LABEL_MAX - suffix.length;
 	return hostRoom > 0 ? `${label.slice(0, hostRoom)}${suffix}` : suffix.slice(0, FAILURE_LABEL_MAX);
-}
-/**
-* Clips the detail into `room` characters, `… (+N chars)` included in the
-* count. `kept` is a fixed point — the number of removed characters sets the
-* marker's own digits — and it is the LARGEST prefix that fits, so the segment
-* uses its budget without ever exceeding it.
-*
-* The final guard never ends the kept prefix between a UTF-16 surrogate pair: a
-* clip there would emit a lone surrogate, which is not valid unicode text (the
-* peer's `unicodeText` params face refuses it) and would travel in a
-* user-visible verdict. Dropping one char pays for a marker that can grow by
-* one digit at a 9→10 boundary, and the marker is re-derived from the new
-* dropped count. DEFENSIVE BRANCH, no committed test: the clip point is
-* private, so a fixture would have to reconstruct `room`; a throwaway probe
-* holds `kept + marker length <= room` and "no lone surrogate" for several
-* rooms instead.
-*/
-function clipFailureDetail(detail, room) {
-	if (detail.length <= room) return detail;
-	let kept = room;
-	for (;;) {
-		const next = room - `… (+${detail.length - kept} chars)`.length;
-		if (next === kept) break;
-		if (next < 0) return "…".slice(0, room);
-		kept = next;
-	}
-	const before = detail.charCodeAt(kept - 1);
-	const after = detail.charCodeAt(kept);
-	if (kept > 0 && before >= 55296 && before <= 56319 && after >= 56320 && after <= 57343) kept -= 1;
-	return `${detail.slice(0, kept)}… (+${detail.length - kept} chars)`;
 }
 /** Dials one candidate address and completes the Noise handshake.
 *
@@ -4185,7 +4254,7 @@ function asPairingError(error, stage) {
 	if (error instanceof PairingError) return error;
 	const reason = rpcReason(error);
 	if (reason !== void 0) return new PairingError("rejected", `the desktop refused the pairing ${stage} (${reason})`);
-	return new PairingError("unreachable", `pairing ${stage} failed: ${error instanceof Error ? error.message : String(error)}`);
+	return new PairingError("unreachable", failureSegment(`pairing ${stage} failed`, error instanceof Error ? error.message : String(error)));
 }
 //#endregion
 //#region src/subscriptions.ts
@@ -11908,6 +11977,30 @@ function subsFor(deviceId) {
 	return created;
 }
 /**
+* Bounds the link-recovery line's session-id list (issue #155).
+*
+* The number of ENTRIES is bounded only by the peer-advertised hello
+* `subscriptions` — a number the peer chooses, not one this assembly can size —
+* and a session id is the protocol's `opaqueId` (≤ 256 characters). The old
+* `sessions.join(', ')` therefore emitted `entries × 258` characters into one
+* info line: the protocol's own `remoteLimits.subscriptions` = 8 still allows
+* ~2 KB, and a peer advertising more grows the line with no ceiling at all. The
+* text is peer-controlled (the ids are echoed back from what the peer accepted
+* as subscriptions), so it needs a LOCAL bound like every other such log.
+*
+* `RECOVERY_SESSIONS_MAX` = 320 is the joined ids' budget: eight normal
+* 36-char UUIDs render as 8 × 36 + 7 × 2 = 302 characters, so the protocol's
+* own subscription cap fits WHOLE — the bound bites only on a peer that
+* advertises more room, or on a malformed over-long id.
+* `RECOVERY_SESSION_ID_MAX` = 256 is that `opaqueId` cap, so a schema-valid id
+* is never clipped; only a malformed one is. A list that stops early names the
+* count (`(+K more)`) and rides ON TOP of the budget; entries are never dropped
+* silently. The bound is on the LOG only — the loop still re-ensures every
+* session.
+*/
+const RECOVERY_SESSIONS_MAX = 320;
+const RECOVERY_SESSION_ID_MAX = 256;
+/**
 * The reconnect recovery line (ruling 8): every session this device had
 * subscribed is re-ensured at its LAST cursor, so the peer replays only what
 * this harness has not yet consumed.
@@ -11921,7 +12014,10 @@ async function recoverSubscriptions(deviceId) {
 	const subscriptions = state.subscriptions.get(deviceId);
 	if (subscriptions === void 0) return;
 	const sessions = subscriptions.activeSessions();
-	if (sessions.length > 0) console.info(`[cherry-remote] recovering ${sessions.length} subscription(s) for ${deviceId}: ${sessions.join(", ")}`);
+	if (sessions.length > 0) console.info(`[cherry-remote] recovering ${sessions.length} subscription(s) for ${deviceId}: ${boundedJoin(sessions, {
+		max: RECOVERY_SESSIONS_MAX,
+		itemMax: RECOVERY_SESSION_ID_MAX
+	})}`);
 	for (const sessionId of sessions) try {
 		const result = subscriptions.read(sessionId);
 		const cursor = "events" in result ? result.nextCursor : void 0;

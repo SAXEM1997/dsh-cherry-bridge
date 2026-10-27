@@ -1731,14 +1731,16 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(error.kind).toBe('unreachable')
   }, 15_000)
 
-  it('⑭d pins the stage name in the one stage-failure text that is passed through whole', async () => {
+  it('⑭d pins the stage name in a SHORT stage-failure text, returned byte for byte', async () => {
     const identity = await createDeviceIdentity()
     // Hold every RPC reply so the FIRST pairing request (`connection.hello`)
     // is still in flight when the link dies: `asPairingError` then renders
-    // `pairing hello failed: …` — the one `unreachable` text that never passes
-    // through the segment shaping. No new fixture: the existing fake's reply
-    // delay plus its `helloCount` counter are enough, and the transport's own
-    // text after the colon is deliberately NOT asserted.
+    // `pairing hello failed: …`. Since #155 that detail rides the shared
+    // segment shaping, so this arm pins the SHORT case — a detail that fits
+    // comes back unchanged, prefix included; ⑯b pins the long case. No new
+    // fixture: the existing fake's reply delay plus its `helloCount` counter
+    // are enough, and the transport's own text after the colon is deliberately
+    // NOT asserted.
     const fakeInfo = await makeFake({ requestDelayMs: 5_000 })
     const store = await makeStore()
 
@@ -1781,6 +1783,84 @@ describe('pairWithPayload over a real loopback channel', () => {
     // ...and the VALUE never is (the payload error face echoes no values).
     expect(error.message).not.toContain('not-a-peer-id')
     expect(fakeInfo.fake.socketCount).toBe(0)
+    expect(store.list()).toEqual([])
+  }, 15_000)
+  // -------------------------------------------------------------------------
+  // Bounded log text and verdicts (issue #155). Two peer-controlled texts get
+  // one local ceiling each: the unknown-key warning (attacker-chosen NAMES,
+  // one payload that could emit ~5-7 KB onto the operator's log) and the
+  // stage-failure verdict (`asPairingError` USED TO pass the peer's
+  // `error.message` through whole, bounded only by the 64 KiB record budget).
+  // -------------------------------------------------------------------------
+
+  it('⑯a bounds the unknown-key warning and names the keys it left out', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+    // 32 unrecognized keys of 256 chars: attacker-CHOSEN names, well under the
+    // 10 KiB payload cap (asserted below), which used to join into ~8.2 KB of
+    // warn line. A key is just a string to the payload schema.
+    const keys = Array.from({ length: 32 }, (_, index) => `k${String(index).padStart(2, '0')}${'x'.repeat(253)}`)
+    expect(new Set(keys).size).toBe(32)
+    expect(keys.every((key) => key.length === 256)).toBe(true)
+    const payload = v3PayloadFor(fakeInfo, Object.fromEntries(keys.map((key) => [key, 'v'])))
+    expect(Buffer.byteLength(payload, 'utf8')).toBeLessThanOrEqual(10 * 1024)
+
+    await pair({ identity, store, payload })
+
+    const line = consoleWarn.mock.calls
+      .flat()
+      .map(String)
+      .find((entry) => entry.includes('ignored unknown field(s)'))
+    expect(line, 'the unknown-key warning must be logged').toBeDefined()
+    // CEILING: the prefix (~55 chars) + UNKNOWN_FIELDS_MAX 240 + the
+    // ` (+29 more)` marker (11) is under 310; 300 is the STATED bound and the
+    // marker rides on top of the budget. An unbounded join of these keys is
+    // ~8.3 KB.
+    expect(line!.length).toBeLessThan(300)
+    // The count of unnamed keys is explicit, and it is the real remainder:
+    // 3 keys fit (64 + 2 + 64 + 2 + 64 = 196; the fourth would make 262 > 240).
+    expect(line).toContain('(+29 more)')
+    // The first key is named but CLIPPED to UNKNOWN_FIELD_MAX (64): its head
+    // survives, its full name does not, and the removal is counted.
+    expect(line).toContain(keys[0]!.slice(0, 50))
+    expect(line).toContain('… (+206 chars)')
+    expect(line).not.toContain(keys[0]!)
+    // The fourth key is NOT named: it did not fit, and the marker says so.
+    expect(line).not.toContain(keys[3]!.slice(0, 50))
+    // The payload itself was accepted: unknown keys are IGNORED, not refused.
+    expect(store.list()).toHaveLength(1)
+  }, 15_000)
+
+  it('⑯b bounds one long peer message in a pairing STAGE failure', async () => {
+    const identity = await createDeviceIdentity()
+    // The peer's own `error.message` for the claim stage. 5,000 characters is
+    // schema-valid on the WIRE (the response schema's `message` has no bound;
+    // only the nested failure `data` object does, which is why the client
+    // discards it and the `unreachable` arm reads the message). Before #155
+    // that text went into the verdict whole — one 64 KiB record could become a
+    // 64 KiB tool result.
+    const longMessage = `peer claim stage exploded ${'z'.repeat(5_000)}`
+    const fakeInfo = await makeFake({
+      pairingClaimFailure: { reason: 'INTERNAL', message: longMessage },
+    })
+    const store = await makeStore()
+
+    const error = await pairingError(pair({ identity, store, payload: v3PayloadFor(fakeInfo) }))
+
+    expect(error.kind).toBe('unreachable')
+    // The stage is still named, and a short detail keeps the pre-#155 prefix
+    // (`pairing <stage> failed: `) byte for byte — see ⑭d for that arm.
+    expect(error.message.startsWith('pairing claim failed: ')).toBe(true)
+    // CEILING: FAILURE_SEGMENT_MAX = 240 for the whole `<label>: <detail>`,
+    // marker included.
+    expect(error.message.length).toBeLessThanOrEqual(240)
+    expect(error.message).toMatch(/… \(\+\d+ chars\)$/)
+    // The marker names a real removal, and the peer's raw text is gone.
+    const removed = Number(/… \(\+(\d+) chars\)$/.exec(error.message)![1])
+    expect(removed).toBeGreaterThan(4_000)
+    expect(error.message).not.toContain(longMessage)
+    expect(error.message).not.toContain('z'.repeat(1_000))
     expect(store.list()).toEqual([])
   }, 15_000)
 })

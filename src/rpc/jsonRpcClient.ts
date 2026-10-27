@@ -5,6 +5,7 @@ import {
   remoteFailureSchema,
 } from '@cherrystudio/remote-protocol'
 import type { SecureChannel } from '@cherrystudio/remote-transport'
+import { clipText, LOG_TEXT_MAX } from '../text.js'
 
 /** Default cap on business requests in flight on a single connection. */
 const DEFAULT_MAX_IN_FLIGHT = 8
@@ -558,7 +559,21 @@ export class JsonRpcClient {
         try {
           handler(method, params)
         } catch (error) {
-          console.warn(`[cherry-remote] notification handler for "${method}" threw`, error)
+          // BOUNDED, and ONE STRING (issue #155). The old form passed the error
+          // OBJECT as a second argument, so the console chose the rendering:
+          // the stack plus every own property, with nothing bounding it. A
+          // handler failure is not a payload, so the line carries what an
+          // operator needs and nothing else — the METHOD (peer-supplied text,
+          // routed through the same `bounded()` the frame-drop path uses; that
+          // helper stays as it is, the count-less older form, and unifying the
+          // two is a separate ticket) and the MESSAGE under LOG_TEXT_MAX.
+          // Ceiling: `[cherry-remote] notification handler for "` (42) +
+          // bounded method (≤ 121: FRAME_FIELD_LIMIT 120 + the ellipsis) +
+          // `" threw: ` (9) + LOG_TEXT_MAX (240) = 412.
+          console.warn(
+            `[cherry-remote] notification handler for "${bounded(method)}" threw: ` +
+              clipText(error instanceof Error ? error.message : String(error), LOG_TEXT_MAX),
+          )
         }
       }
       return

@@ -67,6 +67,24 @@ export interface FakeCherryOptions {
   authenticateFailure?: FakeFailure
   /** Every `connection.refresh` fails with this protocol failure. */
   refreshFailure?: FakeFailure
+  /**
+   * Every `connection.hello` fails with this protocol failure.
+   *
+   * Added for issue #155's (#155a): the protocol-version console.error
+   * interpolates the `ProtocolVersionError` cause, which is the peer's OWN
+   * hello-failure text. The fake's built-in INVALID_CONNECTION_STATE messages
+   * are fixed short strings, so only an injected failure can make that text
+   * long enough to prove the log line is bounded.
+   *
+   * Keep `message` at or below the protocol's 512-character failure-message cap
+   * when the test wants the STRUCTURED arm: `remoteFailureSchema.message` is
+   * `z.string().max(512)`, and above it the client discards `data`, so the
+   * reason is unreadable and the failure takes the transient/offline arm
+   * instead of becoming a `ProtocolVersionError`.
+   *
+   * Optional and additive, like `authenticateFailure` / `refreshFailure`.
+   */
+  helloFailure?: FakeFailure
   /** Accept pings but never answer them (silence-timeout exercises). */
   dropPings?: boolean
   /**
@@ -112,6 +130,18 @@ export interface FakeCherryOptions {
   pairingDecision?: 'approved' | 'rejected' | 'expired'
   /** Number of `pairing.get` calls answered `pending` before the decision. */
   pairingGetPendingPolls?: number
+  /**
+   * Every `pairing.claim` fails with this protocol failure (the same
+   * `FakeFailure` shape `authenticateFailure` / `refreshFailure` take).
+   *
+   * Added for issue #155's ⑯b: the pairing stage error face reads the peer's
+   * own `error.message`, and only an injected failure can make that message
+   * LONG — the fake's built-in claim refusals carry fixed short text. The
+   * HELD-back schema is the point, not an artefact: a message above the nested
+   * failure-data schema's cap makes the client discard `data`, which is exactly
+   * the documented degradation path into the `unreachable` verdict.
+   */
+  pairingClaimFailure?: FakeFailure
   /**
    * Overrides the `expiresAt` the approved `pairing.get` branch reports. Default
    * is a well-formed ISO timestamp; a test injects a malformed one to exercise
@@ -740,6 +770,10 @@ export class FakeCherry {
   // Runtime-mutable injection state (tests flip these mid-flight).
   #refreshFailure: FakeFailure | undefined
   #authenticateFailure: FakeFailure | undefined
+  /** Mirrors `FakeCherryOptions.helloFailure` (read at hello time). */
+  #helloFailure: FakeFailure | undefined
+  /** Mirrors `FakeCherryOptions.pairingClaimFailure` (read at claim time). */
+  #pairingClaimFailure: FakeFailure | undefined
   #dropPings: boolean
   #requestDelayMs: number | undefined
   /** Per-METHOD reply delays, layered over {@link #requestDelayMs}. */
@@ -871,6 +905,8 @@ export class FakeCherry {
     this.#identity = options.identity !== undefined ? Promise.resolve(options.identity) : createDeviceIdentity()
     this.#refreshFailure = options.refreshFailure
     this.#authenticateFailure = options.authenticateFailure
+    this.#helloFailure = options.helloFailure
+    this.#pairingClaimFailure = options.pairingClaimFailure
     this.#dropPings = options.dropPings ?? false
     this.#journalEpoch = options.agent?.streamEpoch ?? 'epoch-1'
     this.#watermark = options.agent?.watermark ?? 0
@@ -1961,6 +1997,10 @@ export class FakeCherry {
   }
 
   #handleHello(live: LiveConnection): Record<string, unknown> {
+    // Injected refusal FIRST: the peer never reads the echo at all, which is
+    // the same wire shape as a real version rejection (one structured failure,
+    // the session then unusable).
+    if (this.#helloFailure !== undefined) throw new FakeRpcError(this.#helloFailure)
     const offered = [...live.channel.offeredVersions]
     this.#offeredVersionsAtHello = offered
     const echoed = this.#lastHelloProtocolVersions
@@ -2048,6 +2088,10 @@ export class FakeCherry {
     // The real desktop answers INVALID_CONNECTION_STATE without a confirmed
     // hello; the pairing client must therefore run the hello face too.
     this.#requireHello(live)
+    // The injected failure rides AFTER the hello gate, exactly like
+    // authenticate's/refresh's: the stage it models is a REACHABLE peer
+    // refusing the claim, not a broken handshake.
+    if (this.#pairingClaimFailure !== undefined) throw new FakeRpcError(this.#pairingClaimFailure)
     const claimedBy = this.#claimPeerIdentity
     if (claimedBy !== undefined && claimedBy !== live.channel.remoteIdentity) {
       throw new FakeRpcError({ reason: 'CONFLICT', message: 'Invitation already claimed' })

@@ -21,6 +21,7 @@ import type {
 } from './httpApi.js'
 import type { DiagnosticsError } from './diagnostics.js'
 import { truncateErrorMessage } from './diagnostics.js'
+import { boundedJoin } from './text.js'
 
 export const name = 'cherry-remote'
 
@@ -652,6 +653,31 @@ function subsFor(deviceId: string): SessionSubscriptions {
 }
 
 /**
+ * Bounds the link-recovery line's session-id list (issue #155).
+ *
+ * The number of ENTRIES is bounded only by the peer-advertised hello
+ * `subscriptions` — a number the peer chooses, not one this assembly can size —
+ * and a session id is the protocol's `opaqueId` (≤ 256 characters). The old
+ * `sessions.join(', ')` therefore emitted `entries × 258` characters into one
+ * info line: the protocol's own `remoteLimits.subscriptions` = 8 still allows
+ * ~2 KB, and a peer advertising more grows the line with no ceiling at all. The
+ * text is peer-controlled (the ids are echoed back from what the peer accepted
+ * as subscriptions), so it needs a LOCAL bound like every other such log.
+ *
+ * `RECOVERY_SESSIONS_MAX` = 320 is the joined ids' budget: eight normal
+ * 36-char UUIDs render as 8 × 36 + 7 × 2 = 302 characters, so the protocol's
+ * own subscription cap fits WHOLE — the bound bites only on a peer that
+ * advertises more room, or on a malformed over-long id.
+ * `RECOVERY_SESSION_ID_MAX` = 256 is that `opaqueId` cap, so a schema-valid id
+ * is never clipped; only a malformed one is. A list that stops early names the
+ * count (`(+K more)`) and rides ON TOP of the budget; entries are never dropped
+ * silently. The bound is on the LOG only — the loop still re-ensures every
+ * session.
+ */
+const RECOVERY_SESSIONS_MAX = 320
+const RECOVERY_SESSION_ID_MAX = 256
+
+/**
  * The reconnect recovery line (ruling 8): every session this device had
  * subscribed is re-ensured at its LAST cursor, so the peer replays only what
  * this harness has not yet consumed.
@@ -671,10 +697,16 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
   const sessions = subscriptions.activeSessions()
   // INFO (spec §5 「订阅建立与恢复」): the recovery line announces what it is
   // about to re-ensure, once per link recovery rather than once per session.
-  // Ids only — a session id is whitelisted, an event payload is not.
+  // Ids only — a session id is whitelisted, an event payload is not. The id
+  // list is bounded by {@link RECOVERY_SESSIONS_MAX} (issue #155); the
+  // `subscription(s)` count above it is the TRUE total, so a clipped list still
+  // says how many sessions are being recovered.
   if (sessions.length > 0) {
     console.info(
-      `[cherry-remote] recovering ${sessions.length} subscription(s) for ${deviceId}: ${sessions.join(', ')}`,
+      `[cherry-remote] recovering ${sessions.length} subscription(s) for ${deviceId}: ${boundedJoin(
+        sessions,
+        { max: RECOVERY_SESSIONS_MAX, itemMax: RECOVERY_SESSION_ID_MAX },
+      )}`,
     )
   }
 

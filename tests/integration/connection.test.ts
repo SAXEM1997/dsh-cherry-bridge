@@ -2203,3 +2203,100 @@ describe('issue #104: a RATE_LIMITED refusal (desktop >= 2.1.7)', () => {
     expect(fakeInfo.fake.methodCount('agent.agents.list')).toBe(1)
   }, 10_000)
 })
+
+describe('log text is bounded (issue #155)', () => {
+  // ---------------------------------------------------------------------------
+  // Bounded LOG text (issue #155). Two connection log lines interpolate text
+  // the PEER controls: the protocol-version console.error (its cause is the
+  // peer's own hello-failure text) and the transient-failure console.warn (an
+  // RPC failure's message is the peer's, verbatim). Both were bounded only by
+  // the 64 KiB record budget, so one record could become one log line.
+  // ---------------------------------------------------------------------------
+
+  it('(#155a) bounds the protocol-version console.error text the peer controls', async () => {
+    const identity = await createDeviceIdentity()
+    // 512 characters — the protocol failure schema's message CAP
+    // (`remoteFailureSchema.message = z.string().max(512)`). At the cap the
+    // client still parses the failure `data`, so the reason is readable and the
+    // line takes the `ProtocolVersionError` arm. The detail it interpolates is
+    // `protocol version confirmation rejected: ` + `JsonRpcRequestError: ` +
+    // this message = 573 characters, before #155 all of it in ONE log line.
+    const longMessage = 'h'.repeat(512)
+    const fakeInfo = await makeFake({
+      helloFailure: { reason: 'INVALID_CONNECTION_STATE', message: longMessage },
+    })
+    const connection = makeConnection({ identity, record: recordFor(fakeInfo) })
+
+    await expect(connection.connect()).rejects.toThrow()
+    expect(connection.state).toBe('offline')
+
+    const line = consoleError.mock.calls
+      .flat()
+      .map(String)
+      .find((entry) => entry.includes('protocol version incompatible'))
+    expect(line, 'the protocol-version error line must be logged').toBeDefined()
+    const prefix = '[cherry-remote] device dev-test: protocol version incompatible ('
+    const suffix = '); upgrade Cherry Studio / the plugin'
+    expect(line!.startsWith(prefix)).toBe(true)
+    expect(line!.endsWith(suffix)).toBe(true)
+    // CEILING: the fixed prefix (64 chars) + LOG_TEXT_MAX (240, marker included)
+    // + the upgrade suffix (37) = 341. Unbounded, this line was 64 + 573 + 37 =
+    // 674 characters.
+    expect(line!.length).toBeLessThanOrEqual(prefix.length + 240 + suffix.length)
+    expect(line!).toMatch(/… \(\+\d+ chars\)/)
+    const removed = Number(/… \(\+(\d+) chars\)/.exec(line!)![1])
+    // The 573-char detail kept 225 and removed the other 348 (the 15-char
+    // marker is charged to the 240 budget).
+    expect(removed).toBe(573 - (240 - '… (+348 chars)'.length))
+    // The peer's raw text is gone; OUR wording (and the remediation hint) stays.
+    expect(line).not.toContain(longMessage)
+    expect(line).not.toContain('h'.repeat(300))
+    expect(line).toContain('upgrade Cherry Studio / the plugin')
+  }, 15_000)
+
+  it('(#155b) bounds the transient-failure console.warn text the peer controls', async () => {
+    const identity = await createDeviceIdentity()
+    // An authenticate refusal with a NON-terminal reason. Its failure message is
+    // far above the 512-char schema cap, so the client discards `data` and the
+    // reason is unreadable — the failure stays transient, every candidate host
+    // "fails", and the warn's detail is `AllHostsUnreachableError`'s wrapper
+    // text, which embeds the peer's message as `last: <peer text>`. Before #155
+    // that produced ONE ~5.2 KB console.warn line.
+    const longMessage = `authenticate rejected because ${'a'.repeat(5_000)}`
+    const fakeInfo = await makeFake({
+      authenticateFailure: { reason: 'INTERNAL', message: longMessage },
+    })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo),
+      backoffInitialMs: 30,
+    })
+
+    await expect(connection.connect()).rejects.toThrow()
+    expect(connection.state).toBe('offline')
+
+    const prefix = '[cherry-remote] device dev-test offline ('
+    const line = consoleWarn.mock.calls
+      .flat()
+      .map(String)
+      .find((entry) => entry.startsWith(prefix))
+    expect(line, 'the transient-failure warning must be logged').toBeDefined()
+    // CEILING: the prefix (41) + LOG_TEXT_MAX (240, marker included) +
+    // `); reconnecting in 60000ms` (26; a deliberately over-long delay, so the
+    // real bound is tighter) + the all-hosts hint (125) = 432 characters.
+    const hint =
+      ' — all candidate addresses were unreachable; if the desktop moved, update ' +
+      'them via the device card 地址维护 (address maintenance)'
+    expect(line!.length).toBeLessThanOrEqual(
+      prefix.length + 240 + '); reconnecting in 60000ms'.length + hint.length,
+    )
+    expect(line!.length).toBeLessThan(433)
+    expect(line!).toMatch(/… \(\+\d+ chars\)/)
+    const removed = Number(/… \(\+(\d+) chars\)/.exec(line!)![1])
+    expect(removed).toBeGreaterThan(4_000)
+    expect(line).not.toContain(longMessage)
+    expect(line).not.toContain('a'.repeat(1_000))
+    // The actionable half survives: the device, the state and the retry cadence.
+    expect(line).toContain('reconnecting in ')
+  }, 15_000)
+})
