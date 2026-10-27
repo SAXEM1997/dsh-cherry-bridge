@@ -403,6 +403,9 @@ async function dial(
         // `error` event (the HTTP handshake's own failure) and a `close` with
         // no error. Both are the `websocket:` kind; the close path is tagged
         // with the close code and (bounded) reason instead of a message.
+        // Unexercised under the pinned `ws` 8.22: every client pre-open failure
+        // emits `error` first (verified in the library source), so a `ws` bump
+        // must re-check that ordering.
         // Whichever fires first wins, and the listeners are removed on settle
         // so a LATER close — e.g. the timeout's `ws.terminate()` — cannot fire
         // a stale rejection on an open promise nobody waits for anymore.
