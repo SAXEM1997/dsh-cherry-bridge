@@ -445,6 +445,9 @@ describe('② cherry_unpair: forget the archive entry and tear the link down', (
       ...recordFor('dev-A', 'Desk Alpha'),
       hosts: [fakeInfo.host],
       port: fakeInfo.port,
+      // Both maps are keyed by host since schemaVersion 4: overriding `hosts`
+      // without `ports` leaves the record pointing at the fixture's dead 65001.
+      ports: { [fakeInfo.host]: fakeInfo.port },
       desktopIdentity: fakeInfo.desktopIdentity,
     })
 
@@ -759,6 +762,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       ...recordFor('dev-A', 'Desk Alpha'),
       hosts: [fakeInfo.host],
       port: fakeInfo.port,
+      // Both maps are keyed by host since schemaVersion 4: overriding `hosts`
+      // without `ports` leaves the record pointing at the fixture's dead 65001.
+      ports: { [fakeInfo.host]: fakeInfo.port },
       desktopIdentity: fakeInfo.desktopIdentity,
     })
   }
