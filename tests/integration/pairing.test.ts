@@ -126,6 +126,8 @@ interface PairOptions {
   pollIntervalMs?: number
   pollTimeoutMs?: number
   connectTimeoutMs?: number
+  /** Forwarded verbatim: the production default applies when unset. */
+  dialBudgetMs?: number
   supportedProtocolVersions?: readonly number[]
   wsOptions?: WsDialOptions
 }
@@ -143,6 +145,7 @@ function pair(opts: PairOptions): ReturnType<typeof pairWithPayload> {
     pollIntervalMs: opts.pollIntervalMs ?? 5,
     pollTimeoutMs: opts.pollTimeoutMs ?? 3_000,
     connectTimeoutMs: opts.connectTimeoutMs ?? 3_000,
+    dialBudgetMs: opts.dialBudgetMs,
     supportedProtocolVersions: opts.supportedProtocolVersions,
     wsOptions: opts.wsOptions,
   })
@@ -538,6 +541,132 @@ describe('pairWithPayload over a real loopback channel', () => {
 
     expect(error.kind).toBe('unreachable')
     expect(store.list()).toEqual([])
+  }, 15_000)
+
+  // -------------------------------------------------------------------------
+  // One aggregate DIAL budget (issue #141): a v3 QR admits up to 32
+  // endpoints, so serial `connectTimeoutMs` dials could spend 320 s on an
+  // invitation that only lives 120 s. The walk is bounded by ONE deadline;
+  // the per-attempt timeout is untouched except for the clamp below.
+  // -------------------------------------------------------------------------
+
+  it('⑦a a spent dial budget dials NOTHING and names every candidate as not attempted', async () => {
+    const identity = await createDeviceIdentity()
+    // The fake listens on ALL loopback addresses, so BOTH endpoints below are
+    // LIVE: under any non-zero budget a dial would connect and claim, which is
+    // what makes `connectionCount: 0` proof the budget (not the address list)
+    // stopped the walk.
+    const fakeInfo = await makeFake({
+      bindHost: '0.0.0.0',
+      pairingDecision: 'approved',
+      pairingGetPendingPolls: APPROVE_AFTER_POLLS,
+    })
+    const store = await makeStore()
+    const endpoints = [
+      { host: '127.0.0.1', port: fakeInfo.port, security: 'ws' },
+      { host: '127.0.0.2', port: fakeInfo.port, security: 'ws' },
+    ]
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        dialBudgetMs: 0,
+        payload: v3PayloadFor(fakeInfo, { endpoints }),
+      }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    // EVERY candidate is named, and named as UNATTEMPTED — and each appears
+    // EXACTLY ONCE. Dropping the branch's `continue` lets the fall-through dial
+    // fail and push a SECOND segment naming the same address (the dial error
+    // already carries the candidate's `host:port`), so this duplicate — not any
+    // particular dial wording — is the wording-independent mutant detector.
+    for (const endpoint of endpoints) {
+      const label = `${endpoint.host}:${endpoint.port}`
+      expect(error.message, `not attempted for ${label}`).toContain(`${label}: not attempted`)
+      expect(error.message.split(label).length - 1, `occurrences of ${label}`).toBe(1)
+    }
+    expect(error.message.match(/not attempted/g) ?? []).toHaveLength(endpoints.length)
+    // Budget 0 means not one dial was even started — against a live peer.
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    expect(fakeInfo.fake.socketCount).toBe(0)
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑦b clamps the dial timeout to the budget remainder, so the walk fails fast', async () => {
+    const identity = await createDeviceIdentity()
+    // The peer is LIVE (it listens and would approve a completed dial), but it
+    // HOLDS its Noise handshake past the per-attempt bound: the clamp is what
+    // ends this dial. Without the clamp the dial would sit the full
+    // `connectTimeoutMs` (10 s) and the elapsed assertion — not the 15 s test
+    // timeout — is what catches it. A plain live peer would instead complete
+    // the handshake inside the clamp, making the test a race.
+    const fakeInfo = await makeFake({
+      pairingDecision: 'approved',
+      pairingGetPendingPolls: APPROVE_AFTER_POLLS,
+      handshakeDelayMs: 11_000,
+    })
+    const store = await makeStore()
+    const startedAt = performance.now()
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        dialBudgetMs: 250,
+        // A per-attempt bound 40x the budget: WITHOUT the clamp this would
+        // sit here for ten seconds after the budget is gone.
+        connectTimeoutMs: 10_000,
+        payload: v3PayloadFor(fakeInfo),
+      }),
+    )
+
+    const elapsed = performance.now() - startedAt
+    expect(error.kind).toBe('unreachable')
+    expect(error.message).toContain('timed out')
+    // The assertion the un-clamped mutant fails. The 15 s test timeout above
+    // is only the safety net, not the claim.
+    expect(elapsed).toBeLessThan(2_000)
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑦c a budget wide enough for the walk leaves the happy path unchanged', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    const record = await pair({
+      identity,
+      store,
+      dialBudgetMs: 5_000,
+      payload: v3PayloadFor(fakeInfo),
+    })
+
+    expect(record.deviceId).toBe(fakeInfo.fake.approvedDeviceId)
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+    expect(store.list()).toEqual([record])
+  }, 15_000)
+
+  it('⑦d a non-finite budget falls back to the default instead of disabling the bound', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    // `NaN` must not become the deadline: `performance.now() + NaN` makes every
+    // `remaining` NaN, the `<= 0` early branch never fires and the per-dial
+    // clamp yields a ~1 ms timeout — every live candidate would "fail". The
+    // default (30 s) has to apply instead, so the happy path still completes.
+    const record = await pair({
+      identity,
+      store,
+      dialBudgetMs: Number.NaN,
+      payload: v3PayloadFor(fakeInfo),
+    })
+
+    expect(record.deviceId).toBe(fakeInfo.fake.approvedDeviceId)
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+    expect(store.list()).toEqual([record])
   }, 15_000)
 
   // -------------------------------------------------------------------------

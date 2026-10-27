@@ -283,12 +283,12 @@ These are load-bearing; the code comments are the long version.
 `agent.parts.list` walk), then project them (one `agent.content.read` walk per
 externalized `{ref}`, digest-verified). The cache sits BETWEEN the steps —
 lookup before the list, store after it — and holds the LIST, never the
-projection. An unchanged message therefore costs no repeat `agent.parts.list`
+projection. An unchanged message costs no repeat `agent.parts.list`
 RPC on send → wait → read rounds, while every read still re-fetches and
 sha256-verifies every `{ref}`'s bytes (a corrupted ref behind an unchanged
 revision fails with `ContentIntegrityError`; `toolsReadCache.test.ts` T1b pins
-this beside the cache). That is the honest claim — 2.1.6+ externalizes every
-part over 4,096 characters, so a hit is not a zero-RPC read.
+this beside the cache). A hit is still not a zero-RPC read: 2.1.6+ externalizes
+every part over 4,096 characters.
 
 - **Entry & key**: the `agent.parts.list` result — `{revision, page}` — keyed
   `<deviceId>\0<messageId>` (device-scoped: a message id is the peer's; two
@@ -441,9 +441,8 @@ shape #3 fixed with a message ceiling and a byte budget (issue #21).
   succeeded must not leave the walk with nothing, so the two phases are bounded
   separately (a pathological call can spend both).
 
-What this is NOT: a global time budget for `cherry_read` or the list tools —
-they have no deadline argument; their bounds are `limit`, the safety breaker
-and the byte budgets.
+What this is NOT: a global `cherry_read`/list-tool budget — they take no
+deadline; their bounds are `limit`, the safety breaker and the byte budgets.
 
 ### Stop-point cursors (the teaching case)
 
@@ -689,9 +688,9 @@ The official client refuses to read a ref whose `byteLength` is not a safe
 integer ≤ 32 MiB (`RESOURCE_UNAVAILABLE`). We are **more tolerant**: a missing or
 unusable `byteLength` falls back to a slice bound (`DEFAULT_CONTENT_SLICE_BOUND`
 = 4,096 slices), and the **cumulative bytes-read arm** still caps the walk, so a
-peer that serves more than it declared is stopped by bytes actually read. This
-is intentional, commented, and covered by a test (a peer serving more than it
-declared). Do not "align" it to the official behaviour without a reason.
+peer that serves more than it declared is stopped by bytes actually read.
+It is commented and covered by a test (a peer serving more than it declared);
+do not "align" it without a reason.
 
 ### Integrity: what degrades, what is fatal
 
@@ -740,10 +739,10 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 ### Device archive: scheme+port per host
 
 `DeviceRecord` (v4) stores host-keyed `security` (`'ws'|'wss'`) and `ports`
-(`number`) maps — one each per candidate, every host once. A stored v4 record
+(`number`) maps — one per candidate host. A stored v4 record
 carries every entry (missing/unknown hosts, junk values rejected); the DIAL's
 `?.` fallback (`ws`/`port`) serves only an in-memory pre-validation record.
-`port` is the winner's at pairing, the operator's after a PATCH, and always the
+`port` is the winner's at pairing, the operator's after a PATCH, and the
 fallback. The steady-state dial uses `directEndpointUrl` + both maps (`??`):
 `wss`→`wss` (#126), non-winner host→own port (#135); pairing dials the QR
 candidate's own host/port/scheme, never the record. v2→v3 backfills `ws`,
@@ -760,6 +759,12 @@ TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
 ignored (half-applied trust reaches some peers, not others). Never persisted,
 logged or reported; `ca` is PEM text.
+
+### Pairing: one dial budget across candidates
+
+ONE aggregate `dialBudgetMs` deadline (30 s) bounds the walk; unreached
+candidates are named. Claim/poll re-anchors a FRESH 120 s race guard at the
+claim (not the invitation's birth); peer `expired` is the real bound.
 
 ### Device selector
 
@@ -860,10 +865,9 @@ the error message).
   `config` keys, and error `reason`/`message`.
 - **Never emitted**: `accessToken`, `tokenExpiresAt`, `invitationSecret`, the
   raw pinned `desktopIdentity`, message text and part text.
-- The report is built field by field into a fresh object, so a credential added
-  to the device archive later is excluded **by construction** — it never
-  depends on someone updating a deny-list. `limits` is re-projected from its
-  four keys: a whitelist inside the whitelist.
+- The report is built field by field, so a later credential is excluded **by
+  construction**, not by a deny-list. `limits` is re-projected from its four
+  keys: a whitelist inside the whitelist.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
   RPC requests — those belong to the transport; a same-named metric would be
   misread. Counters and the error ring are zeroed on every `apply`: the
