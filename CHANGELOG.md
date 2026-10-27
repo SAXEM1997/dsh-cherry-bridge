@@ -5,6 +5,15 @@ All notable changes to `dsh-cherry-bridge`. This project adheres to
 capability, the patch digit carries fixes and hardening with no protocol
 surface change.
 
+## Compatibility
+
+Every release section states the Cherry Studio **desktop** range it was verified
+against; the range for the current tree is **2.1.4 – 2.1.8** (the `v3` pairing QR
+needs 2.1.8+, the `v2` QR works from 2.1.4). Its newest generation, 2.1.8, is the
+one whose protocol packages this project pins. Sections written before this
+convention do not carry the line; both READMEs state the same range for readers
+who never open this file.
+
 ## v0.1.11 (2026-10-23)
 
 Receipt recovery for all three command tools, and a legacy attachment face.
