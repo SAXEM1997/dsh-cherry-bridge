@@ -26,7 +26,7 @@ flowchart TB
 ```
 
 - 包名：`dsh-cherry-bridge`，插件 id：`cherry-remote`
-- 传输：`ws://` + Noise XX（加密由 Noise 记录层提供，不依赖 TLS 终止）
+- 传输：默认 `ws://` + Noise XX（加密由 Noise 记录层提供）；桌面端位于 TLS 前置之后时拨 `wss://`，私有 CA 的信任由 `wsTls` 提供
 - 工具面：14 个 `cherry_*` 工具，**按工作区**启用，默认**谁都没有**（见「启用范围」）
 - 设置页与 HTTP 面：宿主 Web 服务器上的同源前缀 `/cherry-remote/api`
 
@@ -158,7 +158,8 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
   idle 回答的历史走查仍从那一刻起算自己的预算（慢但成功的快照不会把走查挤成零）；
   代价是两段预算**分开计**，病态调用可能把两段都花掉。
 - **已知限制**：`cherry_respond` 让 DSH agent 可代替用户批准 Cherry 端审批卡（MVP 不加拦截层，
-  信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；仅 `ws://`（Noise 加密），不做 TLS 直连。
+  信任 DSH 自身的工具审批）；每设备仅申请 `agent` capability；传输默认 `ws://`，
+  `wss://` 要求桌面端位于 TLS 前置之后（本插件不做 TLS 终止；私有 CA 的信任由 `wsTls` 提供）。
 
 > 传输重放、32 MiB/≈3× 内存、空页与游标容忍、完整性语义等工程细节见 [`AGENTS.md`](AGENTS.md)。
 

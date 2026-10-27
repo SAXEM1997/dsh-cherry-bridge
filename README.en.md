@@ -28,7 +28,7 @@ flowchart TB
 ```
 
 - Package: `dsh-cherry-bridge`, plugin id: `cherry-remote`
-- Transport: `ws://` + Noise XX (encryption lives in the Noise record layer; no TLS termination required)
+- Transport: `ws://` + Noise XX by default (encryption lives in the Noise record layer); a desktop behind a TLS front is reached over `wss://`, with `wsTls` supplying the private-CA trust
 - Tool face: 14 `cherry_*` tools, enabled **per workspace**, and by default **nobody has them** (see “Scope”)
 - Settings page and HTTP face: the same-origin prefix `/cherry-remote/api` on the host web server
 
@@ -203,7 +203,9 @@ subscription was lost and could not be rebuilt, so the outcome is
 - **Known limitations**: `cherry_respond` lets a DSH agent approve Cherry-side
   approval cards on the user's behalf (the MVP adds no interception layer and
   trusts DSH's own tool-call approvals); only the `agent` capability is
-  requested per device; `ws://` only (Noise encryption), no direct TLS.
+  requested per device; transport is `ws://` by default, and `wss://` requires a
+  TLS front in front of the desktop (this plugin never terminates TLS; `wsTls`
+  carries the private-CA trust).
 
 > Engineering detail — replay rules, the 32 MiB/≈3× memory contract, empty-page
 > and cursor tolerance, integrity semantics — lives in [`AGENTS.md`](AGENTS.md).

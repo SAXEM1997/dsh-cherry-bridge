@@ -1819,7 +1819,7 @@ describe('③ release configuration', () => {
     expect(readme).toContain('dsh-cherry-bridge')
     expect(readme).toContain('cherry-remote')
     for (const tool of TOOL_NAMES) expect(readme).toContain(tool)
-    for (const key of ['perSessionCacheBytes', 'rateBudgetPerSecond', 'dataDir']) {
+    for (const key of ['perSessionCacheBytes', 'rateBudgetPerSecond', 'dataDir', 'wsTls']) {
       expect(readme).toContain(key)
     }
   })
