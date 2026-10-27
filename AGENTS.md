@@ -764,6 +764,10 @@ ONE aggregate `dialBudgetMs` deadline (30 s) bounds the walk; unreached
 candidates are named. Claim/poll re-anchors a FRESH 120 s race guard at the
 claim (not the invitation's birth); peer `expired` is the real bound.
 A failed PRE-OPEN dial is prefixed `timeout:` or `websocket:` (the `ws` code is kept); a POST-OPEN channel failure IN THE DIAL is `channel:` (a CLAIM failure rides an established channel and is not tagged).
+Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
+(keeping its port) and `FAILURE_SEGMENT_MAX` = 240 caps the whole
+`<label>: <detail>` (marker `… (+N chars)` included), so 32 candidates join to
+≤ 7,742 characters.
 
 ### Device selector
 

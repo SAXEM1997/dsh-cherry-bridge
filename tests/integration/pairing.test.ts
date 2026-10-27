@@ -1374,4 +1374,222 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(error.kind).toBe('invalid-payload')
     expect(fakeInfo.fake.socketCount).toBe(0)
   })
+
+  // -------------------------------------------------------------------------
+  // Bounded `unreachable` verdict (issue #148): the joined message used to be
+  // unbounded — 32 v3 endpoints × a 253-char host, repeated again inside its
+  // dial error, reached ~17-18 KB in ONE tool result. Each candidate still
+  // contributes exactly one segment (#141: every candidate, attempted or not,
+  // is NAMED); the SEGMENT is bounded, never the coverage.
+  // -------------------------------------------------------------------------
+
+  /**
+   * A schema-valid hostname of exactly `length` characters, unique per `i`
+   * (`hostnameSchema`: dot-separated labels of 1-63 chars, total <= 253),
+   * ending in the reserved non-resolving `.invalid` TLD.
+   */
+  function longHost(i: number, length: number): string {
+    const head = `h${String(i).padStart(2, '0')}`
+    const tail = '.invalid'
+    let host = head
+    while (host.length + tail.length < length) {
+      const labelLength = Math.min(63, length - tail.length - host.length - 1)
+      if (labelLength < 1) break
+      host += `.${'a'.repeat(labelLength)}`
+    }
+    return host + tail
+  }
+
+  it('⑬a bounds the joined verdict for 32 near-maximal candidates WITHOUT dialling', async () => {
+    const identity = await createDeviceIdentity()
+    // A live peer supplies only a valid `desktopIdentity`; the payload's 32
+    // endpoints are the near-maximal names below, and budget 0 means not one
+    // dial starts (so this test is deterministic and offline).
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    const endpoints = Array.from({ length: 32 }, (_, index) => ({
+      host: longHost(index + 1, 253),
+      port: 10_000 + index,
+      security: 'ws' as const,
+    }))
+    const payload = v3PayloadFor(fakeInfo, { endpoints })
+    // MAX_PAYLOAD_BYTES is 10 KiB; 32 × 253-char hosts still fit (~9.6 KB),
+    // asserted rather than assumed — an oversized fixture would be refused as
+    // `invalid-payload` before the walk ever runs.
+    expect(Buffer.byteLength(payload, 'utf8')).toBeLessThanOrEqual(10 * 1024)
+
+    const error = await pairingError(pair({ identity, store, payload, dialBudgetMs: 0 }))
+
+    expect(error.kind).toBe('unreachable')
+    // Budget 0 named every candidate WITHOUT opening a socket.
+    expect(fakeInfo.fake.socketCount).toBe(0)
+
+    const preamble = 'no candidate address could complete pairing ('
+    expect(error.message.startsWith(preamble)).toBe(true)
+    const segments = error.message.slice(preamble.length, -1).split('; ')
+    // This '; ' split is sound only while no detail contains '; ': the
+    // peer-controlled close reason (CLOSE_REASON_MAX = 200) is the only text
+    // that could, and this fixture's details are fixed strings.
+    // 32 segments, not fewer: the bound is per SEGMENT, never a "first N + and
+    // M more" cut (issue #141's contract names every candidate).
+    expect(segments).toHaveLength(32)
+    // TWO different bounds, asserted separately. The JOINED LIST's documented
+    // worst case is 32 segments × 240 + 31 separators × 2 = 7,742; the WHOLE
+    // MESSAGE adds the preamble and the closing paren (7,788). This fixture
+    // joins to 6,526 / renders 6,572, so both are BOUNDS on the documented
+    // worst case, not measurements of this run.
+    expect(segments.join('; ').length, 'joined list above its ceiling').toBeLessThanOrEqual(7_742)
+    expect(error.message.length, 'joined verdict above its documented ceiling').toBeLessThanOrEqual(
+      7_788,
+    )
+    // The label cap's marker is the one this arm carries. The DETAIL cap is
+    // ⑬b's detector: with budget 0 the "not attempted" detail is 72 chars and
+    // never reaches the 110-char room a 128-char label leaves, so ⑬a pins the
+    // label cap and the total ceiling only.
+    expect(error.message).toContain('…')
+
+    endpoints.forEach((endpoint, index) => {
+      const segment = segments[index]!
+      // The CLIP POINT is what pins `FAILURE_LABEL_MAX`: the label is
+      // `<host prefix>…:<port>` and occupies EXACTLY 128 chars, so the ellipsis
+      // sits at 128 − `…:<port>`.length (121 for these 5-digit ports; the
+      // ellipsis's own length is part of the cap). The prefix check below is
+      // NOT load-bearing — it holds with no clipping at all; the marker index,
+      // the exact `…:<port>` suffix and the 128-char label are.
+      const portSuffix = `…:${endpoint.port}`
+      const clip = segment.indexOf('…')
+      expect(clip, `label clip point ${index}`).toBe(128 - portSuffix.length)
+      expect(segment.slice(clip, clip + portSuffix.length), `label suffix ${index}`).toBe(portSuffix)
+      expect(segment.slice(0, clip + portSuffix.length).length, `label length ${index}`).toBe(128)
+      expect(segment.startsWith(endpoint.host.slice(0, 16)), `prefix ${index}`).toBe(true)
+      expect(segment.length, `segment ${index}`).toBeLessThanOrEqual(240)
+    })
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑬b bounds the DETAIL arm: a dial error repeating the long host is clipped, not dropped', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    // A near-maximal, non-resolving host: the dial's own 1 ms timer fires long
+    // before DNS can answer, so the segment carries a LONG detail — and both
+    // arms of that race (the timer's `timeout:` text and `getaddrinfo`'s
+    // `websocket:` text) repeat the 253-char host, which is the point. Which
+    // arm wins is deliberately not pinned.
+    const host = longHost(99, 253)
+    const port = 10_099
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, { endpoints: [{ host, port, security: 'ws' }] }),
+        connectTimeoutMs: 1,
+        // Large: the per-dial bound ends this attempt, not the budget.
+        dialBudgetMs: 5_000,
+      }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    const preamble = 'no candidate address could complete pairing ('
+    const segment = error.message.slice(preamble.length, -1)
+    // ONE candidate, ONE segment.
+    expect(segment).not.toContain('; ')
+    expect(segment.length).toBeLessThanOrEqual(240)
+    // The label's identifying prefix AND its port survive the clip.
+    expect(segment.startsWith(host.slice(0, 16))).toBe(true)
+    const label = `…:${port}: `
+    expect(segment).toContain(label)
+    // The detail is clipped to the room the 128-char label leaves; the kind
+    // prefix survives, and the marker's own length is charged to the bound.
+    const detail = segment.slice(segment.indexOf(label) + label.length)
+    expect(detail).toMatch(/^(?:timeout|websocket):/)
+    expect(detail).toMatch(/… \(\+\d+ chars\)$/)
+    // The marker names a real removal, not a 0-char no-op.
+    expect(Number(/\(\+(\d+) chars\)$/.exec(detail)![1])).toBeGreaterThan(0)
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑬c leaves a short candidate failure byte-for-byte unchanged (no marker, no clip)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // ⑧b's fixture: a refused loopback port, short label and short detail. The
+    // shaping helper must be a PURE IDENTITY here — no marker, no cut.
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { ips: ['127.0.0.1'], port: 1 }) }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    expect(error.message).toMatch(
+      /^no candidate address could complete pairing \(127\.0\.0\.1:1: websocket: .*\(code [A-Z0-9_]+\)\)$/,
+    )
+    // Identity is the assertion: neither truncation marker is present.
+    expect(error.message).not.toContain('…')
+    expect(error.message).not.toContain('(+')
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑬d bounds the CLAIM fall-through segment (a non-PairingError fault in the claim phase)', async () => {
+    const identity = await createDeviceIdentity()
+    // Bind ALL loopback addresses so the LIVE candidate can use a host string
+    // distinct from the dead one: `payload endpoints must not repeat host`, and
+    // 127.0.0.1 appears once already as the dead 127.0.0.1:1 (⑦a's fixture
+    // shape, one candidate over).
+    const fakeInfo = await makeFake({
+      bindHost: '0.0.0.0',
+      pairingDecision: 'approved',
+      pairingGetPendingPolls: APPROVE_AFTER_POLLS,
+    })
+    const store = await makeStore()
+    const liveHost = '127.0.0.2'
+    const live = `${liveHost}:${fakeInfo.port}`
+
+    // The claim arm needs its OWN fixture: `claimAndAwait` turns every
+    // transport/peer fault into a PairingError (which the walk rethrows), so
+    // the arm is reached by any NON-PairingError fault in the claim phase —
+    // HERE, a throwing caller callback. Making `onVerificationCode` throw a
+    // plain Error drives the walk's documented mid-flow fall-through, and the
+    // 3,000-char text makes an UNSHAPED segment unmistakable. Candidate 2 is
+    // dead, so the walk CONTINUES and then ends `unreachable` — the only path
+    // by which this arm's segment is joined.
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: [
+            { host: liveHost, port: fakeInfo.port, security: 'ws' },
+            { host: '127.0.0.1', port: 1, security: 'ws' },
+          ],
+        }),
+        onVerificationCode: () => {
+          throw new Error(`caller callback exploded ${'x'.repeat(3_000)}`)
+        },
+        // The suite's default per-dial bound (3 s) applies: this dial MUST
+        // SUCCEED, so a small `connectTimeoutMs` would race a slow-but-correct
+        // loopback handshake + claim and turn candidate 1 into a short
+        // `timeout:` segment with no marker — red for the wrong reason. The
+        // dead candidate refuses instantly, so nothing gets slower.
+        dialBudgetMs: 10_000,
+      }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    const preamble = 'no candidate address could complete pairing ('
+    const segments = error.message.slice(preamble.length, -1).split('; ')
+    expect(segments).toHaveLength(2)
+
+    // Candidate 1 went THROUGH the helper: the 3,000-char callback text is
+    // clipped to the segment bound and carries the explicit detail marker.
+    const claimSegment = segments.find((segment) => segment.startsWith(`${live}: `))
+    expect(claimSegment, `claim segment for ${live}`).toBeDefined()
+    expect(claimSegment!.length).toBeLessThanOrEqual(240)
+    expect(claimSegment).toContain('… (+')
+
+    // The walk really CONTINUED to the dead candidate after the claim fault.
+    expect(segments.some((segment) => segment.startsWith('127.0.0.1:1: '))).toBe(true)
+    expect(store.list()).toEqual([])
+  }, 15_000)
 })
