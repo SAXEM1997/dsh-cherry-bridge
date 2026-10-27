@@ -741,6 +741,18 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
 
+### Device archive: one scheme per host
+
+`DeviceRecord` (schemaVersion 3) stores `security: Record<host, 'ws'|'wss'>`
+beside `hosts` — one scheme per candidate, every host exactly once, absent
+meaning "dial `ws`". Both dial sites build their URL with the protocol's
+`directEndpointUrl`, so a `wss`-paired desktop reconnects over `wss` (#126).
+A v2 archive migrates on read (backfill `ws`) and is rewritten through the
+ordinary atomic persist; a lost scheme would downgrade a TLS proxy to a dial
+that can never connect, and an edit that re-types a host keeps its scheme
+(`securityFor`). `GET /devices` reports the map; it is an address, not a
+credential — `cherry_devices` and the diagnostics report do not carry it yet.
+
 ### Device selector
 
 `DeviceStore.resolve` = exact `deviceId` → the **union** of `deviceId` prefixes

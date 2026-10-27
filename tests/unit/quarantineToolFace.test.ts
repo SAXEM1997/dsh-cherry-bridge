@@ -180,7 +180,7 @@ describe('R3-F2: a quarantined archive is surfaced on the tool face, never misre
     // to reflect the CURRENT truth, not the truth at construction.
     const file = join(tmp, 'devices.json')
     const store = new DeviceStore(file)
-    writeFileSync(file, JSON.stringify({ schemaVersion: 2, devices: [] }), 'utf8')
+    writeFileSync(file, JSON.stringify({ schemaVersion: 3, devices: [] }), 'utf8')
     store.list()
     expect(store.quarantined).toBe(false)
 

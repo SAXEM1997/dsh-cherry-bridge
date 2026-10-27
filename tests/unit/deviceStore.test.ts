@@ -27,7 +27,7 @@ vi.mock('node:fs', async (importOriginal) => {
 import * as fs from 'node:fs'
 import { CURRENT_SCHEMA_VERSION, DeviceStore, type DeviceRecord } from '../../src/deviceStore.js'
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 const DEVICES_FILENAME = 'devices.json'
 
 const tempDirs: string[] = []
@@ -59,6 +59,7 @@ function makeRecord(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
     displayName: 'Alpha Workstation',
     hosts: ['10.0.0.5', '10.0.0.6'],
     port: 8765,
+    security: { '10.0.0.5': 'ws', '10.0.0.6': 'ws' },
     desktopIdentity: 'desktop-identity-alpha',
     grants: ['agent'],
     accessToken: 'token-alpha',
@@ -107,6 +108,7 @@ describe('DeviceStore persistence', () => {
       displayName: 'Beta Laptop',
       hosts: ['10.0.0.9'],
       port: 9000,
+      security: { '10.0.0.9': 'ws' },
       desktopIdentity: 'desktop-identity-beta',
       accessToken: undefined,
       tokenExpiresAt: undefined,
@@ -170,8 +172,7 @@ describe('DeviceStore persistence', () => {
 
   it('flushes an older archive it migrates, but not one it merely reads (S1/④)', async () => {
     const file = await makeStoreFile()
-    const { schemaVersion: _current, ...fields } = makeRecord()
-    await writeArchive(file, [fields], 1)
+    await writeArchive(file, [makeV1Record()], 1)
 
     vi.mocked(fs.fsyncSync).mockClear()
     new DeviceStore(file).list()
@@ -278,13 +279,127 @@ describe('DeviceStore.resolve', () => {
   })
 })
 
+/**
+ * The v2 shape this store wrote before issue #126: `hosts` + ONE `port`, and
+ * no `security` at all. It is the fixture the v2→v3 tests start from — a real
+ * archive shape, not a synthesised one — because what must not change is how
+ * an archive already on disk behaves.
+ */
+function makeV2Record(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const base = makeRecord()
+  const { security: _security, ...v2Base } = base
+  // `security` is re-attached LAST: the half-migrated fixture supplies its own
+  // partial map, and the v2 default must not overwrite it.
+  return { ...v2Base, ...overrides, schemaVersion: 2 }
+}
+
+/**
+ * A REAL v1 entry: no `schemaVersion`, and — this is the point — no
+ * `security` either. Built by stripping today's record rather than spreading
+ * it, so a future field added to `makeRecord()` cannot quietly leak into a v1
+ * fixture (a fixture that follows the implementation cannot catch the
+ * implementation demanding a field v1 never had).
+ */
+function makeV1Record(): Record<string, unknown> {
+  const { schemaVersion: _version, security: _security, ...v1 } = makeRecord()
+  return v1
+}
+
+describe('DeviceStore v2 → v3 migration (issue #126)', () => {
+  it('backfills security ws for every v2 host, and LOAD → SAVE → LOAD leaves a v3 archive with security explicit', async () => {
+    const file = await makeStoreFile()
+    await writeArchive(file, [makeV2Record()], 2)
+
+    const store = new DeviceStore(file)
+    const migrated = { ...makeRecord(), security: { '10.0.0.5': 'ws', '10.0.0.6': 'ws' } }
+    expect(store.list()).toEqual([migrated])
+
+    // A FRESH store reads what was written: same record, and the file itself is
+    // v3 with `security` explicit. A v3 record that merely imputed `ws` on read
+    // would re-default on every load — which is the bug this keeps dead.
+    expect(new DeviceStore(file).list()).toEqual([migrated])
+    const onDisk = await readArchive(file)
+    expect(onDisk.schemaVersion).toBe(3)
+    expect(onDisk.devices[0]!.security).toEqual({ '10.0.0.5': 'ws', '10.0.0.6': 'ws' })
+  })
+
+  it('fills only the hosts a v2 record has no entry for, never overwriting one it does', async () => {
+    const file = await makeStoreFile()
+    // A half-migrated archive: one host remembers `wss`, the other has no
+    // entry (the v2 shape). The remembered scheme must survive.
+    await writeArchive(file, [makeV2Record({ security: { '10.0.0.5': 'wss' } })], 2)
+
+    expect(new DeviceStore(file).list()[0]!.security).toEqual({
+      '10.0.0.5': 'wss',
+      '10.0.0.6': 'ws',
+    })
+  })
+
+  it('reads a REAL v1 archive (no schemaVersion, no security) and migrates it to v3 with ws backfilled, never quarantining it', async () => {
+    const file = await makeStoreFile()
+    // The fixture is built from the record shape the store actually wrote at
+    // v1 — explicitly WITHOUT `security`, rather than by deriving it from
+    // today's `makeRecord()`. A fixture that follows the current field set is
+    // what hides a regression like "v1 completeness now demands a v3 field".
+    const v1 = makeV1Record()
+    expect(v1).not.toHaveProperty('security')
+    await writeArchive(file, [v1], 1)
+
+    const store = new DeviceStore(file)
+
+    // Loaded, not quarantined: the legacy completeness gate is v1's own field
+    // set, and `security` is the migration's business.
+    expect(store.quarantined).toBe(false)
+    expect(store.list()).toEqual([makeRecord()])
+    await expect(readFile(`${file}.corrupt`, 'utf8')).rejects.toThrow()
+    // ...and it was rewritten through the ordinary persist as an explicit v3.
+    const onDisk = await readArchive(file)
+    expect(onDisk.schemaVersion).toBe(3)
+    expect(onDisk.devices[0]!.security).toEqual({ '10.0.0.5': 'ws', '10.0.0.6': 'ws' })
+  })
+
+  it('rejects a security value that is not a known scheme', async () => {
+    const file = await makeStoreFile()
+    // A complete map whose VALUE is junk: keying and coverage are fine, so only
+    // the per-host value check can catch it.
+    await writeArchive(file, [
+      makeRecord({ security: { '10.0.0.5': 'wss!' as never, '10.0.0.6': 'ws' } }),
+    ])
+
+    expect(() => new DeviceStore(file).list()).toThrow(/"ws" or "wss"/)
+  })
+
+  it('rejects a security field that is not an object at all', async () => {
+    const file = await makeStoreFile()
+    // Present but the wrong SHAPE (a bare string, the value someone writes when
+    // they think `security` is the scheme itself): rejected by the container
+    // check, before any per-host judgement.
+    await writeArchive(file, [makeRecord({ security: 'wss' as never })])
+
+    expect(() => new DeviceStore(file).list()).toThrow(/must be an object keyed by host/)
+  })
+
+  it('rejects a security entry naming a host the record does not list', async () => {
+    const file = await makeStoreFile()
+    // A COMPLETE map (every listed host, so the missing-host rule is satisfied)
+    // plus one stale entry: keyed-by-host means that entry would never be
+    // consulted, and keeping it would re-arm a scheme the operator replaced.
+    // The read path rejects rather than "cleaning it up" in memory, so the
+    // archive a human edits is the archive the store judges.
+    await writeArchive(file, [
+      makeRecord({ security: { '10.0.0.5': 'ws', '10.0.0.6': 'ws', '10.9.9.9': 'wss' } }),
+    ])
+
+    expect(() => new DeviceStore(file).list()).toThrow(/10\.9\.9\.9/)
+  })
+})
+
 describe('DeviceStore schema migration', () => {
   it('lazily migrates a v1 archive (schemaVersion 1) to the current version without losing fields (③)', async () => {
     const file = await makeStoreFile()
-    const { schemaVersion: _current, ...fields } = makeRecord()
-    // v1 is defined as the current field set minus `schemaVersion`; this
-    // fixture is a synthetic sample proving the migration mechanism only.
-    await writeArchive(file, [{ schemaVersion: 1, ...fields }], 1)
+    // v1's own field set — NOT the current one minus `schemaVersion` (see
+    // makeV1Record: deriving it from today's record is what hid a regression).
+    await writeArchive(file, [{ schemaVersion: 1, ...makeV1Record() }], 1)
 
     const store = new DeviceStore(file)
 
@@ -294,8 +409,7 @@ describe('DeviceStore schema migration', () => {
 
   it('treats a complete archive without schemaVersion as v1 (③)', async () => {
     const file = await makeStoreFile()
-    const { schemaVersion: _current, ...fields } = makeRecord()
-    await writeArchive(file, [fields], 1)
+    await writeArchive(file, [makeV1Record()], 1)
 
     const store = new DeviceStore(file)
 
@@ -373,7 +487,7 @@ describe('DeviceStore schema migration', () => {
     // Entry-level versions are inert: they never drive migration or rejection on
     // their own, they are only checked for consistency with the archive.
     expect(() => store.list()).toThrow(
-      /entry declares schemaVersion 99 but its archive is schemaVersion 2/,
+      /entry declares schemaVersion 99 but its archive is schemaVersion 3/,
     )
   })
 
@@ -382,7 +496,7 @@ describe('DeviceStore schema migration', () => {
     await writeArchive(file, [makeRecord({ schemaVersion: 1 })], SCHEMA_VERSION)
 
     expect(() => new DeviceStore(file).list()).toThrow(
-      /entry declares schemaVersion 1 but its archive is schemaVersion 2/,
+      /entry declares schemaVersion 1 but its archive is schemaVersion 3/,
     )
   })
 
@@ -399,7 +513,7 @@ describe('DeviceStore schema migration', () => {
     // "unsupported schemaVersion undefined", which names a value the entry
     // never declared.
     expect(() => new DeviceStore(file).list()).toThrow(
-      /entry has no schemaVersion but its archive is schemaVersion 2/,
+      /entry has no schemaVersion but its archive is schemaVersion 3/,
     )
     // Rejected before the migration loop: the archive is left untouched.
     expect(await readFile(file, 'utf8')).toBe(before)
@@ -414,7 +528,9 @@ describe('DeviceStore schema migration', () => {
   })
 
   it('covers the whole archive-version/entry-version matrix (F2-r2)', async () => {
-    const { schemaVersion: _current, ...versionless } = makeRecord()
+    // `versionless` is the v1 shape (makeV1Record: historical fields only), so
+    // "archive 1 + version-less complete" really is a complete v1 entry.
+    const versionless = makeV1Record()
     const { port: _port, ...incomplete } = versionless
 
     const cases: {
@@ -438,24 +554,24 @@ describe('DeviceStore schema migration', () => {
         message: /incomplete field set/,
       },
       {
-        name: 'archive 2 + declared 2',
+        name: 'archive 3 + declared 3',
         archiveVersion: SCHEMA_VERSION,
         entry: makeRecord(),
         expect: 'migrates',
       },
       {
-        name: 'archive 2 + declared other',
+        name: 'archive 3 + declared other',
         archiveVersion: SCHEMA_VERSION,
         entry: makeRecord({ schemaVersion: 1 }),
         expect: 'throws',
-        message: /entry declares schemaVersion 1 but its archive is schemaVersion 2/,
+        message: /entry declares schemaVersion 1 but its archive is schemaVersion 3/,
       },
       {
-        name: 'archive 2 + version-less',
+        name: 'archive 3 + version-less',
         archiveVersion: SCHEMA_VERSION,
         entry: versionless,
         expect: 'throws',
-        message: /entry has no schemaVersion but its archive is schemaVersion 2/,
+        message: /entry has no schemaVersion but its archive is schemaVersion 3/,
       },
       {
         name: 'archive 99',
@@ -520,6 +636,7 @@ describe('DeviceStore write validation', () => {
       'displayName',
       'hosts',
       'port',
+      'security',
       'desktopIdentity',
       'grants',
       'enabled',

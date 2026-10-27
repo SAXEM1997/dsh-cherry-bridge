@@ -75,10 +75,11 @@ async function makeRig(
   const store = new DeviceStore(join(tmp, 'devices.json'))
 
   store.upsert({
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId: 'dev-A',
     displayName: 'Desk Alpha',
     hosts: [host],
+    security: { [host]: 'ws' as const },
     port,
     desktopIdentity,
     grants: ['agent'] as 'agent'[],
@@ -269,20 +270,22 @@ async function makeTwoDeviceRig(
   const tmp = mkdtempSync(join(tmpdir(), 'cherry-content-gate-'))
   const store = new DeviceStore(join(tmp, 'devices.json'))
   store.upsert({
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId: 'dev-slow',
     displayName: 'Slow Desk',
     hosts: [slowAddress.host],
+    security: { [slowAddress.host]: 'ws' },
     port: slowAddress.port,
     desktopIdentity: await slow.identityId,
     grants: ['agent'] as 'agent'[],
     enabled: true,
   })
   store.upsert({
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId: 'dev-fast',
     displayName: 'Fast Desk',
     hosts: [fastAddress.host],
+    security: { [fastAddress.host]: 'ws' },
     port: fastAddress.port,
     desktopIdentity: await fast.identityId,
     grants: ['agent'] as 'agent'[],

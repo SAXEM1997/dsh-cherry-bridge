@@ -89,10 +89,11 @@ async function makeRig(): Promise<Rig> {
   const tmp = mkdtempSync(join(tmpdir(), 'cherry-send-guard-'))
   const store = new DeviceStore(join(tmp, 'devices.json'))
   store.upsert({
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId: 'dev-A',
     displayName: 'Desk Alpha',
     hosts: [host],
+    security: { [host]: 'ws' as const },
     port,
     desktopIdentity,
     grants: ['agent'] as 'agent'[],

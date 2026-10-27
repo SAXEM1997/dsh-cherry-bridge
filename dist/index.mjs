@@ -5,7 +5,7 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
 import { createHash, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteConnectPath, remoteFailureSchema } from "@cherrystudio/remote-protocol";
+import { directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema } from "@cherrystudio/remote-protocol";
 const FILE_MODE = 384;
 /**
 * Version-to-version migrations, keyed by the version they upgrade from.
@@ -13,15 +13,49 @@ const FILE_MODE = 384;
 * `{ 1 -> 2 }` is a mechanism sample only, mirroring the plan's convention that
 * real schema evolution starts at version 2 after release. A v1 archive is the
 * current field set minus `schemaVersion`.
+*
+* `{ 2 -> 3 }` (issue #126) adds the per-host `security` map. v2 had `hosts` +
+* one `port` and no scheme at all, so every host is backfilled `ws` — the
+* plain dial v2 always used. An archive that already carries SOME entries
+* (a half-migrated file, or one a newer build wrote) keeps them: a scheme the
+* record remembers is never overwritten by the default, because that would
+* downgrade a TLS-proxied desktop to a dial that cannot connect.
+*
+* **v2 is read loosely, v3 strictly — deliberately.** This step fills the map
+* for the CURRENT host list and nothing else: an entry naming a host v2 no
+* longer lists is silently DROPPED (it was unreachable anyway), a non-object
+* `security` degrades to "every host on `ws`", and a junk scheme VALUE is not
+* repaired here at all — the migrated entry then re-enters the read path as a
+* v3 record and `assertValidSecurity` rejects the whole archive. That split is
+* the point: a v2 file is a supported legacy shape and is normalised into one,
+* while a v3 file is this build's own output and any deviation from it is a
+* hand edit worth failing loudly on.
 */
-const MIGRATIONS = { 1: (record) => ({
-	...record,
-	schemaVersion: 2
-}) };
+const MIGRATIONS = {
+	1: (record) => ({
+		...record,
+		schemaVersion: 2
+	}),
+	2: (record) => ({
+		...record,
+		schemaVersion: 3,
+		security: backfilledSecurity(record)
+	})
+};
+/** Every host of a v2 record, defaulting anything it did not already say. */
+function backfilledSecurity(disk) {
+	const existing = disk.security ?? {};
+	return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? "ws"]));
+}
 /**
-* Every field of the *current* set except `schemaVersion` — v1 is defined as
-* the current field set minus the version key, so these are exactly the keys a
-* complete v1 archive must carry.
+* The field set of a v1 entry: what the store wrote before it carried a
+* version at all.
+*
+* FROZEN. It must not track the current record — a v1 archive predates every
+* later field, so demanding one here (as `'security'` was, briefly) fails the
+* completeness gate on an archive that is perfectly intact and quarantines it
+* instead of migrating it. Later fields are the migration chain's business
+* (`backfilledSecurity` supplies `security` from v2 onward).
 */
 const V1_KEYS = [
 	"deviceId",
@@ -32,7 +66,17 @@ const V1_KEYS = [
 	"grants",
 	"enabled"
 ];
-const REQUIRED_KEYS = [...V1_KEYS, "schemaVersion"];
+/**
+* Every field of the CURRENT set plus `schemaVersion`. Unlike {@link V1_KEYS}
+* this is not a historical snapshot: it grows with the record, and it is what
+* `upsert` and the post-migration exit demand (which is why a v3 entry without
+* `security` never reaches `assertValidSecurity`).
+*/
+const REQUIRED_KEYS = [
+	...V1_KEYS,
+	"security",
+	"schemaVersion"
+];
 /**
 * A version-less entry reads as the legacy (v1) shape only when every v1 field
 * is present. A missing `schemaVersion` alone means v1; a missing
@@ -44,12 +88,35 @@ function hasCompleteFieldSet(disk) {
 }
 /** Asserts the required `DeviceRecord` shape. The read path's exit. */
 function assertValidRecord(disk) {
-	if (disk.schemaVersion !== 2) throw new Error(`device archive entry has unsupported schemaVersion ${String(disk.schemaVersion)}; expected 2`);
+	if (disk.schemaVersion !== 3) throw new Error(`device archive entry has unsupported schemaVersion ${String(disk.schemaVersion)}; expected 3`);
 	const missing = REQUIRED_KEYS.filter((key) => disk[key] === void 0);
 	if (missing.length > 0) throw new Error(`device archive entry is missing required field(s): ${missing.join(", ")}`);
 	if (!Array.isArray(disk.hosts)) throw new Error("device archive entry field hosts must be an array");
+	assertValidSecurity(disk.hosts, disk.security);
 	if (disk.accessToken !== void 0 !== (disk.tokenExpiresAt !== void 0)) throw new Error("device archive entry must carry accessToken and tokenExpiresAt together or not at all");
 	return disk;
+}
+/**
+* The `security` map must be EXACTLY one entry per host, each a known scheme.
+*
+* Keyed by host, so a record can carry an entry the dial will never consult
+* (a host it no longer lists) and a host the dial will fall back on silently.
+* Both are hand-edited-archive states, and both are rejected rather than
+* repaired in memory: the archive a human edits is the archive the store
+* judges, and a silent repair would hide the very mistake. The message names
+* the offending HOSTS (they are addresses an operator chose, not secrets).
+*/
+function assertValidSecurity(hosts, security) {
+	if (security === void 0) return;
+	if (security === null || typeof security !== "object" || Array.isArray(security)) throw new Error("device archive entry field security must be an object keyed by host");
+	const map = security;
+	const wanted = new Set(hosts);
+	const unknownHost = Object.keys(map).find((host) => !wanted.has(host));
+	if (unknownHost !== void 0) throw new Error(`device archive entry field security names host "${unknownHost}", which is not in hosts`);
+	for (const host of hosts) {
+		const scheme = map[host];
+		if (scheme !== "ws" && scheme !== "wss") throw new Error(`device archive entry field security["${host}"] must be "ws" or "wss"`);
+	}
 }
 /**
 * Read path, fixed order: loose parse -> completeness gate -> version judgement
@@ -74,7 +141,7 @@ function parseRecord(raw, archiveVersion) {
 	if (declared === void 0 && archiveVersion > 1) throw new Error(`device archive entry has no schemaVersion but its archive is schemaVersion ${archiveVersion}; legacy (v1) entries are only valid inside a schemaVersion-1 archive`);
 	if (declared !== void 0 && declared !== archiveVersion) throw new Error(`device archive entry declares schemaVersion ${declared} but its archive is schemaVersion ${archiveVersion}; the archive version is authoritative`);
 	let migrated = disk;
-	for (let step = archiveVersion; step < 2; step += 1) {
+	for (let step = archiveVersion; step < 3; step += 1) {
 		const migrate = MIGRATIONS[step];
 		if (migrate === void 0) throw new Error(`no migration registered from device archive schemaVersion ${step}`);
 		migrated = migrate(migrated);
@@ -85,7 +152,7 @@ function parseArchive(parsed) {
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("device archive must be a JSON object");
 	const archive = parsed;
 	if (typeof archive.schemaVersion !== "number") throw new Error("device archive is missing a numeric schemaVersion");
-	if (archive.schemaVersion > 2) throw new Error(`device archive declares schemaVersion ${archive.schemaVersion}, newer than supported 2; refusing to read it`);
+	if (archive.schemaVersion > 3) throw new Error(`device archive declares schemaVersion ${archive.schemaVersion}, newer than supported 3; refusing to read it`);
 	if (!Array.isArray(archive.devices)) throw new Error("device archive is missing a devices array");
 	const archiveVersion = archive.schemaVersion;
 	return {
@@ -95,7 +162,7 @@ function parseArchive(parsed) {
 }
 function serializeArchive(devices) {
 	return `${JSON.stringify({
-		schemaVersion: 2,
+		schemaVersion: 3,
 		devices
 	}, null, 2)}\n`;
 }
@@ -376,7 +443,7 @@ var DeviceStore = class {
 		}
 		const devices = archive === void 0 ? [] : archive.devices;
 		this.#devices = devices;
-		if (archive !== void 0 && archive.schemaVersion < 2) this.#persist(devices);
+		if (archive !== void 0 && archive.schemaVersion < 3) this.#persist(devices);
 		return devices;
 	}
 	#persist(devices) {
@@ -2318,21 +2385,6 @@ const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 */
 const MAX_RESUME_TOKEN_CHARS = 4096;
 //#endregion
-//#region src/urlHost.ts
-/**
-* Renders a host as a URL authority component. The device archive and pairing
-* flow store BARE hosts (plan-mandated normalization), so a bare IPv6 literal
-* must be bracketed before it is spliced into a URL — `ws://::1:35543/...`
-* is not a valid URL and `new WebSocket(...)` throws synchronously on it.
-*
-* Shared home for the dial sites: both `connection.ts` (per-device dial) and
-* `pairing.ts` (candidate dial) splice hosts into URLs and must bracket the
-* same way.
-*/
-function urlHost(host) {
-	return host.includes(":") ? `[${host}]` : host;
-}
-//#endregion
 //#region src/connection.ts
 /**
 * The transport call the dial hands a socket to (see
@@ -2831,8 +2883,10 @@ var DeviceConnection = class {
 	#pendingPings = /* @__PURE__ */ new Set();
 	#token;
 	#tokenExpiresAt;
+	#wsOptions;
 	constructor(opts) {
 		this.record = opts.record;
+		this.#wsOptions = opts.wsOptions;
 		this.#identity = opts.identity;
 		this.#limiter = new TieredRateLimiter(opts.rateBudgetPerSecond ?? 32, contentBudgetFor(opts.rateBudgetPerSecond));
 		this.#backoffInitialMs = opts.backoffInitialMs ?? DEFAULT_BACKOFF_INITIAL_MS;
@@ -3080,8 +3134,11 @@ var DeviceConnection = class {
 		throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, lastError);
 	}
 	async #dial(host, port, epoch) {
-		const url = `ws://${urlHost(host)}:${port}${remoteConnectPath}`;
-		const ws = new WebSocket(url);
+		const ws = new WebSocket(directEndpointUrl({
+			host,
+			port,
+			security: this.record.security?.[host] ?? "ws"
+		}), this.#wsOptions);
 		const controller = new AbortController();
 		const opened = new Promise((resolve) => ws.once("open", () => resolve()));
 		const failure = new Promise((_, reject) => {
@@ -3676,9 +3733,9 @@ function sleep$1(ms) {
 * XX handshake must prove, so a swapped-in impostor fails the handshake
 * instead of being pinned as the desktop.
 */
-async function dial(candidate, identity, desktopIdentity, protocolVersions, timeoutMs) {
+async function dial(candidate, identity, desktopIdentity, protocolVersions, timeoutMs, wsOptions) {
 	const { host, port } = candidate;
-	const ws = new WebSocket(directEndpointUrl(candidate));
+	const ws = new WebSocket(directEndpointUrl(candidate), wsOptions);
 	const controller = new AbortController();
 	let timer;
 	const timedOut = new Promise((_, reject) => {
@@ -3763,7 +3820,7 @@ async function pairWithPayload(opts) {
 		const label = `${candidate.host}:${candidate.port}`;
 		let temp;
 		try {
-			temp = await dial(candidate, opts.identity, payload.desktopIdentity, offered, connectTimeoutMs);
+			temp = await dial(candidate, opts.identity, payload.desktopIdentity, offered, connectTimeoutMs, opts.wsOptions);
 		} catch (error) {
 			failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
 			continue;
@@ -3839,10 +3896,11 @@ async function claimAndAwait(client, payload, protocolVersions, opts, onStatus, 
 * payload; the 2.1.8 generation side emits one endpoint per custom-address
 * invitation (`ApiGatewayService.getRemoteEndpoint`:
 * `advertisedEndpoint ? [advertisedEndpoint] : …`), so every real v3 record is
-* faithful. `security` is NOT persisted — `DeviceRecord` schemaVersion 2 has no
-* such field — which means a paired **wss** endpoint reconnects on `ws://`
-* (the steady-state dial, src/connection.ts); making that device reachable
-* after pairing is separate follow-up work, not part of issue #124.
+* faithful. `security` IS persisted (issue #126), one entry per host, taken
+* from the very candidates the walk dialed — so a schemaVersion-3 record
+* remembers the scheme the pairing actually used, and the steady-state dial
+* (src/connection.ts) rebuilds the same URL instead of a plain `ws://`. Before
+* that, #124 paired a TLS endpoint and made it unreachable on every reconnect.
 */
 function recordFrom(payload, approved, deviceName, winner) {
 	const grants = (approved.authorization?.grants ?? []).map((grant) => grant.domain).filter((domain) => domain === "agent");
@@ -3850,11 +3908,12 @@ function recordFrom(payload, approved, deviceName, winner) {
 	const tokenExpiresAt = Date.parse(approved.expiresAt);
 	if (!Number.isFinite(tokenExpiresAt)) throw new PairingError("rejected", `the desktop approved the pairing with an unreadable token expiry (${JSON.stringify(approved.expiresAt)}); re-pair the device`);
 	return {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		deviceId: approved.deviceId,
 		displayName: deviceName,
 		hosts: payload.candidates.map((candidate) => candidate.host),
 		port: winner.port,
+		security: Object.fromEntries(payload.candidates.map((candidate) => [candidate.host, candidate.security])),
 		desktopIdentity: payload.desktopIdentity,
 		grants,
 		accessToken: approved.accessToken,
@@ -10837,7 +10896,8 @@ function listDevices(res, route) {
 		state: projectState(device, route.deps.connect),
 		enabled: device.enabled,
 		hosts: [...device.hosts],
-		port: device.port
+		port: device.port,
+		security: { ...device.security }
 	})));
 }
 /**
@@ -11007,11 +11067,12 @@ function deviceById(deps, deviceId) {
 	const found = deps.store.list().find((device) => device.deviceId === deviceId);
 	if (found !== void 0) return found;
 	return {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		deviceId,
 		displayName: "",
 		hosts: [],
 		port: 0,
+		security: {},
 		desktopIdentity: "",
 		grants: [],
 		enabled: false
@@ -11061,11 +11122,15 @@ async function patchDevice(req, res, route, deviceId) {
 	const previousEnabled = existing.enabled;
 	const previousHosts = existing.hosts;
 	const previousPort = existing.port;
+	const previousSecurity = existing.security;
 	const next = {
 		...existing,
 		...patch.displayName === void 0 ? {} : { displayName: patch.displayName },
 		...patch.enabled === void 0 ? {} : { enabled: patch.enabled },
-		...patch.hosts === void 0 ? {} : { hosts: patch.hosts },
+		...patch.hosts === void 0 ? {} : {
+			hosts: patch.hosts,
+			security: securityFor(patch.hosts, previousSecurity)
+		},
 		...patch.port === void 0 ? {} : { port: patch.port }
 	};
 	try {
@@ -11075,7 +11140,7 @@ async function patchDevice(req, res, route, deviceId) {
 		writeError(res, 400, "invalid-device", error instanceof Error ? error.message : String(error));
 		return;
 	}
-	const addressChanged = patch.hosts !== void 0 && !sameHosts(patch.hosts, previousHosts) || patch.port !== void 0 && patch.port !== previousPort;
+	const addressChanged = patch.hosts !== void 0 && !sameHosts(patch.hosts, previousHosts) || patch.port !== void 0 && patch.port !== previousPort || !sameSecurity(next.security, previousSecurity);
 	const enabledChanged = patch.enabled !== void 0 && patch.enabled !== previousEnabled;
 	if (addressChanged) evict(route, deviceId);
 	if (enabledChanged) hibernate(route, deviceId);
@@ -11095,7 +11160,8 @@ async function patchDevice(req, res, route, deviceId) {
 		state,
 		enabled: next.enabled,
 		hosts: [...next.hosts],
-		port: next.port
+		port: next.port,
+		security: { ...next.security }
 	});
 }
 function warnConnect(deviceId) {
@@ -11106,6 +11172,22 @@ function warnConnect(deviceId) {
 /** Order-sensitive host comparison: `hosts` is an ordered candidate list. */
 function sameHosts(a, b) {
 	return a.length === b.length && a.every((host, index) => host === b[index]);
+}
+/**
+* The scheme map for a WHOLE-REPLACE host list (issue #126): each named host
+* keeps the scheme it was dialed with, a host the list just gained defaults to
+* `ws`, and hosts the list dropped leave no entry behind. An edit is an
+* address edit, not a scheme edit — re-typing the same host must not silently
+* demote a TLS-proxied desktop to a plain dial.
+*/
+function securityFor(hosts, previous) {
+	return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? "ws"]));
+}
+/** Order-insensitive comparison for two scheme maps. */
+function sameSecurity(a, b) {
+	const keys = Object.keys(a);
+	if (keys.length !== Object.keys(b).length) return false;
+	return keys.every((key) => a[key] === b[key]);
 }
 /** Drops the pooled connection, closing any live socket first. */
 function evict(route, deviceId) {

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
-import { remoteConnectPath } from '@cherrystudio/remote-protocol'
+import { directEndpointUrl } from '@cherrystudio/remote-protocol'
 import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcRequestOptions } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
@@ -13,7 +13,6 @@ import {
   DEFAULT_TRANSPORT_RETRY_WAIT_MS,
   RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
-import { urlHost } from './urlHost.js'
 import type { DeviceRecord } from './deviceStore.js'
 
 /**
@@ -55,11 +54,38 @@ export interface EffectiveLimits {
   messageSummaries?: number
 }
 
+/**
+ * Options handed to every `WebSocket` dial (issue #126).
+ *
+ * FLAT `tls.connect` options — `ws` forwards its own option bag straight to
+ * `tls.connect`, so `{ rejectUnauthorized: false }` or `{ ca: <pem> }` belong
+ * at the top level rather than under a `tls:` key.
+ */
+export type WsDialOptions = { rejectUnauthorized?: boolean; ca?: string | Buffer | Array<string | Buffer> }
+
 export interface DeviceConnectionOptions {
   /** Local Ed25519 device identity (raw protobuf private key bytes). */
   identity: Uint8Array
-  /** The paired device record; `hosts`/`port` are re-read on every attempt. */
+  /**
+   * The paired device record; `hosts`/`security`/`port` are re-read on every
+   * attempt. `security` is REQUIRED by schemaVersion 3 and the v2 migration
+   * backfills an explicit `ws`, so the `?.` in the dial guards an in-memory
+   * record assembled without the map (or constructed before validation), not a
+   * migrated one.
+   */
   record: DeviceRecord
+  /**
+   * Options for every dial's `WebSocket` (issue #126) — in practice
+   * `rejectUnauthorized`/`ca`, for a desktop behind a TLS proxy whose
+   * certificate is not in Node's default trust store. Absent means Node's
+   * defaults. Never derived from the record: a certificate is trust the
+   * OPERATOR grants, not a fact the desktop asserts about itself.
+   *
+   * TODAY ONLY TESTS PASS IT — the assembly does not inject it yet; the config
+   * surface that would let a private-CA deployment set it is separate work
+   * (issue #133).
+   */
+  wsOptions?: WsDialOptions
   /**
    * Second-level smoothed request budget for business RPCs on the SHARED tier
    * — every business RPC except `agent.content.read`, which has its own tier
@@ -759,8 +785,11 @@ export class DeviceConnection {
   #token: string | undefined
   #tokenExpiresAt: number | undefined
 
+  readonly #wsOptions: WsDialOptions | undefined
+
   constructor(opts: DeviceConnectionOptions) {
     this.record = opts.record
+    this.#wsOptions = opts.wsOptions
     this.#identity = opts.identity
     this.#limiter = new TieredRateLimiter(
       opts.rateBudgetPerSecond ?? DEFAULT_RATE_BUDGET_PER_SECOND,
@@ -1136,10 +1165,17 @@ export class DeviceConnection {
   }
 
   async #dial(host: string, port: number, epoch: number): Promise<LiveLink> {
-    // Bare IPv6 hosts (the archive's normalized form) must be bracketed into
-    // a URL authority or `new WebSocket` throws Invalid URL.
-    const url = `ws://${urlHost(host)}:${port}${remoteConnectPath}`
-    const ws = new WebSocket(url)
+    // (see {@link DeviceConnectionOptions.wsOptions} for TLS trust)
+    // The URL comes from the SAME helper the pairing dial uses (issue #126):
+    // it brackets bare IPv6 hosts (the archive's normalized form — splicing one
+    // raw into a URL makes `new WebSocket` throw Invalid URL) and selects
+    // `ws:`/`wss:` from the record's own scheme for this host. Persisting the
+    // scheme is what makes a TLS-proxied desktop RE-connectable: #124 paired
+    // over `wss` and this dial then rebuilt `ws://` for every later session.
+    const ws = new WebSocket(
+      directEndpointUrl({ host, port, security: this.record.security?.[host] ?? 'ws' }),
+      this.#wsOptions,
+    )
     const controller = new AbortController()
 
     const opened = new Promise<void>((resolve) => ws.once('open', () => resolve()))
