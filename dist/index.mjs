@@ -3784,18 +3784,33 @@ function sleep$1(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 /**
-* Tags a `ws` error as a candidate-dial failure (issue #142). The `websocket:`
-* prefix is the KIND: the operator's fix is this address or its TLS, not the
-* network — the contrast with `timeout:` is the whole point of the prefix, and
-* it is what the joined `unreachable` verdict shows. The `ws` error carries the
-* discriminator a bare message drops — an OS `code` (`ECONNREFUSED`,
-* `ENOTFOUND`, a TLS code) or a numeric ws code — so it is appended, and only
-* when it is actually a string or a number (never `undefined`/`null`).
+* Tags a PRE-OPEN `ws` error as a candidate-dial failure (issue #142). The
+* `websocket:` prefix is the KIND: the operator's fix is this address or its
+* TLS, not the network — the contrast with `timeout:` is the whole point of the
+* prefix, and it is what the joined `unreachable` verdict shows. The `ws` error
+* carries the discriminator a bare message drops — an OS `code`
+* (`ECONNREFUSED`, `ENOTFOUND`, a TLS code) or a numeric ws code — so it is
+* appended, and only when it is actually a string or a number (never
+* `undefined`/`null`).
 */
 function webSocketFailure(error) {
 	const code = error.code;
 	const suffix = typeof code === "string" || typeof code === "number" ? ` (code ${code})` : "";
 	return /* @__PURE__ */ new Error(`websocket: ${error.message}${suffix}`);
+}
+/**
+* Tags a POST-OPEN channel failure as a candidate-dial failure (issue #147).
+* `channel:` is the THIRD kind, deliberately not `websocket:`: the upgrade
+* completed, so the address works and only the channel's establishment failed
+* (Noise handshake, remote identity proof, protocol offer). Blaming the
+* address would send the operator to inspect something that demonstrably
+* answered. No code suffix is appended: a Noise-stage error can carry its own
+* string code (`ERR_INVALID_CRYPTO_EXCHANGE`), but that is an internal label
+* rather than the ws/OS discriminator the other kinds keep, so it is
+* deliberately dropped.
+*/
+function channelFailure(error) {
+	return /* @__PURE__ */ new Error(`channel: ${error.message}`);
 }
 /** Dials one candidate address and completes the Noise handshake.
 *
@@ -3813,6 +3828,14 @@ function webSocketFailure(error) {
 * rather than assumed: the payload's `desktopIdentity` is the peer the Noise
 * XX handshake must prove, so a swapped-in impostor fails the handshake
 * instead of being pinned as the desktop.
+*
+* A failure carries one of THREE kinds into the joined `unreachable` verdict,
+* because each names the operator's next check: `timeout:` (the per-attempt
+* timer won its race — check the network), `websocket:` (the socket failed
+* BEFORE the upgrade — check this address or its TLS), and `channel:` (the
+* socket came up and the channel failed AFTER it — check the peer's identity
+* or the protocol offer). A stalled handshake stays `timeout:`: the dial
+* promise's own timer settles first, so the abort it triggers cannot win.
 */
 async function dial(candidate, identity, desktopIdentity, protocolVersions, timeoutMs, wsOptions) {
 	const { host, port } = candidate;
@@ -3841,14 +3864,18 @@ async function dial(candidate, identity, desktopIdentity, protocolVersions, time
 				ws.once("error", onError);
 				ws.on("close", onClose);
 			});
-			const stream = new RemoteSocketStream(toRemoteSocket(ws), silentComponentLogger.forComponent("pairing"), "outbound");
-			return connectSecureChannel(stream, {
-				identity,
-				logger: silentComponentLogger,
-				protocolVersions: [...protocolVersions],
-				signal: controller.signal,
-				remoteIdentity: desktopIdentity
-			});
+			try {
+				const stream = new RemoteSocketStream(toRemoteSocket(ws), silentComponentLogger.forComponent("pairing"), "outbound");
+				return await connectSecureChannel(stream, {
+					identity,
+					logger: silentComponentLogger,
+					protocolVersions: [...protocolVersions],
+					signal: controller.signal,
+					remoteIdentity: desktopIdentity
+				});
+			} catch (error) {
+				throw channelFailure(error instanceof Error ? error : new Error(String(error)));
+			}
 		})();
 		const channel = await Promise.race([connecting, timedOut.finally(() => controller.abort(/* @__PURE__ */ new Error("pairing connect timed out")))]);
 		return {

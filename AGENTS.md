@@ -85,19 +85,17 @@ their keys (there is a contract assertion for exactly that).
 
 - **tsdown preserves JSDoc into `dist/index.mjs`.** A change that only touches
   `src/**` **comments** still changes the artifact bytes; editing an exported
-  declaration's doc comment needs `dist` rebuilt in the same commit —
-  `tests/unit/artifactFreshness.test.ts` rebuilds into a temp dir and compares
-  **byte for byte** against the committed files. A missing rebuild is a red
-  test, not a style nit.
+  declaration's doc comment needs `dist` rebuilt in the same commit. A missing
+  rebuild is a red test, not a style nit.
 - **`prepublishOnly` vs `artifactFreshness` — two different gates.**
   - `prepublishOnly` =
     `typecheck && test && build && build:client && npm pack --dry-run`: the
     whole chain (both type projects, the full suite, both builds, the pack
     check) on the publish path; it proves the tree *is* buildable.
-  - `artifactFreshness` = rebuild from current source and byte-compare against
-    **what is committed** — the gate that catches "changed source, forgot to
-    rebuild", including comment-only drift. It proves the artifacts came from
-    this exact source and runs in the fast suite.
+  - `artifactFreshness` = rebuild from current source (into a temp dir) and
+    byte-compare against **what is committed** — the gate that catches
+    "changed source, forgot to rebuild", including comment-only drift. It
+    proves the artifacts came from this exact source and runs in the fast suite.
   - The contract suite's "clean clone → pack" case is a third, coarser arm: a
     clone without `node_modules` must already carry the three artifacts, and
     the `npm pack --ignore-scripts` tarball must contain them. It sees
@@ -765,7 +763,7 @@ logged or reported; `ca` is PEM text.
 ONE aggregate `dialBudgetMs` deadline (30 s) bounds the walk; unreached
 candidates are named. Claim/poll re-anchors a FRESH 120 s race guard at the
 claim (not the invitation's birth); peer `expired` is the real bound.
-A failed PRE-OPEN dial is prefixed `timeout:` or `websocket:` (the `ws` code is kept) so the verdict names the kind.
+A failed PRE-OPEN dial is prefixed `timeout:` or `websocket:` (the `ws` code is kept); a POST-OPEN channel failure IN THE DIAL is `channel:` (a CLAIM failure rides an established channel and is not tagged).
 
 ### Device selector
 
