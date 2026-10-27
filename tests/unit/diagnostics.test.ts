@@ -27,9 +27,14 @@ import { ToolScopeState } from '../../src/toolScope.js'
  * than as "this device has no pinned peer identity".
  */
 
+/** One `ws` entry per host: the plain dial every test fixture stands for. */
+function wsSecurity(hosts: readonly string[]): Record<string, 'ws' | 'wss'> {
+  return Object.fromEntries(hosts.map((host) => [host, 'ws' as const]))
+}
+
 function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
-  return {
-    schemaVersion: 2,
+  const base: Omit<DeviceRecord, 'security'> = {
+    schemaVersion: 3,
     deviceId: 'dev-1',
     displayName: 'Workstation',
     hosts: ['192.168.1.20'],
@@ -37,9 +42,14 @@ function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
     desktopIdentity: 'desktop-abc',
     grants: ['agent'],
     enabled: true,
-    ...overrides,
   }
+  const merged = { ...base, ...overrides }
+  // `security` is keyed by host and must cover exactly the FINAL host list (the
+  // store rejects anything else), so it is derived after the overrides.
+  const hosts = overrides.hosts ?? base.hosts
+  return { ...merged, security: overrides.security ?? wsSecurity(hosts) }
 }
+
 
 describe('final review: digestIdentity on an absent identity', () => {
   it('R10: the empty identity reports `unknown` instead of a plausible digest', () => {

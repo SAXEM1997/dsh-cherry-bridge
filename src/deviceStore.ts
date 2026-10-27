@@ -45,8 +45,21 @@ export interface DeviceRecord {
   schemaVersion: number
   deviceId: string
   displayName: string
+  /**
+   * Ordered dial candidates. `security` is keyed by these same hosts — one
+   * scheme per candidate, exactly the shape the pairing dial already carries
+   * (`PairCandidate`), so a candidate and its scheme are added and replaced as
+   * one unit.
+   */
   hosts: string[]
+  /** Shared by every host (spec §3.2): there is no per-host port. */
   port: number
+  /**
+   * Dial scheme per host (issue #126). Every entry of `hosts` has exactly one
+   * key here; `wss` is a TLS-proxied desktop. Introduced with schemaVersion 3:
+   * a v2 archive had `hosts` + `port` only, and the migration backfills `ws`.
+   */
+  security: Record<string, 'ws' | 'wss'>
   desktopIdentity: string
   grants: 'agent'[]
   /** Paired with `tokenExpiresAt`: present together or absent together. */
@@ -77,7 +90,7 @@ export interface UnresolvedDevice {
 export type DeviceResolution = DeviceRecord | AmbiguousDevice | UnresolvedDevice
 
 /** The only `schemaVersion` this build reads and writes. */
-export const CURRENT_SCHEMA_VERSION = 2
+export const CURRENT_SCHEMA_VERSION = 3
 
 const FILE_MODE = 0o600
 
@@ -105,9 +118,27 @@ type Migration = (record: DeviceRecordOnDisk) => DeviceRecordOnDisk
  * `{ 1 -> 2 }` is a mechanism sample only, mirroring the plan's convention that
  * real schema evolution starts at version 2 after release. A v1 archive is the
  * current field set minus `schemaVersion`.
+ *
+ * `{ 2 -> 3 }` (issue #126) adds the per-host `security` map. v2 had `hosts` +
+ * one `port` and no scheme at all, so every host is backfilled `ws` — the
+ * plain dial v2 always used. An archive that already carries SOME entries
+ * (a half-migrated file, or one a newer build wrote) keeps them: a scheme the
+ * record remembers is never overwritten by the default, because that would
+ * downgrade a TLS-proxied desktop to a dial that cannot connect. The map is
+ * narrowed to the CURRENT host list; `assertValidRecord` is the backstop for
+ * the key-set rule, so this step only has to fill, never clean up.
  */
 const MIGRATIONS: Record<number, Migration> = {
   1: (record) => ({ ...record, schemaVersion: 2 }),
+  2: (record) => ({ ...record, schemaVersion: 3, security: backfilledSecurity(record) }),
+}
+
+/** Every host of a v2 record, defaulting anything it did not already say. */
+function backfilledSecurity(
+  disk: Partial<DeviceRecord>,
+): Record<string, 'ws' | 'wss'> {
+  const existing = disk.security ?? {}
+  return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? 'ws']))
 }
 
 /**
@@ -120,6 +151,7 @@ const V1_KEYS = [
   'displayName',
   'hosts',
   'port',
+  'security',
   'desktopIdentity',
   'grants',
   'enabled',
@@ -153,6 +185,7 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
   if (!Array.isArray(disk.hosts)) {
     throw new Error('device archive entry field hosts must be an array')
   }
+  assertValidSecurity(disk.hosts, disk.security)
 
   // accessToken / tokenExpiresAt live and die together.
   const hasToken = disk.accessToken !== undefined
@@ -164,6 +197,43 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
   }
 
   return disk as DeviceRecord
+}
+
+/**
+ * The `security` map must be EXACTLY one entry per host, each a known scheme.
+ *
+ * Keyed by host, so a record can carry an entry the dial will never consult
+ * (a host it no longer lists) and a host the dial will fall back on silently.
+ * Both are hand-edited-archive states, and both are rejected rather than
+ * repaired in memory: the archive a human edits is the archive the store
+ * judges, and a silent repair would hide the very mistake. The message names
+ * the offending HOSTS (they are addresses an operator chose, not secrets).
+ */
+function assertValidSecurity(hosts: string[], security: unknown): void {
+  // A v2-shaped entry (a hand-edited v3 archive that forgot the map) has no
+  // `security` at all: it reads as "every host on the plain dial", the one
+  // scheme a scheme-less record could ever have meant. A map that IS present
+  // is judged strictly — absence is the old shape, a wrong map is a mistake.
+  if (security === undefined) return
+  if (security === null || typeof security !== 'object' || Array.isArray(security)) {
+    throw new Error('device archive entry field security must be an object keyed by host')
+  }
+  const map = security as Record<string, unknown>
+  const wanted = new Set(hosts)
+  const unknownHost = Object.keys(map).find((host) => !wanted.has(host))
+  if (unknownHost !== undefined) {
+    throw new Error(
+      `device archive entry field security names host "${unknownHost}", which is not in hosts`,
+    )
+  }
+  for (const host of hosts) {
+    const scheme = map[host]
+    if (scheme !== 'ws' && scheme !== 'wss') {
+      throw new Error(
+        `device archive entry field security["${host}"] must be "ws" or "wss"`,
+      )
+    }
+  }
 }
 
 /**

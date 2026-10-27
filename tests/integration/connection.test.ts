@@ -17,8 +17,9 @@ import {
   RpcDeadlineExceededError,
   TransportLostError,
 } from '../../src/connection.js'
-import type { DeviceState, EffectiveLimits } from '../../src/connection.js'
+import type { DeviceState, EffectiveLimits, WsDialOptions } from '../../src/connection.js'
 import { FakeCherry, maxRequestsInAnyOneSecondWindow } from '../loopback/fakeCherry.js'
+import { makeDualPeer, insecureTlsOptions, type DualPeer } from '../helpers/tls/dualPeer.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 /**
@@ -30,6 +31,7 @@ import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 const connections: DeviceConnection[] = []
 const fakes: FakeCherry[] = []
+const peers: DualPeer[] = []
 
 /** Silences DeviceConnection's own logging (asserted explicitly where relevant). */
 let consoleError: ReturnType<typeof vi.fn>
@@ -59,6 +61,7 @@ beforeEach(() => {
 afterEach(async () => {
   for (const connection of connections.splice(0)) await connection.close()
   for (const fake of fakes.splice(0)) await fake.stop()
+  for (const peer of peers.splice(0)) await peer.stop()
   vi.restoreAllMocks()
 })
 
@@ -78,8 +81,8 @@ async function makeFake(options: FakeCherryOptions = {}): Promise<FakeInfo> {
 }
 
 function recordFor(fakeInfo: FakeInfo, overrides: Partial<DeviceRecord> = {}): DeviceRecord {
-  return {
-    schemaVersion: 2,
+  const base: Omit<DeviceRecord, 'security'> = {
+    schemaVersion: 3,
     deviceId: 'dev-test',
     displayName: 'Cherry Desktop',
     hosts: [fakeInfo.host],
@@ -88,7 +91,13 @@ function recordFor(fakeInfo: FakeInfo, overrides: Partial<DeviceRecord> = {}): D
     grants: ['agent'],
     enabled: true,
     ...overrides,
-  }
+  } as Omit<DeviceRecord, 'security'>
+  const hosts = overrides.hosts ?? base.hosts
+  // One `ws` entry per host unless a test says otherwise: the scheme map must
+  // cover exactly the record's host list, so it follows the overrides.
+  const security =
+    overrides.security ?? Object.fromEntries(hosts.map((host) => [host, 'ws' as const]))
+  return { ...base, security }
 }
 
 interface ConnectionOptions {
@@ -99,6 +108,7 @@ interface ConnectionOptions {
   helloProtocolVersions?: number[]
   rateBudgetPerSecond?: number
   transportRetryWaitMs?: number
+  wsOptions?: WsDialOptions
 }
 
 function makeConnection(opts: ConnectionOptions): DeviceConnection {
@@ -1181,6 +1191,79 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(connection.state).toBe('connected')
     expect(fakeInfo.fake.connectionCount).toBe(1)
     expect(fakeInfo.fake.authenticateCount).toBe(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // Issue #126: the steady-state dial honours the PERSISTED scheme.
+  //
+  // #124 made pairing dial a v3 endpoint's own `security` (a TLS-proxied
+  // desktop pairs over `wss`), but the reconnect rebuilt a plain `ws://` URL
+  // from `hosts`+`port` alone, so such a device was pairable and never
+  // RE-connectable. The record now carries a scheme per host, and the dial goes
+  // through the same `directEndpointUrl` helper pairing uses.
+  //
+  // The scheme is judged by WHO ACCEPTS, not by "something connected": the TLS
+  // front and the desktop's own plain listener are two different doors on one
+  // `FakeCherry` (tests/helpers/tls/dualPeer.ts), so a plain dial and a `wss`
+  // dial leave different counts. Both fixtures are needed —
+  //  - the `wss` case proves the persisted scheme is USED, and
+  //  - the `ws` case proves the default is not accidentally flipped.
+  // A single fixture cannot carry both: with only a TLS listener, a plain dial
+  // fails (so the resolver's DEFAULT would be caught too, but the "no change
+  // for v2-only records" claim would not be tested at all).
+  // -------------------------------------------------------------------------
+
+  it('#126 a wss record dials wss on the steady-state path (the desktop is reached through the TLS door only)', async () => {
+    const identity = await createDeviceIdentity()
+    const peer = await makeDualPeer()
+    peers.push(peer)
+    const record = recordFor(
+      {
+        fake: peer.desktop,
+        host: '127.0.0.1',
+        port: peer.tlsPort,
+        desktopIdentity: peer.desktopIdentity,
+      },
+      {
+        hosts: ['127.0.0.1'],
+        port: peer.tlsPort,
+        security: { '127.0.0.1': 'wss' },
+      },
+    )
+    // The record's persisted scheme is the ONLY source of `wss` here — a v2
+    // record has none, and its default (the other test) is not in play.
+    // `wsOptions` is the client-side half a private-CA deployment configures:
+    // it trusts the self-signed fixture and changes nothing else, so the Noise
+    // handshake below is the real one and the desktop's pinned identity is
+    // still proven end to end.
+    const connection = makeConnection({ identity, record, wsOptions: insecureTlsOptions })
+
+    await connection.connect()
+
+    expect(connection.state).toBe('connected')
+    // The TLS-only port completed a handshake AND the desktop completed Noise
+    // behind it: "connected" is not enough on its own — a `ws://` dial against
+    // this port never gets that far, so this pair IS the scheme verdict.
+    expect(peer.tlsHandshakes()).toBe(1)
+    expect(peer.desktopConnections()).toBe(1)
+  })
+
+  it('#126 a record whose security map is ABSENT still dials ws', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    // The legacy shape: a record read before the v3 migration carries hosts
+    // and a single port and nothing about a scheme (in memory such a record is
+    // only reachable through the store's own migration, which backfills `ws`
+    // — so the dial must default, never crash on the missing map).
+    const { security: _security, ...legacy } = recordFor(fakeInfo)
+    const record = legacy as DeviceRecord
+    expect(record.security).toBeUndefined()
+    const connection = makeConnection({ identity, record })
+
+    await connection.connect()
+
+    expect(connection.state).toBe('connected')
+    expect(fakeInfo.fake.connectionCount).toBe(1)
   })
 
   // -------------------------------------------------------------------------

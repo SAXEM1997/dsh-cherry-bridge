@@ -114,6 +114,8 @@ export interface DeviceSummary {
   enabled: boolean
   hosts: string[]
   port: number
+  /** The scheme each host is dialed with (issue #126); see `DeviceRecord`. */
+  security: Record<string, 'ws' | 'wss'>
 }
 
 /** The `device-state` SSE payload. */
@@ -1053,6 +1055,7 @@ function listDevices(res: HttpResponseLike, route: RouteContext): void {
     enabled: device.enabled,
     hosts: [...device.hosts],
     port: device.port,
+    security: { ...device.security },
   }))
   writeJson(res, 200, devices)
 }
@@ -1260,6 +1263,7 @@ function deviceById(deps: CherryHttpDeps, deviceId: string): DeviceRecord {
     displayName: '',
     hosts: [],
     port: 0,
+    security: {},
     desktopIdentity: '',
     grants: [],
     enabled: false,
@@ -1360,12 +1364,17 @@ async function patchDevice(
   const previousEnabled = existing.enabled
   const previousHosts = existing.hosts
   const previousPort = existing.port
+  const previousSecurity = existing.security
   const next: DeviceRecord = {
     ...existing,
     ...(patch.displayName === undefined ? {} : { displayName: patch.displayName }),
     ...(patch.enabled === undefined ? {} : { enabled: patch.enabled }),
-    // hosts is WHOLE-REPLACE: the patch wins outright, never merges.
-    ...(patch.hosts === undefined ? {} : { hosts: patch.hosts }),
+    // hosts is WHOLE-REPLACE: the patch wins outright, never merges. The
+    // scheme map is keyed by host, so replacing the host list drops the
+    // entries for hosts that are gone and defaults the new ones to `ws` —
+    // keeping the OLD schemes indexed by the NEW list would be a stale
+    // pairing of host to scheme (issue #126).
+    ...(patch.hosts === undefined ? {} : { hosts: patch.hosts, security: securityFor(patch.hosts, previousSecurity) }),
     ...(patch.port === undefined ? {} : { port: patch.port }),
   }
 
@@ -1389,7 +1398,8 @@ async function patchDevice(
   // `connect()` to rebuild from the record we just wrote.
   const addressChanged =
     (patch.hosts !== undefined && !sameHosts(patch.hosts, previousHosts)) ||
-    (patch.port !== undefined && patch.port !== previousPort)
+    (patch.port !== undefined && patch.port !== previousPort) ||
+    !sameSecurity(next.security, previousSecurity)
   const enabledChanged = patch.enabled !== undefined && patch.enabled !== previousEnabled
 
   if (addressChanged) {
@@ -1428,6 +1438,7 @@ async function patchDevice(
     enabled: next.enabled,
     hosts: [...next.hosts],
     port: next.port,
+    security: { ...next.security },
   })
 }
 
@@ -1440,6 +1451,30 @@ function warnConnect(deviceId: string): (error: unknown) => void {
 /** Order-sensitive host comparison: `hosts` is an ordered candidate list. */
 function sameHosts(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((host, index) => host === b[index])
+}
+
+/**
+ * The scheme map for a WHOLE-REPLACE host list (issue #126): each named host
+ * keeps the scheme it was dialed with, a host the list just gained defaults to
+ * `ws`, and hosts the list dropped leave no entry behind. An edit is an
+ * address edit, not a scheme edit — re-typing the same host must not silently
+ * demote a TLS-proxied desktop to a plain dial.
+ */
+function securityFor(
+  hosts: readonly string[],
+  previous: Record<string, 'ws' | 'wss'>,
+): Record<string, 'ws' | 'wss'> {
+  return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? 'ws']))
+}
+
+/** Order-insensitive comparison for two scheme maps. */
+function sameSecurity(
+  a: Record<string, 'ws' | 'wss'>,
+  b: Record<string, 'ws' | 'wss'>,
+): boolean {
+  const keys = Object.keys(a)
+  if (keys.length !== Object.keys(b).length) return false
+  return keys.every((key) => a[key] === b[key])
 }
 
 /** Drops the pooled connection, closing any live socket first. */

@@ -269,9 +269,14 @@ let dispose: (() => void) | undefined
 let requests: Array<{ path: string; body?: unknown }>
 let pairImpl: (opts: PairWithPayloadOptions) => Promise<DeviceRecord>
 
+/** One `ws` entry per host: the plain dial every test fixture stands for. */
+function wsSecurity(hosts: readonly string[]): Record<string, 'ws' | 'wss'> {
+  return Object.fromEntries(hosts.map((host) => [host, 'ws' as const]))
+}
+
 function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
-  return {
-    schemaVersion: 2,
+  const base: Omit<DeviceRecord, 'security'> = {
+    schemaVersion: 3,
     deviceId: 'dev-1',
     displayName: 'Workstation',
     hosts: ['192.168.1.20'],
@@ -281,9 +286,14 @@ function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
     accessToken: 'super-secret-token',
     tokenExpiresAt: Date.now() + 3_600_000,
     enabled: true,
-    ...overrides,
   }
+  const merged = { ...base, ...overrides }
+  // `security` is keyed by host and must cover exactly the FINAL host list (the
+  // store rejects anything else), so it is derived after the overrides.
+  const hosts = overrides.hosts ?? base.hosts
+  return { ...merged, security: overrides.security ?? wsSecurity(hosts) }
 }
+
 
 function fakeConnection(initial: DeviceState = 'connected') {
   let state = initial
@@ -406,13 +416,16 @@ describe('① REST round-trip', () => {
       enabled: true,
       hosts: ['192.168.1.20'],
       port: 8765,
+      // The scheme map is part of the address, not a credential: the settings
+      // page shows which door a device dials (issue #126).
+      security: { '192.168.1.20': 'ws' },
     })
     // The credential never reaches the browser: asserted on the parsed object
     // AND on the raw wire bytes (a nested/renamed copy would still leak).
     expect(json[0]).not.toHaveProperty('accessToken')
     expect(json[0]).not.toHaveProperty('tokenExpiresAt')
     expect(Object.keys(json[0]).sort()).toEqual(
-      ['deviceId', 'displayName', 'enabled', 'hosts', 'port', 'state'].sort(),
+      ['deviceId', 'displayName', 'enabled', 'hosts', 'port', 'security', 'state'].sort(),
     )
     expect(res.body).not.toContain('super-secret-token')
     expect(res.body).not.toContain('accessToken')
@@ -926,6 +939,27 @@ describe('④ PATCH address maintenance', () => {
     expect(status).toBe(200)
     expect(json.hosts).toEqual(['10.0.0.9'])
     expect(store.list()[0]!.hosts).toEqual(['10.0.0.9'])
+  })
+
+  it('keeps the scheme of a host that stays in the list, defaults a new one to ws, and drops a removed one', async () => {
+    mount()
+    // A TLS-proxied desktop: its host dials `wss`.
+    store.upsert(
+      record({ hosts: ['10.0.0.1', '10.0.0.2'], security: { '10.0.0.1': 'wss', '10.0.0.2': 'wss' } }),
+    )
+
+    // Re-typing the SAME host is an address edit, not a scheme edit: a
+    // replacement list without it would demote the device to a plain dial it
+    // can never complete. The new host defaults to `ws`; the dropped one
+    // leaves no entry (the store rejects a map naming a host it does not list).
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['10.0.0.1', '10.0.0.9'] }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.security).toEqual({ '10.0.0.1': 'wss', '10.0.0.9': 'ws' })
+    expect(store.list()[0]!.security).toEqual({ '10.0.0.1': 'wss', '10.0.0.9': 'ws' })
   })
 
   it('applies the single shared port to every host and rejects malformed input', async () => {

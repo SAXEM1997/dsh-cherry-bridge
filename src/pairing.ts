@@ -4,6 +4,7 @@ import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-t
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
 import type { z } from 'zod'
 import { directEndpointUrl, pairingQrSchema } from '@cherrystudio/remote-protocol'
+import type { WsDialOptions } from './connection.js'
 import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
 import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
@@ -55,6 +56,12 @@ export interface PairWithPayloadOptions {
   connectTimeoutMs?: number
   /** Locally supported protocol versions (default [1]). */
   supportedProtocolVersions?: readonly number[]
+  /**
+   * The websocket options every dial uses — only `tls` matters (issue #126:
+   * a TLS-proxied endpoint presents a certificate the client must be able to
+   * trust, e.g. a private CA). Absent means Node's default trust store.
+   */
+  wsOptions?: WsDialOptions
 }
 
 // ---------------------------------------------------------------------------
@@ -331,9 +338,10 @@ async function dial(
   desktopIdentity: string,
   protocolVersions: readonly number[],
   timeoutMs: number,
+  wsOptions: PairWithPayloadOptions['wsOptions'],
 ): Promise<TempChannel> {
   const { host, port } = candidate
-  const ws = new WebSocket(directEndpointUrl(candidate))
+  const ws = new WebSocket(directEndpointUrl(candidate), wsOptions)
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<never>((_, reject) => {
@@ -465,6 +473,7 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
         payload.desktopIdentity,
         offered,
         connectTimeoutMs,
+        opts.wsOptions,
       )
     } catch (error) {
       failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`)
@@ -607,10 +616,11 @@ async function claimAndAwait(
  * payload; the 2.1.8 generation side emits one endpoint per custom-address
  * invitation (`ApiGatewayService.getRemoteEndpoint`:
  * `advertisedEndpoint ? [advertisedEndpoint] : …`), so every real v3 record is
- * faithful. `security` is NOT persisted — `DeviceRecord` schemaVersion 2 has no
- * such field — which means a paired **wss** endpoint reconnects on `ws://`
- * (the steady-state dial, src/connection.ts); making that device reachable
- * after pairing is separate follow-up work, not part of issue #124.
+ * faithful. `security` IS persisted (issue #126), one entry per host, taken
+ * from the very candidates the walk dialed — so a schemaVersion-3 record
+ * remembers the scheme the pairing actually used, and the steady-state dial
+ * (src/connection.ts) rebuilds the same URL instead of a plain `ws://`. Before
+ * that, #124 paired a TLS endpoint and made it unreachable on every reconnect.
  */
 function recordFrom(
   payload: PairingPayload,
@@ -645,11 +655,16 @@ function recordFrom(
   }
 
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId: approved.deviceId,
     displayName: deviceName,
     hosts: payload.candidates.map((candidate) => candidate.host),
     port: winner.port,
+    // One scheme per host, from the very candidates the walk dialed: the map
+    // and `hosts` come from the same list, so they cannot disagree.
+    security: Object.fromEntries(
+      payload.candidates.map((candidate) => [candidate.host, candidate.security]),
+    ),
     desktopIdentity: payload.desktopIdentity,
     grants,
     accessToken: approved.accessToken,

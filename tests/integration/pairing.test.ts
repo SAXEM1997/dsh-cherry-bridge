@@ -5,10 +5,12 @@ import { hostname } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
+import type { WsDialOptions } from '../../src/connection.js'
 import { pairWithPayload } from '../../src/pairing.js'
 import type { PairingError } from '../../src/pairing.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
+import { makeDualPeer, insecureTlsOptions, type DualPeer } from '../helpers/tls/dualPeer.js'
 
 /**
  * Task 6 integration suite: the pairing flow (`src/pairing.ts`) against the
@@ -23,6 +25,7 @@ import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
 const fakes: FakeCherry[] = []
 const dirs: string[] = []
+const peers: DualPeer[] = []
 
 // Pristine output (ruling 9): every console channel is spied so a noisy
 // implementation cannot pollute the run, and the warn assertions can read it.
@@ -40,6 +43,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const fake of fakes.splice(0)) await fake.stop()
+  for (const peer of peers.splice(0)) await peer.stop()
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true })
   vi.restoreAllMocks()
 })
@@ -122,6 +126,7 @@ interface PairOptions {
   pollTimeoutMs?: number
   connectTimeoutMs?: number
   supportedProtocolVersions?: readonly number[]
+  wsOptions?: WsDialOptions
 }
 
 /** `pairWithPayload` with the store bound (the store is not in the brief's opts). */
@@ -138,6 +143,7 @@ function pair(opts: PairOptions): ReturnType<typeof pairWithPayload> {
     pollTimeoutMs: opts.pollTimeoutMs ?? 3_000,
     connectTimeoutMs: opts.connectTimeoutMs ?? 3_000,
     supportedProtocolVersions: opts.supportedProtocolVersions,
+    wsOptions: opts.wsOptions,
   })
 }
 
@@ -190,7 +196,7 @@ describe('pairWithPayload over a real loopback channel', () => {
     // pairing.get approved branch — never from the claim receipt.
     expect(store.list()).toEqual([record])
     expect(record).toMatchObject({
-      schemaVersion: 2,
+      schemaVersion: 3,
       // deviceId/grants/token exist ONLY on the approved branch: the claim
       // receipt carried claimId/verificationCode/expiresAt and nothing else.
       deviceId: fakeInfo.fake.approvedDeviceId,
@@ -651,6 +657,55 @@ describe('pairWithPayload over a real loopback channel', () => {
     // No Noise channel ever completed and no pairing RPC ran.
     expect(fakeInfo.fake.connectionCount).toBe(0)
     expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(0)
+  }, 15_000)
+
+  it('⑪h a wss v3 endpoint is persisted with its per-host security (issue #126)', async () => {
+    const identity = await createDeviceIdentity()
+    // The TLS front reaches the SAME fake desktop a plain dial would (see
+    // tests/helpers/tls/dualPeer.ts): the pairing walks the endpoint, the peer
+    // approves, and the record must remember the scheme the walk actually used.
+    const peer = await makeDualPeer({
+      desktop: { pairingDecision: 'approved', pairingGetPendingPolls: APPROVE_AFTER_POLLS },
+    })
+    peers.push(peer)
+    const fakeInfo = {
+      fake: peer.desktop,
+      host: '127.0.0.1',
+      port: peer.tlsPort,
+      desktopIdentity: peer.desktopIdentity,
+    }
+    const store = await makeStore()
+
+    const record = await pair({
+      identity,
+      store,
+      // The self-signed fixture the TLS front presents: trusting it is the
+      // client-side half a private-CA deployment configures.
+      wsOptions: insecureTlsOptions,
+      payload: v3PayloadFor(fakeInfo, {
+        endpoints: [{ host: '127.0.0.1', port: peer.tlsPort, security: 'wss' }],
+      }),
+    })
+
+    // The record's scheme map is the DIAL's own candidate list, so the
+    // steady-state reconnect (src/connection.ts) rebuilds the same URL.
+    expect(record.hosts).toEqual(['127.0.0.1'])
+    expect(record.security).toEqual({ '127.0.0.1': 'wss' })
+    expect(store.list()[0]!.security).toEqual({ '127.0.0.1': 'wss' })
+    expect(peer.desktopConnections()).toBe(1)
+  }, 15_000)
+
+  it('⑪i a v2 payload pairs with security ws for every ip (the pre-#124 shape is unchanged)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+
+    const record = await pair({ identity, store, payload: payloadFor(fakeInfo) })
+
+    // v2 has no endpoint scheme: `ips` are plain hosts, and the persisted map
+    // says so explicitly rather than relying on a read-time default.
+    expect(record.hosts).toEqual([fakeInfo.host])
+    expect(record.security).toEqual({ [fakeInfo.host]: 'ws' })
   }, 15_000)
 
   it('⑪d rejects a v3 payload whose endpoints list is empty as invalid-payload', async () => {

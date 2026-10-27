@@ -140,10 +140,11 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
   const store = new DeviceStore(join(tmp, 'devices.json'))
 
   const record = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId: 'dev-A',
     displayName: 'Desk Alpha',
     hosts: [host],
+    security: { [host]: 'ws' as const },
     port,
     desktopIdentity,
     grants: ['agent'] as 'agent'[],
