@@ -937,6 +937,24 @@ describe('⑤ the pinned protocol versions', () => {
       expect(manifest.version).toBe(version)
     }
   })
+
+  it('our `@libp2p/peer-id` pin is the version the transport itself declares', () => {
+    // `src/pairing.ts` decodes the QR's `desktopIdentity` at parse time with
+    // `peerIdFromString`; the transport decodes the SAME string with the same
+    // package post-open. A transport bump that moves its peer-id dependency
+    // must therefore move our direct pin in lockstep — otherwise a payload
+    // validated by one decoder could be refused (or read differently) by the
+    // other, and the parse-time check would stop being the pre-dial gate.
+    const read = (path: string): { dependencies?: Record<string, string> } =>
+      JSON.parse(readFileSync(join(repoRoot, path), 'utf8')) as {
+        dependencies?: Record<string, string>
+      }
+    expect(read('package.json').dependencies?.['@libp2p/peer-id']).toBe(
+      read('node_modules/@cherrystudio/remote-transport/package.json').dependencies?.[
+        '@libp2p/peer-id'
+      ],
+    )
+  })
 })
 
 describe('① connection.closed is schema-valid but never sent by the real peer', () => {

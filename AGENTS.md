@@ -120,7 +120,9 @@ their keys (there is a contract assertion for exactly that).
 - **Runtime dependencies that are not dead weight:** `zod` is a **runtime**
   dependency (the protocol package `import`s it in its runtime output; peer
   `^4.3.4`, pinned `4.3.4`). `@cherrystudio/remote-protocol` is external in
-  `dist`, so zod is not bundled away.
+  `dist`, so zod is not bundled away. `@libp2p/peer-id` (pinned `6.0.15`, at the
+  transport's own dependency — contract-asserted) exists for ONE thing: the pin
+  decode in Pairing.
 - **TypeScript is pinned `~7.0.2`** (patch digit only). Accepted risk:
   tsdown's dts output rides TS 7's experimental declaration API, which may move
   across minors; the patch-only range means it cannot move silently. An upgrade
@@ -203,7 +205,7 @@ the message page widens (to the negotiated `pageItems`); a
   stops scaling it.
 - Since 2.1.6 the desktop externalizes every part over **4,096 characters**,
   making multi-slice content walks the common case — the reason the content
-  tier exists (one 32/s tier bound such a walk to ~670 KiB/s).
+  tier exists.
 
 ## Design decisions and invariants
 
@@ -749,8 +751,7 @@ port loss dials the right scheme at the wrong port. Re-typing keeps scheme
 `ws`/port; a CHANGED `port` re-points EVERY final host, the current value a map
 no-op (the settings UI sends both on save). `GET /devices` reports both maps
 (addresses, not credentials); tools/diagnostics show only `port`. The settings
-page shows the per-host ports only when they differ from the record-level one,
-and its single port field keeps the CHANGED-only re-point rule.
+page shows the per-host ports only when they differ from the record-level one.
 TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 `ca` only), forwarded to both dial sites (pool, pairing). `resolveBridgeConfig`
 validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
@@ -759,6 +760,9 @@ logged or reported; `ca` is PEM text.
 
 ### Pairing: one dial budget across candidates
 
+`desktopIdentity` is decoded at PARSE time with the transport's own
+`peerIdFromString`: a pin that does not DECODE is `invalid-payload` before any
+socket; a decodable non-Ed25519 pin still fails post-open (`channel:`).
 ONE aggregate `dialBudgetMs` deadline (30 s) bounds the walk; unreached
 candidates are named. Claim/poll re-anchors a FRESH 120 s race guard at the
 claim (not the invitation's birth); peer `expired` is the real bound.
@@ -767,9 +771,9 @@ Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
 (keeping its port) and `FAILURE_SEGMENT_MAX` = 240 caps the whole
 `<label>: <detail>` (marker `… (+N chars)` included), so 32 candidates join to
 ≤ 7,742 characters.
-The progress line is bounded (first host always, 160 chars of host text,
-`(+K more)`); a stage-failure verdict is ONE error (peer or transport), not a
-join, passed through whole — bounded only by the record cap.
+The progress line is bounded (first host always, 160 chars of host names,
+`(+K more)`); a stage-failure verdict is ONE error, not a join, bounded only by
+the record cap.
 
 ### Device selector
 
@@ -955,7 +959,7 @@ faces:
 - Its read path never replays a read; we replay reads **once** (deliberate
   enhancement) while both sides keep commands receipt-recovered.
 - Its command journal backs command recovery, which is why our commands are
-  never replayed; recovery is a caller retry with the original `commandId`.
+  never replayed.
 
 ## Release
 

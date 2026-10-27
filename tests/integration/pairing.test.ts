@@ -835,9 +835,10 @@ describe('pairWithPayload over a real loopback channel', () => {
     // WebSocket upgrade both succeed, and the Noise identity PROOF is what
     // refuses — exactly a QR generated for a different desktop (or one
     // re-scanned after the desktop's identity was reset). A malformed identity
-    // string fails later, inside `secure()`'s post-open pin DECODE, so it
-    // would exercise the decode rather than the proof; that is why the fixture
-    // is a valid OTHER key.
+    // string no longer reaches this arm at all: `parsePayload` decodes the pin
+    // before any socket (issue #153), so the post-open pin DECODE this test
+    // used to disqualify is UNREACHABLE THROUGH THE TOOL — that is why the
+    // fixture must still be a valid OTHER key.
     const otherKey = await createDeviceIdentity()
     // NEGATIVE CONTROL: the passing path never claims, but if the identity
     // check were bypassed the approving peer would complete the handshake and
@@ -1748,5 +1749,38 @@ describe('pairWithPayload over a real loopback channel', () => {
     const error = await pairingError(pending)
     expect(error.kind).toBe('unreachable')
     expect(error.message).toMatch(/^pairing hello failed: /)
+  }, 15_000)
+  // -------------------------------------------------------------------------
+  // The PIN is decoded at parse time (issue #153). `desktopIdentity` is an
+  // opaque 1..256-char string to the published schema, so a junk pin used to
+  // pass validation, dial EVERY candidate (opening real sockets) and fail
+  // post-open as `channel: Please pass a multibase decoder …`. The transport
+  // decodes the same string with the same helper, so the refusal belongs
+  // before any socket and must name the FIELD, never the value.
+  // -------------------------------------------------------------------------
+
+  it('⑮a refuses a malformed desktopIdentity at parse time, before any socket', async () => {
+    const identity = await createDeviceIdentity()
+    // A LIVE peer: without the parse-time refusal this payload dials it and
+    // fails post-open, so `socketCount: 0` is proof the refusal happened
+    // BEFORE the walk rather than after it.
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, { desktopIdentity: 'not-a-peer-id' }),
+      }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    // The FIELD is named...
+    expect(error.message).toContain('desktopIdentity')
+    // ...and the VALUE never is (the payload error face echoes no values).
+    expect(error.message).not.toContain('not-a-peer-id')
+    expect(fakeInfo.fake.socketCount).toBe(0)
+    expect(store.list()).toEqual([])
   }, 15_000)
 })

@@ -2,6 +2,7 @@ import { hostname } from 'node:os'
 import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
+import { peerIdFromString } from '@libp2p/peer-id'
 import type { z } from 'zod'
 import { directEndpointUrl, pairingQrSchema } from '@cherrystudio/remote-protocol'
 import type { WsDialOptions } from './connection.js'
@@ -82,8 +83,8 @@ export interface PairWithPayloadOptions {
 // and whose v3 arm is complete `endpoints` (`host`, `port`, `security`).
 // Hand-rolling the checks is what made a 2.1.8 invitation refuse
 // `invalid-payload` for the whole life of the 0.5.0 pin; consuming the schema
-// means the next widening ships with the pin, not with a parser edit. Three
-// local rules stay, and none of them is a field check:
+// means the next widening ships with the pin, not with a parser edit. Four
+// local rules stay:
 //   - the raw size cap (an oversized blob must not be parsed at all),
 //   - v2's bracketed-IPv6 NORMALIZATION (ruling 2) — the published v2 arm
 //     validates BARE literals, so brackets are stripped before the parse and
@@ -91,7 +92,11 @@ export interface PairWithPayloadOptions {
 //   - the `unicodeText` (lone-surrogate) rule on `invitationId` /
 //     `invitationSecret` / `desktopIdentity`: the protocol values face
 //     enforces it, the pairing QR arm does not, and refusing here keeps the
-//     v2 error face identical one round trip earlier.
+//     v2 error face identical one round trip earlier, and
+//   - the `desktopIdentity` PEER-ID DECODE (issue #153): the schema types the
+//     pin as a bounded string, while the transport only decodes it POST-OPEN,
+//     so a junk pin would otherwise cost a dial of every candidate and surface
+//     as a decoder message. `peerIdFromString` is that same decoder, run here.
 // The error face is `invalid-payload` naming the failing FIELD PATHS only:
 // zod issues carry the `input`, so values never enter the message — an
 // `invitationSecret` must not surface in a user-visible error.
@@ -291,6 +296,19 @@ function parsePayload(payload: string): PairingPayload {
   // there; naming the field now is the same verdict one round trip earlier.
   for (const field of ['invitationId', 'invitationSecret', 'desktopIdentity'] as const) {
     if (!isUnicodeText(qr[field])) invalid(`payload field "${field}" is not valid unicode text`)
+  }
+
+  // The PIN must DECODE here (issue #153). The published schema types
+  // `desktopIdentity` as a 1..256-char string, so a junk pin passes it; the
+  // transport decodes it only POST-OPEN (`peerIdFromString` in the channel
+  // handshake), which cost a dial of every candidate and surfaced as
+  // `channel: Please pass a multibase decoder …` — a decoder message instead
+  // of the offending field. Use the transport's OWN decoder, at the same
+  // version, before any socket: name the FIELD, never the value.
+  try {
+    peerIdFromString(qr.desktopIdentity)
+  } catch {
+    invalid('payload field "desktopIdentity" is not a peer id')
   }
 
   return {

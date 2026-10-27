@@ -67,6 +67,7 @@
   "dependencies": {
     "@cherrystudio/remote-protocol": "0.7.0",
     "@cherrystudio/remote-transport": "0.2.5",
+    "@libp2p/peer-id": "6.0.15",
     "ws": "8.22.0",
     "zod": "4.3.4"
   },
