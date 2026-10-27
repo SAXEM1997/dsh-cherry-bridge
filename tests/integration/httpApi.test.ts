@@ -274,9 +274,14 @@ function wsSecurity(hosts: readonly string[]): Record<string, 'ws' | 'wss'> {
   return Object.fromEntries(hosts.map((host) => [host, 'ws' as const]))
 }
 
+/** One record-level port per host: the pre-#135 shape every fixture starts at. */
+function sharedPorts(hosts: readonly string[], port: number): Record<string, number> {
+  return Object.fromEntries(hosts.map((host) => [host, port]))
+}
+
 function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
-  const base: Omit<DeviceRecord, 'security'> = {
-    schemaVersion: 3,
+  const base: Omit<DeviceRecord, 'security' | 'ports'> = {
+    schemaVersion: 4,
     deviceId: 'dev-1',
     displayName: 'Workstation',
     hosts: ['192.168.1.20'],
@@ -288,10 +293,15 @@ function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
     enabled: true,
   }
   const merged = { ...base, ...overrides }
-  // `security` is keyed by host and must cover exactly the FINAL host list (the
-  // store rejects anything else), so it is derived after the overrides.
+  // `security` and `ports` are keyed by host and must cover exactly the FINAL
+  // host list (the store rejects anything else), so they are derived after the
+  // overrides.
   const hosts = overrides.hosts ?? base.hosts
-  return { ...merged, security: overrides.security ?? wsSecurity(hosts) }
+  return {
+    ...merged,
+    security: overrides.security ?? wsSecurity(hosts),
+    ports: overrides.ports ?? sharedPorts(hosts, overrides.port ?? base.port),
+  }
 }
 
 function fakeConnection(initial: DeviceState = 'connected') {
@@ -415,16 +425,18 @@ describe('① REST round-trip', () => {
       enabled: true,
       hosts: ['192.168.1.20'],
       port: 8765,
-      // The scheme map is part of the address, not a credential: the settings
-      // page shows which door a device dials (issue #126).
+      // The scheme and port maps are part of the address, not a credential:
+      // the settings page shows which door each host dials and on which port
+      // (issues #126/#135).
       security: { '192.168.1.20': 'ws' },
+      ports: { '192.168.1.20': 8765 },
     })
     // The credential never reaches the browser: asserted on the parsed object
     // AND on the raw wire bytes (a nested/renamed copy would still leak).
     expect(json[0]).not.toHaveProperty('accessToken')
     expect(json[0]).not.toHaveProperty('tokenExpiresAt')
     expect(Object.keys(json[0]).sort()).toEqual(
-      ['deviceId', 'displayName', 'enabled', 'hosts', 'port', 'security', 'state'].sort(),
+      ['deviceId', 'displayName', 'enabled', 'hosts', 'port', 'ports', 'security', 'state'].sort(),
     )
     expect(res.body).not.toContain('super-secret-token')
     expect(res.body).not.toContain('accessToken')
@@ -922,7 +934,7 @@ describe('③ SSE stream', () => {
 })
 
 // ---------------------------------------------------------------------------
-// ④ PATCH hosts replace wholesale; port shared by all hosts
+// ④ PATCH hosts replace wholesale; a port edit re-points every host
 // ---------------------------------------------------------------------------
 
 describe('④ PATCH address maintenance', () => {
@@ -937,7 +949,37 @@ describe('④ PATCH address maintenance', () => {
 
     expect(status).toBe(200)
     expect(json.hosts).toEqual(['10.0.0.9'])
+    // The new host has no remembered port, so it falls back to the record-level
+    // `port`; the dropped host leaves no entry behind (the store rejects a map
+    // naming a host it does not list).
+    expect(json.ports).toEqual({ '10.0.0.9': 8765 })
     expect(store.list()[0]!.hosts).toEqual(['10.0.0.9'])
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.9': 8765 })
+  })
+
+  it('keeps the port of a host that stays in the list and defaults a new one to the record port', async () => {
+    mount()
+    // A mixed-port record: the two hosts were paired on DIFFERENT ports.
+    store.upsert(
+      record({
+        hosts: ['10.0.0.1', '10.0.0.2'],
+        port: 8765,
+        ports: { '10.0.0.1': 1111, '10.0.0.2': 2222 },
+      }),
+    )
+
+    // A replacement list is an address edit: the host that STAYS keeps its own
+    // port, the new host falls back to the record-level `port`, and the host
+    // that left leaves no entry behind.
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['10.0.0.1', '10.0.0.9'] }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.port).toBe(8765)
+    expect(json.ports).toEqual({ '10.0.0.1': 1111, '10.0.0.9': 8765 })
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 1111, '10.0.0.9': 8765 })
   })
 
   it('keeps the scheme of a host that stays in the list, defaults a new one to ws, and drops a removed one', async () => {
@@ -961,7 +1003,38 @@ describe('④ PATCH address maintenance', () => {
     expect(store.list()[0]!.security).toEqual({ '10.0.0.1': 'wss', '10.0.0.9': 'ws' })
   })
 
-  it('applies the single shared port to every host and rejects malformed input', async () => {
+  it('re-points EVERY final host when port is patched, with or without a hosts replacement', async () => {
+    mount()
+    store.upsert(
+      record({
+        hosts: ['10.0.0.1', '10.0.0.2'],
+        ports: { '10.0.0.1': 1111, '10.0.0.2': 2222 },
+      }),
+    )
+
+    // `port` alone: every host moves to it. The PATCH face has ONE port field,
+    // so leaving a remembered per-host entry would make the edit inert for
+    // every listed host that already had one.
+    const portOnly = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ port: 9000 }),
+    })
+    expect(portOnly.status).toBe(200)
+    expect(portOnly.json.port).toBe(9000)
+    expect(portOnly.json.ports).toEqual({ '10.0.0.1': 9000, '10.0.0.2': 9000 })
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 9000, '10.0.0.2': 9000 })
+
+    // ...and with a hosts replacement, the FINAL list is what is re-pointed.
+    const both = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['10.0.0.1', '10.0.0.9'], port: 9100 }),
+    })
+    expect(both.status).toBe(200)
+    expect(both.json.ports).toEqual({ '10.0.0.1': 9100, '10.0.0.9': 9100 })
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 9100, '10.0.0.9': 9100 })
+  })
+
+  it('re-points every host on a combined hosts+port PATCH and rejects malformed input', async () => {
     mount()
     store.upsert(record())
 
@@ -972,7 +1045,12 @@ describe('④ PATCH address maintenance', () => {
     expect(ok.status).toBe(200)
     expect(ok.json.hosts).toEqual(['::1', '127.0.0.1'])
     expect(ok.json.port).toBe(9000)
-    expect(store.list()[0]).toMatchObject({ hosts: ['::1', '127.0.0.1'], port: 9000 })
+    expect(ok.json.ports).toEqual({ '::1': 9000, '127.0.0.1': 9000 })
+    expect(store.list()[0]).toMatchObject({
+      hosts: ['::1', '127.0.0.1'],
+      port: 9000,
+      ports: { '::1': 9000, '127.0.0.1': 9000 },
+    })
 
     const badPort = await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ port: 99_999 }) })
     expect(badPort.status).toBe(400)
@@ -992,9 +1070,13 @@ describe('④ PATCH address maintenance', () => {
     })
     store.upsert(record({ hosts: ['10.0.0.1'], port: 1234 }))
 
-    // A rename touches no address: the live connection stays as it is.
-    await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ displayName: 'Renamed' }) })
+    // A rename touches no address: the live connection stays as it is, and the
+    // per-host port map is not rewritten either (neither `hosts` nor `port`
+    // patched → the maps are unchanged).
+    const renamed = await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ displayName: 'Renamed' }) })
     expect(evicted).toEqual([])
+    expect(renamed.json.ports).toEqual({ '10.0.0.1': 1234 })
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 1234 })
 
     await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ hosts: ['10.0.0.1'] }) })
     expect(evicted).toEqual([])

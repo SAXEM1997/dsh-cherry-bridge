@@ -81,8 +81,8 @@ async function makeFake(options: FakeCherryOptions = {}): Promise<FakeInfo> {
 }
 
 function recordFor(fakeInfo: FakeInfo, overrides: Partial<DeviceRecord> = {}): DeviceRecord {
-  const base: Omit<DeviceRecord, 'security'> = {
-    schemaVersion: 3,
+  const base: Omit<DeviceRecord, 'security' | 'ports'> = {
+    schemaVersion: 4,
     deviceId: 'dev-test',
     displayName: 'Cherry Desktop',
     hosts: [fakeInfo.host],
@@ -91,13 +91,18 @@ function recordFor(fakeInfo: FakeInfo, overrides: Partial<DeviceRecord> = {}): D
     grants: ['agent'],
     enabled: true,
     ...overrides,
-  } as Omit<DeviceRecord, 'security'>
+  } as Omit<DeviceRecord, 'security' | 'ports'>
   const hosts = overrides.hosts ?? base.hosts
   // One `ws` entry per host unless a test says otherwise: the scheme map must
   // cover exactly the record's host list, so it follows the overrides.
   const security =
     overrides.security ?? Object.fromEntries(hosts.map((host) => [host, 'ws' as const]))
-  return { ...base, security }
+  // Same rule for the port map (issue #135): each host dials the record-level
+  // `port` unless the test names its own, so an ordinary fixture stays one
+  // address.
+  const ports =
+    overrides.ports ?? Object.fromEntries(hosts.map((host) => [host, base.port]))
+  return { ...base, security, ports }
 }
 
 interface ConnectionOptions {
@@ -1077,9 +1082,12 @@ describe('DeviceConnection over a real loopback channel', () => {
     await expect(connection.connect()).rejects.toThrow()
     expect(connection.state).toBe('offline')
 
-    // Simulated address maintenance (PATCH /devices/:id): the live record's
-    // port is corrected in place; the next backoff attempt picks it up.
+    // Simulated address maintenance (PATCH /devices/:id): the record-level port
+    // AND the host's own entry are corrected in place; the next backoff attempt
+    // picks them up. (A real PATCH re-points every host — see httpApi tests —
+    // but this connection captures the live record object.)
     record.port = fakeInfo.port
+    record.ports['127.0.0.1'] = fakeInfo.port
     await waitForState(connection, 'connected')
     expect(connection.state).toBe('connected')
     expect(fakeInfo.fake.connectionCount).toBeGreaterThanOrEqual(1)
@@ -1258,6 +1266,74 @@ describe('DeviceConnection over a real loopback channel', () => {
     const { security: _security, ...legacy } = recordFor(fakeInfo)
     const record = legacy as DeviceRecord
     expect(record.security).toBeUndefined()
+    const connection = makeConnection({ identity, record })
+
+    await connection.connect()
+
+    expect(connection.state).toBe('connected')
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+  })
+
+  // -------------------------------------------------------------------------
+  // Issue #135: the steady-state dial honours the PERSISTED per-host port.
+  //
+  // #126 fixed the scheme half of per-endpoint pairing; the PORT half predates
+  // it. A v3 QR can carry endpoints on different ports, but the record kept
+  // only the WINNER candidate's `port`, so a reconnect to a non-winner host
+  // built the right scheme at the WRONG port. The record now carries a port
+  // per host, and the dial reads it with the record-level `port` as fallback.
+  //
+  // The fixture makes the two sources DISAGREE on purpose: the record-level
+  // port is dead, so only a dial that reads the per-host map reaches the peer.
+  // -------------------------------------------------------------------------
+
+  it('#135 a non-winner host dials its OWN port, not the record-level winner port', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    // `port` is the winner's (dead here); `ports[host]` is the address the peer
+    // actually listens on. Reading `record.port` reaches nothing.
+    const record = recordFor(fakeInfo, {
+      hosts: [fakeInfo.host],
+      port: 1,
+      ports: { [fakeInfo.host]: fakeInfo.port },
+    })
+    const connection = makeConnection({ identity, record })
+
+    await connection.connect()
+
+    expect(connection.state).toBe('connected')
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+    expect(fakeInfo.fake.authenticateCount).toBe(1)
+  })
+
+  it('#135 a migrated/legacy-shaped record (ports[host] === port) still dials normally', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    // What the v3→v4 migration writes: the map is explicit, and every host's
+    // entry equals the record-level port because v3 had only one.
+    const record = recordFor(fakeInfo, {
+      hosts: [fakeInfo.host],
+      port: fakeInfo.port,
+      ports: { [fakeInfo.host]: fakeInfo.port },
+    })
+    const connection = makeConnection({ identity, record })
+
+    await connection.connect()
+
+    expect(connection.state).toBe('connected')
+    expect(fakeInfo.fake.connectionCount).toBe(1)
+  })
+
+  it('#135 a record whose ports map is ABSENT still dials the record-level port', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    // The `?.` guards an in-memory record assembled without the map (or
+    // constructed before validation); the record-level `port` is its fallback,
+    // exactly like the `security` `?.` above. Without it the dial throws on the
+    // missing map and every candidate fails as "unreachable".
+    const { ports: _ports, ...legacy } = recordFor(fakeInfo)
+    const record = legacy as DeviceRecord
+    expect(record.ports).toBeUndefined()
     const connection = makeConnection({ identity, record })
 
     await connection.connect()

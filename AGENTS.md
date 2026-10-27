@@ -739,22 +739,23 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
 
-### Device archive: one scheme per host
+### Device archive: scheme+port per host
 
-`DeviceRecord` (schemaVersion 3) stores `security: Record<host, 'ws'|'wss'>`
-beside `hosts` — one scheme per candidate, every host exactly once, absent
-meaning "dial `ws`". Both dial sites build their URL with the protocol's
-`directEndpointUrl`, so a `wss`-paired desktop reconnects over `wss` (#126).
-A v2 archive migrates on read (backfill `ws`) and is rewritten through the
-ordinary atomic persist; a lost scheme would downgrade a TLS proxy to a dial
-that can never connect, and an edit that re-types a host keeps its scheme
-(`securityFor`). `GET /devices` reports the map; it is an address, not a
-credential — `cherry_devices` and the diagnostics report do not carry it yet.
-TLS trust is operator config (`wsTls`, FLAT `tls.connect` options — only
-`rejectUnauthorized` / `ca`), forwarded to BOTH dial sites (pool and pairing).
-`resolveBridgeConfig` validates it: an unknown key or unusable value warns by
-FIELD NAME and the WHOLE object is ignored (half-applied trust would reach some
-peers and not others). Never persisted, logged or reported — a `ca` is PEM text.
+`DeviceRecord` (schemaVersion 4) stores `security` (`'ws'|'wss'`) and `ports`
+(`number`) maps keyed by host, beside `hosts` — one each per candidate, every
+host once (absent: `ws`/winner's record `port`). Both dials use
+`directEndpointUrl` + both maps (`??`): `wss`→`wss` (#126), a non-winner host→its
+OWN port (#135). v2→v3 backfills `ws`, v3→v4 `port`; both rewritten atomically
+on read. Scheme loss breaks a TLS proxy; port loss dials right scheme at a dead
+address. Re-typing keeps scheme (`securityFor`)/port (`portsFor`); whole-replace
+`hosts` defaults new ones to `ws`/record port; `port` re-points EVERY final host.
+`GET /devices` reports both maps (addresses, not credentials); tools/diagnostics
+do not.
+TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
+`ca` only), forwarded to both dial sites (pool, pairing). `resolveBridgeConfig`
+validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
+ignored (half-applied trust reaches some peers, not others). Never persisted,
+logged or reported; `ca` is PEM text.
 
 ### Device selector
 

@@ -46,13 +46,17 @@ export interface DeviceRecord {
   deviceId: string
   displayName: string
   /**
-   * Ordered dial candidates. `security` is keyed by these same hosts — one
-   * scheme per candidate, exactly the shape the pairing dial already carries
-   * (`PairCandidate`), so a candidate and its scheme are added and replaced as
-   * one unit.
+   * Ordered dial candidates. `security` and `ports` are keyed by these same
+   * hosts — one scheme and one port per candidate, exactly the shape the
+   * pairing dial already carries (`PairCandidate`), so a candidate and its
+   * address are added and replaced as one unit.
    */
   hosts: string[]
-  /** Shared by every host (spec §3.2): there is no per-host port. */
+  /**
+   * The record-level dial port: the WINNER candidate's port, and the fallback
+   * for a host the map does not name (a record assembled in memory before
+   * validation). Before schemaVersion 4 it was the only port — see `ports`.
+   */
   port: number
   /**
    * Dial scheme per host (issue #126). Every entry of `hosts` has exactly one
@@ -60,6 +64,15 @@ export interface DeviceRecord {
    * a v2 archive had `hosts` + `port` only, and the migration backfills `ws`.
    */
   security: Record<string, 'ws' | 'wss'>
+  /**
+   * Dial port per host (issue #135). Every entry of `hosts` has exactly one
+   * key here, and the value is the port that host was paired on. Introduced
+   * with schemaVersion 4: before it, one `port` was shared by every host (the
+   * winner candidate's), so a steady-state reconnect to a non-winner host
+   * dialed the right scheme at the WRONG port. The v3→v4 migration backfills
+   * `port`; `port` itself stays the record-level fallback.
+   */
+  ports: Record<string, number>
   desktopIdentity: string
   grants: 'agent'[]
   /** Paired with `tokenExpiresAt`: present together or absent together. */
@@ -90,7 +103,7 @@ export interface UnresolvedDevice {
 export type DeviceResolution = DeviceRecord | AmbiguousDevice | UnresolvedDevice
 
 /** The only `schemaVersion` this build reads and writes. */
-export const CURRENT_SCHEMA_VERSION = 3
+export const CURRENT_SCHEMA_VERSION = 4
 
 const FILE_MODE = 0o600
 
@@ -126,19 +139,28 @@ type Migration = (record: DeviceRecordOnDisk) => DeviceRecordOnDisk
  * record remembers is never overwritten by the default, because that would
  * downgrade a TLS-proxied desktop to a dial that cannot connect.
  *
- * **v2 is read loosely, v3 strictly — deliberately.** This step fills the map
- * for the CURRENT host list and nothing else: an entry naming a host v2 no
- * longer lists is silently DROPPED (it was unreachable anyway), a non-object
- * `security` degrades to "every host on `ws`", and a junk scheme VALUE is not
- * repaired here at all — the migrated entry then re-enters the read path as a
- * v3 record and `assertValidSecurity` rejects the whole archive. That split is
- * the point: a v2 file is a supported legacy shape and is normalised into one,
- * while a v3 file is this build's own output and any deviation from it is a
- * hand edit worth failing loudly on.
+ * `{ 3 -> 4 }` (issue #135) adds the per-host `ports` map. v3 had `hosts` + one
+ * shared `port` (the winner candidate's), so every host is backfilled that
+ * port — the only one v3 ever dialed. A half-migrated file keeps the entries it
+ * already carries, for the same reason the scheme step does: a remembered port
+ * is the address the pairing actually used, and overwriting it would point the
+ * host at the winner's port again.
+ *
+ * **A legacy file is read loosely, this build's own output strictly —
+ * deliberately.** Each step fills its map for the CURRENT host list and
+ * nothing else: an entry naming a host the older file no longer lists is
+ * silently DROPPED (it was unreachable anyway), a non-object `security`/`ports`
+ * degrades to "every host on `ws`"/"every host at `port`", and a junk scheme or
+ * port VALUE is not repaired here at all — the migrated entry then continues
+ * down the chain and `assertValidSecurity`/`assertValidPorts` reject the whole
+ * archive. That split is the point: a v2 or v3 file is a supported legacy shape
+ * and is normalised into one, while a v4 file is this build's own output and
+ * any deviation from it is a hand edit worth failing loudly on.
  */
 const MIGRATIONS: Record<number, Migration> = {
   1: (record) => ({ ...record, schemaVersion: 2 }),
   2: (record) => ({ ...record, schemaVersion: 3, security: backfilledSecurity(record) }),
+  3: (record) => ({ ...record, schemaVersion: 4, ports: backfilledPorts(record) }),
 }
 
 /** Every host of a v2 record, defaulting anything it did not already say. */
@@ -149,6 +171,12 @@ function backfilledSecurity(
   return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? 'ws']))
 }
 
+/** Every host of a v3 record, defaulting anything it did not already say. */
+function backfilledPorts(disk: Partial<DeviceRecord>): Record<string, number> {
+  const existing = disk.ports ?? {}
+  return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? disk.port]))
+}
+
 /**
  * The field set of a v1 entry: what the store wrote before it carried a
  * version at all.
@@ -157,7 +185,7 @@ function backfilledSecurity(
  * later field, so demanding one here (as `'security'` was, briefly) fails the
  * completeness gate on an archive that is perfectly intact and quarantines it
  * instead of migrating it. Later fields are the migration chain's business
- * (`backfilledSecurity` supplies `security` from v2 onward).
+ * (`backfilledSecurity`/`backfilledPorts` supply `security`/`ports`).
  */
 const V1_KEYS = [
   'deviceId',
@@ -172,12 +200,13 @@ const V1_KEYS = [
 /**
  * Every field of the CURRENT set plus `schemaVersion`. Unlike {@link V1_KEYS}
  * this is not a historical snapshot: it grows with the record, and it is what
- * `upsert` and the post-migration exit demand (which is why a v3 entry without
- * `security` never reaches `assertValidSecurity`).
+ * `upsert` and the post-migration exit demand (which is why a v4 entry without
+ * `security`/`ports` never reaches its own validator).
  */
 const REQUIRED_KEYS = [
   ...V1_KEYS,
   'security',
+  'ports',
   'schemaVersion',
 ] as const satisfies readonly (keyof DeviceRecord)[]
 
@@ -208,6 +237,7 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
     throw new Error('device archive entry field hosts must be an array')
   }
   assertValidSecurity(disk.hosts, disk.security)
+  assertValidPorts(disk.hosts, disk.ports)
 
   // accessToken / tokenExpiresAt live and die together.
   const hasToken = disk.accessToken !== undefined
@@ -233,11 +263,11 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
  */
 function assertValidSecurity(hosts: string[], security: unknown): void {
   // NOT reached with `undefined` through the store: `REQUIRED_KEYS` rejects a
-  // missing `security` before this runs (a v3 archive is written by this build,
-  // so an absent map there is breakage, not a legacy shape). The arm exists for
-  // the OTHER entry point — `upsert`, which callers may reach with an
-  // in-memory record assembled by hand — and for the length of time a record
-  // exists between construction and its first validation.
+  // missing `security` before this runs (a current-version archive is written
+  // by this build, so an absent map there is breakage, not a legacy shape). The
+  // arm exists for the OTHER entry point — `upsert`, which callers may reach
+  // with an in-memory record assembled by hand — and for the length of time a
+  // record exists between construction and its first validation.
   if (security === undefined) return
   if (security === null || typeof security !== 'object' || Array.isArray(security)) {
     throw new Error('device archive entry field security must be an object keyed by host')
@@ -255,6 +285,42 @@ function assertValidSecurity(hosts: string[], security: unknown): void {
     if (scheme !== 'ws' && scheme !== 'wss') {
       throw new Error(
         `device archive entry field security["${host}"] must be "ws" or "wss"`,
+      )
+    }
+  }
+}
+
+/**
+ * The `ports` map must be EXACTLY one entry per host, each an integer port.
+ *
+ * The same reasoning as {@link assertValidSecurity}: an entry for a host the
+ * record no longer lists would never be consulted, and a missing one would
+ * leave that host on the record-level (winner's) port — the exact failure the
+ * map exists to prevent. Both are rejected rather than repaired. The
+ * message names the offending HOST, never the value (a port is not a secret, but
+ * echoing a junk value back from a hand-edited file adds nothing actionable).
+ */
+function assertValidPorts(hosts: string[], ports: unknown): void {
+  // NOT reached with `undefined` through the store: `REQUIRED_KEYS` rejects a
+  // missing `ports` before this runs. Same other-entry-point reason as
+  // `assertValidSecurity`: `upsert` and construction-to-first-validation.
+  if (ports === undefined) return
+  if (ports === null || typeof ports !== 'object' || Array.isArray(ports)) {
+    throw new Error('device archive entry field ports must be an object keyed by host')
+  }
+  const map = ports as Record<string, unknown>
+  const wanted = new Set(hosts)
+  const unknownHost = Object.keys(map).find((host) => !wanted.has(host))
+  if (unknownHost !== undefined) {
+    throw new Error(
+      `device archive entry field ports names host "${unknownHost}", which is not in hosts`,
+    )
+  }
+  for (const host of hosts) {
+    const port = map[host]
+    if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65_535) {
+      throw new Error(
+        `device archive entry field ports["${host}"] must be an integer in 1..65535`,
       )
     }
   }

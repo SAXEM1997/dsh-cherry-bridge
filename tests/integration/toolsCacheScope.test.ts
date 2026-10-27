@@ -158,11 +158,12 @@ async function makeRig(): Promise<Rig> {
   ] as const) {
     addresses.set(deviceId, { host: info.host, port: info.port, desktopIdentity })
     store.upsert({
-      schemaVersion: 3,
+      schemaVersion: 4,
       deviceId,
       displayName,
       hosts: [info.host],
       security: { [info.host]: 'ws' },
+      ports: { [info.host]: info.port },
       port: info.port,
       desktopIdentity,
       grants: ['agent'],
@@ -347,11 +348,12 @@ describe('engine session caches are scoped by DEVICE as well as session', () => 
     rig.fakes[0].setSessionRevision('s-shared', '773')
     const where = rig.addressOf('dev-A')
     rig.store.upsert({
-      schemaVersion: 3,
+      schemaVersion: 4,
       deviceId: 'dev-A',
       displayName: 'Desk Alpha',
       hosts: [where.host],
       security: { [where.host]: 'ws' },
+      ports: { [where.host]: where.port },
       port: where.port,
       desktopIdentity: where.desktopIdentity,
       grants: ['agent'],

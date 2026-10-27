@@ -1490,11 +1490,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 /** A minimal valid record for the store-level assertions. */
 function recordFor(deviceId: string, displayName: string): import('../../src/deviceStore.js').DeviceRecord {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId,
     displayName,
     hosts: ['127.0.0.1'],
     security: { ['127.0.0.1']: 'ws' },
+    ports: { ['127.0.0.1']: 65001 },
     port: 65001,
     desktopIdentity: 'desktop-identity-0000000000000000000000000000000000000000',
     grants: ['agent'] as 'agent'[],

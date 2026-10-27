@@ -86,11 +86,12 @@ async function makeRig(options: FakeCherryOptions = {}): Promise<Rig> {
   const tmp = mkdtempSync(join(tmpdir(), 'cherry-events-window-'))
   const store = new DeviceStore(join(tmp, 'devices.json'))
   store.upsert({
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId: 'dev-A',
     displayName: 'Desk Alpha',
     hosts: [host],
     security: { [host]: 'ws' as const },
+    ports: { [host]: port },
     port,
     desktopIdentity,
     grants: ['agent'] as 'agent'[],

@@ -607,16 +607,18 @@ async function claimAndAwait(
  * here would lose the 64-char truncation.
  *
  * The address projection: every candidate host is kept (the v2 record always
- * did, and reconnect re-walks them), and the persisted `port` is the one the
- * pairing actually completed on. The two only diverge for a MIXED-PORT v3
- * payload; the 2.1.8 generation side emits one endpoint per custom-address
+ * did, and reconnect re-walks them), and `port` is the one the pairing actually
+ * completed on — the WINNER's port, and the record-level fallback. A mixed-port
+ * v3 payload is now persisted FAITHFULLY, per host, through `ports` (issue
+ * #135): the 2.1.8 generation side emits one endpoint per custom-address
  * invitation (`ApiGatewayService.getRemoteEndpoint`:
- * `advertisedEndpoint ? [advertisedEndpoint] : …`), so every real v3 record is
- * faithful. `security` IS persisted (issue #126), one entry per host, taken
- * from the very candidates the walk dialed — so a schemaVersion-3 record
- * remembers the scheme the pairing actually used, and the steady-state dial
- * (src/connection.ts) rebuilds the same URL instead of a plain `ws://`. Before
- * that, #124 paired a TLS endpoint and made it unreachable on every reconnect.
+ * `advertisedEndpoint ? [advertisedEndpoint] : …`), but a QR that does carry a
+ * mixed list must still reconnect each host on its own port. `security` IS
+ * persisted (issue #126), one entry per host, taken from the very candidates the
+ * walk dialed — so a schemaVersion-4 record remembers the scheme the pairing
+ * actually used, and the steady-state dial (src/connection.ts) rebuilds the
+ * same URL instead of a plain `ws://`. Before that, #124 paired a TLS endpoint
+ * and made it unreachable on every reconnect.
  */
 function recordFrom(
   payload: PairingPayload,
@@ -651,15 +653,20 @@ function recordFrom(
   }
 
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId: approved.deviceId,
     displayName: deviceName,
     hosts: payload.candidates.map((candidate) => candidate.host),
+    // The winner's port, and the record-level fallback (issue #135).
     port: winner.port,
-    // One scheme per host, from the very candidates the walk dialed: the map
-    // and `hosts` come from the same list, so they cannot disagree.
+    // One scheme and one port per host, from the very candidates the walk
+    // dialed: both maps and `hosts` come from the same list, so they cannot
+    // disagree.
     security: Object.fromEntries(
       payload.candidates.map((candidate) => [candidate.host, candidate.security]),
+    ),
+    ports: Object.fromEntries(
+      payload.candidates.map((candidate) => [candidate.host, candidate.port]),
     ),
     desktopIdentity: payload.desktopIdentity,
     grants,

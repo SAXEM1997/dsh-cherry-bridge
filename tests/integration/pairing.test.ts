@@ -196,13 +196,14 @@ describe('pairWithPayload over a real loopback channel', () => {
     // pairing.get approved branch — never from the claim receipt.
     expect(store.list()).toEqual([record])
     expect(record).toMatchObject({
-      schemaVersion: 3,
+      schemaVersion: 4,
       // deviceId/grants/token exist ONLY on the approved branch: the claim
       // receipt carried claimId/verificationCode/expiresAt and nothing else.
       deviceId: fakeInfo.fake.approvedDeviceId,
       displayName: hostname().slice(0, 64),
       hosts: [fakeInfo.host],
       port: fakeInfo.port,
+      ports: { [fakeInfo.host]: fakeInfo.port },
       desktopIdentity: fakeInfo.desktopIdentity,
       grants: ['agent'],
       enabled: true,
@@ -612,7 +613,42 @@ describe('pairWithPayload over a real loopback channel', () => {
     // carries: v3 has no ips array, the endpoints ARE the candidates.
     expect(record.hosts).toEqual([fakeInfo.host])
     expect(record.port).toBe(fakeInfo.port)
+    expect(record.ports).toEqual({ [fakeInfo.host]: fakeInfo.port })
     expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(1)
+  }, 15_000)
+
+  it('⑪j a mixed-port v3 payload persists each endpoint’s OWN port (issue #135)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+    const otherHost = '127.0.0.2'
+    // Never dialed — the live endpoint is first, so the walk stops there. It
+    // only has to be a DIFFERENT port from the winner's for the v3 payload to
+    // be one the old record projection could not describe.
+    const otherPort = fakeInfo.port + 1
+
+    const record = await pair({
+      identity,
+      store,
+      payload: v3PayloadFor(fakeInfo, {
+        endpoints: [
+          { host: fakeInfo.host, port: fakeInfo.port, security: 'ws' },
+          { host: otherHost, port: otherPort, security: 'ws' },
+        ],
+      }),
+    })
+
+    // The winner is the candidate the walk completed on: the record-level
+    // `port` is ITS port and stays the fallback.
+    expect(record.hosts).toEqual([fakeInfo.host, otherHost])
+    expect(record.port).toBe(fakeInfo.port)
+    // ...while every host keeps its own port, so a steady-state reconnect to
+    // the non-winner host does not dial the winner's port (issue #135).
+    expect(record.ports).toEqual({
+      [fakeInfo.host]: fakeInfo.port,
+      [otherHost]: otherPort,
+    })
+    expect(store.list()[0]!.ports).toEqual(record.ports)
   }, 15_000)
 
   it('⑪b dials a bare IPv6 v3 endpoint (bracketed on the URL, bare in the archive)', async () => {
