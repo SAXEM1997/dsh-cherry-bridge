@@ -9148,13 +9148,19 @@ var CherryToolEngine = class {
 	* `aggregateError` is a TOOL RESULT, not a log line — see
 	* {@link defineCherryTool} for the product decision (issue #161): a result is
 	* the MODEL's signal, so it is not bounded by the logging rule, and the
-	* 200-character clip here is this field's own choice. The LOG line below
-	* keeps the full message for the operator: it is ONE interpolated string,
-	* never the error object.
+	* 200-character clip here is this field's own choice.
+	*
+	* The LOG line IS the logging face, and it renders the failure as ONE bounded
+	* string through {@link failureText} (issue #161). An assembly failure is
+	* usually a peer RPC refusal — its `error.message` is the peer's own text,
+	* capped at 512 characters by the failure schema — and the old line
+	* interpolated it whole, so one refusal could become a ~640-character log
+	* line. The RESULT keeps the raw message's first 200 characters; a bound on
+	* the log does not change what the model receives.
 	*/
 	#assemblyFailed(identity, error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.warn(`[cherry-remote] the ${String(identity["status"])} answer for session ${String(identity["sessionId"])} could not assemble its content (${message}); returning the verdict with the assembly failure reported`);
+		console.warn(`[cherry-remote] the ${String(identity["status"])} answer for session ${String(identity["sessionId"])} could not assemble its content (${failureText(error)}); returning the verdict with the assembly failure reported`);
 		return {
 			...identity,
 			aggregateError: message.slice(0, 200),

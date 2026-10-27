@@ -15,6 +15,7 @@ import type {
 } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions, FakeMessageRecord } from '../loopback/fakeCherry.js'
+import { LOG_TEXT_MAX } from '../../src/text.js'
 
 /**
  * Issue #3 acceptance suite: the terminal/timeout/idle aggregate is BOUNDED,
@@ -697,6 +698,57 @@ describe('issue #3 T3: a failed content assembly degrades to a stub receipt inst
     expect(idle.messages).toBeUndefined()
     expect(idle.text).toBeUndefined()
   })
+
+  it('T3c bounds the assembly-failure LOG line when the peer refusal is long (#161)', async () => {
+    // The peer refuses the message walk with a schema-cap 512-character
+    // message. The RESULT keeps its own 200-char choice for the model; the LOG
+    // line is the logging face and renders the failure through `failureText`
+    // under LOG_TEXT_MAX, not the raw peer text.
+    const longMessage = 'p'.repeat(512)
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        messages: [assistantMessage('m-0', 'reply', 'pending'), ...fillerHistory(2)],
+        runDelayMs: 30_000,
+        failAlways: { 'agent.messages.list': { reason: 'INTERNAL', message: longMessage } },
+      },
+    })
+    const listsBefore = rig.fake.methodCount('agent.messages.list')
+
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'slow',
+      timeoutMs: 400,
+    })) as { status?: string; aggregateError?: string; guidance?: string }
+
+    expect(result.status).toBe('timeout')
+    // TOOL OUTPUT UNCHANGED: the result's failure summary is still its own
+    // 200-character clip.
+    expect(typeof result.aggregateError).toBe('string')
+    expect(result.aggregateError!.length).toBeLessThanOrEqual(200)
+    expect(String(result.guidance)).toContain('cherry_read')
+    // WORK PIN: the message walk really ran and was refused by the peer.
+    expect(rig.fake.methodCount('agent.messages.list')).toBeGreaterThan(listsBefore)
+
+    const prefix = '[cherry-remote] the timeout answer for session s-1 could not assemble its content ('
+    const suffix = '); returning the verdict with the assembly failure reported'
+    const call = vi
+      .mocked(console.warn)
+      .mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
+    expect(call, 'the assembly failure must be logged').toBeDefined()
+    // ONE STRING, with the peer's text clipped inside it. Before #161, the raw
+    // 512-char message made this line ~600 characters.
+    expect(call!).toHaveLength(1)
+    const line = String(call![0])
+    expect(line.endsWith(suffix)).toBe(true)
+    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX + suffix.length)
+    const detail = line.slice(prefix.length, line.length - suffix.length)
+    expect(detail).toMatch(/… \(\+\d+ chars\)$/)
+    expect(detail.length).toBe(LOG_TEXT_MAX)
+    expect(line).not.toContain(longMessage)
+  }, 15_000)
 })
 
 describe('issue #3 T4: a timeout answer carries a zero-round-trip heartbeat', () => {
