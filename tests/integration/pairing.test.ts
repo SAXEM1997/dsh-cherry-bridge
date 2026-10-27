@@ -1592,4 +1592,161 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(segments.some((segment) => segment.startsWith('127.0.0.1:1: '))).toBe(true)
     expect(store.list()).toEqual([])
   }, 15_000)
+  // -------------------------------------------------------------------------
+  // Bounded progress line (issue #152). `report()` runs once per stage
+  // transition and used to join EVERY candidate host into one `console.info`
+  // line: a v3 QR admits 32 endpoints and a host name may be 253 characters,
+  // ~8 KB per stage. ⑭a pins the bound; ⑭b is the other side of it — a short
+  // list must still be named in full, with no `(+K more)` marker.
+  // -------------------------------------------------------------------------
+
+  it('⑭a bounds the progress line to the first host plus an explicit omitted count', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    // 32 UNIQUE, schema-valid hosts of the maximum 253 characters: four
+    // labels of ≤63 chars over a lowercase `[a-z0-9-]` alphabet, summed with
+    // the separators to exactly 253 (the published `hostnameSchema`'s cap),
+    // with the `.invalid` TLD marking them as fictional. The fixture is
+    // SCHEMA-validated by the run reaching the progress line; the payload
+    // stays under the 10 KiB cap, and `dialBudgetMs: 0` makes every candidate
+    // `not attempted`, so no dial happens (the fake still binds a real
+    // loopback listener — this is "no dial", not "offline").
+    const hosts = Array.from({ length: 32 }, (_, index) => {
+      const label = `h${String(index).padStart(2, '0')}${'a'.repeat(60)}`
+      return [label, 'b'.repeat(63), 'c'.repeat(58), 'd'.repeat(58), 'invalid'].join('.')
+    })
+    expect(new Set(hosts).size).toBe(32)
+    expect(hosts.every((host) => host.length === 253)).toBe(true)
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        dialBudgetMs: 0,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: hosts.map((host) => ({ host, port: fakeInfo.port, security: 'ws' })),
+        }),
+      }),
+    )
+
+    const progress = consoleInfo.mock.calls
+      .flat()
+      .map(String)
+      .find((line) => line.includes('pairing stage validate'))
+    expect(progress, 'the validate stage must be logged').toBeDefined()
+    // CEILING: the two maxima are mutually exclusive — a first host above the
+    // 160-char budget aborts the fill loop — so the worst case is the prefix
+    // (47 for `validate`) + first host (253) + ` (+31 more)` (11) + closing
+    // `)` (1) = 312 characters. 330 leaves slack for a longer stage name; an
+    // unbounded join of these hosts is ~8 KB.
+    expect(progress!.length).toBeLessThan(330)
+    // The count of omitted candidates is explicit, and the FIRST host — the
+    // run's identity — is still there in full.
+    expect(progress).toContain('(+31 more)')
+    expect(progress).toContain(hosts[0]!)
+    // #141's contract is untouched: the verdict still names every candidate.
+    // A spent budget makes all 32 `not attempted`, and #148 clips each
+    // SEGMENT — it never drops a candidate.
+    expect(error.kind).toBe('unreachable')
+    expect(error.message.match(/not attempted/g) ?? []).toHaveLength(32)
+  }, 15_000)
+
+  it('⑭b names all three short hosts and adds no omitted marker', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    const hosts = ['127.0.0.1', '127.0.0.2', '127.0.0.3']
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        dialBudgetMs: 0,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: hosts.map((host) => ({ host, port: fakeInfo.port, security: 'ws' })),
+        }),
+      }),
+    )
+
+    const progress = consoleInfo.mock.calls
+      .flat()
+      .map(String)
+      .find((line) => line.includes('pairing stage validate'))
+    expect(progress, 'the validate stage must be logged').toBeDefined()
+    // Everything fits the budget, so every host is named and the truncation
+    // marker is ABSENT — a bound that fires on three short hosts is a bug.
+    for (const host of hosts) expect(progress).toContain(host)
+    expect(progress).not.toContain('(+')
+    expect(error.kind).toBe('unreachable')
+  }, 15_000)
+
+  it('⑭c pins the exact fill boundary: 150 + 8 + 2 = 160 fits, the next host is omitted', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    // THE boundary ⑭a/⑭b cannot see: ⑭a's 253-char first host aborts the fill
+    // loop immediately and ⑭b's three hosts total 31 chars, so every budget in
+    // roughly [31, 507] passes both. Here `used + host.length + 2` lands
+    // EXACTLY on 160 with the separator charged (150 + 8 + 2), while the third
+    // host would make it 163 — so the emitted host text is exactly 160 chars
+    // and the third host is explicitly omitted.
+    //
+    // The 150-char host is THREE labels (63 + 1 + 63 + 1 + 22): a single
+    // 150-char label is NOT schema-valid (the published `hostnameSchema` caps
+    // a label at 63), so `'a'.repeat(150)` alone would be refused
+    // `invalid-payload` before any progress line exists.
+    const long = `${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(22)}`
+    expect(long.length).toBe(150)
+    const hosts = [long, 'b'.repeat(8), 'c']
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        dialBudgetMs: 0,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: hosts.map((host) => ({ host, port: fakeInfo.port, security: 'ws' })),
+        }),
+      }),
+    )
+
+    const progress = consoleInfo.mock.calls
+      .flat()
+      .map(String)
+      .find((line) => line.includes('pairing stage validate'))
+    expect(progress, 'the validate stage must be logged').toBeDefined()
+    const prefix = '[cherry-remote] pairing stage validate (hosts: '
+    // The whole line still carries OUR prefix and the stage name...
+    expect(progress!.startsWith(prefix)).toBe(true)
+    // ...and the rendered host list is exactly the string the budget allows.
+    const rendered = progress!.slice(prefix.length, -1)
+    expect(rendered).toBe(`${long}, ${'b'.repeat(8)} (+1 more)`)
+    const named = rendered.slice(0, -' (+1 more)'.length)
+    // The separator is CHARGED: 150 + 2 + 8 = 160, exactly the budget.
+    expect(named.length).toBe(160)
+    // The third host did not fit and is NOT named; the marker counts it.
+    expect(named).not.toContain('c')
+    expect(error.kind).toBe('unreachable')
+  }, 15_000)
+
+  it('⑭d pins the stage name in the one stage-failure text that is passed through whole', async () => {
+    const identity = await createDeviceIdentity()
+    // Hold every RPC reply so the FIRST pairing request (`connection.hello`)
+    // is still in flight when the link dies: `asPairingError` then renders
+    // `pairing hello failed: …` — the one `unreachable` text that never passes
+    // through the segment shaping. No new fixture: the existing fake's reply
+    // delay plus its `helloCount` counter are enough, and the transport's own
+    // text after the colon is deliberately NOT asserted.
+    const fakeInfo = await makeFake({ requestDelayMs: 5_000 })
+    const store = await makeStore()
+
+    const pending = pair({ identity, store, payload: v3PayloadFor(fakeInfo) })
+    await waitFor(() => fakeInfo.fake.helloCount === 1)
+    await fakeInfo.fake.stop()
+
+    const error = await pairingError(pending)
+    expect(error.kind).toBe('unreachable')
+    expect(error.message).toMatch(/^pairing hello failed: /)
+  }, 15_000)
 })

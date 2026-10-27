@@ -85,8 +85,7 @@ their keys (there is a contract assertion for exactly that).
 
 - **tsdown preserves JSDoc into `dist/index.mjs`.** A change that only touches
   `src/**` **comments** still changes the artifact bytes; editing an exported
-  declaration's doc comment needs `dist` rebuilt in the same commit. A missing
-  rebuild is a red test, not a style nit.
+  declaration's doc comment needs `dist` rebuilt in the same commit.
 - **`prepublishOnly` vs `artifactFreshness` — two different gates.**
   - `prepublishOnly` =
     `typecheck && test && build && build:client && npm pack --dry-run`: the
@@ -768,6 +767,9 @@ Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
 (keeping its port) and `FAILURE_SEGMENT_MAX` = 240 caps the whole
 `<label>: <detail>` (marker `… (+N chars)` included), so 32 candidates join to
 ≤ 7,742 characters.
+The progress line is bounded (first host always, 160 chars of host text,
+`(+K more)`); a stage-failure verdict is ONE error (peer or transport), not a
+join, passed through whole — bounded only by the record cap.
 
 ### Device selector
 
@@ -983,7 +985,7 @@ attach the notes to the GitHub release.
 2. **Bump BOTH README install pins in the same commit, before staging** — the
    `@X.Y.Z` and `#vX.Y.Z` specs in `README.md` and `README.en.md`. npm serves
    the README captured in the tarball, so a pin bumped after the publish is
-   stale on the npm page, and the two files are a pair that must never drift.
+   stale on the npm page.
 3. **Re-attach the version-INDEPENDENT release asset.** The market entry
    (`awesome-dsh-plugin`, `data/plugins/SAXEM1997__dsh-cherry-bridge.yml`)
    points at `releases/latest/download/dsh-cherry-bridge.tgz`, so **every**
