@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { boundedJoin, clipText } from '../../src/text.js'
+import { boundedJoin, clipText, failureText, LOG_TEXT_MAX } from '../../src/text.js'
 
 /**
  * The ONE bounded-rendering helper (issue #155). Every face that interpolates
@@ -117,5 +117,45 @@ describe('boundedJoin', () => {
     // the named text never has to absorb its length.
     const text = boundedJoin(items, { max: 10, itemMax: 8 })
     expect(text.slice(0, -' (+3 more)'.length).length).toBeLessThanOrEqual(10)
+  })
+})
+
+/**
+ * The ONE renderer for a caught failure in a log line (issue #161). This does
+ * NOT pass the error to the console: it is a pure string transform, so its
+ * shape is pinned here for every converted call site.
+ */
+describe('failureText', () => {
+  it('renders an Error as its message under LOG_TEXT_MAX', () => {
+    const message = 'x'.repeat(1_000)
+    const rendered = failureText(new Error(message))
+    // The MESSAGE is the half an operator needs; the class name and the stack
+    // are exactly what the old object print added unboundedly.
+    expect(rendered).toBe(clipText(message, LOG_TEXT_MAX))
+    expect(rendered.length).toBe(LOG_TEXT_MAX)
+    expect(rendered).toMatch(/… \(\+\d+ chars\)$/)
+    expect(rendered).not.toContain('Error')
+  })
+
+  it('passes a short message through byte for byte, with no marker', () => {
+    // A marker on an untouched message would read as a truncation that never
+    // happened, and an operator learns to ignore it.
+    expect(failureText(new Error('boom'))).toBe('boom')
+    expect(failureText(new Error(''))).toBe('')
+  })
+
+  it('stringifies a non-Error exactly as the console would have', () => {
+    expect(failureText('plain text')).toBe('plain text')
+    expect(failureText(7)).toBe('7')
+    expect(failureText(undefined)).toBe('undefined')
+    // Objects still get the console's default stringification — the point is
+    // that the VALUE cannot carry a stack or own properties any more.
+    expect(failureText({ message: 'not an error' })).toBe('[object Object]')
+  })
+
+  it('bounds a non-Error WHOLE string too, not just an Error message', () => {
+    const rendered = failureText('y'.repeat(900))
+    expect(rendered.length).toBe(LOG_TEXT_MAX)
+    expect(rendered).toMatch(/… \(\+\d+ chars\)$/)
   })
 })

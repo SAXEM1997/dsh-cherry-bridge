@@ -1,6 +1,7 @@
 import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcClient } from './rpc/jsonRpcClient.js'
 import { DEFAULT_PER_SESSION_CACHE_BYTES } from './defaults.js'
+import { failureText } from './text.js'
 import type { AgentCursor, AgentEvent } from '@cherrystudio/remote-protocol/agent'
 
 /**
@@ -760,8 +761,15 @@ export class SessionSubscriptions {
       await this.#rpc.request('agent.subscriptions.close', { subscriptionId })
     } catch (error) {
       // Closing is best-effort: the peer may already have reset it, and the
-      // caller is about to establish a replacement either way.
-      console.warn(`[cherry-remote] closing subscription ${subscriptionId} failed`, error)
+      // caller is about to establish a replacement either way. ONE bounded
+      // STRING (issue #161): the refusal is the PEER's JSON-RPC
+      // `error.message` verbatim, so the old object print let the console
+      // render peer text with no local bound. Ceiling:
+      // `[cherry-remote] closing subscription ` (37) + subscriptionId +
+      // ` failed: ` (9) + LOG_TEXT_MAX (240).
+      console.warn(
+        `[cherry-remote] closing subscription ${subscriptionId} failed: ${failureText(error)}`,
+      )
     }
   }
 

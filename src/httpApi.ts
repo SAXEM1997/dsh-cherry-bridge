@@ -9,6 +9,7 @@ import { CONTRACT_DIFFERENCES, buildDiagnostics, readScopeSegment } from './diag
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
 import type { ScopeDoc, ToolScopeState } from './toolScope.js'
 import type { RefreshSummary } from './toolScopeHost.js'
+import { failureText } from './text.js'
 
 /**
  * The plugin's same-origin HTTP face (spec §3.7): device management REST plus
@@ -1458,7 +1459,14 @@ async function patchDevice(
     try {
       track(route.deps.connect(deviceId).connect(), warnConnect(deviceId))
     } catch (error) {
-      console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error)
+      // ONE bounded STRING (issue #161): the old form passed the error OBJECT,
+      // so the console printed the stack plus every own property unbounded.
+      // This synchronous arm sees only the connection's construction failure
+      // (`connectionFor` cannot find the record, or the identity failed to
+      // load), i.e. LOCAL text; the DIAL's rejection lands in `warnConnect`
+      // below. Ceiling: `[cherry-remote] device ` (23) + deviceId +
+      // ` reconnect failed: ` (19) + LOG_TEXT_MAX (240).
+      console.warn(`[cherry-remote] device ${deviceId} reconnect failed: ${failureText(error)}`)
     }
   }
 
@@ -1484,7 +1492,15 @@ async function patchDevice(
 
 function warnConnect(deviceId: string): (error: unknown) => void {
   return (error: unknown) => {
-    console.warn(`[cherry-remote] device ${deviceId} lifecycle change failed`, error)
+    // ONE bounded STRING (issue #161). This is the arm that actually receives
+    // the lifecycle rejection: `connect()` rejects with the establishment
+    // failure, whose message embeds the peer's own text (`AllHostsUnreachableError`
+    // wraps `last: <peer message>`, and a hello/authenticate refusal is the
+    // peer's `error.message` verbatim, capped at 512 by the failure schema).
+    // The old form handed the error OBJECT to the console. Ceiling:
+    // `[cherry-remote] device ` (23) + deviceId + ` lifecycle change failed: `
+    // (26) + LOG_TEXT_MAX (240).
+    console.warn(`[cherry-remote] device ${deviceId} lifecycle change failed: ${failureText(error)}`)
   }
 }
 

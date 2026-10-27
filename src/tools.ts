@@ -16,6 +16,7 @@ import { truncateErrorMessage } from './diagnostics.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
 import type { PairingErrorKind } from './pairing.js'
+import { failureText } from './text.js'
 import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
 
 /**
@@ -1869,7 +1870,16 @@ export function registerCherryToolsWithEngine(
   }
 }
 
-/** One tool declaration, in the exact shape the host registry consumes. */
+/**
+ * One tool declaration, in the exact shape the host registry consumes.
+ *
+ * DELIBERATELY no result wrapper and no bound on result text (issue #161): a
+ * tool result is the MODEL's signal, and the peer is the user's own
+ * Noise-authenticated desktop, so shortening the peer's explanation costs the
+ * caller the text it acts on. The decision is the opposite of the LOG face,
+ * where boundedness is required (`failureText` / `clipText` in `src/text.ts`):
+ * this ticket's sweep does not change tool output.
+ */
 function defineCherryTool(definition: {
   name: string
   description: string
@@ -3945,7 +3955,16 @@ export class CherryToolEngine {
         try {
           await subscriptions.ack(sessionId, result.nextCursor)
         } catch (error) {
-          console.warn(`[cherry-remote] acknowledging session ${sessionId} at ${result.nextCursor.seq} failed`, error)
+          // ONE bounded STRING (issue #161): the ack refusal is the PEER's
+          // JSON-RPC `error.message` verbatim (a CONFLICT from an out-of-window
+          // cursor, a reset race), so the old object print let the console
+          // render peer text with no local bound. Ceiling:
+          // `[cherry-remote] acknowledging session ` (38) + sessionId +
+          // ` at ` (4) + seq + ` failed: ` (9) + LOG_TEXT_MAX (240).
+          console.warn(
+            `[cherry-remote] acknowledging session ${sessionId} at ${result.nextCursor.seq} failed: ` +
+              failureText(error),
+          )
           this.#reEnsureInBackground(record.deviceId, sessionId)
         }
         return { events: result.events, nextCursor: result.nextCursor }
@@ -6697,9 +6716,12 @@ export class CherryToolEngine {
    * identity object: the verdict is already known and true, and only the
    * content behind it failed.
    *
-   * `aggregateError` is BOUNDED like every other peer-echoed string in a result
-   * (the full text goes to the log): the reason is actionable at 200 characters
-   * and the log is where the operator reads the rest.
+   * `aggregateError` is a TOOL RESULT, not a log line — see
+   * {@link defineCherryTool} for the product decision (issue #161): a result is
+   * the MODEL's signal, so it is not bounded by the logging rule, and the
+   * 200-character clip here is this field's own choice. The LOG line below
+   * keeps the full message for the operator: it is ONE interpolated string,
+   * never the error object.
    */
   #assemblyFailed(identity: Record<string, unknown>, error: unknown): Record<string, unknown> {
     const message = error instanceof Error ? error.message : String(error)
@@ -6883,11 +6905,24 @@ export class CherryToolEngine {
     try {
       layer = this.#deps.subs(deviceId)
     } catch (error) {
-      console.warn(`[cherry-remote] could not re-ensure session ${sessionId} of ${deviceId}`, error)
+      // ONE bounded STRING (issue #161). This accessor's throw is LOCAL (no
+      // record for the device, or the identity never loaded), but the arm is
+      // converted with its sibling so the background re-ensure has ONE failure
+      // shape and no branch can hand the console an unbounded object.
+      console.warn(
+        `[cherry-remote] could not re-ensure session ${sessionId} of ${deviceId}: ${failureText(error)}`,
+      )
       return
     }
     void layer.ensure(sessionId).catch((error: unknown) => {
-      console.warn(`[cherry-remote] re-ensuring session ${sessionId} of ${deviceId} failed`, error)
+      // ONE bounded STRING (issue #161): `ensure` reaches the peer, so the
+      // rejection message is the peer's JSON-RPC `error.message` verbatim (up
+      // to the 512-char failure schema cap) or a transport message. The old
+      // form passed the error OBJECT, so the console printed its stack plus
+      // every own property unbounded.
+      console.warn(
+        `[cherry-remote] re-ensuring session ${sessionId} of ${deviceId} failed: ${failureText(error)}`,
+      )
     })
   }
 

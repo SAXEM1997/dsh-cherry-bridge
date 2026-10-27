@@ -21,7 +21,7 @@ import type {
 } from './httpApi.js'
 import type { DiagnosticsError } from './diagnostics.js'
 import { truncateErrorMessage } from './diagnostics.js'
-import { boundedJoin } from './text.js'
+import { boundedJoin, failureText } from './text.js'
 
 export const name = 'cherry-remote'
 
@@ -519,7 +519,16 @@ function connectionFor(deviceId: string): DeviceConnection {
     try {
       subsFor(deviceId).handleNotification(method, params)
     } catch (error) {
-      console.warn(`[cherry-remote] notification "${method}" for ${deviceId} failed`, error)
+      // ONE bounded STRING (issue #161): the old form passed the error OBJECT,
+      // so the console printed its stack and every own property unbounded. The
+      // layer tolerates every schema-valid notification today, so this arm is
+      // defensive — but a future throw here must not make the console choose
+      // the rendering. Ceiling: `[cherry-remote] notification "` (30) +
+      // METHOD_MAX (128, already bounded by the notification schema) +
+      // `" for ` (6) + deviceId + ` failed: ` (9) + LOG_TEXT_MAX (240).
+      console.warn(
+        `[cherry-remote] notification "${method}" for ${deviceId} failed: ${failureText(error)}`,
+      )
     }
   })
   state.connections.set(deviceId, connection)
@@ -723,7 +732,15 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
           (cursor === undefined ? '' : ` at seq ${cursor.seq}`),
       )
     } catch (error) {
-      console.warn(`[cherry-remote] re-subscribing session ${sessionId} of ${deviceId} failed`, error)
+      // ONE bounded STRING (issue #161). The catch is peer-triggered:
+      // `ensure` subscribes over the live link, and its failure message is the
+      // peer's JSON-RPC `error.message` verbatim (up to the 512-char failure
+      // schema cap) or a transport message. The old form handed the error
+      // OBJECT to the console, which then printed the stack plus every own
+      // property unbounded.
+      console.warn(
+        `[cherry-remote] re-subscribing session ${sessionId} of ${deviceId} failed: ${failureText(error)}`,
+      )
     }
   }
 }

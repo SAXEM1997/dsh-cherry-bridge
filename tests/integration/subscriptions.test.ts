@@ -6,6 +6,7 @@ import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
 import { JsonRpcClient } from '../../src/rpc/jsonRpcClient.js'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
+import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 
@@ -981,5 +982,41 @@ describe('SessionSubscriptions over a real loopback channel', () => {
       const next = rig.subs.read('s1')
       return 'events' in next && next.events.length === 1
     }, 3_000, 'the well-formed event')
+  })
+
+  it('⑱ bounds the subscription-close warning to ONE string (issue #161)', async () => {
+    const rig = await makeRig()
+    await rig.subs.ensure('s1')
+    const subscriptionId = rig.fake.subscriptions.find((entry) => entry.sessionId === 's1')!.subscriptionId
+    // The refusal is PEER text, and the message schema allows 512 characters —
+    // 272 above the LOG_TEXT_MAX bound this line imposes locally.
+    const longMessage = 'c'.repeat(512)
+    rig.fake.refuseClose({ reason: 'INTERNAL', message: longMessage })
+
+    // Closing is best-effort: dispose() swallows the refusal and logs it. The
+    // peer's ledger still proves the request was SENT (the work pin), so the
+    // assertion below is about the log's shape, not about whether it happened.
+    await rig.subs.dispose()
+    expect(rig.fake.closeCalls.some((call) => call.subscriptionId === subscriptionId)).toBe(true)
+
+    const prefix = `[cherry-remote] closing subscription ${subscriptionId} failed: `
+    const call = consoleWarn.mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
+    expect(call, 'the failed close must be logged').toBeDefined()
+    // ONE STRING: the old form was `console.warn(prefix, error)`, so the
+    // console chose the rendering — the stack plus every own property.
+    expect(call!).toHaveLength(1)
+    const line = String(call![0])
+    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX)
+    expect(line).toMatch(/… \(\+\d+ chars\)$/)
+    // The kept prefix and the marker are charged to the SAME 240-char budget:
+    // 512 → kept 226, `… (+286 chars)` 14 characters, 226 + 14 = 240.
+    const detail = line.slice(prefix.length)
+    const kept = detail.indexOf('…')
+    expect(kept).toBeGreaterThan(0)
+    expect(kept + detail.slice(kept).length).toBe(LOG_TEXT_MAX)
+    expect(detail).toBe('c'.repeat(kept) + `… (+${512 - kept} chars)`)
+    // The peer's tail is gone; our wording survives.
+    expect(line).not.toContain(longMessage)
+    expect(line).toContain('closing subscription')
   })
 })

@@ -8,8 +8,10 @@ import { DeviceStore } from '../../src/deviceStore.js'
 import { QuarantinedArchiveError } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import { pairWithPayload } from '../../src/pairing.js'
+import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
+import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
@@ -769,6 +771,29 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     })
   }
 
+  /**
+   * Assert a converted failure warning is ONE bounded string (issue #161): the
+   * old form was `console.warn(prefix, error)`, so the console chose the
+   * rendering — stack plus every own property, unbounded.
+   */
+  function expectBoundedWarn(prefix: string, longText: string): string {
+    const call = vi
+      .mocked(console.warn)
+      .mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
+    expect(call, `the warning "${prefix}" must be logged`).toBeDefined()
+    expect(call!).toHaveLength(1)
+    const line = String(call![0])
+    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX)
+    expect(line).toMatch(/… \(\+\d+ chars\)$/)
+    const detail = line.slice(prefix.length)
+    const kept = detail.indexOf('…')
+    expect(kept).toBeGreaterThan(0)
+    expect(kept + detail.slice(kept).length).toBe(LOG_TEXT_MAX)
+    expect(detail).toBe(longText.slice(0, kept) + `… (+${longText.length - kept} chars)`)
+    expect(line).not.toContain(longText)
+    return line
+  }
+
   it('③a registers the full 14-tool family on first apply', async () => {
     const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
@@ -1345,11 +1370,17 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         },
         10_000,
       )
-      // The failing session was reported, not swallowed.
-      expect(consoleWarn).toHaveBeenCalledWith(
-        expect.stringContaining('re-subscribing session s-1'),
-        expect.anything(),
+      // The failing session was reported, not swallowed — as ONE bounded
+      // string (issue #161), never `console.warn(prefix, error)`.
+      const failure = consoleWarn.mock.calls
+        .map((call) => ({ call, line: String(call[0]) }))
+        .find(({ line }) => line.includes('re-subscribing session s-1'))
+      expect(failure, 'the failing session must be reported').toBeDefined()
+      expect(failure!.call).toHaveLength(1)
+      expect(failure!.line).toMatch(
+        /^\[cherry-remote\] re-subscribing session s-1 of dev-A failed: /,
       )
+      expect(failure!.line).toContain('boom')
     } finally {
       readSpy.mockRestore()
     }
@@ -1600,6 +1631,101 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       },
       20_000,
     )
+  }, 30_000)
+
+  // -------------------------------------------------------------------------
+  // The two assembly-level failure warps of issue #161. Both are routed by
+  // `src/index.ts` and both used to hand the error OBJECT to `console.warn`;
+  // each must now be ONE bounded string, with the peer's ledger still proving
+  // the WORK (a log line is not evidence that a recovery was attempted).
+  // -------------------------------------------------------------------------
+  it('③v bounds the notification-routing warning to ONE string', async () => {
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake()
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    await connectPool(ctx, fakeInfo)
+
+    // The subscription layer TOLERATES every schema-valid notification (it warns
+    // and returns), so no peer frame can make `handleNotification` throw today:
+    // this catch is defensive. The thrower goes on the PUBLIC method (a
+    // prototype spy, the same seam the reconnect tests use) to prove the catch
+    // renders ONE bounded string whatever throws inside it.
+    const longMessage = 'n'.repeat(3_000)
+    const thrower = vi
+      .spyOn(SessionSubscriptions.prototype, 'handleNotification')
+      .mockImplementation(() => {
+        throw new Error(longMessage)
+      })
+    try {
+      const warn = vi.mocked(console.warn)
+      warn.mockClear()
+      fakeInfo.fake.pushNotification('agent.totallyUnknown', { whatever: true })
+      const prefix = '[cherry-remote] notification "agent.totallyUnknown" for dev-A failed: '
+      await vi.waitFor(
+        () => {
+          expect(warn.mock.calls.some((entry) => String(entry[0]).startsWith(prefix))).toBe(true)
+        },
+        5_000,
+      )
+      expectBoundedWarn(prefix, longMessage)
+    } finally {
+      thrower.mockRestore()
+    }
+  }, 30_000)
+
+  it('③w bounds the subscription-recovery warning to ONE string', async () => {
+    const index = await import('../../src/index.js')
+    const session = {
+      sessionId: 'sess-recovery-161',
+      agentId: 'agent-1',
+      workspaceId: 'ws-1',
+      title: 'Recovery',
+      historyRevision: '1',
+    }
+    const fakeInfo = await makeFake({ agent: { sessions: [session] } })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    await connectPool(ctx, fakeInfo)
+
+    // One live subscription to recover: the cheapest join is a `cherry_read`.
+    const read = ctx.tools.definitions.find((definition) => definition.name === 'cherry_read')!
+    await read.execute({ device: 'dev-A', sessionId: session.sessionId })
+    expect(fakeInfo.fake.subscriptions).toHaveLength(1)
+    const subscribesBeforeDrop = fakeInfo.fake.subscribeCalls.length
+
+    // The PEER then refuses every replacement subscription. Its message is
+    // `Subscribe refused (<reason>)`, so a 300-char reason carries peer text
+    // above LOG_TEXT_MAX while the failure stays a JSON-RPC error.
+    const longReason = 's'.repeat(300)
+    fakeInfo.fake.refuseSubscriptions(longReason)
+    vi.mocked(console.warn).mockClear()
+    expect(fakeInfo.fake.dropConnections()).toBe(1)
+
+    const prefix = `[cherry-remote] re-subscribing session ${session.sessionId} of dev-A failed: `
+    await vi.waitFor(
+      () => {
+        expect(
+          vi.mocked(console.warn).mock.calls.some((entry) => String(entry[0]).startsWith(prefix)),
+        ).toBe(true)
+      },
+      20_000,
+    )
+    // WORK PIN: the recovery really tried, and the PEER refused it — the log
+    // line must not be the only evidence the re-subscribe happened.
+    const afterDrop = fakeInfo.fake.subscribeCalls.slice(subscribesBeforeDrop)
+    expect(
+      afterDrop.some((call) => call.sessionId === session.sessionId && call.mode === 'error'),
+    ).toBe(true)
+    expectBoundedWarn(prefix, `Subscribe refused (${longReason})`)
   }, 30_000)
 })
 

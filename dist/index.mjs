@@ -606,6 +606,15 @@ async function generateIdentity(dataDir, path) {
 * until a log line or a verdict makes it text), name the amount removed with
 * the `… (+N chars)` marker, and never drop a list ENTRY silently (the
 * `(+K more)` count is explicit).
+*
+* Issue #161 finished the class the same review left behind: the SAME SHAPE at
+* sites #155 did not name — a catch handing an error OBJECT to `console.warn`
+* as its second argument. One renderer now states the answer for all of them,
+* {@link failureText}: the message alone, bounded. The two earlier forms it did
+* NOT absorb — `truncateErrorMessage` (the diagnostics digest) and `bounded()`
+* (the frame-drop path) — are deliberately left alone: each emits a different
+* marker (`…[truncated]`, a bare `…`) and its callers/tests assert that exact
+* text, so folding would change output rather than converge on the rule.
 */
 /**
 * Clips `text` into `max` characters, the `… (+N chars)` marker included in
@@ -662,6 +671,21 @@ function boundedJoin(items, limits) {
 	}
 	const omitted = items.length - shown;
 	return omitted > 0 ? `${text} (+${omitted} more)` : text;
+}
+/**
+* Renders ONE caught failure for a log line: the message alone, clipped to
+* {@link LOG_TEXT_MAX}.
+*
+* This is the ONE form a caught failure takes in a log line (issue #161). The
+* old shape — `console.warn(prefix, error)` — handed the console the OBJECT, so
+* the console chose the rendering: the stack plus every own property, with
+* nothing bounding it. These catches are defensive (a listener, a background
+* recovery or a best-effort close whose own failure must not escape), so what
+* an operator needs is the message and nothing else; a non-`Error` value is
+* stringified exactly as the console would have rendered it.
+*/
+function failureText(error) {
+	return clipText(error instanceof Error ? error.message : String(error), 240);
 }
 //#endregion
 //#region src/rpc/jsonRpcClient.ts
@@ -1089,7 +1113,7 @@ var JsonRpcClient = class {
 			for (const handler of [...this.handlers]) try {
 				handler(method, params);
 			} catch (error) {
-				console.warn(`[cherry-remote] notification handler for "${bounded(method)}" threw: ` + clipText(error instanceof Error ? error.message : String(error), 240));
+				console.warn(`[cherry-remote] notification handler for "${bounded(method)}" threw: ${failureText(error)}`);
 			}
 			return;
 		}
@@ -3682,12 +3706,12 @@ var DeviceConnection = class {
 		for (const cb of [...this.#stateListeners]) try {
 			cb(next);
 		} catch (error) {
-			console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}`, error);
+			console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}: ${failureText(error)}`);
 		}
 		for (const cb of [...this.#settleWaiters]) try {
 			cb(next);
 		} catch (error) {
-			console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}`, error);
+			console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}: ${failureText(error)}`);
 		}
 	}
 };
@@ -4784,7 +4808,7 @@ var SessionSubscriptions = class {
 		try {
 			await this.#rpc.request("agent.subscriptions.close", { subscriptionId });
 		} catch (error) {
-			console.warn(`[cherry-remote] closing subscription ${subscriptionId} failed`, error);
+			console.warn(`[cherry-remote] closing subscription ${subscriptionId} failed: ${failureText(error)}`);
 		}
 	}
 	/**
@@ -5974,7 +5998,16 @@ function registerCherryToolsWithEngine(ctx, deps, options = {}) {
 		}
 	};
 }
-/** One tool declaration, in the exact shape the host registry consumes. */
+/**
+* One tool declaration, in the exact shape the host registry consumes.
+*
+* DELIBERATELY no result wrapper and no bound on result text (issue #161): a
+* tool result is the MODEL's signal, and the peer is the user's own
+* Noise-authenticated desktop, so shortening the peer's explanation costs the
+* caller the text it acts on. The decision is the opposite of the LOG face,
+* where boundedness is required (`failureText` / `clipText` in `src/text.ts`):
+* this ticket's sweep does not change tool output.
+*/
 function defineCherryTool(definition) {
 	return {
 		name: definition.name,
@@ -7311,7 +7344,7 @@ var CherryToolEngine = class {
 				try {
 					await subscriptions.ack(sessionId, result.nextCursor);
 				} catch (error) {
-					console.warn(`[cherry-remote] acknowledging session ${sessionId} at ${result.nextCursor.seq} failed`, error);
+					console.warn(`[cherry-remote] acknowledging session ${sessionId} at ${result.nextCursor.seq} failed: ` + failureText(error));
 					this.#reEnsureInBackground(record.deviceId, sessionId);
 				}
 				return {
@@ -9112,9 +9145,12 @@ var CherryToolEngine = class {
 	* identity object: the verdict is already known and true, and only the
 	* content behind it failed.
 	*
-	* `aggregateError` is BOUNDED like every other peer-echoed string in a result
-	* (the full text goes to the log): the reason is actionable at 200 characters
-	* and the log is where the operator reads the rest.
+	* `aggregateError` is a TOOL RESULT, not a log line — see
+	* {@link defineCherryTool} for the product decision (issue #161): a result is
+	* the MODEL's signal, so it is not bounded by the logging rule, and the
+	* 200-character clip here is this field's own choice. The LOG line below
+	* keeps the full message for the operator: it is ONE interpolated string,
+	* never the error object.
 	*/
 	#assemblyFailed(identity, error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -9266,11 +9302,11 @@ var CherryToolEngine = class {
 		try {
 			layer = this.#deps.subs(deviceId);
 		} catch (error) {
-			console.warn(`[cherry-remote] could not re-ensure session ${sessionId} of ${deviceId}`, error);
+			console.warn(`[cherry-remote] could not re-ensure session ${sessionId} of ${deviceId}: ${failureText(error)}`);
 			return;
 		}
 		layer.ensure(sessionId).catch((error) => {
-			console.warn(`[cherry-remote] re-ensuring session ${sessionId} of ${deviceId} failed`, error);
+			console.warn(`[cherry-remote] re-ensuring session ${sessionId} of ${deviceId} failed: ${failureText(error)}`);
 		});
 	}
 	/**
@@ -11494,7 +11530,7 @@ async function patchDevice(req, res, route, deviceId) {
 	if (enabledChanged && patch.enabled) try {
 		track(route.deps.connect(deviceId).connect(), warnConnect(deviceId));
 	} catch (error) {
-		console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error);
+		console.warn(`[cherry-remote] device ${deviceId} reconnect failed: ${failureText(error)}`);
 	}
 	const state = projectState(next, route.deps.connect);
 	if (patch.enabled !== void 0 && patch.enabled !== previousEnabled) route.hub.publish("device-state", {
@@ -11514,7 +11550,7 @@ async function patchDevice(req, res, route, deviceId) {
 }
 function warnConnect(deviceId) {
 	return (error) => {
-		console.warn(`[cherry-remote] device ${deviceId} lifecycle change failed`, error);
+		console.warn(`[cherry-remote] device ${deviceId} lifecycle change failed: ${failureText(error)}`);
 	};
 }
 /** Order-sensitive host comparison: `hosts` is an ordered candidate list. */
@@ -11893,7 +11929,7 @@ function connectionFor(deviceId) {
 		try {
 			subsFor(deviceId).handleNotification(method, params);
 		} catch (error) {
-			console.warn(`[cherry-remote] notification "${method}" for ${deviceId} failed`, error);
+			console.warn(`[cherry-remote] notification "${method}" for ${deviceId} failed: ${failureText(error)}`);
 		}
 	});
 	state.connections.set(deviceId, connection);
@@ -12031,7 +12067,7 @@ async function recoverSubscriptions(deviceId) {
 		await subscriptions.ensure(sessionId, cursor);
 		console.info(`[cherry-remote] subscription recovered for ${deviceId} session ${sessionId}` + (cursor === void 0 ? "" : ` at seq ${cursor.seq}`));
 	} catch (error) {
-		console.warn(`[cherry-remote] re-subscribing session ${sessionId} of ${deviceId} failed`, error);
+		console.warn(`[cherry-remote] re-subscribing session ${sessionId} of ${deviceId} failed: ${failureText(error)}`);
 	}
 }
 /** One dep object, shared by both faces, so there is exactly ONE pool. */

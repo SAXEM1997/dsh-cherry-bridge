@@ -11,6 +11,7 @@ import type { DeviceState } from '../../src/connection.js'
 import { isTrustedWebRequest, registerHttpApi, resolveTrustedHosts } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
 import { ToolScopeState } from '../../src/toolScope.js'
+import { LOG_TEXT_MAX } from '../../src/text.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 /**
@@ -1235,6 +1236,78 @@ describe('⑤ disable/enable flow', () => {
       'connected',
       'disabled',
     ])
+  })
+
+  /**
+   * Bounded log text for the two re-enable failure arms (issue #161). The old
+   * form passed the error OBJECT as `console.warn`'s second argument, so the
+   * console chose the rendering: the stack plus every own property, unbounded.
+   */
+  function boundedWarnCall(prefix: string, longMessage: string) {
+    const warn = vi.mocked(console.warn)
+    const call = warn.mock.calls.find((entry) => String(entry[0]).startsWith(prefix))
+    expect(call, `the warning "${prefix}" must be logged`).toBeDefined()
+    // ONE STRING: the second argument is what let the console render an object.
+    expect(call!).toHaveLength(1)
+    const line = String(call![0])
+    expect(line.length).toBeLessThanOrEqual(prefix.length + LOG_TEXT_MAX)
+    expect(line).toMatch(/… \(\+\d+ chars\)$/)
+    const detail = line.slice(prefix.length)
+    const kept = detail.indexOf('…')
+    expect(kept).toBeGreaterThan(0)
+    expect(kept + detail.slice(kept).length).toBe(LOG_TEXT_MAX)
+    expect(detail).toBe('r'.repeat(kept) + `… (+${longMessage.length - kept} chars)`)
+    expect(line).not.toContain(longMessage)
+    return line
+  }
+
+  it('⑤c renders a SYNCHRONOUS reconnect failure as ONE bounded string (#161)', async () => {
+    const longMessage = 'r'.repeat(3_000)
+    let calls = 0
+    mount({
+      // The first call is the re-enable's rebuild (`connect(deviceId).connect()`);
+      // the second is `projectState` rendering the response.
+      connect: () => {
+        calls += 1
+        if (calls === 1) throw new Error(longMessage)
+        return fakeConnection('offline') as never
+      },
+    })
+    store.upsert(record({ enabled: false }))
+
+    const res = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled: true }),
+    })
+    expect(res.status).toBe(200)
+    boundedWarnCall('[cherry-remote] device dev-1 reconnect failed: ', longMessage)
+  })
+
+  it('⑤d renders a REJECTED reconnect as ONE bounded string (#161)', async () => {
+    const longMessage = 'r'.repeat(3_000)
+    // This is the arm a real peer reaches: `connect()` rejects with the
+    // establishment failure, whose message embeds the peer's own text
+    // (`AllHostsUnreachableError` wraps `last: <peer message>`).
+    const dev = fakeConnection('offline')
+    const rejecting = { ...dev, connect: () => Promise.reject(new Error(longMessage)) }
+    mount({ connect: () => rejecting as never })
+    store.upsert(record({ enabled: false }))
+
+    const res = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled: true }),
+    })
+    expect(res.status).toBe(200)
+    const prefix = '[cherry-remote] device dev-1 lifecycle change failed: '
+    await vi.waitFor(
+      () => {
+        expect(
+          vi.mocked(console.warn).mock.calls.some((entry) => String(entry[0]).startsWith(prefix)),
+        ).toBe(true)
+      },
+      2_000,
+    )
+    boundedWarnCall(prefix, longMessage)
   })
 })
 

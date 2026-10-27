@@ -18,6 +18,15 @@
  * until a log line or a verdict makes it text), name the amount removed with
  * the `… (+N chars)` marker, and never drop a list ENTRY silently (the
  * `(+K more)` count is explicit).
+ *
+ * Issue #161 finished the class the same review left behind: the SAME SHAPE at
+ * sites #155 did not name — a catch handing an error OBJECT to `console.warn`
+ * as its second argument. One renderer now states the answer for all of them,
+ * {@link failureText}: the message alone, bounded. The two earlier forms it did
+ * NOT absorb — `truncateErrorMessage` (the diagnostics digest) and `bounded()`
+ * (the frame-drop path) — are deliberately left alone: each emits a different
+ * marker (`…[truncated]`, a bare `…`) and its callers/tests assert that exact
+ * text, so folding would change output rather than converge on the rule.
  */
 
 /**
@@ -98,18 +107,38 @@ export function boundedJoin(
  * `pairing hello failed` label — 20 characters — plus its `': '`) and often
  * less. Same number, different quantity: this one is the detail alone.
  *
- * Call sites (all render peer-controlled text through {@link clipText} with
- * this value):
+ * Call sites. Two shapes are rendered with it:
  *
- *  - `src/connection.ts` — the protocol-version console.error (the cause is the
- *    peer's own hello-echo text) and the transient-failure console.warn (the
- *    transport's own message).
- *  - `src/rpc/jsonRpcClient.ts` — the notification-handler console.warn: the
- *    thrown error's message, never the error object (console would print its
- *    stack and every own property).
+ *  - peer-controlled DETAIL through {@link clipText}: `src/connection.ts`'s
+ *    protocol-version console.error (the cause is the peer's own hello-echo
+ *    text) and transient-failure console.warn (the transport's own message).
+ *  - a caught FAILURE through {@link failureText} (issue #161): the JSON-RPC
+ *    notification-handler catch (`src/rpc/jsonRpcClient.ts`), the notification
+ *    routing and subscription-recovery warnings in `src/index.ts`, the ack and
+ *    re-ensure warnings in `src/tools.ts`, the reconnect rejection in
+ *    `src/httpApi.ts`, the listener catches in `src/connection.ts`, and the
+ *    subscription-close catch in `src/subscriptions.ts`. None of them passes
+ *    the error object: the console would print its stack plus every own
+ *    property with nothing bounding it.
  *
  * Other bounded faces state their own value beside the line they bound
  * (`UNKNOWN_FIELDS_MAX` / `RECOVERY_SESSIONS_MAX`), because what they bound is
  * a rendered LIST or a joined field, not one detail.
  */
 export const LOG_TEXT_MAX = 240
+
+/**
+ * Renders ONE caught failure for a log line: the message alone, clipped to
+ * {@link LOG_TEXT_MAX}.
+ *
+ * This is the ONE form a caught failure takes in a log line (issue #161). The
+ * old shape — `console.warn(prefix, error)` — handed the console the OBJECT, so
+ * the console chose the rendering: the stack plus every own property, with
+ * nothing bounding it. These catches are defensive (a listener, a background
+ * recovery or a best-effort close whose own failure must not escape), so what
+ * an operator needs is the message and nothing else; a non-`Error` value is
+ * stringified exactly as the console would have rendered it.
+ */
+export function failureText(error: unknown): string {
+  return clipText(error instanceof Error ? error.message : String(error), LOG_TEXT_MAX)
+}

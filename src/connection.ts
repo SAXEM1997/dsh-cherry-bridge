@@ -14,7 +14,7 @@ import {
   RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
 import type { DeviceRecord } from './deviceStore.js'
-import { clipText, LOG_TEXT_MAX } from './text.js'
+import { clipText, failureText, LOG_TEXT_MAX } from './text.js'
 
 /**
  * Per-device persistent connection: the M1 capstone that owns the WebSocket,
@@ -1863,14 +1863,30 @@ export class DeviceConnection {
       try {
         cb(next)
       } catch (error) {
-        console.warn(`[cherry-remote] state listener threw for ${this.record.deviceId}`, error)
+        // ONE bounded STRING (issue #161). The listeners are OURS (the assembly
+        // fan-out, the session caches), so no peer bytes reach this message
+        // today; converted for uniformity anyway, because the old form let the
+        // console print the stack plus every own property with nothing
+        // bounding it. Ceiling: `[cherry-remote] state listener threw for `
+        // (41) + deviceId + `: ` (2) + LOG_TEXT_MAX (240).
+        console.warn(
+          `[cherry-remote] state listener threw for ${this.record.deviceId}: ${failureText(error)}`,
+        )
       }
     }
     for (const cb of [...this.#settleWaiters]) {
       try {
         cb(next)
       } catch (error) {
-        console.warn(`[cherry-remote] settle waiter threw for ${this.record.deviceId}`, error)
+        // ONE bounded STRING (issue #161), same reasoning as the listener arm
+        // above. This arm is DEFENSIVE: `waitForSettled` registers an internal
+        // closure whose only throwing operations are `clearTimeout`,
+        // `Set.delete` and `resolve` — all runtime-provided. Pinned by `#161b`,
+        // which makes the resolver throw AFTER it resolved: the only injection
+        // that both reaches this catch and leaves the returned promise settled.
+        console.warn(
+          `[cherry-remote] settle waiter threw for ${this.record.deviceId}: ${failureText(error)}`,
+        )
       }
     }
   }
