@@ -23,7 +23,14 @@ export const API_BASE = '/cherry-remote/api'
 /** The five device states the connection layer reports. */
 export type DeviceState = 'connected' | 'connecting' | 'offline' | 'disabled' | 'identity-mismatch'
 
-/** One device exactly as `GET /devices` returns it. Never carries a credential. */
+/**
+ * One device exactly as `GET /devices` returns it. Never carries a credential.
+ *
+ * `ports` is the per-HOST dial port map: each candidate address dials its own
+ * port, and the record-level `port` is the fallback for a host the map does not
+ * carry (a stored v4 record has an entry for every host, so the card's `??` arm
+ * only fires on a malformed map). Required — `GET /devices` always emits it.
+ */
 export interface DeviceSummary {
   deviceId: string
   displayName: string
@@ -31,6 +38,7 @@ export interface DeviceSummary {
   enabled: boolean
   hosts: string[]
   port: number
+  ports: Record<string, number>
 }
 
 /** A `PATCH /devices/:id` body; every field optional, `hosts` is whole-replace. */

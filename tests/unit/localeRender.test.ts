@@ -181,6 +181,7 @@ const DEVICE: DeviceSummary = {
   enabled: true,
   hosts: ['192.168.1.10'],
   port: 4343,
+  ports: { '192.168.1.10': 4343 },
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +276,30 @@ describe('DeviceCard renders its own copy in English', () => {
     expect(screen.getByRole('button', { name: tr('device.rename') })).toBeTruthy()
     expect(screen.getByRole('button', { name: tr('device.addresses') })).toBeTruthy()
     expect(screen.getByRole('button', { name: tr('device.remove') })).toBeTruthy()
+  })
+
+  it('renders the mixed-port row and its warning in English', () => {
+    // A record whose hosts dial different ports is the only shape that shows
+    // these two strings, so the zh-only coverage in `ui.test.ts` would leave
+    // the English half of this warning unrendered. `DeviceCard` directly is
+    // enough: no App shell is involved in the card's own copy.
+    localeStore.setLocale('en')
+    render(
+      createElement(DeviceCard, {
+        device: {
+          ...DEVICE,
+          hosts: ['a.local', 'b.local'],
+          port: 65001,
+          ports: { 'a.local': 65001, 'b.local': 65002 },
+        },
+        state: 'connected',
+        onSaved: () => {},
+        onRemoved: () => {},
+      }),
+    )
+
+    expect(screen.getByText(tr('device.field.ports'))).toBeTruthy()
+    expect(screen.getByText(tr('device.ports.hint'))).toBeTruthy()
   })
 
   it('renders the unknown-state light in English when the stream has not spoken', () => {

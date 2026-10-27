@@ -86,6 +86,10 @@ const zh: Dict = {
   'device.field.name': '设备名称',
   'device.field.hosts': '主机地址',
   'device.hosts.hint': '多个候选地址用逗号分隔（整体替换）',
+  'device.field.ports': '每地址端口',
+  'device.ports.hint': '部分候选地址的端口与上方的端口不同；在「地址维护」里改动端口会把所有候选地址改为同一端口。',
+  'device.ports.current': '当前端口映射：',
+  'device.port.hint': '保持当前值会保留各地址自己的端口；改成新值会把所有候选地址重指到该端口。',
   'device.save.name': '保存名称',
   'device.save.addresses': '保存地址',
   'device.remove.confirm': '确认移除',
@@ -236,6 +240,12 @@ const en: Dict = {
   'device.field.name': 'Device name',
   'device.field.hosts': 'Host addresses',
   'device.hosts.hint': 'Separate candidate addresses with commas (the whole list is replaced)',
+  'device.field.ports': 'Ports per address',
+  'device.ports.hint':
+    'Some candidate addresses dial a different port than the one above; changing the port in address maintenance moves every candidate address to that one port.',
+  'device.ports.current': 'Current port map:',
+  'device.port.hint':
+    'Keeping the current value preserves each address’s own port; a new value re-points every candidate address.',
   'device.save.name': 'Save name',
   'device.save.addresses': 'Save addresses',
   'device.remove.confirm': 'Confirm removal',

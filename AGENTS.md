@@ -752,7 +752,9 @@ port loss dials the right scheme at the wrong port. Re-typing keeps scheme
 (`securityFor`)/port (`portsFor`); whole-replace `hosts` defaults new hosts to
 `ws`/port; a CHANGED `port` re-points EVERY final host, the current value a map
 no-op (the settings UI sends both on save). `GET /devices` reports both maps
-(addresses, not credentials); tools/diagnostics show only `port`.
+(addresses, not credentials); tools/diagnostics show only `port`. The settings
+page shows the per-host ports only when they differ from the record-level one,
+and its single port field keeps the CHANGED-only re-point rule.
 TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 `ca` only), forwarded to both dial sites (pool, pairing). `resolveBridgeConfig`
 validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
