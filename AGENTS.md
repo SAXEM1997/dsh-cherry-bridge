@@ -294,14 +294,18 @@ this beside the cache). That is the honest claim — 2.1.6+ externalizes every
 part over 4,096 characters, so a hit is not a zero-RPC read.
 
 - **Entry & key**: the `agent.parts.list` result — `{revision, page}` — keyed
-  `<deviceId>\0<messageId>` (device-scoped: a message id is the peer's). The
-  revision is the FENCE, not part of the key, and it covers parts RECORDS only:
-  the cache inherits the peer's own `REVISION_EXPIRED` staleness class and adds
-  none — and no more strength: the revision is a millisecond wall clock, so two
-  writes inside one millisecond can keep it equal while the parts differ (a
-  shared property of the scheme, not one the cache invented).
+  `<deviceId>\0<messageId>` (device-scoped: a message id is the peer's; two
+  desktops can issue the same one). The revision is the FENCE, not part of the
+  key, and it covers parts RECORDS only: the cache inherits the peer's own
+  `REVISION_EXPIRED` staleness class and adds none — and no more strength: the
+  revision is a millisecond wall clock, so two writes inside one millisecond
+  can keep it equal while the parts differ — a hit would then serve the older
+  list for that revision's lifetime, and reproducing it needs a read between
+  the two same-millisecond writes (a shared property of the scheme, not one
+  the cache invented).
 - **Never cached**: a row with an EMPTY revision (no fence — defensive only,
-  `messageRevision` is a strict decimal), a TRUNCATED parts page (a short list
+  `messageRevision` is a strict decimal, so no test drives it), a TRUNCATED
+  parts page (a short list
   from a transient fault is retried, never remembered; the refusal is
   reason-blind so a future reason cannot reintroduce the bug), and a page above
   `MESSAGE_CACHE_ENTRY_BYTES` (1 MiB; walked fresh rather than allowed to crowd
@@ -319,12 +323,12 @@ part over 4,096 characters, so a hit is not a zero-RPC read.
 - **Eviction is FIFO** — `Map` order IS the policy (the same choice `#remember`
   documents). A **refresh keeps the key's insertion position** (a rewrite, not
   a use; delete-then-set would silently make it LRU). Room is made BEFORE a
-  write for the write's **growth** (`bytes - previous`), so a device never
-  passes budget on either path — the refresh-that-grew case is the one that
-  used to slip through. `#dropCachedMessage` is the ONE delete path (totals
-  cannot drift from the map); the loop skips the key being written
-  (self-eviction would reorder it). A drop warns once per insert: device and
-  count only, never a message id.
+  write for the write's **growth** (`bytes - previous`, zero when it shrinks),
+  so a device never passes budget on either path — the refresh-that-grew case
+  is the one that used to slip through. `#dropCachedMessage` is the ONE delete
+  path (totals cannot drift from the map); the loop skips the key being written
+  (self-eviction would reorder it). A drop warns once per insert that dropped
+  anything: device and count only, never a message id.
 - **A hit hands the PAGE out BY REFERENCE** — safe while projection only reads
   the records; a future mutator must copy first.
 - **Invalidation** rides `#forgetDevice` with the three session caches;
