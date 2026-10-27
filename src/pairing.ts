@@ -337,6 +337,23 @@ const CLOSE_REASON_MAX = 200
  */
 const FAILURE_LABEL_MAX = 128
 const FAILURE_SEGMENT_MAX = 240
+/**
+ * Bounds the progress line's HOST TEXT (issue #152). `report()` runs once per
+ * stage transition and used to join every candidate host: a v3 QR admits 32
+ * endpoints and a host name may be 253 characters, so one stage wrote ~8 KB.
+ *
+ * The FIRST host is always shown — a line with no host at all would lose the
+ * run's identity — then further hosts are appended while the host NAMES fit
+ * this budget; a truncated list carries an explicit `(+K more)` marker that
+ * rides ON TOP of the budget (the marker is a COUNT, not a host name).
+ *
+ * Invariant: the host names consume ≤ `STAGE_HOSTS_CHARS`, with ONE exception
+ * — a FIRST host that alone exceeds it, still shown because the identity rule
+ * outranks the bound. A LATER over-long host can never enter the bounded
+ * section (`used` already holds the first host, so it fails the fit test) and
+ * is omitted into the marker.
+ */
+const STAGE_HOSTS_CHARS = 160
 
 const noop = (): void => {}
 
@@ -623,6 +640,30 @@ type GetResult =
     }
 
 /**
+ * Renders the progress line's host list under {@link STAGE_HOSTS_CHARS} (the
+ * invariant lives on that constant). A truncated list names the first host,
+ * then says how many candidates it is NOT naming — the count is explicit so a
+ * reader can tell a short host list from a bounded one.
+ */
+function stageHosts(hosts: readonly string[]): string {
+  const [first, ...rest] = hosts
+  // Defensive only: both QR arms require at least one candidate, so a parsed
+  // payload always reaches the fill loop below.
+  if (first === undefined) return ''
+  let text = first
+  let used = first.length
+  let shown = 1
+  for (const host of rest) {
+    if (used + host.length + 2 > STAGE_HOSTS_CHARS) break
+    text += `, ${host}`
+    used += host.length + 2
+    shown += 1
+  }
+  const omitted = hosts.length - shown
+  return omitted > 0 ? `${text} (+${omitted} more)` : text
+}
+
+/**
  * Pairs this DSH profile with a Cherry Studio desktop from its pairing payload,
  * returning the PERSISTED record (ruling 6).
  *
@@ -644,12 +685,13 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   const onStatus = opts.onStatus ?? noop
   // INFO-LEVEL PROGRESS (spec §5): every stage transition is logged, so an
   // operator watching a run that can take a minute can see where it is WITHOUT
-  // the tool result. Only the stage NAME and the payload's host list are
-  // recorded — never `invitationSecret`, the claim's verification code, or any
-  // token (those are exactly what the sanitization contract forbids).
+  // the tool result. Only the stage NAME and a BOUNDED view of the payload's
+  // host list are recorded — never `invitationSecret`, the claim's verification
+  // code, or any token (those are exactly what the sanitization contract
+  // forbids), and never an unbounded join of 32 maximum-length hosts.
   const report = (stage: string): void => {
     console.info(
-      `[cherry-remote] pairing stage ${stage} (hosts: ${payload.candidates.map((candidate) => candidate.host).join(', ')})`,
+      `[cherry-remote] pairing stage ${stage} (hosts: ${stageHosts(payload.candidates.map((candidate) => candidate.host))})`,
     )
     onStatus(stage)
   }
