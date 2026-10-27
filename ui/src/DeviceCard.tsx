@@ -42,6 +42,11 @@ function parseHosts(raw: string): string[] {
     .filter((entry) => entry !== '')
 }
 
+/** The dial port for one host: its own stored port, else the record-level one. */
+function dialPort(device: DeviceSummary, host: string): number {
+  return device.ports?.[host] ?? device.port
+}
+
 export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProps): ReturnType<typeof Object> {
   const t = useT()
   const [editor, setEditor] = useState<Editor>('none')
@@ -141,6 +146,13 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     })
   }
 
+  // The record-level `port` alone would claim every host dials it, which is
+  // false for a record whose map disagrees. `mixedPorts` decides whether the
+  // card has anything to say beyond that single number; `addressList` is the
+  // per-host truth (map value, record port as the fallback).
+  const mixedPorts = device.hosts.some((host) => dialPort(device, host) !== device.port)
+  const addressList = device.hosts.map((host) => `${host}:${dialPort(device, host)}`).join(', ')
+
   // `?? state` keeps an unknown future state transparent — the enum is the only
   // honest thing left to show for one this build has no copy for — while every
   // state it DOES know renders through the dictionary.
@@ -183,9 +195,17 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
         <dd>{device.hosts.join(', ')}</dd>
         <dt>{t('device.field.port')}</dt>
         <dd>{device.port}</dd>
+        {mixedPorts && (
+          <>
+            <dt>{t('device.field.ports')}</dt>
+            <dd className="cherry-mono">{addressList}</dd>
+          </>
+        )}
         <dt>{t('device.field.id')}</dt>
         <dd className="cherry-mono">{device.deviceId}</dd>
       </dl>
+
+      {mixedPorts && <p className="cherry-hint">{t('device.ports.hint')}</p>}
 
       {editor === 'rename' && (
         <form className="cherry-inline-form" onSubmit={saveName}>
@@ -210,6 +230,9 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
             onChange={(event: ChangeEvent<HTMLInputElement>) => setHostsText(event.target.value)}
           />
           <span className="cherry-hint">{t('device.hosts.hint')}</span>
+          <span className="cherry-hint">
+            {t('device.ports.current')} <span className="cherry-mono">{addressList}</span>
+          </span>
           <label htmlFor={`port-${device.deviceId}`}>{t('device.field.port')}</label>
           <input
             id={`port-${device.deviceId}`}
@@ -217,6 +240,7 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
             value={portText}
             onChange={(event: ChangeEvent<HTMLInputElement>) => setPortText(event.target.value)}
           />
+          <span className="cherry-hint">{t('device.port.hint')}</span>
           <button type="submit" disabled={busy}>
             {t('device.save.addresses')}
           </button>

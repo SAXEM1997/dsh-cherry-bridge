@@ -173,6 +173,9 @@ const DEVICE = {
   enabled: true,
   hosts: ['192.168.1.10'],
   port: 4343,
+  // Uniform on purpose: every host dials the record port, so the per-address
+  // row stays hidden and every existing card assertion renders the same tree.
+  ports: { '192.168.1.10': 4343 },
 }
 
 type AppProps = ComponentProps<typeof App>
@@ -697,6 +700,89 @@ describe('device card actions', () => {
     await waitFor(() => {
       expect(screen.queryByText(DEVICE.displayName)).toBeNull()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ②b Per-host dial ports — READ-ONLY, and one port field still re-points every
+// host when (and only when) its value CHANGES.
+// ---------------------------------------------------------------------------
+
+describe('device card per-host ports', () => {
+  /**
+   * The record whose hosts disagree: `a.local` keeps the record port and
+   * `b.local` dials another one, which is exactly what the record-level `port`
+   * alone cannot show an operator.
+   */
+  const mixed: DeviceSummary = {
+    deviceId: 'dev-ports',
+    displayName: '混合端口设备',
+    state: 'offline',
+    enabled: true,
+    hosts: ['a.local', 'b.local'],
+    port: 65001,
+    ports: { 'a.local': 65001, 'b.local': 65002 },
+  }
+
+  const mixedHint = '各候选地址使用不同端口；在「地址维护」里改动端口会把所有候选地址改为同一端口。'
+
+  /**
+   * Renders the page for ONE record, the same opening move as the status-light
+   * tests above (which is why the assertion style is repeated rather than a new
+   * harness invented): the PATCH answer echoes the record it was handed.
+   */
+  async function renderRecord(device: DeviceSummary): Promise<Harness> {
+    const harness = installFetch([
+      ['GET', '/cherry-remote/api/devices', jsonResponse(200, [device])],
+      ['PATCH', `/cherry-remote/api/devices/${device.deviceId}`, jsonResponse(200, device)],
+    ])
+    render(createElement(App, { eventSourceFactory: harness.eventSourceFactory }))
+    stream().emit({ event: 'device-state', data: { deviceId: device.deviceId, state: device.state } })
+    await screen.findByText(device.displayName)
+    return harness
+  }
+
+  it('①a shows every candidate address port and says the ports differ', async () => {
+    await renderRecord(mixed)
+
+    expect(screen.getByText('每地址端口')).toBeTruthy()
+    expect(screen.getByText('a.local:65001, b.local:65002')).toBeTruthy()
+    expect(screen.getByText(mixedHint)).toBeTruthy()
+  })
+
+  it('①b hides the per-address row and the hint when every host dials the record port', async () => {
+    await renderRecord({ ...mixed, ports: { 'a.local': 65001, 'b.local': 65001 } })
+
+    expect(screen.queryByText('每地址端口')).toBeNull()
+    expect(screen.queryByText(mixedHint)).toBeNull()
+  })
+
+  it('①c falls back to the record port for a host the map does not carry', async () => {
+    await renderRecord({ ...mixed, ports: { 'a.local': 65002 } })
+
+    expect(screen.getByText('a.local:65002, b.local:65001')).toBeTruthy()
+  })
+
+  it('①d shows the current map in the editor, and an unchanged port keeps the map', async () => {
+    // The field is a re-point control, not a per-host editor: saving the value
+    // the record already holds is the documented map no-op, so the PATCH body
+    // still carries the address list plus that one port — never `ports`.
+    const harness = await renderRecord(mixed)
+
+    fireEvent.click(screen.getByRole('button', { name: '地址维护' }))
+    const form = screen.getByLabelText('端口').closest('form')
+    expect(form).not.toBeNull()
+    expect(within(form as HTMLElement).getByText('当前端口映射：')).toBeTruthy()
+    expect(within(form as HTMLElement).getByText('a.local:65001, b.local:65002')).toBeTruthy()
+    expect(within(form as HTMLElement).getByText(/保持当前值/)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存地址' }))
+
+    await waitFor(() => {
+      expect(harness.calls.some((call) => call.method === 'PATCH')).toBe(true)
+    })
+    const patch = harness.calls.find((call) => call.method === 'PATCH')
+    expect(patch?.body).toEqual({ hosts: ['a.local', 'b.local'], port: 65001 })
   })
 })
 
