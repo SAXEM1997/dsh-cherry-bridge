@@ -326,13 +326,16 @@ describe('DeviceStore v2 → v3 migration (issue #126)', () => {
 
   it('rejects a security entry naming a host the record does not list', async () => {
     const file = await makeStoreFile()
-    // `security` is keyed by host: an entry for a host the record no longer
-    // lists is unreachable, and keeping it would re-arm a scheme the operator
-    // replaced. The read path rejects rather than "cleaning it up" in memory,
-    // so the archive a human edits is the archive the store judges.
-    await writeArchive(file, [makeRecord({ security: { '10.0.0.5': 'ws', '10.9.9.9': 'wss' } })])
+    // A COMPLETE map (every listed host, so the missing-host rule is satisfied)
+    // plus one stale entry: keyed-by-host means that entry would never be
+    // consulted, and keeping it would re-arm a scheme the operator replaced.
+    // The read path rejects rather than "cleaning it up" in memory, so the
+    // archive a human edits is the archive the store judges.
+    await writeArchive(file, [
+      makeRecord({ security: { '10.0.0.5': 'ws', '10.0.0.6': 'ws', '10.9.9.9': 'wss' } }),
+    ])
 
-    expect(() => new DeviceStore(file).list()).toThrow(/security/)
+    expect(() => new DeviceStore(file).list()).toThrow(/10\.9\.9\.9/)
   })
 })
 
