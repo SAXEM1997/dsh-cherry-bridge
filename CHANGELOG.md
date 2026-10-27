@@ -14,6 +14,201 @@ one whose protocol packages this project pins. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.2.0 (2026-10-27)
+
+Alignment with desktop **2.1.8**. The protocol pins move to `0.7.0` / `0.2.5` —
+the versions 2.1.8 ships — which brings custom-address (`v3`) pairing
+invitations, paged message summaries behind the hello capability, and a `wss`
+desktop that is now pairable **and** re-connectable. Verified against desktop
+**2.1.4 – 2.1.8**: the `v3` QR needs 2.1.8+, the `v2` QR keeps working from
+2.1.4. A 2.1.4 – 2.1.7 desktop keeps working exactly as before: the new
+capabilities are gated on what the peer advertises (paged summaries) or on a
+`v3` QR only 2.1.8 can mint. The tool face is unchanged — still 14 `cherry_*`
+tools with the same input schemas — everything below is transport, pairing,
+durability and rendering.
+
+Two one-way doors travel with this release; both are stated first.
+
+### Upgrade notes
+
+- **The device archive migrates itself on first read.** `2→3` adds the per-host
+  `security` map, `3→4` the per-host `ports` map; the file is rewritten at
+  `schemaVersion` 4 in one atomic write and every paired device keeps working —
+  no re-pairing, no manual step.
+- **A downgrade to 0.1.x loses the device list.** 0.1.11 reads at most
+  `schemaVersion` 2 and refuses a newer archive (`device archive declares
+  schemaVersion 4, newer than supported 2; refusing to read it`), so every
+  device tool fails until `devices.json` is moved aside — and then each desktop
+  must be paired again. Copy `<dataDir>/devices.json` before downgrading.
+- **A `wss` desktop behind a private CA needs `wsTls`.** The SCHEME is
+  persisted with the device; the TRUST deliberately is not, because a
+  certificate in an archive is a certificate in every backup of that archive.
+  Without `wsTls` a self-signed TLS front fails the handshake exactly as it did
+  in 0.1.11 — now tagged `websocket:` before the upgrade and `channel:` after
+  it, so the failure says which half broke.
+
+### Added
+
+- **A custom-address pairing invitation (`v3` QR) is accepted** (#124,
+  PR #125). Pairing now consumes the published `pairingQrSchema` as a `v2` |
+  `v3` union instead of hand-rolling field checks. A 2.1.8 desktop can mint an
+  invitation that names its own host, port and scheme per endpoint (up to 32
+  candidates), and the walk dials each one — `ws` for a plain address, `wss`
+  for a TLS front. `v2` payloads (auto-detected addresses) keep their exact
+  error face, host normalization and redaction. `@libp2p/peer-id` joins the
+  dependencies (pinned `6.0.15`, the transport's own version) for the pin
+  decode below.
+- **Paged message summaries are adopted behind the hello capability** (#105,
+  PR #129). When a connection's hello advertises
+  `agentMessageSummariesVersion: 1`, `cherry_read` and the
+  terminal/timeout/idle wait send `partsMode: 'paged'` and enumerate parts
+  through `agent.parts.list`; message rows stay metadata instead of carrying
+  their `partIds`, which is what made a large row collide with the peer's
+  per-item byte budget. The dialect is decided in ONE helper both walks go
+  through, never sent to a peer that did not advertise it, and re-decided on
+  every reconnect (the hello is re-negotiated). The byte-safe page clamp is
+  relaxed for that peer, never removed: a count-paged desktop still gets the
+  16-item page, a summary peer a full 100-item page. `GET …/diagnostics` gained
+  a top-level `messageSummaries` field — present only while a live connection
+  reported it — so one `curl` answers "does this desktop speak summaries?"
+  without a packet capture.
+- **A permanent peer refusal explains the recovery it cannot offer** (#105,
+  PR #129). `RESOURCE_EXHAUSTED` carrying `details.retryable: false` now
+  extends the message with the two opposite pieces of advice it needs:
+  `ITEM_TOO_LARGE` means the item itself is past the peer's 62,279-byte
+  per-item budget, so no page size and no request shape can fetch it (nor the
+  items behind it — upstream #21951), while any other permanent shape says to
+  ask for fewer items per page. The reason, the `data` and the error identity
+  stay the peer's.
+- **`wsTls`: operator TLS trust for `wss` dials** (#133, PR #137). Flat
+  `tls.connect` options — `rejectUnauthorized` and `ca` only — applied to BOTH
+  dial sites (pairing and the reconnect pool). Never written to the device
+  archive, never logged, never in diagnostics. All-or-nothing: an unknown key
+  or an unusable value warns by name and falls back to Node's default trust
+  store, with no partial application. `ca` is PEM CONTENT (the certificate
+  text), not a path. Both READMEs gained the config row.
+- **Per-host dial ports are visible in the settings page** (#140, PR #145).
+  When a record's `ports` map disagrees with its record-level `port`, the
+  device card shows a read-only `host:port` list (IPv6 literals bracketed for
+  display) plus a hint, so an operator can see that a host dials somewhere
+  other than the single number the record advertises. Per-host EDITING stays
+  out: the card keeps one port field, and changing it re-points every host.
+
+### Fixed
+
+- **A `wss`-paired desktop reconnects over `wss`** (#126, PR #132). The pairing
+  dial honoured the endpoint's own scheme while the steady-state reconnect
+  rebuilt a plain `ws://` URL: such a device paired, worked for one session,
+  then failed every reconnect. The record now carries `security` per host
+  (`schemaVersion` 3), and both dial sites build their URL through the same
+  `directEndpointUrl` helper.
+- **A multi-endpoint `v3` record reconnects each host on ITS OWN port** (#135,
+  PR #138). The record kept one `port` — the winner candidate's — beside a
+  per-host scheme map, so a non-winner host dialled the right scheme at the
+  wrong port. `schemaVersion` 4 adds `ports: Record<host, number>`, backfilled
+  from `port` for every existing host. `GET …/devices` returns both maps, and a
+  PATCH derives them rather than accepting them: a host that survives a `hosts`
+  replacement keeps its own scheme and port, a CHANGED `port` re-points every
+  final host, and a re-sent unchanged `port` leaves a mixed map intact (which is
+  what the settings page does on every save). A PATCH whose `hosts` repeats a
+  host after normalization is refused — the maps are keyed by host, so a
+  duplicate has no single entry.
+- **The candidate dial walk has ONE aggregate budget** (#141, PR #146). Each
+  attempt was bounded (10 s), the walk was not: a schema-valid `v3` invitation
+  admits 32 endpoints, so an unreachable one could spend 320 s before
+  `unreachable`, outliving the 120 s invitation it was trying to claim. The
+  walk now derives a 30 s budget once (never above the poll timeout), stops
+  when it expires, names what it skipped (`not attempted (the 30000 ms dial
+  budget was exhausted before this candidate)`), and clamps the last attempt so
+  it cannot overshoot. The per-attempt `connectTimeoutMs` is unchanged: a slow
+  LAN Noise handshake is real.
+- **Every candidate failure names its kind** (#142, PR #149; #147, PR #151). A
+  failure used to reach the operator as a raw `Error.message`, dropping the
+  discriminator that decides the fix. There are now three kinds: `timeout:`
+  (the per-attempt timer won — check the network), `websocket:` (the socket
+  failed BEFORE the upgrade — check this address or its TLS, with the `ws`/OS
+  code appended when one exists, including a close frame's code), and
+  `channel:` (the upgrade completed and the CHANNEL failed — Noise handshake,
+  remote identity proof, protocol offer — so blaming the address would send the
+  operator to inspect something that demonstrably answered).
+- **The joined `unreachable` verdict is bounded** (#148, PR #154). One segment
+  per candidate with no cap reached roughly 17–18 KB for a pathological `v3`
+  QR (32 endpoints × long hosts, each host repeated inside its `ENOTFOUND`
+  text). A segment is now `<label>: <detail>`, at most 240 characters, so 32
+  candidates join to ≤ 7,742; every `host:port` stays identifiable, the label
+  is clipped in the HOST so the port survives, and a truncated detail carries
+  the shared `… (+N chars)` marker. No candidate is dropped — #141's contract is
+  that an unattempted candidate is NAMED.
+- **The progress line and the stage-failure text are bounded too** (#152,
+  PR #157). `report()` runs once per stage transition and joined every
+  candidate host: ~8 KB per stage for the same pathological QR. The host list
+  is now at most 160 characters of names, with the first host always shown and
+  an explicit `(+K more)` marker on top, and `asPairingError`'s
+  `pairing <stage> failed: …` — the one `unreachable` text that never passed
+  through the segment helper — is clipped through the same bound.
+- **A malformed `desktopIdentity` is refused at parse time** (#153, PR #158).
+  The schema accepts any 1..256-character string for the pin, so junk passed
+  validation, every candidate consumed a socket, and the verdict named a
+  multibase decoder. The pin is now decoded before any dial
+  (`peerIdFromString`), refused as `invalid-payload` naming the field, with
+  zero sockets opened and nothing persisted — the same rule the address checks
+  already follow: an invalid invitation must never consume itself.
+- **Peer- and payload-controlled text is bounded everywhere it is RENDERED**
+  (#155, PR #162; #161, PR #164). One module (`src/text.ts`) now owns the
+  bounded-rendering forms: `clipText` (fixed-point `… (+N chars)` marker),
+  `boundedJoin` (`(+K more)` count), `LOG_TEXT_MAX` = 240 for one detail, and
+  `failureText` for a caught failure — the message alone, clipped, and TOTAL: a
+  caught value whose `toString` or `message` getter throws yields
+  `<unrenderable failure>` instead of escaping the catch. What is bounded is
+  what a peer or an operator-supplied payload controls (pairing segments, the
+  unknown-key warning, the recovery session list, the two connection log lines,
+  the JSON-RPC notification line). The follow-up audit covered 27
+  `console.*(…, error)` sites — 7 converted to `failureText`, 20 kept as the
+  error OBJECT because they are purely local fan-out, where the stack is the
+  useful half — plus the sites an `error`-shaped grep misses (two
+  `reportError` catches and one `error.cause`, all local and now marked) and
+  one log line that interpolated a message unbounded. The rule and its
+  boundary (`deviceId` stays unclipped — the operator correlates on it; tool
+  RESULTS stay unbounded by product decision; `truncateErrorMessage` and
+  `bounded()` stay separate because their markers mean different things) are
+  written down in `src/AGENTS.md`.
+
+### Changed
+
+- **Protocol pins**: `@cherrystudio/remote-protocol` `0.5.0` → `0.7.0`,
+  `@cherrystudio/remote-transport` `0.2.1` → `0.2.5` (#124, PR #125). `zod`
+  stays `4.3.4` (0.7.0's peer is still `^4.3.4`); `json-canonicalize@3.0.1`
+  arrives transitively with the protocol package and is not a direct
+  dependency.
+- `src/urlHost.ts` is retired: both dial sites build their URL from one helper,
+  `directEndpointUrl` (#134, PR #136).
+- Repository hygiene: `.gitignore`'s scratch rule widens from `.scratch-*/` to
+  `.scratch-*`, so a scratch FILE can no longer ride into a commit (#139).
+
+### Docs
+
+- **Both READMEs state the desktop range** (#159): 2.1.4 – 2.1.8 tested, the
+  `v3` QR needs 2.1.8+, and outside that range the peer fails loudly as
+  `unreachable` because the handshake negotiates protocol version `[1]` only.
+  This file gained the `## Compatibility` preamble that makes the range a
+  standing part of every release section — the GitHub release bodies are these
+  sections verbatim.
+- **`AGENTS.md` is split into per-tree files** (#160, PR #163). The root keeps
+  the rules every session needs (flow, tests + mutation, commits, build facts,
+  release); the protocol basis and every design invariant moved to
+  `src/AGENTS.md`, the test shapes and numbering to `tests/AGENTS.md`, the
+  settings page's seams to `ui/AGENTS.md`. A nested file loads automatically
+  when a file tool touches its tree, so ~54 KB of invariants is no longer paid
+  on every turn — same content, same rules, relocated. (Just before it, #128,
+  PR #131 had pulled the single root file back under the 64 KiB instruction
+  budget, which is what the split then made durable.)
+- **The upstream research baseline moves to app v0.5.0** (#144, PR #150): it
+  sits on exactly our pins, so there is no new capability to track at desktop
+  2.1.8, and the "retries forever" claim is corrected (the app honours
+  `details.retryable: false`).
+- **The e2e checklist's verified range moves to 2.1.8** (#127, PR #130), and its
+  "Protocol basis" pointer now targets `src/AGENTS.md`.
+
 ## v0.1.11 (2026-10-23)
 
 Receipt recovery for all three command tools, and a legacy attachment face.
