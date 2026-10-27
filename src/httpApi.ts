@@ -1258,7 +1258,7 @@ function deviceById(deps: CherryHttpDeps, deviceId: string): DeviceRecord {
   const found = deps.store.list().find((device) => device.deviceId === deviceId)
   if (found !== undefined) return found
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     deviceId,
     displayName: '',
     hosts: [],

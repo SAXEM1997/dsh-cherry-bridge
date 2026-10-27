@@ -50,7 +50,6 @@ function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
   return { ...merged, security: overrides.security ?? wsSecurity(hosts) }
 }
 
-
 describe('final review: digestIdentity on an absent identity', () => {
   it('R10: the empty identity reports `unknown` instead of a plausible digest', () => {
     // 12 hex chars is the digest's own shape, so the digest of `''` is

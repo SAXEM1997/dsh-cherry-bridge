@@ -68,16 +68,22 @@ export interface DeviceConnectionOptions {
   identity: Uint8Array
   /**
    * The paired device record; `hosts`/`security`/`port` are re-read on every
-   * attempt (a record migrated from schemaVersion 2 has no `security` yet, and
-   * every host then dials `ws`).
+   * attempt. `security` is REQUIRED by schemaVersion 3 and the v2 migration
+   * backfills an explicit `ws`, so the `?.` in the dial guards an in-memory
+   * record assembled without the map (or constructed before validation), not a
+   * migrated one.
    */
   record: DeviceRecord
   /**
-   * Options for every dial's `WebSocket` (issue #126) — in practice `tls`/
-   * `ca`, for a desktop behind a TLS proxy whose certificate is not in Node's
-   * default trust store. Absent means Node's defaults. Injected by the
-   * assembly, never derived from the record (a certificate is trust the
-   * OPERATOR grants, not a fact the desktop asserts about itself).
+   * Options for every dial's `WebSocket` (issue #126) — in practice
+   * `rejectUnauthorized`/`ca`, for a desktop behind a TLS proxy whose
+   * certificate is not in Node's default trust store. Absent means Node's
+   * defaults. Never derived from the record: a certificate is trust the
+   * OPERATOR grants, not a fact the desktop asserts about itself.
+   *
+   * TODAY ONLY TESTS PASS IT — the assembly does not inject it yet; the config
+   * surface that would let a private-CA deployment set it is separate work
+   * (issue #133).
    */
   wsOptions?: WsDialOptions
   /**
@@ -140,7 +146,6 @@ export interface DeviceConnectionOptions {
  * this one seam, and a symbol is the narrowest one that can be found.
  */
 export const CHANNEL_SEAM: unique symbol = Symbol('dsh-cherry-bridge.channel')
-
 
 /**
  * The structured §6 "设备离线" error: tool calls against a non-connected

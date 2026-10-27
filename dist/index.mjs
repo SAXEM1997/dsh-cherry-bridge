@@ -19,9 +19,17 @@ const FILE_MODE = 384;
 * plain dial v2 always used. An archive that already carries SOME entries
 * (a half-migrated file, or one a newer build wrote) keeps them: a scheme the
 * record remembers is never overwritten by the default, because that would
-* downgrade a TLS-proxied desktop to a dial that cannot connect. The map is
-* narrowed to the CURRENT host list; `assertValidRecord` is the backstop for
-* the key-set rule, so this step only has to fill, never clean up.
+* downgrade a TLS-proxied desktop to a dial that cannot connect.
+*
+* **v2 is read loosely, v3 strictly — deliberately.** This step fills the map
+* for the CURRENT host list and nothing else: an entry naming a host v2 no
+* longer lists is silently DROPPED (it was unreachable anyway), a non-object
+* `security` degrades to "every host on `ws`", and a junk scheme VALUE is not
+* repaired here at all — the migrated entry then re-enters the read path as a
+* v3 record and `assertValidSecurity` rejects the whole archive. That split is
+* the point: a v2 file is a supported legacy shape and is normalised into one,
+* while a v3 file is this build's own output and any deviation from it is a
+* hand edit worth failing loudly on.
 */
 const MIGRATIONS = {
 	1: (record) => ({
@@ -40,21 +48,35 @@ function backfilledSecurity(disk) {
 	return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? "ws"]));
 }
 /**
-* Every field of the *current* set except `schemaVersion` — v1 is defined as
-* the current field set minus the version key, so these are exactly the keys a
-* complete v1 archive must carry.
+* The field set of a v1 entry: what the store wrote before it carried a
+* version at all.
+*
+* FROZEN. It must not track the current record — a v1 archive predates every
+* later field, so demanding one here (as `'security'` was, briefly) fails the
+* completeness gate on an archive that is perfectly intact and quarantines it
+* instead of migrating it. Later fields are the migration chain's business
+* (`backfilledSecurity` supplies `security` from v2 onward).
 */
 const V1_KEYS = [
 	"deviceId",
 	"displayName",
 	"hosts",
 	"port",
-	"security",
 	"desktopIdentity",
 	"grants",
 	"enabled"
 ];
-const REQUIRED_KEYS = [...V1_KEYS, "schemaVersion"];
+/**
+* Every field of the CURRENT set plus `schemaVersion`. Unlike {@link V1_KEYS}
+* this is not a historical snapshot: it grows with the record, and it is what
+* `upsert` and the post-migration exit demand (which is why a v3 entry without
+* `security` never reaches `assertValidSecurity`).
+*/
+const REQUIRED_KEYS = [
+	...V1_KEYS,
+	"security",
+	"schemaVersion"
+];
 /**
 * A version-less entry reads as the legacy (v1) shape only when every v1 field
 * is present. A missing `schemaVersion` alone means v1; a missing
@@ -11045,7 +11067,7 @@ function deviceById(deps, deviceId) {
 	const found = deps.store.list().find((device) => device.deviceId === deviceId);
 	if (found !== void 0) return found;
 	return {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		deviceId,
 		displayName: "",
 		hosts: [],

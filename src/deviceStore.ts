@@ -124,9 +124,17 @@ type Migration = (record: DeviceRecordOnDisk) => DeviceRecordOnDisk
  * plain dial v2 always used. An archive that already carries SOME entries
  * (a half-migrated file, or one a newer build wrote) keeps them: a scheme the
  * record remembers is never overwritten by the default, because that would
- * downgrade a TLS-proxied desktop to a dial that cannot connect. The map is
- * narrowed to the CURRENT host list; `assertValidRecord` is the backstop for
- * the key-set rule, so this step only has to fill, never clean up.
+ * downgrade a TLS-proxied desktop to a dial that cannot connect.
+ *
+ * **v2 is read loosely, v3 strictly — deliberately.** This step fills the map
+ * for the CURRENT host list and nothing else: an entry naming a host v2 no
+ * longer lists is silently DROPPED (it was unreachable anyway), a non-object
+ * `security` degrades to "every host on `ws`", and a junk scheme VALUE is not
+ * repaired here at all — the migrated entry then re-enters the read path as a
+ * v3 record and `assertValidSecurity` rejects the whole archive. That split is
+ * the point: a v2 file is a supported legacy shape and is normalised into one,
+ * while a v3 file is this build's own output and any deviation from it is a
+ * hand edit worth failing loudly on.
  */
 const MIGRATIONS: Record<number, Migration> = {
   1: (record) => ({ ...record, schemaVersion: 2 }),
@@ -142,22 +150,36 @@ function backfilledSecurity(
 }
 
 /**
- * Every field of the *current* set except `schemaVersion` — v1 is defined as
- * the current field set minus the version key, so these are exactly the keys a
- * complete v1 archive must carry.
+ * The field set of a v1 entry: what the store wrote before it carried a
+ * version at all.
+ *
+ * FROZEN. It must not track the current record — a v1 archive predates every
+ * later field, so demanding one here (as `'security'` was, briefly) fails the
+ * completeness gate on an archive that is perfectly intact and quarantines it
+ * instead of migrating it. Later fields are the migration chain's business
+ * (`backfilledSecurity` supplies `security` from v2 onward).
  */
 const V1_KEYS = [
   'deviceId',
   'displayName',
   'hosts',
   'port',
-  'security',
   'desktopIdentity',
   'grants',
   'enabled',
 ] as const satisfies readonly (keyof DeviceRecord)[]
 
-const REQUIRED_KEYS = [...V1_KEYS, 'schemaVersion'] as const satisfies readonly (keyof DeviceRecord)[]
+/**
+ * Every field of the CURRENT set plus `schemaVersion`. Unlike {@link V1_KEYS}
+ * this is not a historical snapshot: it grows with the record, and it is what
+ * `upsert` and the post-migration exit demand (which is why a v3 entry without
+ * `security` never reaches `assertValidSecurity`).
+ */
+const REQUIRED_KEYS = [
+  ...V1_KEYS,
+  'security',
+  'schemaVersion',
+] as const satisfies readonly (keyof DeviceRecord)[]
 
 /**
  * A version-less entry reads as the legacy (v1) shape only when every v1 field
@@ -210,10 +232,12 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
  * the offending HOSTS (they are addresses an operator chose, not secrets).
  */
 function assertValidSecurity(hosts: string[], security: unknown): void {
-  // A v2-shaped entry (a hand-edited v3 archive that forgot the map) has no
-  // `security` at all: it reads as "every host on the plain dial", the one
-  // scheme a scheme-less record could ever have meant. A map that IS present
-  // is judged strictly — absence is the old shape, a wrong map is a mistake.
+  // NOT reached with `undefined` through the store: `REQUIRED_KEYS` rejects a
+  // missing `security` before this runs (a v3 archive is written by this build,
+  // so an absent map there is breakage, not a legacy shape). The arm exists for
+  // the OTHER entry point — `upsert`, which callers may reach with an
+  // in-memory record assembled by hand — and for the length of time a record
+  // exists between construction and its first validation.
   if (security === undefined) return
   if (security === null || typeof security !== 'object' || Array.isArray(security)) {
     throw new Error('device archive entry field security must be an object keyed by host')

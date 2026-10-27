@@ -294,7 +294,6 @@ function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
   return { ...merged, security: overrides.security ?? wsSecurity(hosts) }
 }
 
-
 function fakeConnection(initial: DeviceState = 'connected') {
   let state = initial
   const listeners = new Set<(state: DeviceState) => void>()

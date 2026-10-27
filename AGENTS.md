@@ -750,8 +750,8 @@ meaning "dial `ws`". Both dial sites build their URL with the protocol's
 A v2 archive migrates on read (backfill `ws`) and is rewritten through the
 ordinary atomic persist; a lost scheme would downgrade a TLS proxy to a dial
 that can never connect, and an edit that re-types a host keeps its scheme
-(`securityFor`). `cherry_devices`, `GET /devices` and diagnostics report the
-map; it is an address, not a credential.
+(`securityFor`). `GET /devices` reports the map; it is an address, not a
+credential — `cherry_devices` and the diagnostics report do not carry it yet.
 
 ### Device selector
 
