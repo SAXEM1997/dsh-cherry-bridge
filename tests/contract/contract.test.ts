@@ -245,11 +245,12 @@ async function makeRig(options: RigOptions = {}): Promise<Rig> {
   const desktop = await makeFake(options)
   const store = new DeviceStore(join(tempDir('cherry-contract-'), 'devices.json'))
   store.upsert({
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId: 'dev-A',
     displayName: 'Desk Alpha',
     hosts: [desktop.host],
     security: { [desktop.host]: 'ws' },
+    ports: { [desktop.host]: desktop.port },
     port: desktop.port,
     desktopIdentity: desktop.desktopIdentity,
     grants: ['agent'],
@@ -726,11 +727,12 @@ describe('③ diagnostics output is sanitized', () => {
   it('builds a live report from the pool surfaces with no credential anywhere in it', () => {
     const store = new DeviceStore(join(tempDir('cherry-diag-'), 'devices.json'))
     store.upsert({
-      schemaVersion: 3,
+      schemaVersion: 4,
       deviceId: 'dev-1',
       displayName: 'Desk Alpha',
       hosts: ['127.0.0.1'],
       security: { ['127.0.0.1']: 'ws' },
+      ports: { ['127.0.0.1']: 8765 },
       port: 8765,
       desktopIdentity: 'desktop-abc',
       grants: ['agent'],
@@ -805,11 +807,12 @@ describe('③ diagnostics output is sanitized', () => {
   it('emits the hello-negotiated limits per device when a connection reports them (minor 3)', () => {
     const store = new DeviceStore(join(tempDir('cherry-diag-limits-'), 'devices.json'))
     store.upsert({
-      schemaVersion: 3,
+      schemaVersion: 4,
       deviceId: 'dev-1',
       displayName: 'Desk Alpha',
       hosts: ['127.0.0.1'],
       security: { ['127.0.0.1']: 'ws' },
+      ports: { ['127.0.0.1']: 8765 },
       port: 8765,
       desktopIdentity: 'desktop-abc',
       grants: ['agent'],
@@ -1244,11 +1247,12 @@ describe('② GET /diagnostics', () => {
     const mounted = mountHttpApi()
     try {
       mounted.store.upsert({
-        schemaVersion: 3,
+        schemaVersion: 4,
         deviceId: 'dev-1',
         displayName: 'Desk Alpha',
         hosts: ['192.168.1.20'],
         security: { ['192.168.1.20']: 'ws' },
+        ports: { ['192.168.1.20']: 8765 },
         port: 8765,
         desktopIdentity: 'desktop-raw-pin',
         grants: ['agent'],
@@ -1301,11 +1305,12 @@ describe('② GET /diagnostics', () => {
     })
     try {
       mounted.store.upsert({
-        schemaVersion: 3,
+        schemaVersion: 4,
         deviceId: 'dev-1',
         displayName: 'Desk Alpha',
         hosts: ['192.168.1.20'],
         security: { ['192.168.1.20']: 'ws' },
+        ports: { ['192.168.1.20']: 8765 },
         port: 8765,
         desktopIdentity: 'desktop-raw-pin',
         grants: ['agent'],
@@ -1912,11 +1917,12 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     try {
       const store = new DeviceStore(join(dir, 'devices.json'))
       store.upsert({
-        schemaVersion: 3,
+        schemaVersion: 4,
         deviceId: 'dev-1',
         displayName: 'Desk Alpha',
         hosts: ['127.0.0.1'],
         security: { ['127.0.0.1']: 'ws' },
+        ports: { ['127.0.0.1']: 1111 },
         port: 1111,
         desktopIdentity: 'assembly-raw-pin',
         grants: ['agent'],
@@ -2084,11 +2090,12 @@ async function waitForDeviceState(
 /** One `wss` record pointing at the dual peer's TLS door. */
 function seedWssDevice(dataDir: string, peer: DualPeer): void {
   new DeviceStore(join(dataDir, 'devices.json')).upsert({
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId: 'dev-wss',
     displayName: 'TLS Desk',
     hosts: [TLS_HOST],
     security: { [TLS_HOST]: 'wss' },
+    ports: { [TLS_HOST]: peer.tlsPort },
     port: peer.tlsPort,
     desktopIdentity: peer.desktopIdentity,
     grants: ['agent'],
@@ -2347,6 +2354,7 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
       expect(record.hosts).toEqual([TLS_HOST])
       expect(record.security).toEqual({ [TLS_HOST]: 'wss' })
       expect(record.port).toBe(peer.tlsPort)
+      expect(record.ports).toEqual({ [TLS_HOST]: peer.tlsPort })
       // The pairing dial itself reached the desktop through the TLS front.
       expect(peer.desktopConnections()).toBe(1)
     } finally {

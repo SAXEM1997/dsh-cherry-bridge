@@ -43,17 +43,16 @@ are process records, and they stay in `docs/superpowers/**` (not published).
 - **The READMEs are a pair.** `README.md` (简体中文) and `README.en.md` (English)
   are expected to say the same thing; an edit to one is an edit to both.
 - **AGENTS.md lives under a byte budget.** The workspace-instruction budget is
-  65,536 bytes, and the harness **silently truncates the tail** past what fits
-  — observed when this file stood past the budget: rules at the file's end
-  vanished from context. Keep the file
+  65,536 bytes; the harness **silently truncates the tail** past it — observed
+  here: rules at the file's end vanished from context. Keep the file
   **≤ 64,512 bytes** (64 KiB − 1 KiB safety; check `wc -c AGENTS.md`); an
   addition needs a compensating trim in the same change.
 - **Every promise a test starts settles INSIDE the test.** A request or
-  `connect()` nobody awaits still holds its caller for `DEFAULT_TIMEOUT_MS`
-  when the answer never comes; `void ... .catch(() => {})` hides that, and the
-  next afterEach that awaits it turns it into a stalled suite.
-  Produce the settlement (usually `close()`) and **assert** the verdict — issue
-  #43 is the two sites that were masked this way.
+  `connect()` nobody awaits still holds its caller for `DEFAULT_TIMEOUT_MS` when
+  the answer never comes; `void ... .catch(() => {})` hides that, and the next
+  afterEach that awaits it turns it into a stalled suite. Produce the settlement
+  (usually `close()`) and **assert** the verdict — issue #43 is the two masked
+  sites.
 - **Commit messages** are English, imperative, `type(scope): summary` —
   `fix(tools):`, `feat(scope):`, `test(connection):`, `docs:`, `chore(release):`.
   The body explains the failure mode that motivated the change and the
@@ -84,29 +83,29 @@ their keys (there is a contract assertion for exactly that).
 | `dist/index.mjs`, `dist/index.d.mts` | tsdown (`tsdown.config.ts`) | `npm run build` |
 | `lib/client.js` (settings-page web bundle) | vite (`ui/vite.config.ts`) | `npm run build:client` |
 
-- **tsdown preserves JSDoc into `dist/index.mjs`.** Therefore a change that
-  only touches `src/**` **comments** still changes the artifact bytes. If you
-  edit an exported declaration's doc comment, rebuild `dist` in the same commit
-  — `tests/unit/artifactFreshness.test.ts` rebuilds into a temp dir and compares
-  **byte for byte** against the committed files. A missing rebuild
-  is a red test, not a style nit.
+- **tsdown preserves JSDoc into `dist/index.mjs`.** A change that only touches
+  `src/**` **comments** still changes the artifact bytes; editing an exported
+  declaration's doc comment needs `dist` rebuilt in the same commit —
+  `tests/unit/artifactFreshness.test.ts` rebuilds into a temp dir and compares
+  **byte for byte** against the committed files. A missing rebuild is a red
+  test, not a style nit.
 - **`prepublishOnly` vs `artifactFreshness` — two different gates.**
   - `prepublishOnly` =
-    `typecheck && test && build && build:client && npm pack --dry-run`: runs
-    the whole chain (both type projects, the full suite, both builds, and the
-    pack check) on the publish path. It proves the tree *is* buildable.
+    `typecheck && test && build && build:client && npm pack --dry-run`: the
+    whole chain (both type projects, the full suite, both builds, the pack
+    check) on the publish path; it proves the tree *is* buildable.
   - `artifactFreshness` = rebuild from current source and byte-compare against
-    **what is committed**. It proves the committed artifacts were built from
-    this exact source — the gate that catches "changed source, forgot to
-    rebuild", including comment-only drift. It runs in the fast suite.
-  - The contract suite's "clean clone → pack" case is a third, coarser arm: it
-    clones without `node_modules` and asserts the three artifacts are already
-    present in the clone and inside the `npm pack --ignore-scripts` tarball.
-    It only sees *existence*, never bytes.
-- **There is deliberately no `prepare` hook.** `prepare` also runs on
-  `npm install`, where `--omit=dev` prunes devDependencies first — the hook then
-  dies (exit 127) looking for `tsdown`/`vite`. Committing the artifacts makes
-  git installs, `--omit=dev` and packing a bare clone work with zero build steps.
+    **what is committed** — the gate that catches "changed source, forgot to
+    rebuild", including comment-only drift. It proves the artifacts came from
+    this exact source and runs in the fast suite.
+  - The contract suite's "clean clone → pack" case is a third, coarser arm: a
+    clone without `node_modules` must already carry the three artifacts, and
+    the `npm pack --ignore-scripts` tarball must contain them. It sees
+    *existence*, never bytes.
+- **There is deliberately no `prepare` hook:** it also runs on `npm install`,
+  where `--omit=dev` prunes devDependencies first, so it dies (exit 127)
+  looking for `tsdown`/`vite`. Committing the artifacts makes git installs,
+  `--omit=dev` and packing a bare clone work with zero build steps.
 - **The publish surface** (`package.json` `files`): `lib`, `dist`, `src`, `ui`,
   `locale`, `docs/e2e-checklist.md`, `cordis.patch.yml`, `README.md`,
   `README.en.md`, `static`.
@@ -122,14 +121,14 @@ their keys (there is a contract assertion for exactly that).
     `dist/index.mjs`); `./client` → `lib/client.js`; `./locale/*.json`;
     `./package.json`.
 - **Runtime dependencies that are not dead weight:** `zod` is a **runtime**
-  dependency (the protocol package `import`s it everywhere in its own runtime
-  output; peer `^4.3.4`, pinned at `4.3.4`). `@cherrystudio/remote-protocol`
-  is external in `dist`, so zod is not bundled away.
+  dependency (the protocol package `import`s it in its runtime output; peer
+  `^4.3.4`, pinned `4.3.4`). `@cherrystudio/remote-protocol` is external in
+  `dist`, so zod is not bundled away.
 - **TypeScript is pinned `~7.0.2`** (patch digit only). Accepted risk:
   tsdown's dts output rides TS 7's experimental declaration API, which may move
-  across minors. The patch-only range means it cannot move silently; an upgrade
+  across minors; the patch-only range means it cannot move silently. An upgrade
   is an explicit `package.json` edit plus `npm run build` plus the full suite —
-  a bad upgrade shows up in the byte gate immediately, not downstream.
+  a bad one shows in the byte gate immediately, not downstream.
 
 ## Protocol basis
 
@@ -164,11 +163,11 @@ byte-safe clamps (`defaults.ts`: a 4-bytes-per-char worst case over the peer's
 4,096-char `INLINE_TEXT_LIMIT`, +2 KiB margin) fix it; the effective page size
 is `min(negotiated pageItems, clamp)`.
 
-**Upstream context (#21854, shipped in 2.1.8).** Upstream added a
-`PAGE_ITEM_BYTES` byte budget (62,279) to every paged `agent.*.list` face
-(`pageOf` truncates, `queryPage` re-queries a keyset page at a halved limit);
-an item that cannot fit raises `RESOURCE_EXHAUSTED`. No release through 2.1.7
-carries it, so deployed peers mostly page by count alone and the clamps stay.
+**Upstream context (#21854, shipped in 2.1.8).** A `PAGE_ITEM_BYTES` byte budget
+(62,279) was added to every paged `agent.*.list` face (`pageOf` truncates,
+`queryPage` re-queries a keyset page at a halved limit); an item that cannot fit
+raises `RESOURCE_EXHAUSTED`. No release through 2.1.7 carries it, so deployed
+peers mostly page by count alone and the clamps stay.
 
 Follow-up [`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951):
 an item above the budget **dead-ends the cursor** — it and everything behind it
@@ -378,12 +377,11 @@ part over 4,096 characters, so a hit is not a zero-RPC read.
 ### Wait answers: one absolute deadline
 
 The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
-timeout and idle faces) runs AFTER — or at the end of — the caller's wait
-window, so the window cannot bound it. It used to have no time bound at all:
-since #12 a read whose link dies waits up to `transportRetryWaitMs` (5 s) for a
-reconnect, so under a flapping link each of the walk's ~30 requests could
-absorb that wait — a 1 s window answering ~150 s later, the shape
-#3 fixed with a message ceiling and a byte budget (issue #21).
+timeout and idle faces) runs AFTER the caller's wait window, so the window
+cannot bound it. It once had no time bound at all: since #12 a read whose link
+dies waits up to `transportRetryWaitMs` (5 s), so under a flapping link each of
+~30 requests could absorb that wait — a 1 s window answering ~150 s later, the
+shape #3 fixed with a message ceiling and a byte budget (issue #21).
 
 - **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
   clamp(window, WAIT_ANSWER_TAIL_FLOOR_MS, WAIT_ANSWER_TAIL_MS)` — one more
@@ -473,9 +471,9 @@ Three `truncationReason` values mean different things:
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
 Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
-`limit`" was a field defect: a caller raised `limit` repeatedly, paid for every
-round trip, and still never saw the cut-off history. The second half was a
-marker with no consumer: the loss stated, nothing able to act on it.
+`limit`" was a field defect (a caller paid every round trip and still never saw
+the cut-off history), and a marker with no consumer states a loss nothing can
+act on.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -739,22 +737,27 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
 
-### Device archive: one scheme per host
+### Device archive: scheme+port per host
 
-`DeviceRecord` (schemaVersion 3) stores `security: Record<host, 'ws'|'wss'>`
-beside `hosts` — one scheme per candidate, every host exactly once, absent
-meaning "dial `ws`". Both dial sites build their URL with the protocol's
-`directEndpointUrl`, so a `wss`-paired desktop reconnects over `wss` (#126).
-A v2 archive migrates on read (backfill `ws`) and is rewritten through the
-ordinary atomic persist; a lost scheme would downgrade a TLS proxy to a dial
-that can never connect, and an edit that re-types a host keeps its scheme
-(`securityFor`). `GET /devices` reports the map; it is an address, not a
-credential — `cherry_devices` and the diagnostics report do not carry it yet.
-TLS trust is operator config (`wsTls`, FLAT `tls.connect` options — only
-`rejectUnauthorized` / `ca`), forwarded to BOTH dial sites (pool and pairing).
-`resolveBridgeConfig` validates it: an unknown key or unusable value warns by
-FIELD NAME and the WHOLE object is ignored (half-applied trust would reach some
-peers and not others). Never persisted, logged or reported — a `ca` is PEM text.
+`DeviceRecord` (v4) stores host-keyed `security` (`'ws'|'wss'`) and `ports`
+(`number`) maps — one each per candidate, every host once. A stored v4 record
+carries every entry (missing/unknown hosts, junk values rejected); the DIAL's
+`?.` fallback (`ws`/`port`) serves only an in-memory pre-validation record.
+`port` is the winner's at pairing, the operator's after a PATCH, and always the
+fallback. The steady-state dial uses `directEndpointUrl` + both maps (`??`):
+`wss`→`wss` (#126), non-winner host→own port (#135); pairing dials the QR
+candidate's own host/port/scheme, never the record. v2→v3 backfills `ws`,
+v3→v4 `ports` from `port`, atomic on read. Scheme loss breaks a TLS proxy;
+port loss dials the right scheme at the wrong port. Re-typing keeps scheme
+(`securityFor`)/port (`portsFor`); whole-replace `hosts` defaults new hosts to
+`ws`/port; a CHANGED `port` re-points EVERY final host, the current value a map
+no-op (the settings UI sends both on save). `GET /devices` reports both maps
+(addresses, not credentials); tools/diagnostics show only `port`.
+TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
+`ca` only), forwarded to both dial sites (pool, pairing). `resolveBridgeConfig`
+validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
+ignored (half-applied trust reaches some peers, not others). Never persisted,
+logged or reported; `ca` is PEM text.
 
 ### Device selector
 
@@ -769,10 +772,9 @@ selector, `cherry_pair` does not.
 
 ### Scope: hiding, not refusing
 
-- The 14 tools are decided **per workspace**, and the default is
-  `selected` + an empty list — **nobody** has them (fail-closed: a corrupt,
-  invalid or unreadable document lands on the stricter side; there is no
-  "unreadable → global" escape).
+- The 14 tools are decided **per workspace**; the default is `selected` + an
+  empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
+  document lands on the stricter side; no "unreadable → global" escape).
 - A save re-installs or releases the restriction layer for **every live agent**
   and takes effect on the **next turn** — no restart, no new session.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
@@ -886,17 +888,16 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 (4) `Origin` absent → **allow** (curl, not a cross-site page).
 
 - **A folded bind is normalized to an AUTHORITY.** `webStartup.host` is a bare
-  hostname, but every `trustedHosts` entry is parsed with
-  `new URL('http://' + entry)`, and an IPv6 literal MUST be bracketed there. So
-  an IPv6 `--host` is bracketed when folded (`fe80::1` → `[fe80::1]`) and a
-  value that is already bracketed is left alone (`[[fe80::2]]` would parse to
-  nothing). Without this an IPv6 LAN bind contributed no usable entry and only
-  loopback stayed reachable — fail-closed, but an availability gap (issue #9).
-  Zone-scoped literals (`fe80::1%eth0`, with or without the `%25` spelling) still
-  parse to nothing — this runtime rejects zone ids in an IPv6 literal outright —
-  and a browser sends no zone id at all. A bind carrying a PORT
+  hostname, but every `trustedHosts` entry is parsed with `new URL('http://' +
+  entry)`, where an IPv6 literal MUST be bracketed. So an IPv6 `--host` is
+  bracketed when folded (`fe80::1` → `[fe80::1]`) and an already-bracketed value
+  is left alone (`[[fe80::2]]` parses to nothing). Without this an IPv6 LAN bind
+  contributed no usable entry and only loopback stayed reachable — fail-closed,
+  but an availability gap (issue #9). Zone-scoped literals (`fe80::1%eth0`, with
+  or without `%25`) still parse to nothing — this runtime rejects zone ids in an
+  IPv6 literal — and a browser sends no zone id. A bind with a PORT
   (`example.com:8080`) is out of contract for `webStartup.host` and is dropped
-  rather than trusted, which is the fail-closed direction.
+  rather than trusted, the fail-closed direction.
 
 ## Upstream references
 
@@ -916,10 +917,9 @@ Neither reference lives in this repository.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.8** (plus post-2.1.8 commits on `main`).
-mDNS, protocol versions (`[1]`) and Noise saw **zero changes** there; pairing
-changed only by ADDING the v3 QR arm (below).
-Notable faces:
+**Verified desktop range: 2.1.4 → 2.1.8** (plus post-2.1.8 `main` commits).
+mDNS, protocol versions (`[1]`) and Noise saw **zero changes**; pairing only
+ADDED the v3 QR arm (below). Notable faces:
 
 | Upstream change | Impact |
 | --- | --- |
@@ -937,14 +937,13 @@ Notable faces:
 
 - Its `RemoteAgentError` marks `RATE_LIMITED`/`TOKEN_EXPIRED`/
   `RESOURCE_EXHAUSTED`/`CONNECTION_LOST` retryable and retries forever at the
-  same page size, so a `RESOURCE_EXHAUSTED` from the byte budget never
-  converges. Our answer is the byte-safe page **clamp**: never ask for a page
-  that cannot fit.
-- Its read path refuses a ref whose `byteLength` is unusable; we fall back to a
-  slice bound plus the cumulative arm.
+  same page size, so a byte-budget `RESOURCE_EXHAUSTED` never converges. Our
+  answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
+- Its read path refuses an unusable `byteLength`; we fall back to a slice bound
+  plus the cumulative arm.
 - Its read path never replays a read; we replay reads **once** (deliberate
   enhancement) while both sides keep commands receipt-recovered.
-- Its command journal backs command recovery — the reason our commands are
+- Its command journal backs command recovery, which is why our commands are
   never replayed; recovery is a caller retry with the original `commandId`.
 
 ## Release
@@ -959,15 +958,15 @@ attach the notes to the GitHub release.
 
 **Three release steps fail silently when skipped.**
 
-1. **Publish through staged publishing.** Direct `npm publish` is refused on
-   this account (`E403 … two-factor authentication … required`). The npm bundled
-   with Node 22 (10.x) has no `stage` subcommand, so stage with npm 11:
+1. **Publish through staged publishing.** Direct `npm publish` is refused here
+   (`E403 … two-factor authentication … required`); the npm bundled with Node 22
+   (10.x) has no `stage`, so use npm 11:
    `NPM_CONFIG_CACHE=/workspace/dsh/.superpowers/npm-cache npx npm@11 stage publish --registry=https://registry.npmjs.org/ --access public --tag latest`
    (add `--ignore-scripts` only when `prepublishOnly` just passed on this exact
    clean tree), then approve the printed stage id on npmjs.com →
    **Staged Packages**. `npm stage approve` answers `404 staged version … not
-   found` here (every token tried, incl. publish-capable and `--otp`), while
-   `GET /-/stage/<id>` returns 200 — so the web approval is the one that works.
+   found` here (every token tried, incl. `--otp`), while `GET /-/stage/<id>`
+   returns 200 — the web approval is the one that works.
    Check the result with
    `npm view dsh-cherry-bridge dist-tags`: an unapproved stage is silent.
    A first publish also leaves a public `0.0.0-stage` placeholder in

@@ -140,11 +140,12 @@ async function makeRig(
   const store = new DeviceStore(join(tmp, 'devices.json'))
 
   const record = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId: 'dev-A',
     displayName: 'Desk Alpha',
     hosts: [host],
     security: { [host]: 'ws' as const },
+    ports: { [host]: port },
     port,
     desktopIdentity,
     grants: ['agent'] as 'agent'[],

@@ -21,15 +21,23 @@ const FILE_MODE = 384;
 * record remembers is never overwritten by the default, because that would
 * downgrade a TLS-proxied desktop to a dial that cannot connect.
 *
-* **v2 is read loosely, v3 strictly — deliberately.** This step fills the map
-* for the CURRENT host list and nothing else: an entry naming a host v2 no
-* longer lists is silently DROPPED (it was unreachable anyway), a non-object
-* `security` degrades to "every host on `ws`", and a junk scheme VALUE is not
-* repaired here at all — the migrated entry then re-enters the read path as a
-* v3 record and `assertValidSecurity` rejects the whole archive. That split is
-* the point: a v2 file is a supported legacy shape and is normalised into one,
-* while a v3 file is this build's own output and any deviation from it is a
-* hand edit worth failing loudly on.
+* `{ 3 -> 4 }` (issue #135) adds the per-host `ports` map. v3 had `hosts` + one
+* shared `port` (the winner candidate's), so the step backfills `ports` from
+* `port` for every host — the only one v3 ever dialed. A half-migrated file
+* keeps the entries it already carries, for the same reason the scheme step
+* does: a remembered port is the address the pairing actually used, and
+* overwriting it would point the host at the winner's port again.
+*
+* **A legacy file is read loosely, this build's own output strictly —
+* deliberately.** Each step fills its map for the CURRENT host list and
+* nothing else: an entry naming a host the older file no longer lists is
+* silently DROPPED (it was unreachable anyway), a non-object `security`/`ports`
+* degrades to "every host on `ws`"/"every host at `port`", and a junk scheme or
+* port VALUE is not repaired here at all — the migrated entry then continues
+* down the chain and `assertValidSecurity`/`assertValidPorts` reject the whole
+* archive. That split is the point: a v2 or v3 file is a supported legacy shape
+* and is normalised into one, while a v4 file is this build's own output and
+* any deviation from it is a hand edit worth failing loudly on.
 */
 const MIGRATIONS = {
 	1: (record) => ({
@@ -40,12 +48,25 @@ const MIGRATIONS = {
 		...record,
 		schemaVersion: 3,
 		security: backfilledSecurity(record)
+	}),
+	3: (record) => ({
+		...record,
+		schemaVersion: 4,
+		ports: backfilledPorts(record)
 	})
 };
 /** Every host of a v2 record, defaulting anything it did not already say. */
 function backfilledSecurity(disk) {
+	const hosts = Array.isArray(disk.hosts) ? disk.hosts : [];
 	const existing = disk.security ?? {};
-	return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? "ws"]));
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(existing, host) ? existing[host] : "ws"]));
+}
+/** Every host of a v3 record, defaulting anything it did not already say. */
+function backfilledPorts(disk) {
+	const hosts = Array.isArray(disk.hosts) ? disk.hosts : [];
+	const existing = disk.ports ?? {};
+	const fallback = disk.port;
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(existing, host) ? existing[host] : fallback]));
 }
 /**
 * The field set of a v1 entry: what the store wrote before it carried a
@@ -55,7 +76,7 @@ function backfilledSecurity(disk) {
 * later field, so demanding one here (as `'security'` was, briefly) fails the
 * completeness gate on an archive that is perfectly intact and quarantines it
 * instead of migrating it. Later fields are the migration chain's business
-* (`backfilledSecurity` supplies `security` from v2 onward).
+* (`backfilledSecurity`/`backfilledPorts` supply `security`/`ports`).
 */
 const V1_KEYS = [
 	"deviceId",
@@ -69,12 +90,13 @@ const V1_KEYS = [
 /**
 * Every field of the CURRENT set plus `schemaVersion`. Unlike {@link V1_KEYS}
 * this is not a historical snapshot: it grows with the record, and it is what
-* `upsert` and the post-migration exit demand (which is why a v3 entry without
-* `security` never reaches `assertValidSecurity`).
+* `upsert` and the post-migration exit demand (which is why a v4 entry without
+* `security`/`ports` never reaches its own validator).
 */
 const REQUIRED_KEYS = [
 	...V1_KEYS,
 	"security",
+	"ports",
 	"schemaVersion"
 ];
 /**
@@ -88,11 +110,13 @@ function hasCompleteFieldSet(disk) {
 }
 /** Asserts the required `DeviceRecord` shape. The read path's exit. */
 function assertValidRecord(disk) {
-	if (disk.schemaVersion !== 3) throw new Error(`device archive entry has unsupported schemaVersion ${String(disk.schemaVersion)}; expected 3`);
+	if (disk.schemaVersion !== 4) throw new Error(`device archive entry has unsupported schemaVersion ${String(disk.schemaVersion)}; expected 4`);
 	const missing = REQUIRED_KEYS.filter((key) => disk[key] === void 0);
 	if (missing.length > 0) throw new Error(`device archive entry is missing required field(s): ${missing.join(", ")}`);
 	if (!Array.isArray(disk.hosts)) throw new Error("device archive entry field hosts must be an array");
+	if (typeof disk.port !== "number" || !Number.isInteger(disk.port) || disk.port < 1 || disk.port > 65535) throw new Error("device archive entry field port must be an integer in 1..65535");
 	assertValidSecurity(disk.hosts, disk.security);
+	assertValidPorts(disk.hosts, disk.ports);
 	if (disk.accessToken !== void 0 !== (disk.tokenExpiresAt !== void 0)) throw new Error("device archive entry must carry accessToken and tokenExpiresAt together or not at all");
 	return disk;
 }
@@ -119,6 +143,28 @@ function assertValidSecurity(hosts, security) {
 	}
 }
 /**
+* The `ports` map must be EXACTLY one entry per host, each an integer port.
+*
+* The same reasoning as {@link assertValidSecurity}: an entry for a host the
+* record no longer lists would never be consulted, and a missing one would
+* leave that host on the record-level (winner's) port — the exact failure the
+* map exists to prevent. Both are rejected rather than repaired. The
+* message names the offending HOST, never the value (a port is not a secret, but
+* echoing a junk value back from a hand-edited file adds nothing actionable).
+*/
+function assertValidPorts(hosts, ports) {
+	if (ports === void 0) return;
+	if (ports === null || typeof ports !== "object" || Array.isArray(ports)) throw new Error("device archive entry field ports must be an object keyed by host");
+	const map = ports;
+	const wanted = new Set(hosts);
+	const unknownHost = Object.keys(map).find((host) => !wanted.has(host));
+	if (unknownHost !== void 0) throw new Error(`device archive entry field ports names host "${unknownHost}", which is not in hosts`);
+	for (const host of hosts) {
+		const port = map[host];
+		if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`device archive entry field ports["${host}"] must be an integer in 1..65535`);
+	}
+}
+/**
 * Read path, fixed order: loose parse -> completeness gate -> version judgement
 * -> migration -> assert the required `DeviceRecord` type.
 *
@@ -141,7 +187,7 @@ function parseRecord(raw, archiveVersion) {
 	if (declared === void 0 && archiveVersion > 1) throw new Error(`device archive entry has no schemaVersion but its archive is schemaVersion ${archiveVersion}; legacy (v1) entries are only valid inside a schemaVersion-1 archive`);
 	if (declared !== void 0 && declared !== archiveVersion) throw new Error(`device archive entry declares schemaVersion ${declared} but its archive is schemaVersion ${archiveVersion}; the archive version is authoritative`);
 	let migrated = disk;
-	for (let step = archiveVersion; step < 3; step += 1) {
+	for (let step = archiveVersion; step < 4; step += 1) {
 		const migrate = MIGRATIONS[step];
 		if (migrate === void 0) throw new Error(`no migration registered from device archive schemaVersion ${step}`);
 		migrated = migrate(migrated);
@@ -152,7 +198,7 @@ function parseArchive(parsed) {
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("device archive must be a JSON object");
 	const archive = parsed;
 	if (typeof archive.schemaVersion !== "number") throw new Error("device archive is missing a numeric schemaVersion");
-	if (archive.schemaVersion > 3) throw new Error(`device archive declares schemaVersion ${archive.schemaVersion}, newer than supported 3; refusing to read it`);
+	if (archive.schemaVersion > 4) throw new Error(`device archive declares schemaVersion ${archive.schemaVersion}, newer than supported 4; refusing to read it`);
 	if (!Array.isArray(archive.devices)) throw new Error("device archive is missing a devices array");
 	const archiveVersion = archive.schemaVersion;
 	return {
@@ -162,7 +208,7 @@ function parseArchive(parsed) {
 }
 function serializeArchive(devices) {
 	return `${JSON.stringify({
-		schemaVersion: 3,
+		schemaVersion: 4,
 		devices
 	}, null, 2)}\n`;
 }
@@ -443,7 +489,7 @@ var DeviceStore = class {
 		}
 		const devices = archive === void 0 ? [] : archive.devices;
 		this.#devices = devices;
-		if (archive !== void 0 && archive.schemaVersion < 3) this.#persist(devices);
+		if (archive !== void 0 && archive.schemaVersion < 4) this.#persist(devices);
 		return devices;
 	}
 	#persist(devices) {
@@ -3096,6 +3142,12 @@ var DeviceConnection = class {
 	* network failures fall through to the next candidate — the §6
 	* 「候选地址全部不可达」 verdict only holds when EVERY host failed.
 	*
+	* Each candidate dials with ITS OWN port from `record.ports`; the record-level
+	* `port` (the winner's at pairing, the operator's after a PATCH) is the
+	* fallback for an in-memory record assembled without the map (issue #135).
+	* Before that, one port was shared by every host, so a reconnect to a
+	* non-winner host dialed the right scheme at the wrong port.
+	*
 	* "Per-host" covers the CHANNEL-LEVEL handshake failures as well as the dial:
 	* a socket that opens and then dies mid-handshake (the peer accepted the TCP
 	* connection and went away, a proxy reset it, the Noise exchange was cut) is a
@@ -3113,7 +3165,8 @@ var DeviceConnection = class {
 			if (!this.#running || epoch !== this.#epoch) throw new CancelledError();
 			let link;
 			try {
-				link = await this.#dial(host, this.record.port, epoch);
+				const port = this.record.ports?.[host] ?? this.record.port;
+				link = await this.#dial(host, port, epoch);
 			} catch (error) {
 				if (error instanceof IdentityMismatchError) throw error;
 				lastError = error instanceof Error ? error : new Error(String(error));
@@ -3683,6 +3736,12 @@ function parsePayload(payload) {
 		port: endpoint.port,
 		security: endpoint.security
 	}));
+	const seenHosts = /* @__PURE__ */ new Set();
+	for (const candidate of candidates) {
+		if (!Number.isInteger(candidate.port) || candidate.port < 1 || candidate.port > 65535) invalid(`payload endpoint "${candidate.host}": port must be an integer in 1..65535`);
+		if (seenHosts.has(candidate.host)) invalid(`payload endpoints must not repeat host "${candidate.host}"`);
+		seenHosts.add(candidate.host);
+	}
 	for (const field of [
 		"invitationId",
 		"invitationSecret",
@@ -3816,6 +3875,7 @@ async function pairWithPayload(opts) {
 	const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
 	report("connect");
 	const failures = [];
+	let approved;
 	for (const candidate of payload.candidates) {
 		const label = `${candidate.host}:${candidate.port}`;
 		let temp;
@@ -3826,17 +3886,18 @@ async function pairWithPayload(opts) {
 			continue;
 		}
 		try {
-			const record = await claimAndAwait(temp.client, payload, offered, opts, report, candidate);
+			approved = await claimAndAwait(temp.client, payload, offered, opts, report, candidate);
 			destroy(temp);
-			opts.store.upsert(record);
-			return record;
+			break;
 		} catch (error) {
 			destroy(temp);
 			if (error instanceof PairingError) throw error;
 			failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	throw new PairingError("unreachable", `no candidate address could complete pairing (${failures.join("; ")})`);
+	if (approved === void 0) throw new PairingError("unreachable", `no candidate address could complete pairing (${failures.join("; ")})`);
+	opts.store.upsert(approved);
+	return approved;
 }
 /**
 * The RPC half of one candidate: confirm the protocol, claim, present the code,
@@ -3891,16 +3952,18 @@ async function claimAndAwait(client, payload, protocolVersions, opts, onStatus, 
 * here would lose the 64-char truncation.
 *
 * The address projection: every candidate host is kept (the v2 record always
-* did, and reconnect re-walks them), and the persisted `port` is the one the
-* pairing actually completed on. The two only diverge for a MIXED-PORT v3
-* payload; the 2.1.8 generation side emits one endpoint per custom-address
+* did, and reconnect re-walks them), and `port` is the one the pairing actually
+* completed on — the WINNER's port, and the record-level fallback. A mixed-port
+* v3 payload is now persisted FAITHFULLY, per host, through `ports` (issue
+* #135): the 2.1.8 generation side emits one endpoint per custom-address
 * invitation (`ApiGatewayService.getRemoteEndpoint`:
-* `advertisedEndpoint ? [advertisedEndpoint] : …`), so every real v3 record is
-* faithful. `security` IS persisted (issue #126), one entry per host, taken
-* from the very candidates the walk dialed — so a schemaVersion-3 record
-* remembers the scheme the pairing actually used, and the steady-state dial
-* (src/connection.ts) rebuilds the same URL instead of a plain `ws://`. Before
-* that, #124 paired a TLS endpoint and made it unreachable on every reconnect.
+* `advertisedEndpoint ? [advertisedEndpoint] : …`), but a QR that does carry a
+* mixed list must still reconnect each host on its own port. `security` IS
+* persisted (issue #126), one entry per host, taken from the very candidates the
+* walk dialed — so a schemaVersion-4 record remembers the scheme the pairing
+* actually used, and the steady-state dial (src/connection.ts) rebuilds the
+* same URL instead of a plain `ws://`. Before that, #124 paired a TLS endpoint
+* and made it unreachable on every reconnect.
 */
 function recordFrom(payload, approved, deviceName, winner) {
 	const grants = (approved.authorization?.grants ?? []).map((grant) => grant.domain).filter((domain) => domain === "agent");
@@ -3908,12 +3971,13 @@ function recordFrom(payload, approved, deviceName, winner) {
 	const tokenExpiresAt = Date.parse(approved.expiresAt);
 	if (!Number.isFinite(tokenExpiresAt)) throw new PairingError("rejected", `the desktop approved the pairing with an unreadable token expiry (${JSON.stringify(approved.expiresAt)}); re-pair the device`);
 	return {
-		schemaVersion: 3,
+		schemaVersion: 4,
 		deviceId: approved.deviceId,
 		displayName: deviceName,
 		hosts: payload.candidates.map((candidate) => candidate.host),
 		port: winner.port,
 		security: Object.fromEntries(payload.candidates.map((candidate) => [candidate.host, candidate.security])),
+		ports: Object.fromEntries(payload.candidates.map((candidate) => [candidate.host, candidate.port])),
 		desktopIdentity: payload.desktopIdentity,
 		grants,
 		accessToken: approved.accessToken,
@@ -10472,9 +10536,20 @@ function normalizeHost(raw) {
 	return raw.slice(1, -1);
 }
 /**
-* Validates a PATCH body. `hosts` is WHOLE-REPLACE by contract, and `port` is
-* shared by every host (spec §3.2) — there is no per-host port and no merge
-* semantics to get wrong.
+* Validates a PATCH body. `hosts` is WHOLE-REPLACE by contract.
+*
+* The map semantics this face owes (the record's per-host maps are DERIVED,
+* never patched directly — there is no `ports` field in this body):
+*
+*  - neither `hosts` nor `port` patched → the maps are unchanged;
+*  - `hosts` replaced → a host that stays keeps ITS OWN scheme and port, a new
+*    host gets `ws` and the record-level port;
+*  - a CHANGED `port` (with or without `hosts`) → EVERY final host is
+*    re-pointed to it. The face has one port field, so leaving per-host
+*    entries would make the edit inert for every listed host that already had
+*    one. Sending the CURRENT value is a no-op for the maps — the settings page
+*    sends both fields on every save, and a mixed-port record must not be
+*    flattened by a save that did not change the port.
 */
 function parsePatch(body) {
 	const patch = {};
@@ -10498,6 +10573,7 @@ function parsePatch(body) {
 			if (typeof entry !== "string") throw new PatchError("hosts entries must be strings");
 			return normalizeHost(entry);
 		});
+		if (new Set(patch.hosts).size !== patch.hosts.length) throw new PatchError("hosts must not contain duplicates");
 	}
 	const port = body["port"];
 	if (port !== void 0) {
@@ -10897,7 +10973,8 @@ function listDevices(res, route) {
 		enabled: device.enabled,
 		hosts: [...device.hosts],
 		port: device.port,
-		security: { ...device.security }
+		security: { ...device.security },
+		ports: { ...device.ports }
 	})));
 }
 /**
@@ -11067,12 +11144,13 @@ function deviceById(deps, deviceId) {
 	const found = deps.store.list().find((device) => device.deviceId === deviceId);
 	if (found !== void 0) return found;
 	return {
-		schemaVersion: 3,
+		schemaVersion: 4,
 		deviceId,
 		displayName: "",
 		hosts: [],
 		port: 0,
 		security: {},
+		ports: {},
 		desktopIdentity: "",
 		grants: [],
 		enabled: false
@@ -11123,6 +11201,8 @@ async function patchDevice(req, res, route, deviceId) {
 	const previousHosts = existing.hosts;
 	const previousPort = existing.port;
 	const previousSecurity = existing.security;
+	const previousPorts = existing.ports;
+	const nextPorts = patch.port !== void 0 && patch.port !== previousPort ? portsFor(patch.hosts ?? previousHosts, {}, patch.port) : patch.hosts === void 0 ? previousPorts : portsFor(patch.hosts, previousPorts, previousPort);
 	const next = {
 		...existing,
 		...patch.displayName === void 0 ? {} : { displayName: patch.displayName },
@@ -11131,7 +11211,8 @@ async function patchDevice(req, res, route, deviceId) {
 			hosts: patch.hosts,
 			security: securityFor(patch.hosts, previousSecurity)
 		},
-		...patch.port === void 0 ? {} : { port: patch.port }
+		...patch.port === void 0 ? {} : { port: patch.port },
+		ports: nextPorts
 	};
 	try {
 		route.deps.store.upsert(next);
@@ -11161,7 +11242,8 @@ async function patchDevice(req, res, route, deviceId) {
 		enabled: next.enabled,
 		hosts: [...next.hosts],
 		port: next.port,
-		security: { ...next.security }
+		security: { ...next.security },
+		ports: { ...next.ports }
 	});
 }
 function warnConnect(deviceId) {
@@ -11181,7 +11263,20 @@ function sameHosts(a, b) {
 * demote a TLS-proxied desktop to a plain dial.
 */
 function securityFor(hosts, previous) {
-	return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? "ws"]));
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : "ws"]));
+}
+/**
+* The port map for a host list (issue #135): each named host keeps the port it
+* was dialed with, a host the list just gained defaults to `fallback` (the
+* record-level port), and hosts the list dropped leave no entry behind.
+*
+* `previous` is empty when the caller is re-pointing EVERY host (a CHANGED
+* `port` patch): there is no remembered entry to keep, by design — one port
+* field on this face must move the whole list. Same `Object.hasOwn` rule as
+* `securityFor`: an inherited function is not a remembered port.
+*/
+function portsFor(hosts, previous, fallback) {
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : fallback]));
 }
 /** Order-insensitive comparison for two scheme maps. */
 function sameSecurity(a, b) {

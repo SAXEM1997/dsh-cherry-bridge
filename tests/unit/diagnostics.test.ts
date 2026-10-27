@@ -33,8 +33,8 @@ function wsSecurity(hosts: readonly string[]): Record<string, 'ws' | 'wss'> {
 }
 
 function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
-  const base: Omit<DeviceRecord, 'security'> = {
-    schemaVersion: 3,
+  const base: Omit<DeviceRecord, 'security' | 'ports'> = {
+    schemaVersion: 4,
     deviceId: 'dev-1',
     displayName: 'Workstation',
     hosts: ['192.168.1.20'],
@@ -44,10 +44,17 @@ function record(overrides: Partial<DeviceRecord> = {}): DeviceRecord {
     enabled: true,
   }
   const merged = { ...base, ...overrides }
-  // `security` is keyed by host and must cover exactly the FINAL host list (the
-  // store rejects anything else), so it is derived after the overrides.
+  // `security` and `ports` are keyed by host and must cover exactly the FINAL
+  // host list (the store rejects anything else), so they are derived after the
+  // overrides.
   const hosts = overrides.hosts ?? base.hosts
-  return { ...merged, security: overrides.security ?? wsSecurity(hosts) }
+  return {
+    ...merged,
+    security: overrides.security ?? wsSecurity(hosts),
+    ports:
+      overrides.ports ??
+      Object.fromEntries(hosts.map((host) => [host, overrides.port ?? base.port])),
+  }
 }
 
 describe('final review: digestIdentity on an absent identity', () => {

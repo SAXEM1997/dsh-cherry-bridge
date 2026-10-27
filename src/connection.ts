@@ -67,11 +67,15 @@ export interface DeviceConnectionOptions {
   /** Local Ed25519 device identity (raw protobuf private key bytes). */
   identity: Uint8Array
   /**
-   * The paired device record; `hosts`/`security`/`port` are re-read on every
-   * attempt. `security` is REQUIRED by schemaVersion 3 and the v2 migration
-   * backfills an explicit `ws`, so the `?.` in the dial guards an in-memory
-   * record assembled without the map (or constructed before validation), not a
-   * migrated one.
+   * The paired device record; `hosts`/`security`/`ports`/`port` are re-read on
+   * every attempt. `security` and `ports` are REQUIRED by schemaVersion 4 (the
+   * v2→v3 and v3→v4 migrations backfill them), so the `?.` in the STEADY-STATE
+   * dial guards an in-memory record assembled without the map (or constructed
+   * before validation), not a migrated one. That dial — this class — consumes
+   * both per-host maps; the pairing dial never reads the record (it dials the
+   * QR candidate's own host/port/scheme, which is why the record can persist
+   * them). Each host dials with its OWN port; the record-level `port` is the
+   * winner's at pairing, the operator's after a PATCH, and always the fallback.
    */
   record: DeviceRecord
   /**
@@ -1087,6 +1091,12 @@ export class DeviceConnection {
    * network failures fall through to the next candidate — the §6
    * 「候选地址全部不可达」 verdict only holds when EVERY host failed.
    *
+   * Each candidate dials with ITS OWN port from `record.ports`; the record-level
+   * `port` (the winner's at pairing, the operator's after a PATCH) is the
+   * fallback for an in-memory record assembled without the map (issue #135).
+   * Before that, one port was shared by every host, so a reconnect to a
+   * non-winner host dialed the right scheme at the wrong port.
+   *
    * "Per-host" covers the CHANNEL-LEVEL handshake failures as well as the dial:
    * a socket that opens and then dies mid-handshake (the peer accepted the TCP
    * connection and went away, a proxy reset it, the Noise exchange was cut) is a
@@ -1127,7 +1137,11 @@ export class DeviceConnection {
       if (!this.#running || epoch !== this.#epoch) throw new CancelledError()
       let link: LiveLink
       try {
-        link = await this.#dial(host, this.record.port, epoch)
+        // Per-host port, with the record-level (winner's) port as the fallback
+        // for an in-memory record assembled without the map — the same `?.`
+        // default the scheme gets in #dial (issue #135).
+        const port = this.record.ports?.[host] ?? this.record.port
+        link = await this.#dial(host, port, epoch)
       } catch (error) {
         if (error instanceof IdentityMismatchError) throw error
         lastError = error instanceof Error ? error : new Error(String(error))

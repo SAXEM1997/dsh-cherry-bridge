@@ -445,6 +445,9 @@ describe('② cherry_unpair: forget the archive entry and tear the link down', (
       ...recordFor('dev-A', 'Desk Alpha'),
       hosts: [fakeInfo.host],
       port: fakeInfo.port,
+      // Both maps are keyed by host since schemaVersion 4: overriding `hosts`
+      // without `ports` leaves the record pointing at the fixture's dead 65001.
+      ports: { [fakeInfo.host]: fakeInfo.port },
       desktopIdentity: fakeInfo.desktopIdentity,
     })
 
@@ -759,6 +762,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       ...recordFor('dev-A', 'Desk Alpha'),
       hosts: [fakeInfo.host],
       port: fakeInfo.port,
+      // Both maps are keyed by host since schemaVersion 4: overriding `hosts`
+      // without `ports` leaves the record pointing at the fixture's dead 65001.
+      ports: { [fakeInfo.host]: fakeInfo.port },
       desktopIdentity: fakeInfo.desktopIdentity,
     })
   }
@@ -1490,11 +1496,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 /** A minimal valid record for the store-level assertions. */
 function recordFor(deviceId: string, displayName: string): import('../../src/deviceStore.js').DeviceRecord {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     deviceId,
     displayName,
     hosts: ['127.0.0.1'],
     security: { ['127.0.0.1']: 'ws' },
+    ports: { ['127.0.0.1']: 65001 },
     port: 65001,
     desktopIdentity: 'desktop-identity-0000000000000000000000000000000000000000',
     grants: ['agent'] as 'agent'[],
