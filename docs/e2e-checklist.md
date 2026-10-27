@@ -284,8 +284,43 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
             `data` part（任务事件等）不是附件，原样透传。
       - [ ] `cherry_send` 传空白文本（如 `"   "`）→ 本地返回 `text-empty`，对端未收到
             `agent.messages.send`。
+      - [ ] 桌面端为 2.1.8+ 且 hello 广播了 `agentMessageSummariesVersion: 1` 时：
+            `GET /cherry-remote/api/diagnostics` 顶层出现 `messageSummaries: 1`，且一次
+            `cherry_read` 正常返回消息与 parts（消息行走分页摘要，请求带 `partsMode:"paged"`，
+            part 经 `agent.parts.list` 按 messageId + revision 枚举）。桌面端未广播时该字段
+            **不出现**，读路径回落到字节安全的分页尺寸。
       - [ ] 桌面端广播了本插件不认识的支持字段时，`cherry_devices` 的 limits 投影仍只有
             4 个已知键（heartbeatMs/subscriptions/pageItems/inFlightRequests），连接不被拒。
 - [ ] `package.json` 中 `@cherrystudio/remote-protocol`、`@cherrystudio/remote-transport`
       为精确版本（无 `^`）。
 - [ ] `npm test` 全绿（含 `tests/contract/contract.test.ts`）。
+
+---
+
+## 第四部分：机器可验证项实测记录
+
+A–G 各节要真人 + Electron 端批准，无法被 CI 化；下表只记录其中**不需要人工点击、agent
+在本机就能断言**的那部分，用于跨版本比对「哪些已经被证过」。带勾选框的条目仍是唯一判据。
+
+### 0.2.0（2026-10-27 · DSH profile `web` · 桌面端 ISV-ZYX 2.1.8）
+
+| 项 | 结果 | 观测 |
+| --- | --- | --- |
+| 装机生效 | 通过 | 包 mtime `18:49:52` 早于宿主 PID 1 启动 `18:50:00`；装机 `dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`、`locale/zh.json` 与发行 tarball sha256 全同 |
+| 设备档案迁移 `schemaVersion` 2→4 | 通过 | `devices.json` 为 `schemaVersion: 4`，逐设备 `security` / `ports` 两个映射就位；设备**未重新配对**，重启后自行连上 |
+| `GET /cherry-remote/api/devices` 新字段 | 通过 | 返回 `security` 与 `ports`（0.1.11 没有这两个键） |
+| 分页摘要能力 | 通过 | `GET …/diagnostics` 顶层 `messageSummaries: 1`；`cherry_read` 正常返回历史会话，parts 由 `agent.parts.list` 回填 |
+| 坏 pin 解析期拒绝（#153） | 通过 | `desktopIdentity: "not-a-peer-id"` → `invalid-payload`／`payload field "desktopIdentity" is not a peer id`；`connections`/`sockets`/`connectionsBuilt` 保持 1/1/1，设备数不变，**零 socket** |
+| 失败分型 + 裁决有界（#142 / #148） | 通过 | 3 个 193 字符主机 → `unreachable`，每段形如 `…:9400: websocket: getaddrinfo ENOTFOUND … (+147 chars)`：分型在、端口保留、段 ≤240 |
+| 进度行有界（#152） | 通过 | 宿主日志 `pairing stage validate (hosts: h0.… (+2 more))` 整行 251 字符 |
+
+**本轮未覆盖**（环境不可达，**不是通过**）：
+
+- **#141 拨号总预算**：需要黑洞地址让每次拨号烧满 `connectTimeoutMs`，实测要挂满 30 s；
+  由集成测试的 `dialBudgetMs: 0` 用例覆盖（断言 `connectionCount === 0` 且每个候选各出现一次）。
+- **#133 `wsTls`**：被测环境是内网 `ws://`、没有 TLS 前置，配置该键只会被忽略；由
+  `tests/helpers/tls/dualPeer.ts` 的自签 TLS 握手用例覆盖。
+- **#140 设置页 per-host 端口行**：该行**仅在**各主机端口与记录级 `port` 不一致时渲染，
+  被测设备是单主机同端口；需要造一条混合端口记录才能走。
+- **#161 `failureText`**：要制造一个 peer 可达的 caught failure（如 ack 失败）才会出现，
+  本轮 `recentErrors` 为空。
