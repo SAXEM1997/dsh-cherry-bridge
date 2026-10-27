@@ -1,4 +1,6 @@
 import { mkdtemp, rm } from 'node:fs/promises'
+import { createServer } from 'node:net'
+import type { AddressInfo, Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { hostname } from 'node:os'
@@ -667,6 +669,161 @@ describe('pairWithPayload over a real loopback channel', () => {
     expect(record.deviceId).toBe(fakeInfo.fake.approvedDeviceId)
     expect(fakeInfo.fake.connectionCount).toBe(1)
     expect(store.list()).toEqual([record])
+  }, 15_000)
+
+  // -------------------------------------------------------------------------
+  // Candidate failure KIND (issue #142): a failed PRE-OPEN dial is prefixed
+  // `timeout:` or `websocket:` so the joined `unreachable` verdict names the
+  // FIX — retry the network (a timeout) versus fix the address/TLS (a
+  // refused/closed socket) — and the ws error's own code survives in the
+  // message. Post-open (Noise/identity/protocol) failures are a separate kind,
+  // tracked by #147 and out of scope here.
+  // -------------------------------------------------------------------------
+
+  it('⑧a names a timed-out candidate dial timeout:, never websocket:', async () => {
+    const identity = await createDeviceIdentity()
+    // The peer is LIVE but HOLDS its Noise handshake past the per-dial bound,
+    // so the elapsed timer is the only thing that can end this dial. The dial
+    // budget is left at its default: the budget is not what this test moves.
+    const fakeInfo = await makeFake({
+      pairingDecision: 'approved',
+      pairingGetPendingPolls: APPROVE_AFTER_POLLS,
+      handshakeDelayMs: 2_000,
+    })
+    const store = await makeStore()
+    const label = `${fakeInfo.host}:${fakeInfo.port}`
+
+    const error = await pairingError(
+      pair({ identity, store, connectTimeoutMs: 50, payload: v3PayloadFor(fakeInfo) }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    // The KIND precedes the candidate's own description, so the joined verdict
+    // says the network is the thing to retry. Without the prefix this reads as
+    // `connect to host:port timed out`, indistinguishable from a socket fault.
+    expect(error.message).toContain(`${label}: timeout:`)
+    expect(error.message).not.toContain('websocket:')
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑧b names a refused candidate socket websocket: and keeps the OS code', async () => {
+    const identity = await createDeviceIdentity()
+    // The fake supplies a valid payload identity; its OWN port is not dialed.
+    // Port 1 is a closed loopback port (the ⑥b fixture): the OS refuses the
+    // TCP connect, which is exactly the address/TLS class of fault.
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    const error = await pairingError(
+      pair({ identity, store, payload: payloadFor(fakeInfo, { ips: ['127.0.0.1'], port: 1 }) }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    // The failed segment STARTS with the kind, after the candidate label.
+    expect(error.message).toContain('127.0.0.1:1: websocket:')
+    // The ws error's `code` is the discriminator a bare message drops. The
+    // exact errno is PLATFORM-dependent (ECONNREFUSED on Linux, another name
+    // elsewhere), so only the shape is pinned, never the literal.
+    expect(error.message).toMatch(/127\.0\.0\.1:1: websocket: .*\(code [A-Z0-9_]+\)/)
+    expect(error.message).not.toContain('timeout:')
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑧c a socket that closes before open is a websocket: verdict, not a timeout', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    // A bare TCP peer that accepts and destroys the socket: the WebSocket
+    // upgrade never completes, so the dial must reject on the socket's own
+    // failure instead of waiting out `connectTimeoutMs`. The ACCEPTED COUNTER
+    // is what proves this fixture was hit: a connect that was never accepted
+    // (an unused port) would fail as a refused connect — a different fixture
+    // that the message assertions alone cannot tell apart from this one.
+    let accepted = 0
+    const server = createServer((socket) => {
+      accepted += 1
+      socket.destroy()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as AddressInfo).port
+    const startedAt = performance.now()
+    try {
+      const error = await pairingError(
+        pair({
+          identity,
+          store,
+          // Ten seconds of per-dial bound: only the socket's own failure can
+          // end this run inside the elapsed assertion below.
+          connectTimeoutMs: 10_000,
+          payload: v3PayloadFor(fakeInfo, {
+            endpoints: [{ host: '127.0.0.1', port, security: 'ws' }],
+          }),
+        }),
+      )
+
+      const elapsed = performance.now() - startedAt
+      expect(error.kind).toBe('unreachable')
+      // The fixture really was dialed...
+      expect(accepted).toBe(1)
+      // ...and the failure is THIS fixture's: a reset of an accepted socket
+      // ("socket hang up"/ECONNRESET), not a refused connect.
+      expect(error.message).toContain('socket hang up')
+      expect(error.message).toContain('(code ECONNRESET)')
+      expect(error.message).toContain(`127.0.0.1:${port}: websocket:`)
+      expect(error.message).not.toContain('timeout:')
+      // No multi-second wait: the close/error path woke the dial, not the timer.
+      expect(elapsed).toBeLessThan(2_000)
+      expect(store.list()).toEqual([])
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  }, 15_000)
+
+  it('⑧d a ws error with no code keeps websocket: and fabricates no code', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+    // A bare TCP peer that answers the upgrade with a plain 404: ws rejects the
+    // handshake as "Unexpected server response: 404" — an Error with NO `code`.
+    // That is the arm where the suffix must simply be ABSENT; appending
+    // `(code undefined)` would invent a discriminator the operator cannot use.
+    // `socket.end` leaves the peer's half of THIS fixture open on this runtime,
+    // so the connections are tracked and destroyed before `close()` (which
+    // otherwise never calls back).
+    let accepted = 0
+    const sockets = new Set<Socket>()
+    const server = createServer((socket) => {
+      accepted += 1
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+      socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as AddressInfo).port
+    try {
+      const error = await pairingError(
+        pair({
+          identity,
+          store,
+          payload: v3PayloadFor(fakeInfo, {
+            endpoints: [{ host: '127.0.0.1', port, security: 'ws' }],
+          }),
+        }),
+      )
+
+      expect(error.kind).toBe('unreachable')
+      expect(accepted).toBe(1)
+      // The failed segment starts with the kind and carries the peer's answer.
+      expect(error.message).toContain(`127.0.0.1:${port}: websocket: `)
+      expect(error.message).toContain('404')
+      expect(error.message).not.toContain('timeout:')
+      // No `code` on this ws error, so no `(code …)` suffix.
+      expect(error.message).not.toContain('(code')
+      expect(store.list()).toEqual([])
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   }, 15_000)
 
   // -------------------------------------------------------------------------

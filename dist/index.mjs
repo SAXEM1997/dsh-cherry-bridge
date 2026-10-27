@@ -3767,6 +3767,8 @@ const DEFAULT_POLL_INTERVAL_MS = 1e3;
 /** The protocol invitationMs: 120s of invitation, and our poll race guard. */
 const DEFAULT_POLL_TIMEOUT_MS = 12e4;
 const VERIFICATION_CODE_RE = /^[0-9]{6}$/;
+/** Bounds the close frame's reason text quoted into a candidate failure. */
+const CLOSE_REASON_MAX = 200;
 const noop = () => {};
 /** A callable silent libp2p logger (same shape as the connection layer's). */
 function makeSilentLogger() {
@@ -3780,6 +3782,20 @@ function makeSilentLogger() {
 const silentComponentLogger = { forComponent: () => makeSilentLogger() };
 function sleep$1(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/**
+* Tags a `ws` error as a candidate-dial failure (issue #142). The `websocket:`
+* prefix is the KIND: the operator's fix is this address or its TLS, not the
+* network — the contrast with `timeout:` is the whole point of the prefix, and
+* it is what the joined `unreachable` verdict shows. The `ws` error carries the
+* discriminator a bare message drops — an OS `code` (`ECONNREFUSED`,
+* `ENOTFOUND`, a TLS code) or a numeric ws code — so it is appended, and only
+* when it is actually a string or a number (never `undefined`/`null`).
+*/
+function webSocketFailure(error) {
+	const code = error.code;
+	const suffix = typeof code === "string" || typeof code === "number" ? ` (code ${code})` : "";
+	return /* @__PURE__ */ new Error(`websocket: ${error.message}${suffix}`);
 }
 /** Dials one candidate address and completes the Noise handshake.
 *
@@ -3804,13 +3820,26 @@ async function dial(candidate, identity, desktopIdentity, protocolVersions, time
 	const controller = new AbortController();
 	let timer;
 	const timedOut = new Promise((_, reject) => {
-		timer = setTimeout(() => reject(/* @__PURE__ */ new Error(`connect to ${host}:${port} timed out`)), timeoutMs);
+		timer = setTimeout(() => reject(/* @__PURE__ */ new Error(`timeout: connect to ${host}:${port} timed out`)), timeoutMs);
 	});
 	try {
 		const connecting = (async () => {
 			await new Promise((resolve, reject) => {
-				ws.once("open", () => resolve());
-				ws.once("error", (error) => reject(error));
+				const settle = (outcome) => {
+					ws.off("open", onOpen);
+					ws.off("error", onError);
+					ws.off("close", onClose);
+					outcome();
+				};
+				const onOpen = () => settle(resolve);
+				const onError = (error) => settle(() => reject(webSocketFailure(error)));
+				const onClose = (code, reason) => {
+					const text = reason.toString("utf8").slice(0, CLOSE_REASON_MAX);
+					settle(() => reject(/* @__PURE__ */ new Error(`websocket: closed before open (code ${code})${text === "" ? "" : ` ${text}`}`)));
+				};
+				ws.once("open", onOpen);
+				ws.once("error", onError);
+				ws.on("close", onClose);
 			});
 			const stream = new RemoteSocketStream(toRemoteSocket(ws), silentComponentLogger.forComponent("pairing"), "outbound");
 			return connectSecureChannel(stream, {

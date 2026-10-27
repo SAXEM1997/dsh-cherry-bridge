@@ -765,6 +765,7 @@ logged or reported; `ca` is PEM text.
 ONE aggregate `dialBudgetMs` deadline (30 s) bounds the walk; unreached
 candidates are named. Claim/poll re-anchors a FRESH 120 s race guard at the
 claim (not the invitation's birth); peer `expired` is the real bound.
+A failed PRE-OPEN dial is prefixed `timeout:` or `websocket:` (the `ws` code is kept) so the verdict names the kind.
 
 ### Device selector
 

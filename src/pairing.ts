@@ -313,6 +313,8 @@ const DEFAULT_POLL_INTERVAL_MS = 1_000
 /** The protocol invitationMs: 120s of invitation, and our poll race guard. */
 const DEFAULT_POLL_TIMEOUT_MS = 120_000
 const VERIFICATION_CODE_RE = /^[0-9]{6}$/
+/** Bounds the close frame's reason text quoted into a candidate failure. */
+const CLOSE_REASON_MAX = 200
 
 const noop = (): void => {}
 
@@ -341,6 +343,21 @@ interface TempChannel {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Tags a `ws` error as a candidate-dial failure (issue #142). The `websocket:`
+ * prefix is the KIND: the operator's fix is this address or its TLS, not the
+ * network — the contrast with `timeout:` is the whole point of the prefix, and
+ * it is what the joined `unreachable` verdict shows. The `ws` error carries the
+ * discriminator a bare message drops — an OS `code` (`ECONNREFUSED`,
+ * `ENOTFOUND`, a TLS code) or a numeric ws code — so it is appended, and only
+ * when it is actually a string or a number (never `undefined`/`null`).
+ */
+function webSocketFailure(error: Error): Error {
+  const code = (error as { code?: unknown }).code
+  const suffix = typeof code === 'string' || typeof code === 'number' ? ` (code ${code})` : ''
+  return new Error(`websocket: ${error.message}${suffix}`)
 }
 
 /** Dials one candidate address and completes the Noise handshake.
@@ -373,14 +390,46 @@ async function dial(
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`connect to ${host}:${port} timed out`)), timeoutMs)
+    timer = setTimeout(
+      () => reject(new Error(`timeout: connect to ${host}:${port} timed out`)),
+      timeoutMs,
+    )
   })
 
   try {
     const connecting = (async (): Promise<SecureChannel> => {
       await new Promise<void>((resolve, reject) => {
-        ws.once('open', () => resolve())
-        ws.once('error', (error: Error) => reject(error))
+        // A socket can fail before the upgrade completes in two shapes: an
+        // `error` event (the HTTP handshake's own failure) and a `close` with
+        // no error. Both are the `websocket:` kind; the close path is tagged
+        // with the close code and (bounded) reason instead of a message.
+        // Unexercised under the pinned `ws` 8.22: every client pre-open failure
+        // emits `error` first (verified in the library source), so a `ws` bump
+        // must re-check that ordering.
+        // Whichever fires first wins, and the listeners are removed on settle
+        // so a LATER close — e.g. the timeout's `ws.terminate()` — cannot fire
+        // a stale rejection on an open promise nobody waits for anymore.
+        const settle = (outcome: () => void): void => {
+          ws.off('open', onOpen)
+          ws.off('error', onError)
+          ws.off('close', onClose)
+          outcome()
+        }
+        const onOpen = (): void => settle(resolve)
+        const onError = (error: Error): void => settle(() => reject(webSocketFailure(error)))
+        const onClose = (code: number, reason: Buffer): void => {
+          const text = reason.toString('utf8').slice(0, CLOSE_REASON_MAX)
+          settle(() =>
+            reject(
+              new Error(
+                `websocket: closed before open (code ${code})${text === '' ? '' : ` ${text}`}`,
+              ),
+            ),
+          )
+        }
+        ws.once('open', onOpen)
+        ws.once('error', onError)
+        ws.on('close', onClose)
       })
       const stream = new RemoteSocketStream(
         toRemoteSocket(ws),
