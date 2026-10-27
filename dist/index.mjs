@@ -11303,7 +11303,7 @@ function openEvents(req, res, route) {
 //#region src/index.ts
 const name = "cherry-remote";
 const inject = ["tools"];
-/** Applies the documented fallbacks to the plugin config's numeric keys. */
+/** Applies the documented fallbacks and validates the plugin config's keys. */
 function resolveBridgeConfig(config = {}) {
 	return {
 		rateBudgetPerSecond: positive("rateBudgetPerSecond", config.rateBudgetPerSecond, 32),
@@ -11341,9 +11341,19 @@ function shapeOf(value) {
 	if (Array.isArray(value)) return "array";
 	return typeof value;
 }
-/** A non-empty `ca` entry: PEM text or its bytes, and nothing else. */
+/**
+* One `ca` entry: PEM CONTENT for a string, non-empty bytes for a Buffer.
+*
+* A string is the certificate TEXT itself, NEVER a file path: `tls.connect`
+* would happily read whatever path it is handed, so accepting `'/etc/ssl/ca.pem'`
+* would load bytes the operator never inspected. The header check is a SHAPE
+* check only — whether the PEM parses beyond `-----BEGIN` is Node's business,
+* and an unparseable body fails the handshake loudly, which is the honest
+* verdict. Buffers keep the non-empty test with no header requirement: DER and
+* programmatically built PEM bytes are legitimate `ca` values.
+*/
 function certificateEntry(value) {
-	if (typeof value === "string") return value.length > 0;
+	if (typeof value === "string") return value.trimStart().startsWith("-----BEGIN");
 	if (Buffer.isBuffer(value)) return value.length > 0;
 	return false;
 }
@@ -11383,7 +11393,7 @@ function dialOptions(value) {
 	const ca = record["ca"];
 	if (ca !== void 0) {
 		if (!(Array.isArray(ca) ? ca.length > 0 && ca.every((entry) => certificateEntry(entry)) : certificateEntry(ca))) {
-			console.warn("[cherry-remote] config \"wsTls.ca\" must be non-empty PEM text, a non-empty Buffer, or a non-empty array of those; ignoring the whole object");
+			console.warn("[cherry-remote] config \"wsTls.ca\" must be PEM CONTENT (the certificate text itself, not a file path) — a \"-----BEGIN\" string, a non-empty Buffer, or a non-empty array of those; ignoring the whole object");
 			return;
 		}
 	}

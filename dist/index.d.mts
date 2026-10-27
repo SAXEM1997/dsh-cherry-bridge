@@ -292,8 +292,9 @@ export interface CherryBridgeConfig {
   wsTls?: WsDialOptions;
 }
 /**
- * The two config values that reach constructor arguments, with their defaults
- * applied.
+ * The plugin-config values that reach constructor arguments, resolved once: the
+ * two numeric budgets with their defaults applied, and the validated TLS trust
+ * bag (see {@link dialOptions}).
  *
  * Resolved ONCE per `apply` and threaded explicitly, rather than re-read at each
  * construction site: a config surface that can change between two constructions
@@ -304,7 +305,7 @@ export interface ResolvedBridgeConfig {
   perSessionCacheBytes: number;
   wsTls: WsDialOptions | undefined;
 }
-/** Applies the documented fallbacks to the plugin config's numeric keys. */
+/** Applies the documented fallbacks and validates the plugin config's keys. */
 export declare function resolveBridgeConfig(config?: CherryBridgeConfig): ResolvedBridgeConfig;
 /** The context slice `apply` touches beyond the HTTP face's own services. */
 export interface CherryBridgeContext extends CherryHttpContext, CherryToolsContext {

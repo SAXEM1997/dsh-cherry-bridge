@@ -113,8 +113,9 @@ export interface CherryBridgeConfig {
 }
 
 /**
- * The two config values that reach constructor arguments, with their defaults
- * applied.
+ * The plugin-config values that reach constructor arguments, resolved once: the
+ * two numeric budgets with their defaults applied, and the validated TLS trust
+ * bag (see {@link dialOptions}).
  *
  * Resolved ONCE per `apply` and threaded explicitly, rather than re-read at each
  * construction site: a config surface that can change between two constructions
@@ -144,7 +145,7 @@ export {
   DEFAULT_RATE_BUDGET_PER_SECOND,
 } from './defaults.js'
 
-/** Applies the documented fallbacks to the plugin config's numeric keys. */
+/** Applies the documented fallbacks and validates the plugin config's keys. */
 export function resolveBridgeConfig(config: CherryBridgeConfig = {}): ResolvedBridgeConfig {
   return {
     rateBudgetPerSecond: positive('rateBudgetPerSecond', config.rateBudgetPerSecond, DEFAULT_RATE_BUDGET_PER_SECOND),
@@ -189,9 +190,19 @@ function shapeOf(value: unknown): string {
   return typeof value
 }
 
-/** A non-empty `ca` entry: PEM text or its bytes, and nothing else. */
+/**
+ * One `ca` entry: PEM CONTENT for a string, non-empty bytes for a Buffer.
+ *
+ * A string is the certificate TEXT itself, NEVER a file path: `tls.connect`
+ * would happily read whatever path it is handed, so accepting `'/etc/ssl/ca.pem'`
+ * would load bytes the operator never inspected. The header check is a SHAPE
+ * check only — whether the PEM parses beyond `-----BEGIN` is Node's business,
+ * and an unparseable body fails the handshake loudly, which is the honest
+ * verdict. Buffers keep the non-empty test with no header requirement: DER and
+ * programmatically built PEM bytes are legitimate `ca` values.
+ */
 function certificateEntry(value: unknown): boolean {
-  if (typeof value === 'string') return value.length > 0
+  if (typeof value === 'string') return value.trimStart().startsWith('-----BEGIN')
   if (Buffer.isBuffer(value)) return value.length > 0
   return false
 }
@@ -248,9 +259,11 @@ function dialOptions(value: unknown): WsDialOptions | undefined {
       ? ca.length > 0 && ca.every((entry) => certificateEntry(entry))
       : certificateEntry(ca)
     if (!usable) {
+      // FIELD only — never the value: a `ca` is certificate text.
       console.warn(
-        '[cherry-remote] config "wsTls.ca" must be non-empty PEM text, a non-empty Buffer, ' +
-          'or a non-empty array of those; ignoring the whole object',
+        '[cherry-remote] config "wsTls.ca" must be PEM CONTENT (the certificate text itself, ' +
+          'not a file path) — a "-----BEGIN" string, a non-empty Buffer, or a non-empty array ' +
+          'of those; ignoring the whole object',
       )
       return undefined
     }

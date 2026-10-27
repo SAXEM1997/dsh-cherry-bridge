@@ -37,7 +37,7 @@ import type {
 } from '../../src/httpApi.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry.js'
-import { makeDualPeer, insecureTlsOptions, type DualPeer } from '../helpers/tls/dualPeer.js'
+import { makeDualPeer, testTlsCaPem, type DualPeer } from '../helpers/tls/dualPeer.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 /**
@@ -2207,6 +2207,10 @@ describe('③w resolveBridgeConfig: wsTls is validated, whole-object-or-nothing 
       [{ tls: { rejectUnauthorized: false } }, 'tls'],
       [{ rejectUnauthorized: 'false' }, 'rejectUnauthorized'],
       [{ ca: 42 }, 'ca'],
+      // A string `ca` is PEM CONTENT, never a file path or whitespace: Node
+      // would read whatever path it is handed, so a path is refused here.
+      [{ ca: '/etc/ssl/ca.pem' }, 'ca'],
+      [{ ca: '   ' }, 'ca'],
       [{ ca: '' }, 'ca'],
       [{ ca: Buffer.alloc(0) }, 'ca'],
       [{ ca: [] }, 'ca'],
@@ -2223,18 +2227,24 @@ describe('③w resolveBridgeConfig: wsTls is validated, whole-object-or-nothing 
   })
 
   it('never echoes a certificate value into the warning', () => {
-    // A `ca` is PEM CONTENT, not a value to print. The object is invalid
-    // because a SIBLING entry is not, and the refusal must name the bad field
-    // while leaving the certificate out of the log entirely.
+    // A `ca` is PEM CONTENT, not a value to print. The three shapes below reach
+    // DIFFERENT refusal branches (bad rejectUnauthorized, bad ca entry, unknown
+    // key), and none of them may put the certificate — or even its header —
+    // into the log.
     const sentinel = '-----BEGIN CERTIFICATE-----WS-TLS-SENTINEL-PEM-----END CERTIFICATE-----'
-    consoleWarn.mockClear()
-    expect(
-      resolveBridgeConfig({ wsTls: { ca: sentinel, rejectUnauthorized: 'no' } as never }).wsTls,
-    ).toBeUndefined()
-    const text = consoleWarn.mock.calls.flat().map(String).join('\n')
-    expect(text).toContain('rejectUnauthorized')
-    expect(text).not.toContain(sentinel)
-    expect(text).not.toContain('BEGIN CERTIFICATE')
+    const invalid: Array<[unknown, string]> = [
+      [{ ca: sentinel, rejectUnauthorized: 'no' }, 'rejectUnauthorized'],
+      [{ ca: [sentinel, ''] }, 'ca'],
+      [{ tls: { x: 1 }, ca: sentinel }, 'tls'],
+    ]
+    for (const [value, needle] of invalid) {
+      consoleWarn.mockClear()
+      expect(resolveBridgeConfig({ wsTls: value as never }).wsTls).toBeUndefined()
+      const text = consoleWarn.mock.calls.flat().map(String).join('\n')
+      expect(text).toContain(needle)
+      expect(text).not.toContain(sentinel)
+      expect(text).not.toContain('BEGIN CERTIFICATE')
+    }
   })
 })
 
@@ -2247,8 +2257,10 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     const server = makeServer()
     const ctx = assemblyCtx(server)
     // The self-signed fixture is not in Node's trust store; this config object
-    // is the ONLY thing that changes the dial's verdict.
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: insecureTlsOptions })
+    // is the ONLY thing that changes the dial's verdict. `ca`-only is the
+    // private-CA production shape (no `rejectUnauthorized: false` crutch): a
+    // bag that drops `ca` must NOT connect.
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: { ca: testTlsCaPem } })
 
     try {
       // Written AFTER `apply` (the assembly creates its store handle there),
@@ -2311,7 +2323,9 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     const dir = tempDir('cherry-wstls-pair-')
     const server = makeServer()
     const ctx = assemblyCtx(server)
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: insecureTlsOptions })
+    // `ca`-only, no `rejectUnauthorized: false` crutch: the pairing dial must
+    // carry the CA itself (a bag that drops `ca` must NOT pair).
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: { ca: testTlsCaPem } })
 
     try {
       await waitForPath(join(dir, 'identity.key'))

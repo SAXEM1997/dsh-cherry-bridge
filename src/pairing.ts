@@ -56,9 +56,11 @@ export interface PairWithPayloadOptions {
   /** Locally supported protocol versions (default [1]). */
   supportedProtocolVersions?: readonly number[]
   /**
-   * The websocket options every dial uses — only `tls` matters (issue #126:
-   * a TLS-proxied endpoint presents a certificate the client must be able to
-   * trust, e.g. a private CA). Absent means Node's default trust store.
+   * The websocket options every dial uses — only TLS trust (`rejectUnauthorized`
+   * / `ca`) matters (issue #126: a TLS-proxied endpoint presents a certificate
+   * the client must be able to trust, e.g. a private CA; the nested
+   * `{ tls: {…} }` shape `https` accepts is NOT read by `ws`). Absent means
+   * Node's default trust store.
    */
   wsOptions?: WsDialOptions
 }

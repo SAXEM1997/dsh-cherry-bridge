@@ -77,13 +77,11 @@ export interface DeviceConnectionOptions {
   /**
    * Options for every dial's `WebSocket` (issue #126) — in practice
    * `rejectUnauthorized`/`ca`, for a desktop behind a TLS proxy whose
-   * certificate is not in Node's default trust store. Absent means Node's
-   * defaults. Never derived from the record: a certificate is trust the
-   * OPERATOR grants, not a fact the desktop asserts about itself.
-   *
-   * TODAY ONLY TESTS PASS IT — the assembly does not inject it yet; the config
-   * surface that would let a private-CA deployment set it is separate work
-   * (issue #133).
+   * certificate is not in Node's default trust store. The assembly injects it
+   * from plugin config `wsTls` at BOTH dial sites (the pool and pairing); tests
+   * may still pass it directly. Absent means Node's defaults. NEVER derived
+   * from the record: trust is a grant the OPERATOR makes, not a fact the
+   * desktop asserts about itself.
    */
   wsOptions?: WsDialOptions
   /**
