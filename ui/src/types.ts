@@ -26,10 +26,10 @@ export type DeviceState = 'connected' | 'connecting' | 'offline' | 'disabled' | 
 /**
  * One device exactly as `GET /devices` returns it. Never carries a credential.
  *
- * `ports` is the per-HOST dial port map: each candidate address may dial a port
- * of its own, while the record-level `port` is the fallback and the default for
- * hosts the map does not carry (and for new hosts). Optional because an
- * in-memory pre-validation record may not have been normalized yet.
+ * `ports` is the per-HOST dial port map: each candidate address dials its own
+ * port, and the record-level `port` is the fallback for a host the map does not
+ * carry (a stored v4 record has an entry for every host, so the card's `??` arm
+ * only fires on a malformed map). Required — `GET /devices` always emits it.
  */
 export interface DeviceSummary {
   deviceId: string
@@ -38,7 +38,7 @@ export interface DeviceSummary {
   enabled: boolean
   hosts: string[]
   port: number
-  ports?: Record<string, number>
+  ports: Record<string, number>
 }
 
 /** A `PATCH /devices/:id` body; every field optional, `hosts` is whole-replace. */
