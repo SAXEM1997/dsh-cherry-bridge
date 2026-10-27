@@ -35,6 +35,8 @@ flowchart TB
 ## Install
 
 > **DSH version requirement**: `>=0.2.0-rc.2 <0.3.0-0` (declared via `engines.dsh` in `package.json`; when unmet the bundle is skipped and its settings-page row disabled — `dsh plugin allow-version` grants an explicit exemption; 0.3.0 needs a fresh compatibility pass before the range widens).
+>
+> **Cherry Studio compatibility**: desktop **2.1.4 – 2.1.8 is tested** — the `v3` custom-address QR needs **2.1.8+**, and the `v2` QR of 2.1.4 – 2.1.7 works too. Outside that range is unverified: the handshake negotiates protocol version `[1]` only, so an incompatible peer fails loudly as `unreachable` instead of misbehaving. The protocol packages are pinned to `0.7.0` / `0.2.5` — the versions desktop 2.1.8 ships.
 
 ```bash
 # From npm (recommended, pinned)
