@@ -351,18 +351,34 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Tags a `ws` error as a candidate-dial failure (issue #142). The `websocket:`
- * prefix is the KIND: the operator's fix is this address or its TLS, not the
- * network — the contrast with `timeout:` is the whole point of the prefix, and
- * it is what the joined `unreachable` verdict shows. The `ws` error carries the
- * discriminator a bare message drops — an OS `code` (`ECONNREFUSED`,
- * `ENOTFOUND`, a TLS code) or a numeric ws code — so it is appended, and only
- * when it is actually a string or a number (never `undefined`/`null`).
+ * Tags a PRE-OPEN `ws` error as a candidate-dial failure (issue #142). The
+ * `websocket:` prefix is the KIND: the operator's fix is this address or its
+ * TLS, not the network — the contrast with `timeout:` is the whole point of the
+ * prefix, and it is what the joined `unreachable` verdict shows. The `ws` error
+ * carries the discriminator a bare message drops — an OS `code`
+ * (`ECONNREFUSED`, `ENOTFOUND`, a TLS code) or a numeric ws code — so it is
+ * appended, and only when it is actually a string or a number (never
+ * `undefined`/`null`).
  */
 function webSocketFailure(error: Error): Error {
   const code = (error as { code?: unknown }).code
   const suffix = typeof code === 'string' || typeof code === 'number' ? ` (code ${code})` : ''
   return new Error(`websocket: ${error.message}${suffix}`)
+}
+
+/**
+ * Tags a POST-OPEN channel failure as a candidate-dial failure (issue #147).
+ * `channel:` is the THIRD kind, deliberately not `websocket:`: the upgrade
+ * completed, so the address works and only the channel's establishment failed
+ * (Noise handshake, remote identity proof, protocol offer). Blaming the
+ * address would send the operator to inspect something that demonstrably
+ * answered. No code suffix is appended: a Noise-stage error can carry its own
+ * string code (`ERR_INVALID_CRYPTO_EXCHANGE`), but that is an internal label
+ * rather than the ws/OS discriminator the other kinds keep, so it is
+ * deliberately dropped.
+ */
+function channelFailure(error: Error): Error {
+  return new Error(`channel: ${error.message}`)
 }
 
 /** Dials one candidate address and completes the Noise handshake.
@@ -381,6 +397,14 @@ function webSocketFailure(error: Error): Error {
  * rather than assumed: the payload's `desktopIdentity` is the peer the Noise
  * XX handshake must prove, so a swapped-in impostor fails the handshake
  * instead of being pinned as the desktop.
+ *
+ * A failure carries one of THREE kinds into the joined `unreachable` verdict,
+ * because each names the operator's next check: `timeout:` (the per-attempt
+ * timer won its race — check the network), `websocket:` (the socket failed
+ * BEFORE the upgrade — check this address or its TLS), and `channel:` (the
+ * socket came up and the channel failed AFTER it — check the peer's identity
+ * or the protocol offer). A stalled handshake stays `timeout:`: the dial
+ * promise's own timer settles first, so the abort it triggers cannot win.
  */
 async function dial(
   candidate: PairCandidate,
@@ -436,18 +460,27 @@ async function dial(
         ws.once('error', onError)
         ws.on('close', onClose)
       })
-      const stream = new RemoteSocketStream(
-        toRemoteSocket(ws),
-        silentComponentLogger.forComponent('pairing'),
-        'outbound',
-      )
-      return connectSecureChannel(stream, {
-        identity,
-        logger: silentComponentLogger,
-        protocolVersions: [...protocolVersions],
-        signal: controller.signal,
-        remoteIdentity: desktopIdentity,
-      })
+      // The POST-OPEN half starts here: the upgrade completed, so the socket
+      // is not what failed. Tag it `channel:` rather than `websocket:` — the
+      // address demonstrably worked, and blaming it would send the operator to
+      // the wrong fix. Wrapping only these two statements keeps every pre-open
+      // arm on its own `websocket:`/`timeout:` kind.
+      try {
+        const stream = new RemoteSocketStream(
+          toRemoteSocket(ws),
+          silentComponentLogger.forComponent('pairing'),
+          'outbound',
+        )
+        return await connectSecureChannel(stream, {
+          identity,
+          logger: silentComponentLogger,
+          protocolVersions: [...protocolVersions],
+          signal: controller.signal,
+          remoteIdentity: desktopIdentity,
+        })
+      } catch (error) {
+        throw channelFailure(error instanceof Error ? error : new Error(String(error)))
+      }
     })()
 
     // Aborting on timeout is what unsticks the channel half: the ws 'error'

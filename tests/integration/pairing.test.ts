@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { hostname } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createDeviceIdentity } from '@cherrystudio/remote-transport'
+import { createDeviceIdentity, deviceIdentityId } from '@cherrystudio/remote-transport'
 import { pairingQrSchema } from '@cherrystudio/remote-protocol'
 import { DeviceStore } from '../../src/deviceStore.js'
 import type { WsDialOptions } from '../../src/connection.js'
@@ -476,11 +476,12 @@ describe('pairWithPayload over a real loopback channel', () => {
     const fakeInfo = await makeFake({ protocolVersions: [1] })
     const store = await makeStore()
 
-    // NOTE — this is the REAL negotiation-failure face: version selection
-    // happens inside the Noise prelude (`connectSecureChannel` sends the offer
-    // and the peer answers `Unsupported remote protocol` when the sets do not
-    // intersect). Contrast with Task 5①, which injects a RECEIPT inconsistency
-    // (a hello echo differing from the offer) and is not a negotiation failure.
+    // NOTE — the empty intersection is refused LOCALLY, inside the post-open
+    // half: `connectSecureChannel` parses the offer before writing any prelude,
+    // and `protocolSupportSchema` requires at least one version. So this is a
+    // `channel:` failure (⑧e's kind), NOT a peer prelude verdict — no offer
+    // ever reached the wire. Contrast with Task 5①, which injects a RECEIPT
+    // inconsistency (a hello echo differing from the offer).
     const error = await pairingError(
       pair({
         identity,
@@ -492,14 +493,16 @@ describe('pairWithPayload over a real loopback channel', () => {
 
     expect(error.kind).toBe('unreachable')
     expect(store.list()).toEqual([])
-    // The offer really was dialed — the failure is the peer's prelude verdict,
-    // not a local pre-check. No Noise channel completed and no pairing RPC ran.
+    // The socket was dialed, but no Noise channel completed and no pairing RPC
+    // ran: the refusal happened before the prelude write.
     expect(fakeInfo.fake.socketCount).toBe(1)
     expect(fakeInfo.fake.connectionCount).toBe(0)
     expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(0)
     expect(fakeInfo.fake.methodCount('connection.hello')).toBe(0)
-    // The diagnosis names the mismatch so the user knows to upgrade a side.
-    expect(error.message).toContain('7')
+    // The failure is the local post-open refusal, so it carries the kind. The
+    // candidate label ALREADY contains digits, so `toContain('7')` here would
+    // be satisfied by `127.0.0.1` — the kind is what makes this non-vacuous.
+    expect(error.message).toContain(': channel:')
   }, 15_000)
 
   it('⑥c offers the INTERSECTION, not the raw payload set', async () => {
@@ -676,8 +679,8 @@ describe('pairWithPayload over a real loopback channel', () => {
   // `timeout:` or `websocket:` so the joined `unreachable` verdict names the
   // FIX — retry the network (a timeout) versus fix the address/TLS (a
   // refused/closed socket) — and the ws error's own code survives in the
-  // message. Post-open (Noise/identity/protocol) failures are a separate kind,
-  // tracked by #147 and out of scope here.
+  // message. A POST-OPEN (Noise/identity/protocol) failure is the third kind,
+  // `channel:` (⑧e) — the socket worked, so the address is not the suspect.
   // -------------------------------------------------------------------------
 
   it('⑧a names a timed-out candidate dial timeout:, never websocket:', async () => {
@@ -824,6 +827,83 @@ describe('pairWithPayload over a real loopback channel', () => {
       for (const socket of sockets) socket.destroy()
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
+  }, 15_000)
+
+  it('⑧e names a post-open identity failure channel:, never websocket: or timeout:', async () => {
+    const identity = await createDeviceIdentity()
+    // A valid peer identity that is NOT this fake's: the TCP connect and the
+    // WebSocket upgrade both succeed, and the Noise identity PROOF is what
+    // refuses — exactly a QR generated for a different desktop (or one
+    // re-scanned after the desktop's identity was reset). A malformed identity
+    // string fails later, inside `secure()`'s post-open pin DECODE, so it
+    // would exercise the decode rather than the proof; that is why the fixture
+    // is a valid OTHER key.
+    const otherKey = await createDeviceIdentity()
+    // NEGATIVE CONTROL: the passing path never claims, but if the identity
+    // check were bypassed the approving peer would complete the handshake and
+    // the test would fail fast instead of waiting out the 3 s poll cap.
+    const fakeInfo = await makeApprovingFake()
+    const store = await makeStore()
+    const label = `${fakeInfo.host}:${fakeInfo.port}`
+
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, { desktopIdentity: deviceIdentityId(otherKey) }),
+      }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    // REACH PROOF, wording-independent: the fixture accepted exactly one
+    // socket and never counted a Noise channel as established. The failure text
+    // asserted below is the discriminator for WHICH post-open arm this is, but
+    // it comes from the pinned transport's Noise dependency and a bump could
+    // reword it with no product change — so it is never the reach proof.
+    expect(fakeInfo.fake.socketCount).toBe(1)
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    // The failed segment STARTS with the third kind: the socket reached the
+    // peer and only the identity proof failed. An unprefixed rejection here
+    // reads exactly like a pre-open one, which is the defect this pins.
+    expect(error.message).toContain(`${label}: channel:`)
+    expect(error.message).not.toContain('websocket:')
+    expect(error.message).not.toContain('timeout:')
+    // Our LOCAL Noise initiator compares the presented static key against the
+    // pin; no peer-authored message travels. The prefix is ours and the local
+    // diagnosis follows it, so the operator still learns which keys disagreed.
+    expect(error.message).toContain('does not match expected remote identity key')
+    expect(store.list()).toEqual([])
+  }, 15_000)
+
+  it('⑧f names a peer-side protocol refusal channel: and fails fast', async () => {
+    const identity = await createDeviceIdentity()
+    // The peer supports [7]; the payload and local support are [1]. The offer
+    // is NON-EMPTY and reaches the wire: the client's prelude write succeeds
+    // and the PEER refuses the selection. That is the one arm ⑥ does not
+    // cover — ⑥ is a LOCAL empty-offer parse with no wire offer.
+    const fakeInfo = await makeFake({ protocolVersions: [7] })
+    const store = await makeStore()
+    const label = `${fakeInfo.host}:${fakeInfo.port}`
+    const startedAt = performance.now()
+
+    const error = await pairingError(
+      pair({ identity, store, payload: v3PayloadFor(fakeInfo, { protocolVersions: [1] }) }),
+    )
+
+    expect(error.kind).toBe('unreachable')
+    expect(error.message).toContain(`${label}: channel:`)
+    expect(error.message).not.toContain('websocket:')
+    expect(error.message).not.toContain('timeout:')
+    // The dial reached a live peer that then REFUSED: one accepted socket and
+    // no channel. A dial refusal would be a different fixture.
+    expect(fakeInfo.fake.socketCount).toBe(1)
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    expect(store.list()).toEqual([])
+    // Determinism guard: the peer's refusal must settle the dial. If it went
+    // silent instead, the per-dial timer (3 s in this suite) would win and the
+    // verdict would be `timeout:` — caught above, and this bound keeps a slow
+    // pass from ever masking it.
+    expect(performance.now() - startedAt).toBeLessThan(2_000)
   }, 15_000)
 
   // -------------------------------------------------------------------------
