@@ -761,6 +761,13 @@ validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
 ignored (half-applied trust reaches some peers, not others). Never persisted,
 logged or reported; `ca` is PEM text.
 
+### Pairing: one dial budget across candidates
+
+The walk spends ONE aggregate deadline (`dialBudgetMs`, default 30 s), not
+`connectTimeoutMs` per address: a v3 QR admits 32 endpoints while the
+invitation lives 120 s. A candidate the budget never reached is reported
+`not attempted`, never dropped. Claim/poll keeps its own invitation deadline.
+
 ### Device selector
 
 `DeviceStore.resolve` = exact `deviceId` → the **union** of `deviceId` prefixes

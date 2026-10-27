@@ -53,6 +53,13 @@ export interface PairWithPayloadOptions {
   pollTimeoutMs?: number
   /** Per-candidate dial+handshake timeout (default 10s). */
   connectTimeoutMs?: number
+  /**
+   * Aggregate budget for the candidate DIAL walk (default 30s). It bounds the
+   * SUM of dial attempts, never a single attempt (that is `connectTimeoutMs`),
+   * and it does not cover the claim/poll phase, which keeps its own
+   * invitation-bound deadline (`pollTimeoutMs`).
+   */
+  dialBudgetMs?: number
   /** Locally supported protocol versions (default [1]). */
   supportedProtocolVersions?: readonly number[]
   /**
@@ -296,6 +303,12 @@ function parsePayload(payload: string): PairingPayload {
 
 const DEFAULT_SUPPORTED_PROTOCOL_VERSIONS: readonly number[] = [1]
 const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
+/**
+ * ONE aggregate budget for the candidate DIAL walk (issue #141). A v3 QR admits
+ * up to 32 endpoints, so 32 serial `connectTimeoutMs` dials could spend 320 s
+ * on an invitation that lives 120 s. It bounds the SUM, never one attempt.
+ */
+const DEFAULT_DIAL_BUDGET_MS = 30_000
 const DEFAULT_POLL_INTERVAL_MS = 1_000
 /** The protocol invitationMs: 120s of invitation, and our poll race guard. */
 const DEFAULT_POLL_TIMEOUT_MS = 120_000
@@ -475,6 +488,13 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   const offered = payload.protocolVersions.filter((version) => supported.includes(version))
 
   const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+  // ONE deadline for the whole candidate walk (issue #141). The per-attempt
+  // bound stays `connectTimeoutMs`, but no candidate may START after this
+  // instant and the last dial is clamped to what is left of it. The CLAIM/POLL
+  // phase below is deliberately outside it: that phase keeps its own
+  // invitation-bound deadline (`pollTimeoutMs`).
+  const dialBudgetMs = opts.dialBudgetMs ?? DEFAULT_DIAL_BUDGET_MS
+  const dialDeadline = Date.now() + dialBudgetMs
   report('connect')
 
   const failures: string[] = []
@@ -482,6 +502,13 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   let approved: DeviceRecord | undefined
   for (const candidate of payload.candidates) {
     const label = `${candidate.host}:${candidate.port}`
+    const remaining = dialDeadline - Date.now()
+    if (remaining <= 0) {
+      failures.push(
+        `${label}: not attempted (the ${dialBudgetMs} ms dial budget was spent on earlier candidates)`,
+      )
+      continue
+    }
     let temp: TempChannel
     try {
       temp = await dial(
@@ -489,7 +516,9 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
         opts.identity,
         payload.desktopIdentity,
         offered,
-        connectTimeoutMs,
+        // Clamped so the last attempt cannot OVERSHOOT the budget: a dial must
+        // never outlive the deadline it was started under.
+        Math.min(connectTimeoutMs, remaining),
         opts.wsOptions,
       )
     } catch (error) {

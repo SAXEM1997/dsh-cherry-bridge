@@ -3757,6 +3757,12 @@ function parsePayload(payload) {
 }
 const DEFAULT_SUPPORTED_PROTOCOL_VERSIONS = [1];
 const DEFAULT_CONNECT_TIMEOUT_MS = 1e4;
+/**
+* ONE aggregate budget for the candidate DIAL walk (issue #141). A v3 QR admits
+* up to 32 endpoints, so 32 serial `connectTimeoutMs` dials could spend 320 s
+* on an invitation that lives 120 s. It bounds the SUM, never one attempt.
+*/
+const DEFAULT_DIAL_BUDGET_MS = 3e4;
 const DEFAULT_POLL_INTERVAL_MS = 1e3;
 /** The protocol invitationMs: 120s of invitation, and our poll race guard. */
 const DEFAULT_POLL_TIMEOUT_MS = 12e4;
@@ -3873,14 +3879,21 @@ async function pairWithPayload(opts) {
 	const supported = opts.supportedProtocolVersions ?? DEFAULT_SUPPORTED_PROTOCOL_VERSIONS;
 	const offered = payload.protocolVersions.filter((version) => supported.includes(version));
 	const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+	const dialBudgetMs = opts.dialBudgetMs ?? DEFAULT_DIAL_BUDGET_MS;
+	const dialDeadline = Date.now() + dialBudgetMs;
 	report("connect");
 	const failures = [];
 	let approved;
 	for (const candidate of payload.candidates) {
 		const label = `${candidate.host}:${candidate.port}`;
+		const remaining = dialDeadline - Date.now();
+		if (remaining <= 0) {
+			failures.push(`${label}: not attempted (the ${dialBudgetMs} ms dial budget was spent on earlier candidates)`);
+			continue;
+		}
 		let temp;
 		try {
-			temp = await dial(candidate, opts.identity, payload.desktopIdentity, offered, connectTimeoutMs, opts.wsOptions);
+			temp = await dial(candidate, opts.identity, payload.desktopIdentity, offered, Math.min(connectTimeoutMs, remaining), opts.wsOptions);
 		} catch (error) {
 			failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
 			continue;
