@@ -1503,7 +1503,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
   // sessions are live at once — the attack shape, in the assembly's own
   // harness.
   // -------------------------------------------------------------------------
-  it('③p bounds the link-recovery line\'s session-id list and names the count it left out', async () => {
+  it('③u bounds the link-recovery line\'s session-id list and names the count it left out', async () => {
     const index = await import('../../src/index.js')
     // 48-char ids: schema-valid `opaqueId`s, and long enough that 15 of them
     // cannot fit the 320-char list budget.
@@ -1539,6 +1539,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       await read.execute({ device: 'dev-A', sessionId: session.sessionId })
     }
     expect(fakeInfo.fake.subscriptions).toHaveLength(15)
+
+    // The peer's own subscribe ledger is the WORK pin for this test: the
+    // post-drop slice must contain a successful subscribe for every session.
+    // The log bound must not shrink the work — a run that recovered three
+    // sessions and clipped the line anyway would pass every log assertion.
+    const subscribesBeforeDrop = fakeInfo.fake.subscribeCalls.length
 
     // The `console.info` spy from the shared beforeEach is the capture point:
     // clearing it makes the NEXT recovery line the one this drop produced.
@@ -1578,12 +1584,18 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     // The tail genuinely is not on the line.
     expect(line).not.toContain(sessions[sessions.length - 1]!.sessionId)
     // The recovery itself still covered EVERY session: a bound on the log, not
-    // on the work.
+    // on the work. Asserted on the PEER's subscribe record, not on the info
+    // lines — a failure warn (`re-subscribing session <id> … failed`) also
+    // contains the id, so log text cannot distinguish "recovered" from "tried
+    // and failed".
     await vi.waitFor(
       () => {
-        const lines = info.mock.calls.flat().map(String)
+        const afterDrop = fakeInfo.fake.subscribeCalls.slice(subscribesBeforeDrop)
+        const recovered = new Set(
+          afterDrop.filter((call) => call.mode !== 'error').map((call) => call.sessionId),
+        )
         for (const session of sessions) {
-          expect(lines.some((entry) => entry.includes(session.sessionId))).toBe(true)
+          expect(recovered.has(session.sessionId), `no post-recovery subscribe for ${session.sessionId}`).toBe(true)
         }
       },
       20_000,

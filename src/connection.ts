@@ -1036,8 +1036,13 @@ export class DeviceConnection {
       // BOUNDED (issue #155): the `cause` is the peer's OWN hello-echo text —
       // `ProtocolVersionError` is built from `String(<the peer's RPC failure>)`
       // — so the message can carry up to a whole 64 KiB record of peer text.
-      // Ceiling: the fixed prefix (64) + LOG_TEXT_MAX (240, marker included) +
-      // the upgrade suffix (37) = 341 characters.
+      // Ceiling: 56 fixed characters + the `deviceId` + LOG_TEXT_MAX (240,
+      // marker included) + the 37-character upgrade suffix. The id is
+      // deliberately NOT clipped (a whitelisted identifier an operator
+      // correlates on), and it is peer-assigned (`pairing.get`'s approved
+      // result, `opaqueId` ≤ 256), so the bound moves with it: 8-character
+      // fixture id → 341; a 36-char UUID → 369; the schema worst case (256) →
+      // 589.
       console.error(
         `[cherry-remote] device ${this.record.deviceId}: protocol version incompatible ` +
           `(${clipText(error.message, LOG_TEXT_MAX)}); upgrade Cherry Studio / the plugin`,
@@ -1080,10 +1085,12 @@ export class DeviceConnection {
         // BOUNDED (issue #155): this text is peer-influenced — an RPC failure
         // carries the peer's own `error.message` verbatim (an authenticate
         // refusal, a hello fault), and a transport error carries the system's.
-        // Only the 64 KiB record budget bounded it before. Ceiling: the fixed
-        // prefix (41) + LOG_TEXT_MAX (240, marker included) + `); reconnecting
-        // in <delay>ms` (26 at the 60,000 ms backoff cap) + the all-hosts hint
-        // (125) = 432 characters.
+        // Only the 64 KiB record budget bounded it before. Ceiling: 33 fixed
+        // characters + the `deviceId` + LOG_TEXT_MAX (240, marker included) +
+        // `); reconnecting in <delay>ms` (26 at the 60,000 ms backoff cap) +
+        // the all-hosts hint (125). The id is NOT clipped (same decision as
+        // above), so a 36-char UUID gives 460 and the schema worst case (256)
+        // gives 680, against 432 for the 8-character fixture id.
         `(${clipText(detail, LOG_TEXT_MAX)}); reconnecting in ${delay}ms${hint}`,
     )
     this.#setTimer('backoff', setTimeout(() => this.#tryEstablish(), delay))

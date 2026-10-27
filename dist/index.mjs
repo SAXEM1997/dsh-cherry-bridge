@@ -589,12 +589,17 @@ async function generateIdentity(dataDir, path) {
 /**
 * Bounded rendering for peer- and payload-controlled text (issue #155).
 *
-* ONE helper for every face that interpolates text a REMOTE peer controls — or
-* that a pairing payload the operator scanned controls — into a log line or a
-* user-visible verdict. The audit behind #155 found four such sites in three
-* files, each left unbounded for a different "why not" (a 10 KiB payload cap, a
-* hello-advertised field, the 64 KiB record budget), which is exactly how the
-* class of defect recurs: each site answered the question for itself.
+* The ONE helper this audit STANDARDISED ON — not the first attempt at the
+* idea: `src/diagnostics.ts`'s `truncateErrorMessage` (the diagnostics error
+* digest) and `src/rpc/jsonRpcClient.ts`'s `bounded()` (the frame-drop
+* warning's classification fields) predate it and stay where they are, for
+* their own callers. #155 is where the rendering rule was stated once and
+* applied to the SIX sites the audit found — four files: pairing's unknown-key
+* warning and stage verdict, the link-recovery line, the two connection error
+* lines, and the JSON-RPC notification-handler line. Each was unbounded for a
+* different "why not" (a 10 KiB payload cap, a hello-advertised field, the
+* 64 KiB record budget), which is exactly how the class of defect recurs: each
+* site answered the question for itself.
 *
 * The rule these helpers establish is stated once, here: bound the text where
 * it is RENDERED (never where it is carried — an error message is a value
@@ -3704,12 +3709,14 @@ const MAX_PAYLOAD_BYTES = 10240;
 * Bounds the unknown-key WARNING (issue #155). The keys in that warning are
 * payload-CONTROLLED NAMES, and `MAX_PAYLOAD_BYTES` is no bound at all on the
 * line: a 10 KiB payload carrying 32 unknown keys of ~256 characters used to
-* join into ~5-7 KB of attacker-chosen text on the operator's log (the
-* measured fixture is 8.2 KB of keys, 8.3 KB of line).
+* join into ~8.2 KB of attacker-chosen text (the measured fixture is 8,192
+* characters of keys and an 8,312-character line) on the operator's log.
 *
 * `UNKNOWN_FIELDS_MAX` is the joined list's budget — the same 240-character
-* working ceiling as `LOG_TEXT_MAX` / `FAILURE_SEGMENT_MAX`, so "one bounded
-* peer detail" means one number on every face. `UNKNOWN_FIELD_MAX` clips ONE
+* working budget as `LOG_TEXT_MAX`, so "one bounded peer detail" means one
+* number for one detail-sized face (pairing's `FAILURE_SEGMENT_MAX` is the
+* same NUMBER bounding a different quantity: a whole `<label>: <detail>`).
+* `UNKNOWN_FIELD_MAX` clips ONE
 * key: 64 characters is longer than any field name the protocol defines, so a
 * clipped key is always a malformed or hostile payload, never a real typo the
 * operator needs whole. A list that stops early names the count (`(+K more)`);

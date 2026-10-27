@@ -1813,11 +1813,13 @@ describe('pairWithPayload over a real loopback channel', () => {
       .map(String)
       .find((entry) => entry.includes('ignored unknown field(s)'))
     expect(line, 'the unknown-key warning must be logged').toBeDefined()
-    // CEILING: the prefix (~55 chars) + UNKNOWN_FIELDS_MAX 240 + the
-    // ` (+29 more)` marker (11) is under 310; 300 is the STATED bound and the
-    // marker rides on top of the budget. An unbounded join of these keys is
-    // ~8.3 KB.
-    expect(line!.length).toBeLessThan(300)
+    const prefix = '[cherry-remote] pairing payload ignored unknown field(s): '
+    expect(line!.startsWith(prefix)).toBe(true)
+    // CEILING: the fixed prefix (58 chars) + UNKNOWN_FIELDS_MAX (240) for the
+    // joined keys + the ` (+29 more)` marker (11), which rides ON TOP of the
+    // budget — 309 characters, not 300. An unbounded join of these keys is
+    // 8,312 characters (the mutation recorded for this test).
+    expect(line!.length).toBeLessThanOrEqual(prefix.length + 240 + ' (+29 more)'.length)
     // The count of unnamed keys is explicit, and it is the real remainder:
     // 3 keys fit (64 + 2 + 64 + 2 + 64 = 196; the fourth would make 262 > 240).
     expect(line).toContain('(+29 more)')

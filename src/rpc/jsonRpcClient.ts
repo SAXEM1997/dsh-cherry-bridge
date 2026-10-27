@@ -563,10 +563,12 @@ export class JsonRpcClient {
           // OBJECT as a second argument, so the console chose the rendering:
           // the stack plus every own property, with nothing bounding it. A
           // handler failure is not a payload, so the line carries what an
-          // operator needs and nothing else — the METHOD (peer-supplied text,
-          // routed through the same `bounded()` the frame-drop path uses; that
-          // helper stays as it is, the count-less older form, and unifying the
-          // two is a separate ticket) and the MESSAGE under LOG_TEXT_MAX.
+          // operator needs and nothing else — the METHOD and the MESSAGE under
+          // LOG_TEXT_MAX. The method is already bounded twice over, without
+          // clipText: the notification schema caps `method` at 128 characters
+          // and `bounded()` (the frame-drop path's older, count-less form, left
+          // as it is — unifying the two is a separate ticket) clips to 120 + an
+          // ellipsis.
           // Ceiling: `[cherry-remote] notification handler for "` (42) +
           // bounded method (≤ 121: FRAME_FIELD_LIMIT 120 + the ellipsis) +
           // `" threw: ` (9) + LOG_TEXT_MAX (240) = 412.

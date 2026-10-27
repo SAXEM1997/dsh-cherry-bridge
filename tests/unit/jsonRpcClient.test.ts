@@ -684,7 +684,7 @@ describe('JsonRpcClient', () => {
   // nothing bounding it. The line is now ONE string: the method through the
   // frame-drop path's own `bounded()` and the message under LOG_TEXT_MAX.
   // -------------------------------------------------------------------------
-  it('(#155) renders a throwing notification handler as ONE bounded string, never the error object', async () => {
+  it('⑫ (issue #155) renders a throwing notification handler as ONE bounded string, never the error object', async () => {
     const { client, peer } = await openLoopback()
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 

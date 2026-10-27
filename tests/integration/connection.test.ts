@@ -2239,15 +2239,27 @@ describe('log text is bounded (issue #155)', () => {
     const suffix = '); upgrade Cherry Studio / the plugin'
     expect(line!.startsWith(prefix)).toBe(true)
     expect(line!.endsWith(suffix)).toBe(true)
-    // CEILING: the fixed prefix (64 chars) + LOG_TEXT_MAX (240, marker included)
-    // + the upgrade suffix (37) = 341. Unbounded, this line was 64 + 573 + 37 =
-    // 674 characters.
+    // CEILING, per the deviceId's length: 56 fixed characters + id + LOG_TEXT_MAX
+    // (240, marker included) + the 37-char suffix. The 8-char fixture id gives
+    // 341; a 36-char UUID gives 369; the schema worst case (`opaqueId` ≤ 256)
+    // gives 589. `deviceId` is deliberately NOT clipped (a whitelisted
+    // identifier an operator correlates on), so the bound moves with it.
+    // Unbounded, this line was 64 + 573 + 37 = 674 characters with the fixture
+    // id.
     expect(line!.length).toBeLessThanOrEqual(prefix.length + 240 + suffix.length)
     expect(line!).toMatch(/… \(\+\d+ chars\)/)
-    const removed = Number(/… \(\+(\d+) chars\)/.exec(line!)![1])
-    // The 573-char detail kept 225 and removed the other 348 (the 15-char
-    // marker is charged to the 240 budget).
-    expect(removed).toBe(573 - (240 - '… (+348 chars)'.length))
+    // The kept prefix and the marker are charged to the SAME 240-char budget:
+    // derive both from the rendered detail instead of hardcoding a marker
+    // width, so a marker whose own digit count changes cannot slip through.
+    const renderedDetail = line!.slice(prefix.length, line!.length - suffix.length)
+    const kept = renderedDetail.indexOf('…')
+    expect(kept).toBeGreaterThan(0)
+    const marker = renderedDetail.slice(kept)
+    expect(kept + marker.length).toBe(240)
+    // The 573-char detail kept 226 and removed 347; `… (+347 chars)` is 14
+    // characters, and 226 + 14 = 240.
+    expect(marker).toBe(`… (+${573 - kept} chars)`)
+    expect(573 - kept).toBe(347)
     // The peer's raw text is gone; OUR wording (and the remediation hint) stays.
     expect(line).not.toContain(longMessage)
     expect(line).not.toContain('h'.repeat(300))
@@ -2281,16 +2293,18 @@ describe('log text is bounded (issue #155)', () => {
       .map(String)
       .find((entry) => entry.startsWith(prefix))
     expect(line, 'the transient-failure warning must be logged').toBeDefined()
-    // CEILING: the prefix (41) + LOG_TEXT_MAX (240, marker included) +
-    // `); reconnecting in 60000ms` (26; a deliberately over-long delay, so the
-    // real bound is tighter) + the all-hosts hint (125) = 432 characters.
+    // CEILING, per the deviceId's length: 33 fixed characters + id + LOG_TEXT_MAX
+    // (240, marker included) + `); reconnecting in <delay>ms` (26 at the 60,000 ms
+    // backoff CAP — this test's first delay is 30 ms, so the real line is far
+    // shorter) + the all-hosts hint (125). The 8-char fixture id gives 432; a
+    // 36-char UUID gives 460; the schema worst case (`opaqueId` ≤ 256) gives
+    // 680. Unclipped, this line was 5,259 characters.
     const hint =
       ' — all candidate addresses were unreachable; if the desktop moved, update ' +
       'them via the device card 地址维护 (address maintenance)'
     expect(line!.length).toBeLessThanOrEqual(
       prefix.length + 240 + '); reconnecting in 60000ms'.length + hint.length,
     )
-    expect(line!.length).toBeLessThan(433)
     expect(line!).toMatch(/… \(\+\d+ chars\)/)
     const removed = Number(/… \(\+(\d+) chars\)/.exec(line!)![1])
     expect(removed).toBeGreaterThan(4_000)

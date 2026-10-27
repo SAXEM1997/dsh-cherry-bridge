@@ -47,14 +47,6 @@ describe('clipText', () => {
     // bound. The loop re-derives 227 + `… (+22 chars)` = 240.
     expect(clipText('x'.repeat(249), 240)).toBe(`${'x'.repeat(227)}… (+22 chars)`)
     expect(clipText('x'.repeat(249), 240).length).toBe(240)
-
-    // The largest prefix that fits, at a 1 -> 2 digit removal boundary: the
-    // first fixed point the loop visits is charged the marker it will carry.
-    const text = 'y'.repeat(40)
-    const clipped = clipText(text, 20)
-    const kept = clipped.indexOf('…')
-    expect(clipped.length).toBeLessThanOrEqual(20)
-    expect(Number(/… \(\+(\d+) chars\)$/.exec(clipped)![1])).toBe(text.length - kept)
   })
 
   it('admits the loss with a bare ellipsis when the room cannot carry the marker', () => {

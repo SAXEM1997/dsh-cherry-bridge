@@ -68,21 +68,12 @@ export interface FakeCherryOptions {
   /** Every `connection.refresh` fails with this protocol failure. */
   refreshFailure?: FakeFailure
   /**
-   * Every `connection.hello` fails with this protocol failure.
-   *
-   * Added for issue #155's (#155a): the protocol-version console.error
-   * interpolates the `ProtocolVersionError` cause, which is the peer's OWN
-   * hello-failure text. The fake's built-in INVALID_CONNECTION_STATE messages
-   * are fixed short strings, so only an injected failure can make that text
-   * long enough to prove the log line is bounded.
-   *
-   * Keep `message` at or below the protocol's 512-character failure-message cap
-   * when the test wants the STRUCTURED arm: `remoteFailureSchema.message` is
-   * `z.string().max(512)`, and above it the client discards `data`, so the
-   * reason is unreadable and the failure takes the transient/offline arm
-   * instead of becoming a `ProtocolVersionError`.
-   *
-   * Optional and additive, like `authenticateFailure` / `refreshFailure`.
+   * Every `connection.hello` fails with this protocol failure. Added for
+   * #155a: the protocol-version log line interpolates the peer's own
+   * hello-failure text, and the fake's built-in INVALID_CONNECTION_STATE
+   * strings are fixed-short. A `message` above the 512-char
+   * `remoteFailureSchema.message` cap makes the client discard `data`, so the
+   * reason is unreadable and the failure takes the transient arm instead.
    */
   helloFailure?: FakeFailure
   /** Accept pings but never answer them (silence-timeout exercises). */
@@ -131,15 +122,11 @@ export interface FakeCherryOptions {
   /** Number of `pairing.get` calls answered `pending` before the decision. */
   pairingGetPendingPolls?: number
   /**
-   * Every `pairing.claim` fails with this protocol failure (the same
-   * `FakeFailure` shape `authenticateFailure` / `refreshFailure` take).
-   *
-   * Added for issue #155's ⑯b: the pairing stage error face reads the peer's
-   * own `error.message`, and only an injected failure can make that message
-   * LONG — the fake's built-in claim refusals carry fixed short text. The
-   * HELD-back schema is the point, not an artefact: a message above the nested
-   * failure-data schema's cap makes the client discard `data`, which is exactly
-   * the documented degradation path into the `unreachable` verdict.
+   * Every `pairing.claim` fails with this protocol failure (same `FakeFailure`
+   * shape as `authenticateFailure` / `refreshFailure`). Added for ⑯b: only an
+   * injected failure can make the peer's `error.message` long, and a message
+   * above the nested failure-data schema's cap makes the client discard
+   * `data` — the documented degradation path into the `unreachable` verdict.
    */
   pairingClaimFailure?: FakeFailure
   /**

@@ -1,12 +1,17 @@
 /**
  * Bounded rendering for peer- and payload-controlled text (issue #155).
  *
- * ONE helper for every face that interpolates text a REMOTE peer controls — or
- * that a pairing payload the operator scanned controls — into a log line or a
- * user-visible verdict. The audit behind #155 found four such sites in three
- * files, each left unbounded for a different "why not" (a 10 KiB payload cap, a
- * hello-advertised field, the 64 KiB record budget), which is exactly how the
- * class of defect recurs: each site answered the question for itself.
+ * The ONE helper this audit STANDARDISED ON — not the first attempt at the
+ * idea: `src/diagnostics.ts`'s `truncateErrorMessage` (the diagnostics error
+ * digest) and `src/rpc/jsonRpcClient.ts`'s `bounded()` (the frame-drop
+ * warning's classification fields) predate it and stay where they are, for
+ * their own callers. #155 is where the rendering rule was stated once and
+ * applied to the SIX sites the audit found — four files: pairing's unknown-key
+ * warning and stage verdict, the link-recovery line, the two connection error
+ * lines, and the JSON-RPC notification-handler line. Each was unbounded for a
+ * different "why not" (a 10 KiB payload cap, a hello-advertised field, the
+ * 64 KiB record budget), which is exactly how the class of defect recurs: each
+ * site answered the question for itself.
  *
  * The rule these helpers establish is stated once, here: bound the text where
  * it is RENDERED (never where it is carried — an error message is a value
@@ -85,10 +90,13 @@ export function boundedJoin(
 
 /**
  * The ceiling for ONE peer- or payload-controlled detail interpolated into a
- * log line: 240 characters, the same working ceiling pairing already gives one
- * rendered peer-controlled failure detail (`FAILURE_SEGMENT_MAX`) — a log line
- * needs no more room than a user-facing verdict, and one number for both faces
- * is what keeps "bounded" from meaning two different things.
+ * log line: 240 characters, the `… (+N chars)` marker included.
+ *
+ * It is deliberately NOT the same budget as pairing's `FAILURE_SEGMENT_MAX`,
+ * although both read 240: that one bounds the WHOLE `<label>: <detail>`, so
+ * the label eats from it and the detail there is at most 218 (a
+ * `pairing hello failed` label — 20 characters — plus its `': '`) and often
+ * less. Same number, different quantity: this one is the detail alone.
  *
  * Call sites (all render peer-controlled text through {@link clipText} with
  * this value):
