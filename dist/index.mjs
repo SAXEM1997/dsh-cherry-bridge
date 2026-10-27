@@ -22,11 +22,11 @@ const FILE_MODE = 384;
 * downgrade a TLS-proxied desktop to a dial that cannot connect.
 *
 * `{ 3 -> 4 }` (issue #135) adds the per-host `ports` map. v3 had `hosts` + one
-* shared `port` (the winner candidate's), so every host is backfilled that
-* port — the only one v3 ever dialed. A half-migrated file keeps the entries it
-* already carries, for the same reason the scheme step does: a remembered port
-* is the address the pairing actually used, and overwriting it would point the
-* host at the winner's port again.
+* shared `port` (the winner candidate's), so the step backfills `ports` from
+* `port` for every host — the only one v3 ever dialed. A half-migrated file
+* keeps the entries it already carries, for the same reason the scheme step
+* does: a remembered port is the address the pairing actually used, and
+* overwriting it would point the host at the winner's port again.
 *
 * **A legacy file is read loosely, this build's own output strictly —
 * deliberately.** Each step fills its map for the CURRENT host list and
@@ -57,13 +57,16 @@ const MIGRATIONS = {
 };
 /** Every host of a v2 record, defaulting anything it did not already say. */
 function backfilledSecurity(disk) {
+	const hosts = Array.isArray(disk.hosts) ? disk.hosts : [];
 	const existing = disk.security ?? {};
-	return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? "ws"]));
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(existing, host) ? existing[host] : "ws"]));
 }
 /** Every host of a v3 record, defaulting anything it did not already say. */
 function backfilledPorts(disk) {
+	const hosts = Array.isArray(disk.hosts) ? disk.hosts : [];
 	const existing = disk.ports ?? {};
-	return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? disk.port]));
+	const fallback = disk.port;
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(existing, host) ? existing[host] : fallback]));
 }
 /**
 * The field set of a v1 entry: what the store wrote before it carried a
@@ -111,6 +114,7 @@ function assertValidRecord(disk) {
 	const missing = REQUIRED_KEYS.filter((key) => disk[key] === void 0);
 	if (missing.length > 0) throw new Error(`device archive entry is missing required field(s): ${missing.join(", ")}`);
 	if (!Array.isArray(disk.hosts)) throw new Error("device archive entry field hosts must be an array");
+	if (typeof disk.port !== "number" || !Number.isInteger(disk.port) || disk.port < 1 || disk.port > 65535) throw new Error("device archive entry field port must be an integer in 1..65535");
 	assertValidSecurity(disk.hosts, disk.security);
 	assertValidPorts(disk.hosts, disk.ports);
 	if (disk.accessToken !== void 0 !== (disk.tokenExpiresAt !== void 0)) throw new Error("device archive entry must carry accessToken and tokenExpiresAt together or not at all");
@@ -3139,10 +3143,10 @@ var DeviceConnection = class {
 	* 「候选地址全部不可达」 verdict only holds when EVERY host failed.
 	*
 	* Each candidate dials with ITS OWN port from `record.ports`; the record-level
-	* `port` (the winner's) is the fallback for an in-memory record assembled
-	* without the map (issue #135). Before that, one port was shared by every
-	* host, so a reconnect to a non-winner host dialed the right scheme at the
-	* wrong port.
+	* `port` (the winner's at pairing, the operator's after a PATCH) is the
+	* fallback for an in-memory record assembled without the map (issue #135).
+	* Before that, one port was shared by every host, so a reconnect to a
+	* non-winner host dialed the right scheme at the wrong port.
 	*
 	* "Per-host" covers the CHANNEL-LEVEL handshake failures as well as the dial:
 	* a socket that opens and then dies mid-handshake (the peer accepted the TCP
@@ -3732,6 +3736,12 @@ function parsePayload(payload) {
 		port: endpoint.port,
 		security: endpoint.security
 	}));
+	const seenHosts = /* @__PURE__ */ new Set();
+	for (const candidate of candidates) {
+		if (!Number.isInteger(candidate.port) || candidate.port < 1 || candidate.port > 65535) invalid(`payload endpoint "${candidate.host}": port must be an integer in 1..65535`);
+		if (seenHosts.has(candidate.host)) invalid(`payload endpoints must not repeat host "${candidate.host}"`);
+		seenHosts.add(candidate.host);
+	}
 	for (const field of [
 		"invitationId",
 		"invitationSecret",
@@ -3865,6 +3875,7 @@ async function pairWithPayload(opts) {
 	const connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
 	report("connect");
 	const failures = [];
+	let approved;
 	for (const candidate of payload.candidates) {
 		const label = `${candidate.host}:${candidate.port}`;
 		let temp;
@@ -3875,17 +3886,18 @@ async function pairWithPayload(opts) {
 			continue;
 		}
 		try {
-			const record = await claimAndAwait(temp.client, payload, offered, opts, report, candidate);
+			approved = await claimAndAwait(temp.client, payload, offered, opts, report, candidate);
 			destroy(temp);
-			opts.store.upsert(record);
-			return record;
+			break;
 		} catch (error) {
 			destroy(temp);
 			if (error instanceof PairingError) throw error;
 			failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
-	throw new PairingError("unreachable", `no candidate address could complete pairing (${failures.join("; ")})`);
+	if (approved === void 0) throw new PairingError("unreachable", `no candidate address could complete pairing (${failures.join("; ")})`);
+	opts.store.upsert(approved);
+	return approved;
 }
 /**
 * The RPC half of one candidate: confirm the protocol, claim, present the code,
@@ -10530,11 +10542,14 @@ function normalizeHost(raw) {
 * never patched directly — there is no `ports` field in this body):
 *
 *  - neither `hosts` nor `port` patched → the maps are unchanged;
-*  - `hosts` replaced, `port` unchanged → a host that stays keeps ITS OWN
-*    scheme and port, a new host gets `ws` and the record-level port;
-*  - `port` patched (with or without `hosts`) → EVERY final host is re-pointed
-*    to the new port. The face has one port field; leaving per-host entries
-*    would make the edit inert for every listed host that already had one.
+*  - `hosts` replaced → a host that stays keeps ITS OWN scheme and port, a new
+*    host gets `ws` and the record-level port;
+*  - a CHANGED `port` (with or without `hosts`) → EVERY final host is
+*    re-pointed to it. The face has one port field, so leaving per-host
+*    entries would make the edit inert for every listed host that already had
+*    one. Sending the CURRENT value is a no-op for the maps — the settings page
+*    sends both fields on every save, and a mixed-port record must not be
+*    flattened by a save that did not change the port.
 */
 function parsePatch(body) {
 	const patch = {};
@@ -10558,6 +10573,7 @@ function parsePatch(body) {
 			if (typeof entry !== "string") throw new PatchError("hosts entries must be strings");
 			return normalizeHost(entry);
 		});
+		if (new Set(patch.hosts).size !== patch.hosts.length) throw new PatchError("hosts must not contain duplicates");
 	}
 	const port = body["port"];
 	if (port !== void 0) {
@@ -11186,7 +11202,7 @@ async function patchDevice(req, res, route, deviceId) {
 	const previousPort = existing.port;
 	const previousSecurity = existing.security;
 	const previousPorts = existing.ports;
-	const nextPorts = patch.port !== void 0 ? portsFor(patch.hosts ?? previousHosts, {}, patch.port) : patch.hosts === void 0 ? previousPorts : portsFor(patch.hosts, previousPorts, previousPort);
+	const nextPorts = patch.port !== void 0 && patch.port !== previousPort ? portsFor(patch.hosts ?? previousHosts, {}, patch.port) : patch.hosts === void 0 ? previousPorts : portsFor(patch.hosts, previousPorts, previousPort);
 	const next = {
 		...existing,
 		...patch.displayName === void 0 ? {} : { displayName: patch.displayName },
@@ -11205,7 +11221,7 @@ async function patchDevice(req, res, route, deviceId) {
 		writeError(res, 400, "invalid-device", error instanceof Error ? error.message : String(error));
 		return;
 	}
-	const addressChanged = patch.hosts !== void 0 && !sameHosts(patch.hosts, previousHosts) || patch.port !== void 0 && patch.port !== previousPort || !sameSecurity(next.security, previousSecurity) || !samePorts(next.ports, previousPorts);
+	const addressChanged = patch.hosts !== void 0 && !sameHosts(patch.hosts, previousHosts) || patch.port !== void 0 && patch.port !== previousPort || !sameSecurity(next.security, previousSecurity);
 	const enabledChanged = patch.enabled !== void 0 && patch.enabled !== previousEnabled;
 	if (addressChanged) evict(route, deviceId);
 	if (enabledChanged) hibernate(route, deviceId);
@@ -11247,28 +11263,23 @@ function sameHosts(a, b) {
 * demote a TLS-proxied desktop to a plain dial.
 */
 function securityFor(hosts, previous) {
-	return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? "ws"]));
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : "ws"]));
 }
 /**
 * The port map for a host list (issue #135): each named host keeps the port it
 * was dialed with, a host the list just gained defaults to `fallback` (the
 * record-level port), and hosts the list dropped leave no entry behind.
 *
-* `previous` is empty when the caller is re-pointing EVERY host (a `port`
-* patch): there is no remembered entry to keep, by design — one port field on
-* this face must move the whole list.
+* `previous` is empty when the caller is re-pointing EVERY host (a CHANGED
+* `port` patch): there is no remembered entry to keep, by design — one port
+* field on this face must move the whole list. Same `Object.hasOwn` rule as
+* `securityFor`: an inherited function is not a remembered port.
 */
 function portsFor(hosts, previous, fallback) {
-	return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? fallback]));
+	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : fallback]));
 }
 /** Order-insensitive comparison for two scheme maps. */
 function sameSecurity(a, b) {
-	const keys = Object.keys(a);
-	if (keys.length !== Object.keys(b).length) return false;
-	return keys.every((key) => a[key] === b[key]);
-}
-/** Order-insensitive comparison for two port maps (same rule as security). */
-function samePorts(a, b) {
 	const keys = Object.keys(a);
 	if (keys.length !== Object.keys(b).length) return false;
 	return keys.every((key) => a[key] === b[key]);

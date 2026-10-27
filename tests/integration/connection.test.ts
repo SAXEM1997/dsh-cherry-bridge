@@ -1259,10 +1259,10 @@ describe('DeviceConnection over a real loopback channel', () => {
   it('#126 a record whose security map is ABSENT still dials ws', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake()
-    // The legacy shape: a record read before the v3 migration carries hosts
-    // and a single port and nothing about a scheme (in memory such a record is
-    // only reachable through the store's own migration, which backfills `ws`
-    // — so the dial must default, never crash on the missing map).
+    // The legacy shape: a record read before the v3/v4 migrations carries
+    // `hosts` + `port` and nothing about a scheme or a per-host port (in memory
+    // such a record is only reachable through the store's own migrations, which
+    // backfill both — so the dial must default, never crash on a missing map).
     const { security: _security, ...legacy } = recordFor(fakeInfo)
     const record = legacy as DeviceRecord
     expect(record.security).toBeUndefined()
@@ -1283,19 +1283,23 @@ describe('DeviceConnection over a real loopback channel', () => {
   // built the right scheme at the WRONG port. The record now carries a port
   // per host, and the dial reads it with the record-level `port` as fallback.
   //
-  // The fixture makes the two sources DISAGREE on purpose: the record-level
-  // port is dead, so only a dial that reads the per-host map reaches the peer.
+  // The fixture makes the sources DISAGREE on purpose, across TWO candidates:
+  // the record-level port and the FIRST host's port are dead, and only the
+  // SECOND host's own entry reaches the peer. A dial reading `record.port` —
+  // or `ports[record.hosts[0]]` — therefore connects to nothing.
   // -------------------------------------------------------------------------
 
   it('#135 a non-winner host dials its OWN port, not the record-level winner port', async () => {
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake()
-    // `port` is the winner's (dead here); `ports[host]` is the address the peer
-    // actually listens on. Reading `record.port` reaches nothing.
+    const deadPort = 1
+    // `localhost` (the second candidate) resolves to the fake's loopback
+    // listener; `127.0.0.1` (the first) is alive only on the live port, which
+    // this record deliberately does not give it.
     const record = recordFor(fakeInfo, {
-      hosts: [fakeInfo.host],
-      port: 1,
-      ports: { [fakeInfo.host]: fakeInfo.port },
+      hosts: ['127.0.0.1', 'localhost'],
+      port: deadPort,
+      ports: { '127.0.0.1': deadPort, localhost: fakeInfo.port },
     })
     const connection = makeConnection({ identity, record })
 
@@ -1304,24 +1308,6 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(connection.state).toBe('connected')
     expect(fakeInfo.fake.connectionCount).toBe(1)
     expect(fakeInfo.fake.authenticateCount).toBe(1)
-  })
-
-  it('#135 a migrated/legacy-shaped record (ports[host] === port) still dials normally', async () => {
-    const identity = await createDeviceIdentity()
-    const fakeInfo = await makeFake()
-    // What the v3→v4 migration writes: the map is explicit, and every host's
-    // entry equals the record-level port because v3 had only one.
-    const record = recordFor(fakeInfo, {
-      hosts: [fakeInfo.host],
-      port: fakeInfo.port,
-      ports: { [fakeInfo.host]: fakeInfo.port },
-    })
-    const connection = makeConnection({ identity, record })
-
-    await connection.connect()
-
-    expect(connection.state).toBe('connected')
-    expect(fakeInfo.fake.connectionCount).toBe(1)
   })
 
   it('#135 a record whose ports map is ABSENT still dials the record-level port', async () => {
@@ -1482,8 +1468,9 @@ describe('DeviceConnection over a real loopback channel', () => {
     // One peer that accepts the socket and STALLS the handshake — the window
     // close() has to land in.
     const fakeInfo = await makeFake({ requestDelayMs: 5_000 })
-    // The SAME address listed twice. A record's candidates share one port, so
-    // this is the honest way to observe a second candidate attempt: without the
+    // The SAME address listed twice, on the same port (the fixture derives one
+    // port entry per host from the record-level port). Duplicating the entry is
+    // the honest way to observe a second candidate attempt: without the
     // cancellation guard the loop falls through to candidate 2 and dials the
     // very same peer again, which the peer counts as a second accepted socket.
     const record = recordFor(fakeInfo, { hosts: [fakeInfo.host, fakeInfo.host] })

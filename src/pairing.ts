@@ -255,6 +255,25 @@ function parsePayload(payload: string): PairingPayload {
           security: endpoint.security,
         }))
 
+  // ADDRESS rules the schema cannot express (issue #135 review). The pinned
+  // schema already constrains a v3 endpoint port, but that is the PIN's
+  // property, not ours — a widening must not reopen the hole — and it has no
+  // uniqueness rule at all. Judged HERE — for BOTH arms, after normalization,
+  // before any socket — because an invalid address must never consume the
+  // invitation, and must never reach `store.upsert` after an approval (where a
+  // validation failure would surface as `unreachable` about an invitation
+  // already spent).
+  const seenHosts = new Set<string>()
+  for (const candidate of candidates) {
+    if (!Number.isInteger(candidate.port) || candidate.port < 1 || candidate.port > 65_535) {
+      invalid(`payload endpoint "${candidate.host}": port must be an integer in 1..65535`)
+    }
+    if (seenHosts.has(candidate.host)) {
+      invalid(`payload endpoints must not repeat host "${candidate.host}"`)
+    }
+    seenHosts.add(candidate.host)
+  }
+
   // The lone-surrogate rule is ours (see the header): the claim RPC would
   // carry such a value to the peer's unicodeText params face and be refused
   // there; naming the field now is the same verdict one round trip earlier.
@@ -459,6 +478,8 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
   report('connect')
 
   const failures: string[] = []
+  // The approved record, set by the winner and written ONCE after the loop.
+  let approved: DeviceRecord | undefined
   for (const candidate of payload.candidates) {
     const label = `${candidate.host}:${candidate.port}`
     let temp: TempChannel
@@ -476,33 +497,45 @@ export async function pairWithPayload(opts: PairWithPayloadOptions): Promise<Dev
       continue
     }
     try {
-      const record = await claimAndAwait(temp.client, payload, offered, opts, report, candidate)
+      approved = await claimAndAwait(temp.client, payload, offered, opts, report, candidate)
       destroy(temp)
-      // `DeviceStore.upsert` persists and returns nothing, so the call returns
-      // the very record it handed over — the persisted archive entry, not a
-      // pre-write copy.
-      opts.store.upsert(record)
-      return record
+      // Settled: stop walking. The ARCHIVE WRITE is deliberately outside this
+      // per-candidate catch (below) — see the fall-through comment.
+      break
     } catch (error) {
       destroy(temp)
       if (error instanceof PairingError) throw error
-      // MID-FLOW FALL-THROUGH (documented boundary): a NON-`PairingError` here
-      // is an unexpected fault on THIS candidate — not a verdict about the
-      // invitation. The walk therefore CONTINUES to the next candidate address,
-      // and if a later candidate reaches a real terminal state that verdict
-      // wins. Only if EVERY candidate fails does the walk end as `unreachable`;
-      // conversely an unexpected fault on the FIRST candidate followed by a
-      // peer `rejected` on the SECOND surfaces as `rejected`, not `unreachable`.
-      // That is deliberate: the peer's answer about the invitation outranks our
-      // own transport trouble, and it is the one the user can act on.
+      // MID-FLOW FALL-THROUGH (documented boundary): a NON-`PairingError` DIAL
+      // or CLAIM fault here is an unexpected fault on THIS candidate — not a
+      // verdict about the invitation. The walk therefore CONTINUES to the next
+      // candidate address, and if a later candidate reaches a real terminal
+      // state that verdict wins. Only if EVERY candidate fails does the walk end
+      // as `unreachable`; conversely an unexpected fault on the FIRST candidate
+      // followed by a peer `rejected` on the SECOND surfaces as `rejected`, not
+      // `unreachable`. That is deliberate: the peer's answer about the invitation
+      // outranks our own transport trouble, and it is the one the user can act
+      // on. The archive write is NOT in this arm: it happens once, after a
+      // winner, and is TERMINAL — a store failure is a fact about the archive,
+      // never an address failure.
       failures.push(`${label}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
 
-  throw new PairingError(
-    'unreachable',
-    `no candidate address could complete pairing (${failures.join('; ')})`,
-  )
+  if (approved === undefined) {
+    throw new PairingError(
+      'unreachable',
+      `no candidate address could complete pairing (${failures.join('; ')})`,
+    )
+  }
+
+  // ONE write, after a winner and outside every per-candidate catch. A failure
+  // here surfaces as itself (`QuarantinedArchiveError`, a validation error, …):
+  // the desktop already approved, so blaming an address would be a lie and the
+  // invitation is already spent. `upsert` returns nothing, so the return value
+  // is the record handed to it — the persisted archive entry, not a pre-write
+  // copy.
+  opts.store.upsert(approved)
+  return approved
 }
 
 /**

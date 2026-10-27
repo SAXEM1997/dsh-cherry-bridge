@@ -982,6 +982,77 @@ describe('④ PATCH address maintenance', () => {
     expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 1111, '10.0.0.9': 8765 })
   })
 
+  it('does not flatten a mixed-port map when the PATCH repeats the current record port', async () => {
+    mount()
+    store.upsert(
+      record({
+        hosts: ['10.0.0.1', '10.0.0.2'],
+        port: 8765,
+        ports: { '10.0.0.1': 1111, '10.0.0.2': 2222 },
+      }),
+    )
+
+    // The settings page sends `hosts` AND `port` on every address save. When
+    // the port VALUE is unchanged, the edit is a no-op for the map: the staying
+    // host keeps its own port and the new host gets the record port — the same
+    // rule a hosts-only PATCH follows (asymmetric with #126 would silently
+    // flatten a mixed-port record on its first save).
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['10.0.0.1', '10.0.0.9'], port: 8765 }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.port).toBe(8765)
+    expect(json.ports).toEqual({ '10.0.0.1': 1111, '10.0.0.9': 8765 })
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 1111, '10.0.0.9': 8765 })
+  })
+
+  it('defaults a new host named `constructor` from the record maps, never from Object.prototype', async () => {
+    mount()
+    // A host called `constructor`/`__proto__` is a legal operator-chosen
+    // address; the maps must default it from the record, not inline the Object
+    // prototype's own properties. (`??` alone would carry an inherited
+    // FUNCTION into the map and the store would reject the edit.)
+    store.upsert(
+      record({
+        hosts: ['10.0.0.1'],
+        port: 8765,
+        ports: { '10.0.0.1': 1111 },
+        security: { '10.0.0.1': 'wss' },
+      }),
+    )
+
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['constructor'] }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.hosts).toEqual(['constructor'])
+    expect(json.security).toEqual({ constructor: 'ws' })
+    expect(json.ports).toEqual({ constructor: 8765 })
+    expect(store.list()[0]!.security).toEqual({ constructor: 'ws' })
+    expect(store.list()[0]!.ports).toEqual({ constructor: 8765 })
+  })
+
+  it('rejects duplicate hosts AFTER IPv6 normalization', async () => {
+    mount()
+    store.upsert(record())
+
+    // `[::1]` normalizes to the bare `::1`, so this list names ONE host twice.
+    // The maps are keyed by host, so a duplicate has no single scheme/port and
+    // last-wins is not a contract.
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['[::1]', '::1'] }),
+    })
+
+    expect(status).toBe(400)
+    expect(json.message).toMatch(/hosts must not contain duplicates/)
+    expect(store.list()[0]!.hosts).toEqual(['192.168.1.20'])
+  })
+
   it('keeps the scheme of a host that stays in the list, defaults a new one to ws, and drops a removed one', async () => {
     mount()
     // A TLS-proxied desktop: its host dials `wss`.
@@ -1068,15 +1139,18 @@ describe('④ PATCH address maintenance', () => {
         evicted.push(deviceId)
       },
     })
-    store.upsert(record({ hosts: ['10.0.0.1'], port: 1234 }))
+    // A mixed-port fixture: the record-level port and this host's dial port
+    // DIFFER, so a rewrite of the map is observable (an equal-value fixture
+    // would pass whether or not the map was rewritten).
+    store.upsert(record({ hosts: ['10.0.0.1'], port: 1234, ports: { '10.0.0.1': 4321 } }))
 
     // A rename touches no address: the live connection stays as it is, and the
     // per-host port map is not rewritten either (neither `hosts` nor `port`
     // patched → the maps are unchanged).
     const renamed = await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ displayName: 'Renamed' }) })
     expect(evicted).toEqual([])
-    expect(renamed.json.ports).toEqual({ '10.0.0.1': 1234 })
-    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 1234 })
+    expect(renamed.json.ports).toEqual({ '10.0.0.1': 4321 })
+    expect(store.list()[0]!.ports).toEqual({ '10.0.0.1': 4321 })
 
     await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ hosts: ['10.0.0.1'] }) })
     expect(evicted).toEqual([])

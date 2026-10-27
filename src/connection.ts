@@ -69,10 +69,13 @@ export interface DeviceConnectionOptions {
   /**
    * The paired device record; `hosts`/`security`/`ports`/`port` are re-read on
    * every attempt. `security` and `ports` are REQUIRED by schemaVersion 4 (the
-   * v2→v3 and v3→v4 migrations backfill them), so the `?.` at each dial site
-   * guards an in-memory record assembled without the map (or constructed before
-   * validation), not a migrated one. Each host dials with its OWN port; the
-   * record-level `port` is the winner's and stays the fallback.
+   * v2→v3 and v3→v4 migrations backfill them), so the `?.` in the STEADY-STATE
+   * dial guards an in-memory record assembled without the map (or constructed
+   * before validation), not a migrated one. That dial — this class — consumes
+   * both per-host maps; the pairing dial never reads the record (it dials the
+   * QR candidate's own host/port/scheme, which is why the record can persist
+   * them). Each host dials with its OWN port; the record-level `port` is the
+   * winner's at pairing, the operator's after a PATCH, and always the fallback.
    */
   record: DeviceRecord
   /**
@@ -1089,10 +1092,10 @@ export class DeviceConnection {
    * 「候选地址全部不可达」 verdict only holds when EVERY host failed.
    *
    * Each candidate dials with ITS OWN port from `record.ports`; the record-level
-   * `port` (the winner's) is the fallback for an in-memory record assembled
-   * without the map (issue #135). Before that, one port was shared by every
-   * host, so a reconnect to a non-winner host dialed the right scheme at the
-   * wrong port.
+   * `port` (the winner's at pairing, the operator's after a PATCH) is the
+   * fallback for an in-memory record assembled without the map (issue #135).
+   * Before that, one port was shared by every host, so a reconnect to a
+   * non-winner host dialed the right scheme at the wrong port.
    *
    * "Per-host" covers the CHANNEL-LEVEL handshake failures as well as the dial:
    * a socket that opens and then dies mid-handshake (the peer accepted the TCP

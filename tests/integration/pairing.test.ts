@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { hostname } from 'node:os'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
+import { pairingQrSchema } from '@cherrystudio/remote-protocol'
 import { DeviceStore } from '../../src/deviceStore.js'
 import type { WsDialOptions } from '../../src/connection.js'
 import { pairWithPayload } from '../../src/pairing.js'
@@ -649,6 +650,154 @@ describe('pairWithPayload over a real loopback channel', () => {
       [otherHost]: otherPort,
     })
     expect(store.list()[0]!.ports).toEqual(record.ports)
+  }, 15_000)
+
+  it('⑪k rejects a v3 endpoint port outside the dial range BEFORE any device work', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // The live endpoint is FIRST: the only reason it is never dialed is that
+    // the whole address list is judged before the walk starts. (With the
+    // PINNED schema the verdict is the schema's — its endpoint port is already
+    // int 1..65535 — and the local rule below is the pin-independent backstop;
+    // ⑪k2 drives that rule directly.)
+    for (const port of [0, 70_000, 80.5]) {
+      const error = await pairingError(
+        pair({
+          identity,
+          store,
+          payload: v3PayloadFor(fakeInfo, {
+            endpoints: [
+              { host: fakeInfo.host, port: fakeInfo.port, security: 'ws' },
+              { host: '127.0.0.2', port, security: 'ws' },
+            ],
+          }),
+        }),
+      )
+
+      expect(error.kind, `port ${port}`).toBe('invalid-payload')
+      expect(fakeInfo.fake.connectionCount, `port ${port}`).toBe(0)
+      expect(fakeInfo.fake.methodCount('pairing.claim'), `port ${port}`).toBe(0)
+      expect(store.list(), `port ${port}`).toEqual([])
+    }
+  })
+
+  it('⑪k2 the local address rule refuses a junk endpoint port even when the schema admits it', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // Simulate the FUTURE pin the header warns about: a schema that accepts the
+    // port (the pin-independent rule must still refuse it before any device
+    // work). Without this, the guard is invisible behind the pinned schema and
+    // a schema widening would silently reintroduce the post-approval failure.
+    const admitted = (port: number): never =>
+      ({
+        success: true,
+        data: {
+          v: 3,
+          t: 'cherry-studio-pair',
+          name: 'cherry-host',
+          desktopIdentity: fakeInfo.desktopIdentity,
+          invitationId: 'inv-1',
+          invitationSecret: 'secret-1',
+          protocolVersions: [1],
+          endpoints: [
+            { host: fakeInfo.host, port: fakeInfo.port, security: 'ws' },
+            { host: '127.0.0.2', port, security: 'ws' },
+          ],
+        },
+      }) as never
+
+    for (const port of [0, 70_000, 80.5]) {
+      vi.spyOn(pairingQrSchema, 'safeParse').mockReturnValueOnce(admitted(port))
+      const error = await pairingError(pair({ identity, store, payload: v3PayloadFor(fakeInfo) }))
+
+      expect(error.kind, `port ${port}`).toBe('invalid-payload')
+      expect(error.message, `port ${port}`).toContain('port must be an integer in 1..65535')
+      expect(fakeInfo.fake.connectionCount, `port ${port}`).toBe(0)
+      expect(fakeInfo.fake.methodCount('pairing.claim'), `port ${port}`).toBe(0)
+      expect(store.list(), `port ${port}`).toEqual([])
+    }
+  })
+
+  it('⑪l rejects duplicate v3 endpoints BEFORE any device work', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // The maps are keyed by host, so one host cannot carry two ports. (The two
+    // entries differ by port, which is what makes this a HOST duplicate rather
+    // than a repeated endpoint.)
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: v3PayloadFor(fakeInfo, {
+          endpoints: [
+            { host: fakeInfo.host, port: fakeInfo.port, security: 'ws' },
+            { host: fakeInfo.host, port: fakeInfo.port + 1, security: 'ws' },
+          ],
+        }),
+      }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(error.message).toContain(`must not repeat host "${fakeInfo.host}"`)
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(0)
+    expect(store.list()).toEqual([])
+  })
+
+  it('⑪m rejects duplicate v2 hosts AFTER IPv6 normalization BEFORE any device work', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake()
+    const store = await makeStore()
+
+    // `[::1]` is normalized to the bare `::1` before the schema sees it, so
+    // these are the same host twice — the collapsed form is what would reach
+    // the record and its host-keyed maps.
+    const error = await pairingError(
+      pair({
+        identity,
+        store,
+        payload: payloadFor(fakeInfo, { ips: ['[::1]', '::1'], port: 65_001 }),
+      }),
+    )
+
+    expect(error.kind).toBe('invalid-payload')
+    expect(error.message).toContain('must not repeat host "::1"')
+    expect(fakeInfo.fake.connectionCount).toBe(0)
+    expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(0)
+    expect(store.list()).toEqual([])
+  })
+
+  it('⑪n a store failure after approval surfaces as itself, never as `unreachable`', async () => {
+    const identity = await createDeviceIdentity()
+    // The desktop APPROVES (the invitation is consumed); the archive write is
+    // what fails. That is a fact about the archive, not about any address, so
+    // classifying it as `unreachable` would send the operator to re-pair a
+    // device the desktop has already approved.
+    const fakeInfo = await makeApprovingFake()
+    const sentinel = new Error('STORE-SENTINEL')
+    const store = {
+      upsert: () => {
+        throw sentinel
+      },
+    } as unknown as DeviceStore
+
+    const error = await pair({ identity, store, payload: payloadFor(fakeInfo) }).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    )
+
+    // The very thrown object, not a PairingError wrapping it.
+    expect(error).toBe(sentinel)
+    expect((error as { kind?: string }).kind).toBeUndefined()
+    // ...and the run really did reach approval first.
+    expect(fakeInfo.fake.methodCount('pairing.claim')).toBe(1)
+    expect(fakeInfo.fake.methodCount('pairing.get')).toBeGreaterThanOrEqual(1)
   }, 15_000)
 
   it('⑪b dials a bare IPv6 v3 endpoint (bracketed on the URL, bare in the archive)', async () => {

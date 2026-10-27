@@ -53,9 +53,11 @@ export interface DeviceRecord {
    */
   hosts: string[]
   /**
-   * The record-level dial port: the WINNER candidate's port, and the fallback
-   * for a host the map does not name (a record assembled in memory before
-   * validation). Before schemaVersion 4 it was the only port — see `ports`.
+   * The record-level dial port: the WINNER candidate's port at pairing, the
+   * operator's after a PATCH, and always the dial's fallback. A stored v4
+   * record carries an explicit `ports` entry for every host; this value is only
+   * the fallback for an in-memory record assembled before validation. Before
+   * schemaVersion 4 it was the only port — see `ports`.
    */
   port: number
   /**
@@ -70,7 +72,7 @@ export interface DeviceRecord {
    * with schemaVersion 4: before it, one `port` was shared by every host (the
    * winner candidate's), so a steady-state reconnect to a non-winner host
    * dialed the right scheme at the WRONG port. The v3→v4 migration backfills
-   * `port`; `port` itself stays the record-level fallback.
+   * `ports` from `port`; `port` itself stays the record-level fallback.
    */
   ports: Record<string, number>
   desktopIdentity: string
@@ -140,11 +142,11 @@ type Migration = (record: DeviceRecordOnDisk) => DeviceRecordOnDisk
  * downgrade a TLS-proxied desktop to a dial that cannot connect.
  *
  * `{ 3 -> 4 }` (issue #135) adds the per-host `ports` map. v3 had `hosts` + one
- * shared `port` (the winner candidate's), so every host is backfilled that
- * port — the only one v3 ever dialed. A half-migrated file keeps the entries it
- * already carries, for the same reason the scheme step does: a remembered port
- * is the address the pairing actually used, and overwriting it would point the
- * host at the winner's port again.
+ * shared `port` (the winner candidate's), so the step backfills `ports` from
+ * `port` for every host — the only one v3 ever dialed. A half-migrated file
+ * keeps the entries it already carries, for the same reason the scheme step
+ * does: a remembered port is the address the pairing actually used, and
+ * overwriting it would point the host at the winner's port again.
  *
  * **A legacy file is read loosely, this build's own output strictly —
  * deliberately.** Each step fills its map for the CURRENT host list and
@@ -167,14 +169,36 @@ const MIGRATIONS: Record<number, Migration> = {
 function backfilledSecurity(
   disk: Partial<DeviceRecord>,
 ): Record<string, 'ws' | 'wss'> {
+  // A hand-edited file can carry a non-array `hosts`; read it as empty here and
+  // let `assertValidRecord` name the real rule, instead of throwing a TypeError
+  // out of `.map` first.
+  const hosts = Array.isArray(disk.hosts) ? disk.hosts : []
   const existing = disk.security ?? {}
-  return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? 'ws']))
+  // `Object.hasOwn`, never `existing[host] ?? …`: on an empty map a host named
+  // `constructor`/`__proto__`/`toString` would otherwise pick up an INHERITED
+  // function and poison the map. A remembered own entry wins even when its
+  // value is null — a junk value is the validator's to reject, not to repair.
+  return Object.fromEntries(
+    hosts.map((host) => [host, Object.hasOwn(existing, host) ? existing[host] : 'ws']),
+  )
 }
 
 /** Every host of a v3 record, defaulting anything it did not already say. */
 function backfilledPorts(disk: Partial<DeviceRecord>): Record<string, number> {
+  // Same two rules as `backfilledSecurity`: non-array hosts read as empty, and
+  // only an OWN entry is remembered (an inherited function is not a port).
+  const hosts = Array.isArray(disk.hosts) ? disk.hosts : []
   const existing = disk.ports ?? {}
-  return Object.fromEntries((disk.hosts ?? []).map((host) => [host, existing[host] ?? disk.port]))
+  // The cast states this function's EXIT shape, not a guarantee about the
+  // input: a malformed entry may omit `port`, and the `undefined` that would
+  // produce is rejected by `assertValidPorts` right after the migration chain.
+  const fallback = disk.port as number
+  return Object.fromEntries(
+    hosts.map((host): [string, number] => [
+      host,
+      Object.hasOwn(existing, host) ? existing[host] : fallback,
+    ]),
+  )
 }
 
 /**
@@ -235,6 +259,19 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
   }
   if (!Array.isArray(disk.hosts)) {
     throw new Error('device archive entry field hosts must be an array')
+  }
+  // The record-level port is the fallback a hosts-only PATCH derives a NEW
+  // host's entry from, so it is judged like any map value: a hand-edited v4
+  // record with a valid `ports` map but a junk `port` would otherwise make that
+  // PATCH 400 (naming a field absent from its body). The message names the
+  // field, never the value. Before this it was the one unchecked record number.
+  if (
+    typeof disk.port !== 'number' ||
+    !Number.isInteger(disk.port) ||
+    disk.port < 1 ||
+    disk.port > 65_535
+  ) {
+    throw new Error('device archive entry field port must be an integer in 1..65535')
   }
   assertValidSecurity(disk.hosts, disk.security)
   assertValidPorts(disk.hosts, disk.ports)

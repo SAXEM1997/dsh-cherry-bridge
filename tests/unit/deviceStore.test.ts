@@ -352,6 +352,15 @@ describe('DeviceStore v2 → v4 migration (issue #126)', () => {
     })
   })
 
+  it('backfills a v2 host named `constructor` with ws, never Object.prototype.constructor', async () => {
+    const file = await makeStoreFile()
+    // `existing['constructor']` is an inherited FUNCTION on an empty map; only
+    // an own-property lookup may default a scheme.
+    await writeArchive(file, [makeV2Record({ hosts: ['constructor'] })], 2)
+
+    expect(new DeviceStore(file).list()[0]!.security).toEqual({ constructor: 'ws' })
+  })
+
   it('reads a REAL v1 archive (no schemaVersion, no security, no ports) and migrates it all the way to v4, never quarantining it', async () => {
     const file = await makeStoreFile()
     // The fixture is built from the record shape the store actually wrote at
@@ -457,26 +466,58 @@ describe('DeviceStore v3 → v4 migration (issue #135)', () => {
     })
   })
 
-  it('does NOT repair a junk ports VALUE: the v4 validator rejects the migrated record', async () => {
+  it.each([
+    ['a string', '8765'],
+    ['null', null],
+  ])('does NOT repair a junk ports VALUE (%s): the v4 validator rejects the migrated record', async (_label, value) => {
     const file = await makeStoreFile()
     // A junk value is not a legacy SHAPE the migration normalises: a v4 file is
     // this build's own output, so any deviation is a hand edit worth failing
-    // loudly on. The migration keeps `'8765'` as-is and `assertValidPorts`
-    // rejects the whole archive.
-    await writeArchive(file, [makeV3Record({ ports: { '10.0.0.5': '8765' } })], 3)
+    // loudly on. A remembered entry is looked up with `Object.hasOwn`, so even
+    // `null` is kept as-is (an `??` fallback would have silently repaired it)
+    // and `assertValidPorts` rejects the whole archive.
+    await writeArchive(file, [makeV3Record({ ports: { '10.0.0.5': value } })], 3)
 
     expect(() => new DeviceStore(file).list()).toThrow(
       /ports\["10\.0\.0\.5"\] must be an integer in 1\.\.65535/,
     )
   })
+
+  it('backfills a host named `constructor` from the record port, never from Object.prototype', async () => {
+    const file = await makeStoreFile()
+    // `existing['constructor']` is `Object.prototype.constructor` on an empty
+    // map: an inherited FUNCTION, which `??` would keep as the port. Only an
+    // own-property lookup may remember a port.
+    await writeArchive(
+      file,
+      [makeV3Record({ hosts: ['constructor'], security: { constructor: 'ws' }, port: 8765 })],
+      3,
+    )
+
+    expect(new DeviceStore(file).list()[0]!.ports).toEqual({ constructor: 8765 })
+  })
+
+  it('reports a non-array hosts field from a v3 archive as a bad record, not a TypeError', async () => {
+    const file = await makeStoreFile()
+    // A hand-edited file can carry `hosts: "nope"`. The migration must not call
+    // `.map` on it: it reads an empty host list, and `assertValidRecord` names
+    // the real rule ("hosts must be an array").
+    await writeArchive(file, [makeV3Record({ hosts: 'nope' })], 3)
+
+    expect(() => new DeviceStore(file).list()).toThrow(/field hosts must be an array/)
+  })
 })
 
 describe('DeviceStore ports validation (issue #135)', () => {
-  it('rejects a ports field that is not an object at all', async () => {
+  it.each([
+    ['a string', '8765'],
+    ['null', null],
+    ['an array', []],
+  ])('rejects a ports field that is %s', async (_label, value) => {
     const file = await makeStoreFile()
     // Present but the wrong SHAPE: rejected by the container check, before any
     // per-host judgement.
-    await writeArchive(file, [makeRecord({ ports: '8765' as never })])
+    await writeArchive(file, [makeRecord({ ports: value as never })])
 
     expect(() => new DeviceStore(file).list()).toThrow(/must be an object keyed by host/)
   })
@@ -507,6 +548,7 @@ describe('DeviceStore ports validation (issue #135)', () => {
   it.each([
     ['a non-integer', 80.5],
     ['zero', 0],
+    ['below the port range', -1],
     ['above the port range', 65_536],
     ['a string', '8765'],
   ])('rejects a ports value that is %s', async (_label, value) => {
@@ -519,6 +561,25 @@ describe('DeviceStore ports validation (issue #135)', () => {
 
     expect(() => new DeviceStore(file).list()).toThrow(
       /ports\["10\.0\.0\.5"\] must be an integer in 1\.\.65535/,
+    )
+  })
+})
+
+describe('DeviceStore record-level port validation (issue #135)', () => {
+  it.each([
+    ['zero', 0],
+    ['a non-integer', 80.5],
+    ['above the port range', 65_536],
+    ['a string', '8765'],
+  ])('rejects a record-level port that is %s', async (_label, port) => {
+    const file = await makeStoreFile()
+    // The per-host map is VALID here, so only the record-level field can catch
+    // this — the value a hosts-only PATCH would derive its new-host fallback
+    // from. The message names the field, never the value.
+    await writeArchive(file, [makeRecord({ port: port as never })])
+
+    expect(() => new DeviceStore(file).list()).toThrow(
+      /field port must be an integer in 1\.\.65535/,
     )
   })
 })

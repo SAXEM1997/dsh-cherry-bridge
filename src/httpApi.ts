@@ -548,11 +548,14 @@ interface DevicePatch {
  * never patched directly — there is no `ports` field in this body):
  *
  *  - neither `hosts` nor `port` patched → the maps are unchanged;
- *  - `hosts` replaced, `port` unchanged → a host that stays keeps ITS OWN
- *    scheme and port, a new host gets `ws` and the record-level port;
- *  - `port` patched (with or without `hosts`) → EVERY final host is re-pointed
- *    to the new port. The face has one port field; leaving per-host entries
- *    would make the edit inert for every listed host that already had one.
+ *  - `hosts` replaced → a host that stays keeps ITS OWN scheme and port, a new
+ *    host gets `ws` and the record-level port;
+ *  - a CHANGED `port` (with or without `hosts`) → EVERY final host is
+ *    re-pointed to it. The face has one port field, so leaving per-host
+ *    entries would make the edit inert for every listed host that already had
+ *    one. Sending the CURRENT value is a no-op for the maps — the settings page
+ *    sends both fields on every save, and a mixed-port record must not be
+ *    flattened by a save that did not change the port.
  */
 function parsePatch(body: Record<string, unknown>): DevicePatch {
   const patch: DevicePatch = {}
@@ -585,6 +588,12 @@ function parsePatch(body: Record<string, unknown>): DevicePatch {
       if (typeof entry !== 'string') throw new PatchError('hosts entries must be strings')
       return normalizeHost(entry)
     })
+    // Checked AFTER normalization: `[::1]` and `::1` collapse to one host. The
+    // scheme/port maps are keyed by host, so a duplicate has no single entry
+    // and silently last-wins — an ambiguous record, not an edit.
+    if (new Set(patch.hosts).size !== patch.hosts.length) {
+      throw new PatchError('hosts must not contain duplicates')
+    }
   }
 
   const port = body['port']
@@ -1381,13 +1390,15 @@ async function patchDevice(
   // The per-host port map is DERIVED from the patch, never patched directly
   // (there is no `ports` field in the body):
   //  - no address field → unchanged;
-  //  - `hosts` replaced, `port` untouched → a staying host keeps its own port,
-  //    a new host gets the record-level `port`;
-  //  - `port` patched (with or without `hosts`) → EVERY final host is
-  //    re-pointed. One port field on this face, so leaving per-host entries
-  //    would make the edit inert for every listed host that already had one.
+  //  - `hosts` replaced → a staying host keeps its own port, a new host gets the
+  //    record-level `port`;
+  //  - a CHANGED `port` (with or without `hosts`) → EVERY final host is
+  //    re-pointed; one port field on this face, so leaving per-host entries
+  //    would make the edit inert. Sending the CURRENT value is a no-op for the
+  //    map (see `parsePatch`), because the settings page sends both fields on
+  //    every save.
   const nextPorts =
-    patch.port !== undefined
+    patch.port !== undefined && patch.port !== previousPort
       ? portsFor(patch.hosts ?? previousHosts, {}, patch.port)
       : patch.hosts === undefined
         ? previousPorts
@@ -1427,8 +1438,7 @@ async function patchDevice(
   const addressChanged =
     (patch.hosts !== undefined && !sameHosts(patch.hosts, previousHosts)) ||
     (patch.port !== undefined && patch.port !== previousPort) ||
-    !sameSecurity(next.security, previousSecurity) ||
-    !samePorts(next.ports, previousPorts)
+    !sameSecurity(next.security, previousSecurity)
   const enabledChanged = patch.enabled !== undefined && patch.enabled !== previousEnabled
 
   if (addressChanged) {
@@ -1494,7 +1504,12 @@ function securityFor(
   hosts: readonly string[],
   previous: Record<string, 'ws' | 'wss'>,
 ): Record<string, 'ws' | 'wss'> {
-  return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? 'ws']))
+  // `Object.hasOwn`, never `previous[host] ?? 'ws'`: a host named `constructor`
+  // (or `__proto__`/`toString`) would otherwise inherit a FUNCTION from
+  // Object.prototype and poison the map the store then rejects.
+  return Object.fromEntries(
+    hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : 'ws']),
+  )
 }
 
 /**
@@ -1502,16 +1517,19 @@ function securityFor(
  * was dialed with, a host the list just gained defaults to `fallback` (the
  * record-level port), and hosts the list dropped leave no entry behind.
  *
- * `previous` is empty when the caller is re-pointing EVERY host (a `port`
- * patch): there is no remembered entry to keep, by design — one port field on
- * this face must move the whole list.
+ * `previous` is empty when the caller is re-pointing EVERY host (a CHANGED
+ * `port` patch): there is no remembered entry to keep, by design — one port
+ * field on this face must move the whole list. Same `Object.hasOwn` rule as
+ * `securityFor`: an inherited function is not a remembered port.
  */
 function portsFor(
   hosts: readonly string[],
   previous: Record<string, number>,
   fallback: number,
 ): Record<string, number> {
-  return Object.fromEntries(hosts.map((host) => [host, previous[host] ?? fallback]))
+  return Object.fromEntries(
+    hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : fallback]),
+  )
 }
 
 /** Order-insensitive comparison for two scheme maps. */
@@ -1524,15 +1542,6 @@ function sameSecurity(
   return keys.every((key) => a[key] === b[key])
 }
 
-/** Order-insensitive comparison for two port maps (same rule as security). */
-function samePorts(
-  a: Record<string, number>,
-  b: Record<string, number>,
-): boolean {
-  const keys = Object.keys(a)
-  if (keys.length !== Object.keys(b).length) return false
-  return keys.every((key) => a[key] === b[key])
-}
 
 /** Drops the pooled connection, closing any live socket first. */
 function evict(route: RouteContext, deviceId: string): void {
