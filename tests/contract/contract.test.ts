@@ -37,6 +37,7 @@ import type {
 } from '../../src/httpApi.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry.js'
+import { makeDualPeer, insecureTlsOptions, type DualPeer } from '../helpers/tls/dualPeer.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
 /**
@@ -102,6 +103,7 @@ function runGitClone(source: string, target: string): void {
 }
 
 const fakes: FakeCherry[] = []
+const peers: DualPeer[] = []
 const connections: DeviceConnection[] = []
 const subscriptionLayers: SessionSubscriptions[] = []
 const dirs: string[] = []
@@ -147,6 +149,7 @@ afterEach(async () => {
   for (const layer of subscriptionLayers.splice(0)) await layer.dispose().catch(() => {})
   for (const connection of connections.splice(0)) await connection.close().catch(() => {})
   for (const fake of fakes.splice(0)) await fake.stop()
+  for (const peer of peers.splice(0)) await peer.stop()
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
   vi.restoreAllMocks()
 })
@@ -1731,6 +1734,7 @@ describe('③ release configuration', () => {
     expect(resolveBridgeConfig({})).toEqual({
       perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
       rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+      wsTls: undefined,
     })
 
     // ABSENT is silent; PRESENT-but-unusable warns by name and falls back —
@@ -1742,6 +1746,7 @@ describe('③ release configuration', () => {
       expect(resolveBridgeConfig({ rateBudgetPerSecond: null as never })).toEqual({
         perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
         rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+        wsTls: undefined,
       })
       expect(warn.mock.calls.flat().map(String).join('\n')).toContain('rateBudgetPerSecond')
 
@@ -1749,6 +1754,7 @@ describe('③ release configuration', () => {
       expect(resolveBridgeConfig({ perSessionCacheBytes: 'big' as never })).toEqual({
         perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
         rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+        wsTls: undefined,
       })
       expect(warn.mock.calls.flat().map(String).join('\n')).toContain('perSessionCacheBytes')
 
@@ -1757,6 +1763,7 @@ describe('③ release configuration', () => {
       expect(resolveBridgeConfig({ rateBudgetPerSecond: 64 })).toEqual({
         perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
         rateBudgetPerSecond: 64,
+        wsTls: undefined,
       })
       expect(warn).not.toHaveBeenCalled()
     } finally {
@@ -1839,8 +1846,20 @@ describe('③ release configuration', () => {
  * has to exist — but it must exist, or the subsystem's callback would starve and
  * the assembly path under test would no longer be the production one.
  */
-function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unknown> {
+function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unknown> & {
+  readonly injectedEffects: Array<() => void>
+  /** Runs (and awaits) the assembly's own root teardown. */
+  dispose(): Promise<void>
+} {
   const injectedEffects: Array<() => void> = []
+  /**
+   * The root effects `apply` registered. The assembly's teardown is the
+   * disposer `ctx.effect(cb)` RETURNS, so a test that leaves a device dialing
+   * past its own `finally` (a failed TLS handshake backs off and redials) has
+   * to run it; capturing it here is what makes that possible without a second,
+   * test-only teardown path.
+   */
+  const disposers: Array<() => unknown> = []
   return {
     inject(deps: string[], cb: (ctx: unknown) => void | (() => void)): void {
       // The scope keys match as an EXACT set (B6): a misspelled key in the
@@ -1869,7 +1888,15 @@ function assemblyCtx(server: ReturnType<typeof makeServer>): Record<string, unkn
     get(): unknown {
       return undefined
     },
-    effect(): void {},
+    // Cordis calls the callback to install a root effect and keeps whatever it
+    // returns as the teardown. The assembly's root effect returns the promise
+    // that drops its sockets, so it is awaited rather than discarded.
+    effect(cb: () => () => unknown): void {
+      disposers.push(cb())
+    },
+    async dispose(): Promise<void> {
+      for (const dispose of disposers.splice(0)) await dispose()
+    },
     injectedEffects,
   }
 }
@@ -1982,6 +2009,399 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
       expect(layer.cursorOf('s-1')).toBeUndefined()
       expect(layer.windowStart('s-1')).toBeUndefined()
     } finally {
+      server.routes.clear()
+    }
+  }, 20_000)
+})
+
+// ---------------------------------------------------------------------------
+// ③w wsTls (issue #133): the operator's TLS trust reaches BOTH dial sites
+//
+// #126 gave `DeviceConnectionOptions` / `PairWithPayloadOptions` a flat
+// `wsOptions` bag, but NOTHING in plugin config could produce one: a production
+// deployment whose desktop sits behind a private CA or a self-signed TLS front
+// had no way to pass trust, so its `wss` device paired (or not) and then could
+// never reconnect. `wsTls` is that config key. These cases drive the REAL
+// `apply()` and assert the configured object is what each dial actually used:
+// `makeDualPeer` runs the real FakeCherry behind a real TLS server whose
+// certificate only `wsTls` can make this client trust.
+// ---------------------------------------------------------------------------
+
+const TLS_HOST = '127.0.0.1'
+/** Approval delay used by the pairing cases (mirrors pairing.test.ts). */
+const APPROVE_AFTER_POLLS = 2
+
+/** The 2.1.8 custom-address invitation (v3 `endpoints`, `wss` arm). */
+function v3PayloadFor(peer: DualPeer): string {
+  return JSON.stringify({
+    v: 3,
+    t: 'cherry-studio-pair',
+    name: 'cherry-host',
+    desktopIdentity: peer.desktopIdentity,
+    invitationId: 'inv-1',
+    invitationSecret: 'secret-1',
+    protocolVersions: [1],
+    endpoints: [{ host: TLS_HOST, port: peer.tlsPort, security: 'wss' }],
+  })
+}
+
+/** The assembly starts its identity load in `apply`; pairing/connecting need it. */
+async function waitForPath(file: string, timeoutMs = 5_000): Promise<void> {
+  const started = Date.now()
+  while (!existsSync(file)) {
+    if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for ${file}`)
+    await sleep(10)
+  }
+}
+
+/** `GET /devices` through the mounted assembly, parsed. */
+async function getDevices(
+  server: ReturnType<typeof makeServer>,
+): Promise<Array<{ deviceId: string; state: string; security: Record<string, string> }>> {
+  const { res, sent } = makeResponse()
+  await server.dispatch(makeRequest(`${HTTP_PREFIX}/devices`, { host: HTTP_HOST }), res)
+  expect(sent.status).toBe(200)
+  return sent.body as Array<{ deviceId: string; state: string; security: Record<string, string> }>
+}
+
+/** Polls `GET /devices` (bounded) until the single device reports `want`. */
+async function waitForDeviceState(
+  server: ReturnType<typeof makeServer>,
+  want: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  const started = Date.now()
+  let last = 'none'
+  for (;;) {
+    const devices = await getDevices(server)
+    last = devices[0]?.state ?? 'none'
+    if (last === want) return
+    if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for state ${want}; still ${last}`)
+    await sleep(10)
+  }
+}
+
+/** One `wss` record pointing at the dual peer's TLS door. */
+function seedWssDevice(dataDir: string, peer: DualPeer): void {
+  new DeviceStore(join(dataDir, 'devices.json')).upsert({
+    schemaVersion: 3,
+    deviceId: 'dev-wss',
+    displayName: 'TLS Desk',
+    hosts: [TLS_HOST],
+    security: { [TLS_HOST]: 'wss' },
+    port: peer.tlsPort,
+    desktopIdentity: peer.desktopIdentity,
+    grants: ['agent'],
+    enabled: true,
+  })
+}
+
+/**
+ * `POST /pair` with a JSON body, through the fake host's dispatcher.
+ *
+ * The route answers 202 + `{claimId}` BEFORE the run finishes: the terminal
+ * verdict (including a failed dial) rides the `pairing-progress` channel, so a
+ * synchronous status assertion could only ever see 202.
+ */
+async function postPair(server: ReturnType<typeof makeServer>, payload: string): Promise<SentFrame> {
+  const { res, sent } = makeResponse()
+  const body = Buffer.from(JSON.stringify({ payload }), 'utf8')
+  await server.dispatch(
+    {
+      method: 'POST',
+      url: `${HTTP_PREFIX}/pair`,
+      headers: { host: HTTP_HOST },
+      on: () => undefined,
+      async *[Symbol.asyncIterator]() {
+        yield new Uint8Array(body)
+      },
+    },
+    res,
+  )
+  return sent
+}
+
+/** A response recorder for the SSE route, with a bounded frame waiter. */
+function makeEventStream(): {
+  res: HttpResponseLike
+  waitFor<T>(event: string, predicate: (data: T) => boolean, timeoutMs?: number): Promise<T>
+} {
+  let body = ''
+  const res: HttpResponseLike = {
+    writeHead() {
+      return res
+    },
+    write(chunk: string) {
+      body += chunk
+      return res
+    },
+    end() {
+      return res
+    },
+    on() {
+      return res
+    },
+  }
+  const frames = (): Array<{ event: string; data: unknown }> => {
+    const seen: Array<{ event: string; data: unknown }> = []
+    for (const block of body.split('\n\n')) {
+      let event: string | undefined
+      let data: string | undefined
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event: ')) event = line.slice(7)
+        else if (line.startsWith('data: ')) data = line.slice(6)
+      }
+      if (event === undefined || data === undefined) continue
+      try {
+        seen.push({ event, data: JSON.parse(data) as unknown })
+      } catch {
+        // A frame the stream has not finished writing yet.
+      }
+    }
+    return seen
+  }
+  return {
+    res,
+    async waitFor<T>(event: string, predicate: (data: T) => boolean, timeoutMs = 10_000): Promise<T> {
+      const started = Date.now()
+      for (;;) {
+        const found = frames()
+          .filter((frame) => frame.event === event)
+          .map((frame) => frame.data as T)
+          .find(predicate)
+        if (found !== undefined) return found
+        if (Date.now() - started > timeoutMs) throw new Error(`timed out waiting for a "${event}" frame`)
+        await sleep(20)
+      }
+    },
+  }
+}
+
+describe('③w resolveBridgeConfig: wsTls is validated, whole-object-or-nothing (issue #133)', () => {
+  it('takes a usable wsTls verbatim and stays silent', () => {
+    const pem = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----'
+    const ca = [pem, Buffer.from(pem)]
+    consoleWarn.mockClear()
+    expect(resolveBridgeConfig({ wsTls: { rejectUnauthorized: false, ca } }).wsTls).toEqual({
+      rejectUnauthorized: false,
+      ca,
+    })
+    // `{}` is the documented default written out: no override, and nothing to
+    // warn about (unlike a key that is present but unusable).
+    expect(resolveBridgeConfig({ wsTls: {} }).wsTls).toBeUndefined()
+    // An absent key is the documented default too.
+    expect(resolveBridgeConfig({}).wsTls).toBeUndefined()
+    expect(consoleWarn).not.toHaveBeenCalled()
+  })
+
+  it('ignores the WHOLE object and warns by name when any entry is unusable', () => {
+    // Every row names the FIELD (never a value) whose refusal discarded the
+    // bag. The fail-closed half is asserted on every row: one bad entry means
+    // the usable ones are NOT partially applied.
+    const unusable: Array<[unknown, string]> = [
+      [null, 'null'],
+      [[], 'array'],
+      ['strict', 'string'],
+      [42, 'number'],
+      // The shape `ws` DOES NOT accept: flat options, not `{ tls: {...} }`.
+      [{ tls: { rejectUnauthorized: false } }, 'tls'],
+      [{ rejectUnauthorized: 'false' }, 'rejectUnauthorized'],
+      [{ ca: 42 }, 'ca'],
+      [{ ca: '' }, 'ca'],
+      [{ ca: Buffer.alloc(0) }, 'ca'],
+      [{ ca: [] }, 'ca'],
+      [{ ca: [1] }, 'ca'],
+      [{ ca: [Buffer.from('ok'), ''] }, 'ca'],
+    ]
+    for (const [value, needle] of unusable) {
+      consoleWarn.mockClear()
+      expect(resolveBridgeConfig({ wsTls: value as never }).wsTls).toBeUndefined()
+      const text = consoleWarn.mock.calls.flat().map(String).join('\n')
+      expect(text).toContain('wsTls')
+      expect(text).toContain(needle)
+    }
+  })
+
+  it('never echoes a certificate value into the warning', () => {
+    // A `ca` is PEM CONTENT, not a value to print. The object is invalid
+    // because a SIBLING entry is not, and the refusal must name the bad field
+    // while leaving the certificate out of the log entirely.
+    const sentinel = '-----BEGIN CERTIFICATE-----WS-TLS-SENTINEL-PEM-----END CERTIFICATE-----'
+    consoleWarn.mockClear()
+    expect(
+      resolveBridgeConfig({ wsTls: { ca: sentinel, rejectUnauthorized: 'no' } as never }).wsTls,
+    ).toBeUndefined()
+    const text = consoleWarn.mock.calls.flat().map(String).join('\n')
+    expect(text).toContain('rejectUnauthorized')
+    expect(text).not.toContain(sentinel)
+    expect(text).not.toContain('BEGIN CERTIFICATE')
+  })
+})
+
+describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () => {
+  it('reaches the steady-state dial: the wss device behind a self-signed front connects', async () => {
+    const index = await import('../../src/index.js')
+    const peer = await makeDualPeer()
+    peers.push(peer)
+    const dir = tempDir('cherry-wstls-conn-')
+    const server = makeServer()
+    const ctx = assemblyCtx(server)
+    // The self-signed fixture is not in Node's trust store; this config object
+    // is the ONLY thing that changes the dial's verdict.
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: insecureTlsOptions })
+
+    try {
+      // Written AFTER `apply` (the assembly creates its store handle there),
+      // BEFORE the first read, which is the point: the pool has not loaded the
+      // archive yet, so this is the record it will see.
+      seedWssDevice(dir, peer)
+      await waitForPath(join(dir, 'identity.key'))
+      // `GET /devices` is the production trigger: `projectState → connect →
+      // connectionFor` builds AND dials the pooled connection (src/httpApi.ts).
+      await waitForDeviceState(server, 'connected')
+      // A completed TLS front AND a completed Noise handshake behind it: the
+      // state alone is not the proof, this pair is.
+      expect(peer.tlsHandshakes()).toBe(1)
+      expect(peer.desktopConnections()).toBe(1)
+    } finally {
+      // The assembly's own teardown: without it a connection that never came up
+      // would keep backing off and redialing past this test.
+      await ctx.dispose()
+      server.routes.clear()
+    }
+  }, 20_000)
+
+  it('without wsTls the SAME device never connects (trust is not silently defaulted)', async () => {
+    const index = await import('../../src/index.js')
+    const peer = await makeDualPeer()
+    peers.push(peer)
+    const dir = tempDir('cherry-wstls-control-')
+    const server = makeServer()
+    const ctx = assemblyCtx(server)
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir })
+
+    try {
+      seedWssDevice(dir, peer)
+      await waitForPath(join(dir, 'identity.key'))
+      // The first read builds the pooled connection and dials it with exactly
+      // the config given: the TLS handshake is refused (self-signed), so the
+      // device may sit in `connecting`/`offline` but never `connected`.
+      const first = await getDevices(server)
+      expect(first[0]?.state).not.toBe('connected')
+      // One full backoff window: a dial that could succeed would have by now.
+      await sleep(1_000)
+      expect((await getDevices(server))[0]?.state).not.toBe('connected')
+      const diagnostics = await getDiagnostics(server)
+      // The dial was genuinely ATTEMPTED (the pool built the connection), so
+      // "never connected" is a verdict about the trust, not a skipped test.
+      expect((diagnostics.body as { stats: { connections: number } }).stats.connections).toBe(1)
+      expect(peer.desktopConnections()).toBe(0)
+    } finally {
+      await ctx.dispose()
+      server.routes.clear()
+    }
+  }, 20_000)
+
+  it('reaches the pairing dial: POST /pair pairs through the wss front with wsTls', async () => {
+    const index = await import('../../src/index.js')
+    const peer = await makeDualPeer({
+      desktop: { pairingDecision: 'approved', pairingGetPendingPolls: APPROVE_AFTER_POLLS },
+    })
+    peers.push(peer)
+    const dir = tempDir('cherry-wstls-pair-')
+    const server = makeServer()
+    const ctx = assemblyCtx(server)
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: insecureTlsOptions })
+
+    try {
+      await waitForPath(join(dir, 'identity.key'))
+      const sent = await postPair(server, v3PayloadFor(peer))
+      // Asynchronous by contract: 202 + claimId, the run continues in the
+      // background and persists the record only on approval.
+      expect(sent.status).toBe(202)
+      expect(sent.body).toMatchObject({ claimId: expect.any(String) })
+
+      // A FRESH handle per poll: `DeviceStore` caches on first read, so one
+      // handle would keep serving the empty archive it saw before the write.
+      const started = Date.now()
+      for (;;) {
+        if (new DeviceStore(join(dir, 'devices.json')).list().length > 0) break
+        if (Date.now() - started > 10_000) throw new Error('timed out waiting for the paired record')
+        await sleep(50)
+      }
+      const record = new DeviceStore(join(dir, 'devices.json')).list()[0]!
+      expect(record.hosts).toEqual([TLS_HOST])
+      expect(record.security).toEqual({ [TLS_HOST]: 'wss' })
+      expect(record.port).toBe(peer.tlsPort)
+      // The pairing dial itself reached the desktop through the TLS front.
+      expect(peer.desktopConnections()).toBe(1)
+    } finally {
+      await ctx.dispose()
+      server.routes.clear()
+    }
+  }, 20_000)
+
+  it('without wsTls POST /pair ends unreachable and persists no record', async () => {
+    const index = await import('../../src/index.js')
+    const peer = await makeDualPeer({
+      desktop: { pairingDecision: 'approved', pairingGetPendingPolls: APPROVE_AFTER_POLLS },
+    })
+    peers.push(peer)
+    const dir = tempDir('cherry-wstls-pair-control-')
+    const server = makeServer()
+    const ctx = assemblyCtx(server)
+    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir })
+
+    try {
+      await waitForPath(join(dir, 'identity.key'))
+      // Watch the progress channel BEFORE posting: the route's verdict for a
+      // failed run is a `pairing-progress` frame, not a synchronous status —
+      // `unreachable` is the same PairingError kind a synchronous face maps to
+      // 502.
+      const stream = makeEventStream()
+      await server.dispatch(makeRequest(`${HTTP_PREFIX}/events`, { host: HTTP_HOST }), stream.res)
+
+      const sent = await postPair(server, v3PayloadFor(peer))
+      expect(sent.status).toBe(202)
+      const verdict = await stream.waitFor<{ stage: string; detail?: string }>(
+        'pairing-progress',
+        (frame) => frame.stage === 'unreachable',
+      )
+      expect(verdict.detail).toContain('no candidate address')
+      // The terminal frame is published only AFTER the run has ended, so the
+      // archive verdict read here cannot race a later write.
+      expect(new DeviceStore(join(dir, 'devices.json')).list()).toEqual([])
+      expect(peer.desktopConnections()).toBe(0)
+    } finally {
+      await ctx.dispose()
+      server.routes.clear()
+    }
+  }, 20_000)
+
+  it('never reports the value: a configured ca PEM is absent from diagnostics and the logs', async () => {
+    const index = await import('../../src/index.js')
+    const sentinel = '-----BEGIN CERTIFICATE-----WS-TLS-PEM-SENTINEL-----END CERTIFICATE-----'
+    const server = makeServer()
+    const ctx = assemblyCtx(server)
+    index.apply(ctx as unknown as CherryHttpContext, {
+      dataDir: tempDir('cherry-wstls-secret-'),
+      wsTls: { ca: sentinel },
+    })
+
+    try {
+      const sent = await getDiagnostics(server)
+      expect(sent.status).toBe(200)
+      expect(JSON.stringify(sent.body)).not.toContain(sentinel)
+      // The report's `config` stays the two numeric keys — the whitelist is
+      // pinned structurally here as well as by the ③ assertion above.
+      expect((sent.body as { config: Record<string, unknown> }).config).toEqual({
+        rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
+        perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+      })
+      // Nothing on any console channel carries the certificate.
+      expect(capturedLogText()).not.toContain(sentinel)
+    } finally {
+      await ctx.dispose()
       server.routes.clear()
     }
   }, 20_000)

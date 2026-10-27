@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { DeviceStore } from './deviceStore.js'
 import { loadOrCreateIdentity } from './identity.js'
 import { DeviceConnection } from './connection.js'
-import type { DeviceState } from './connection.js'
+import type { DeviceState, WsDialOptions } from './connection.js'
 import { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
@@ -97,6 +97,19 @@ export interface CherryBridgeConfig {
    * (not a protocol value). Omitted uses {@link DEFAULT_PER_SESSION_CACHE_BYTES}.
    */
   perSessionCacheBytes?: number
+  /**
+   * FLAT `tls.connect` options for every `wss` dial (issue #133): the operator's
+   * TLS trust for a desktop behind a private CA or a self-signed TLS front.
+   * `ws` forwards this bag straight to Node's TLS layer, so `{ ca: <pem> }` and
+   * `{ rejectUnauthorized: false }` belong at the TOP level — the `{ tls: {…} }`
+   * shape (`https`' wrapper) is not recognised by `ws` and is refused here.
+   * Applied to BOTH dial sites: the steady-state pool and pairing.
+   *
+   * NEVER persisted in the record, never logged, never reported: a `ca` is PEM
+   * CONTENT, and trust is a grant the operator makes, not a fact the desktop
+   * asserts about itself.
+   */
+  wsTls?: WsDialOptions
 }
 
 /**
@@ -110,6 +123,7 @@ export interface CherryBridgeConfig {
 export interface ResolvedBridgeConfig {
   rateBudgetPerSecond: number
   perSessionCacheBytes: number
+  wsTls: WsDialOptions | undefined
 }
 
 /**
@@ -135,6 +149,7 @@ export function resolveBridgeConfig(config: CherryBridgeConfig = {}): ResolvedBr
   return {
     rateBudgetPerSecond: positive('rateBudgetPerSecond', config.rateBudgetPerSecond, DEFAULT_RATE_BUDGET_PER_SECOND),
     perSessionCacheBytes: positive('perSessionCacheBytes', config.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES),
+    wsTls: dialOptions(config.wsTls),
   }
 }
 
@@ -162,6 +177,92 @@ function positive(key: string, value: unknown, fallback: number): number {
     return fallback
   }
   return value
+}
+
+/** The keys {@link WsDialOptions} carries; anything else is a config mistake. */
+const WS_TLS_KEYS: ReadonlySet<string> = new Set(['rejectUnauthorized', 'ca'])
+
+/** The shape a non-object config value arrived as, for a value-free warning. */
+function shapeOf(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  return typeof value
+}
+
+/** A non-empty `ca` entry: PEM text or its bytes, and nothing else. */
+function certificateEntry(value: unknown): boolean {
+  if (typeof value === 'string') return value.length > 0
+  if (Buffer.isBuffer(value)) return value.length > 0
+  return false
+}
+
+/**
+ * A configured TLS trust bag, or `undefined` when absent/unusable.
+ *
+ * ABSENT is the documented default (Node's trust store) and says nothing —
+ * exactly like {@link positive}. A key that is PRESENT but unusable is a
+ * deployment mistake that silently changes which peers are reachable, so it is
+ * warned about by name rather than swallowed — but NEVER by value: a `ca` is
+ * PEM CONTENT, and a certificate must not reach a log.
+ *
+ * FAIL CLOSED, WHOLE OBJECT. One unknown or malformed entry discards the WHOLE
+ * bag rather than forwarding the parts that happen to look right. Trust must be
+ * applied AS WRITTEN: a partially applied bag would reach some peers and not
+ * others with nothing telling the operator which half took effect, and their
+ * `ca` intention would be silently replaced by Node's default store. The
+ * fallback is "no override" — the same state as absent.
+ */
+function dialOptions(value: unknown): WsDialOptions | undefined {
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    console.warn(
+      `[cherry-remote] config "wsTls" must be a plain object of flat tls.connect options ` +
+        `(got ${shapeOf(value)}); ignoring it`,
+    )
+    return undefined
+  }
+  const record = value as Record<string, unknown>
+  const unknownKeys = Object.keys(record).filter((key) => !WS_TLS_KEYS.has(key))
+  if (unknownKeys.length > 0) {
+    // The `{ tls: {…} }` wrapper is the common mistake (`https`' shape, which
+    // `ws` ignores), so naming the offending keys points straight at it.
+    console.warn(
+      `[cherry-remote] config "wsTls" carries unsupported key(s) ${unknownKeys.join(', ')}; ` +
+        'only flat rejectUnauthorized / ca are accepted — ignoring the whole object',
+    )
+    return undefined
+  }
+
+  const rejectUnauthorized = record['rejectUnauthorized']
+  if (rejectUnauthorized !== undefined && typeof rejectUnauthorized !== 'boolean') {
+    // FIELD only — a config value never enters the message.
+    console.warn(
+      '[cherry-remote] config "wsTls.rejectUnauthorized" must be a boolean; ignoring the whole object',
+    )
+    return undefined
+  }
+
+  const ca = record['ca']
+  if (ca !== undefined) {
+    const usable = Array.isArray(ca)
+      ? ca.length > 0 && ca.every((entry) => certificateEntry(entry))
+      : certificateEntry(ca)
+    if (!usable) {
+      console.warn(
+        '[cherry-remote] config "wsTls.ca" must be non-empty PEM text, a non-empty Buffer, ' +
+          'or a non-empty array of those; ignoring the whole object',
+      )
+      return undefined
+    }
+  }
+
+  // `{}` (or an explicit `undefined` value) is the documented default written
+  // out: no override, and no warning.
+  if (rejectUnauthorized === undefined && ca === undefined) return undefined
+  return {
+    ...(rejectUnauthorized === undefined ? {} : { rejectUnauthorized }),
+    ...(ca === undefined ? {} : { ca: ca as WsDialOptions['ca'] }),
+  }
 }
 
 /** The context slice `apply` touches beyond the HTTP face's own services. */
@@ -213,6 +314,13 @@ interface AssemblyState {
    */
   rateBudgetPerSecond: number
   perSessionCacheBytes: number
+  /**
+   * The current apply's TLS trust bag (issue #133), handed to BOTH dial sites —
+   * the pooled connection and pairing's temporary channel. Held on the state for
+   * the same reason as the two numeric values: a re-apply must move both faces
+   * onto the new config. `undefined` = Node's default trust store.
+   */
+  wsTls: WsDialOptions | undefined
   readonly connections: Map<string, DeviceConnection>
   /**
    * One subscription layer per device, sharing nothing with its siblings: the
@@ -275,6 +383,7 @@ const state: AssemblyState = {
   identityError: undefined,
   rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
   perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+  wsTls: undefined,
   connections: new Map(),
   subscriptions: new Map(),
   deviceStateListeners: new Set(),
@@ -363,6 +472,9 @@ function connectionFor(deviceId: string): DeviceConnection {
     identity: requireIdentity(),
     record,
     rateBudgetPerSecond: state.rateBudgetPerSecond,
+    // Spread-if-present, never `wsOptions: undefined`: the option is optional,
+    // and an absent key is the honest "no override" (Node's trust store).
+    ...(state.wsTls === undefined ? {} : { wsOptions: state.wsTls }),
   })
   state.connectionsBuilt += 1
   connection.onState((deviceState: DeviceState) => {
@@ -603,6 +715,11 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
         payload: request.payload,
         store: state.store,
         ...(request.name === undefined ? {} : { name: request.name }),
+        // The same operator TLS trust the steady-state dial uses (issue #133):
+        // a desktop behind a private CA must be pairABLE over `wss` as well as
+        // reconnectable. Read from the assembly state, never from `request`: a
+        // caller cannot supply trust.
+        ...(state.wsTls === undefined ? {} : { wsOptions: state.wsTls }),
         onVerificationCode: request.onVerificationCode,
         // Pair bridging (ruling 10): the call site's stages reach the assembly's
         // progress fan-out, which is what the SSE route consumes.
@@ -715,6 +832,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   const bridgeConfig = resolveBridgeConfig(config)
   state.rateBudgetPerSecond = bridgeConfig.rateBudgetPerSecond
   state.perSessionCacheBytes = bridgeConfig.perSessionCacheBytes
+  state.wsTls = bridgeConfig.wsTls
   state.store = new DeviceStore(join(dataDir, 'devices.json'))
 
   // A re-apply is a fresh assembly: the previous run's error summaries and

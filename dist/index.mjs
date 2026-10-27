@@ -11307,7 +11307,8 @@ const inject = ["tools"];
 function resolveBridgeConfig(config = {}) {
 	return {
 		rateBudgetPerSecond: positive("rateBudgetPerSecond", config.rateBudgetPerSecond, 32),
-		perSessionCacheBytes: positive("perSessionCacheBytes", config.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES)
+		perSessionCacheBytes: positive("perSessionCacheBytes", config.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES),
+		wsTls: dialOptions(config.wsTls)
 	};
 }
 /**
@@ -11331,6 +11332,66 @@ function positive(key, value, fallback) {
 		return fallback;
 	}
 	return value;
+}
+/** The keys {@link WsDialOptions} carries; anything else is a config mistake. */
+const WS_TLS_KEYS = /* @__PURE__ */ new Set(["rejectUnauthorized", "ca"]);
+/** The shape a non-object config value arrived as, for a value-free warning. */
+function shapeOf(value) {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	return typeof value;
+}
+/** A non-empty `ca` entry: PEM text or its bytes, and nothing else. */
+function certificateEntry(value) {
+	if (typeof value === "string") return value.length > 0;
+	if (Buffer.isBuffer(value)) return value.length > 0;
+	return false;
+}
+/**
+* A configured TLS trust bag, or `undefined` when absent/unusable.
+*
+* ABSENT is the documented default (Node's trust store) and says nothing —
+* exactly like {@link positive}. A key that is PRESENT but unusable is a
+* deployment mistake that silently changes which peers are reachable, so it is
+* warned about by name rather than swallowed — but NEVER by value: a `ca` is
+* PEM CONTENT, and a certificate must not reach a log.
+*
+* FAIL CLOSED, WHOLE OBJECT. One unknown or malformed entry discards the WHOLE
+* bag rather than forwarding the parts that happen to look right. Trust must be
+* applied AS WRITTEN: a partially applied bag would reach some peers and not
+* others with nothing telling the operator which half took effect, and their
+* `ca` intention would be silently replaced by Node's default store. The
+* fallback is "no override" — the same state as absent.
+*/
+function dialOptions(value) {
+	if (value === void 0) return void 0;
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		console.warn(`[cherry-remote] config "wsTls" must be a plain object of flat tls.connect options (got ${shapeOf(value)}); ignoring it`);
+		return;
+	}
+	const record = value;
+	const unknownKeys = Object.keys(record).filter((key) => !WS_TLS_KEYS.has(key));
+	if (unknownKeys.length > 0) {
+		console.warn(`[cherry-remote] config "wsTls" carries unsupported key(s) ${unknownKeys.join(", ")}; only flat rejectUnauthorized / ca are accepted — ignoring the whole object`);
+		return;
+	}
+	const rejectUnauthorized = record["rejectUnauthorized"];
+	if (rejectUnauthorized !== void 0 && typeof rejectUnauthorized !== "boolean") {
+		console.warn("[cherry-remote] config \"wsTls.rejectUnauthorized\" must be a boolean; ignoring the whole object");
+		return;
+	}
+	const ca = record["ca"];
+	if (ca !== void 0) {
+		if (!(Array.isArray(ca) ? ca.length > 0 && ca.every((entry) => certificateEntry(entry)) : certificateEntry(ca))) {
+			console.warn("[cherry-remote] config \"wsTls.ca\" must be non-empty PEM text, a non-empty Buffer, or a non-empty array of those; ignoring the whole object");
+			return;
+		}
+	}
+	if (rejectUnauthorized === void 0 && ca === void 0) return void 0;
+	return {
+		...rejectUnauthorized === void 0 ? {} : { rejectUnauthorized },
+		...ca === void 0 ? {} : { ca }
+	};
 }
 /** The data directory convention every DSH plugin follows. */
 function resolveDataDir(config = {}, env = process.env) {
@@ -11373,6 +11434,7 @@ const state = {
 	identityError: void 0,
 	rateBudgetPerSecond: 32,
 	perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
+	wsTls: void 0,
 	connections: /* @__PURE__ */ new Map(),
 	subscriptions: /* @__PURE__ */ new Map(),
 	deviceStateListeners: /* @__PURE__ */ new Set(),
@@ -11438,7 +11500,8 @@ function connectionFor(deviceId) {
 	const connection = new DeviceConnection({
 		identity: requireIdentity(),
 		record,
-		rateBudgetPerSecond: state.rateBudgetPerSecond
+		rateBudgetPerSecond: state.rateBudgetPerSecond,
+		...state.wsTls === void 0 ? {} : { wsOptions: state.wsTls }
 	});
 	state.connectionsBuilt += 1;
 	connection.onState((deviceState) => {
@@ -11598,6 +11661,7 @@ function assemblyDeps() {
 				payload: request.payload,
 				store: state.store,
 				...request.name === void 0 ? {} : { name: request.name },
+				...state.wsTls === void 0 ? {} : { wsOptions: state.wsTls },
 				onVerificationCode: request.onVerificationCode,
 				onStatus: (stage) => publishPairingProgress({ stage })
 			});
@@ -11666,6 +11730,7 @@ function apply(ctx, config = {}) {
 	const bridgeConfig = resolveBridgeConfig(config);
 	state.rateBudgetPerSecond = bridgeConfig.rateBudgetPerSecond;
 	state.perSessionCacheBytes = bridgeConfig.perSessionCacheBytes;
+	state.wsTls = bridgeConfig.wsTls;
 	state.store = new DeviceStore(join(dataDir, "devices.json"));
 	state.recentErrors.length = 0;
 	state.connectionsBuilt = 0;

@@ -752,6 +752,11 @@ ordinary atomic persist; a lost scheme would downgrade a TLS proxy to a dial
 that can never connect, and an edit that re-types a host keeps its scheme
 (`securityFor`). `GET /devices` reports the map; it is an address, not a
 credential — `cherry_devices` and the diagnostics report do not carry it yet.
+TLS trust is operator config (`wsTls`, FLAT `tls.connect` options), forwarded
+to BOTH dial sites — the steady-state pool and pairing. It is validated at
+`resolveBridgeConfig`: an unknown key or unusable value warns by FIELD NAME and
+the WHOLE object is ignored (half-applied trust would reach some peers and not
+others). Never persisted, logged or reported — a `ca` is PEM content.
 
 ### Device selector
 

@@ -93,6 +93,9 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | `dataDir` | string | `$DSH_HOME/cherry-remote` (fallback `~/.dsh/cherry-remote`) | Plugin data directory holding `identity.key` and `devices.json` (both `0600`). |
 | `perSessionCacheBytes` | number | `2097152` (2 MiB) | Per-session cap on the **local** subscription event cache; beyond it the oldest events are dropped LRU-style with a `warn`. |
 | `rateBudgetPerSecond` | number | `32` | Per-device smoothed request budget (req/s). The desktop's shared allowance is 64 req/s through 2.1.6 and 256 req/s from 2.1.7, and only the newer generation downgrades an overrun to a single `RATE_LIMITED` refusal (the older one terminates the session with close `1011`) — hence a value sized for the harsher generation. Content reads (`agent.content.read`) derive their own tier at 8:1, **capped at 512/s** (that allowance is the same in both generations). |
+| `wsTls` | object | — | **Flat** `tls.connect` options for every `wss` dial (`rejectUnauthorized` / `ca` only): operator-supplied trust for a desktop behind a private CA or a self-signed TLS front. Applied to BOTH dial sites — pairing and reconnect. **Never written to the device archive, never logged, never in diagnostics.** The whole object applies as written or is ignored entirely: an unknown key or unusable value warns by name and falls back to Node's default trust store (no partial application). |
+
+> `wsTls.ca` is **PEM CONTENT** (the certificate text itself), not a file path.
 
 > ⚠️ `cordis.patch.yml`'s `config` is **whole-replace**, not merged with the
 > defaults. Removing a key gets you the plugin default; a key that exists but is

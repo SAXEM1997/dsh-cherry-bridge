@@ -1185,6 +1185,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     expect(index.resolveBridgeConfig({})).toEqual({
       rateBudgetPerSecond: 32,
       perSessionCacheBytes: 2 * 1024 * 1024,
+      wsTls: undefined,
     })
     expect(consoleWarn).not.toHaveBeenCalled()
 
@@ -1203,6 +1204,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     expect(index.resolveBridgeConfig({ rateBudgetPerSecond: 7, perSessionCacheBytes: 4096 })).toEqual({
       rateBudgetPerSecond: 7,
       perSessionCacheBytes: 4096,
+      wsTls: undefined,
     })
     expect(consoleWarn).not.toHaveBeenCalled()
   })
