@@ -166,6 +166,15 @@ recovery / multi-device coexistence must be exercised by hand on a real desktop.
 Tag `vX.Y.Z`, publish to npm (`publishConfig` pins the public registry), and
 attach the notes to the GitHub release.
 
+**Three destinations from one artefact.** The tarball `npm pack --dry-run`
+checks is all three:
+
+| Destination | What a consumer hits | Who publishes it |
+| --- | --- | --- |
+| npm registry | `plugin add dsh-cherry-bridge@X.Y.Z` | the staged publish + the web approval (1) |
+| GitHub release asset | `releases/latest/download/dsh-cherry-bridge.tgz` | the same tarball, renamed, attached to the release (3) |
+| plugin catalog | that fixed URL, probed nightly at 02:23 UTC | nothing per version — the merged entry follows `repository` |
+
 **Three release steps fail silently when skipped.**
 
 1. **Publish through staged publishing.** Direct `npm publish` is refused here
@@ -193,9 +202,12 @@ attach the notes to the GitHub release.
    equals the npm tarball's: without the asset the download URL 404s for every
    catalog user (0.1.5 did exactly that).
 
-The catalog needs no PR for a new version: the merged entry is picked up by the
-index's nightly probe (02:23 UTC) once `package.json`'s `repository` points
-back at this repo.
+**Retry discipline.** Re-read the published state before retrying (the stage
+id, `dist-tags`, the asset URL) — the silent failures above look like success
+from the terminal. A retry re-stages or re-attaches the SAME tarball: compare
+shas (`npm pack --dry-run` against the registry's `dist.shasum`) and stop on a
+mismatch, rather than rebuilding and publishing different bytes under a tag
+that is already out.
 
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
 ruling`, `UltraReview` — point at internal SDD process records under
