@@ -502,6 +502,85 @@ describe('pairing wizard', () => {
     expect(screen.getByLabelText('配对信息')).toBeTruthy()
     expect(screen.queryByText('配对进行中')).toBeNull()
   })
+
+  it('①b a run no terminal frame reaches still hands the form back, without claiming failure', async () => {
+    // The server publishes a terminal stage on every outcome, but the stream
+    // carries NO replay: one dropped frame after the 202 and the verdict is gone
+    // for good. `busy` is then never cleared (only a terminal frame or a refused
+    // POST clears it) and the submit button stays disabled with no cancel
+    // control — the page can only recover by a reload. The run deadline is the
+    // exit for exactly that case.
+    const harness = await renderWithDevice(
+      [['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-silent' })]],
+      { runLifetimeMs: 80 },
+    )
+
+    submitPayload()
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'verification-code', detail: '246810', claimId: 'claim-silent' },
+    })
+    await screen.findByText('246810')
+
+    // The run is in 'waiting': nothing but a terminal frame can settle it.
+    expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(true)
+
+    await waitFor(() => {
+      const alerts = screen.getAllByRole('alert').map((node) => node.textContent ?? '')
+      expect(alerts.some((text) => text.includes('没有等到配对结果'))).toBe(true)
+    })
+
+    // The form works again, the in-flight narration is gone, and the transient
+    // code went with it (a code left on screen beside a dead run invites
+    // comparing a stale number, which is what its own lifetime rule prevents).
+    expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByText('配对进行中')).toBeNull()
+    expect(screen.queryByText('246810')).toBeNull()
+    // NOT a verdict. The run may have been APPROVED while its frame was lost, so
+    // the copy points at the device list instead of asserting a failure — a
+    // "配对失败" here would be a lie the list right below it contradicts.
+    expect(screen.queryByText(/配对失败/)).toBeNull()
+    // …and "look below" must be TRUE, not merely said: settling re-reads the
+    // list (mount + settle = two GETs), so an approved-but-silent run shows up.
+    expect(harness.calls.filter((call) => call.url.endsWith('/devices'))).toHaveLength(2)
+  })
+
+  it('①c an idle wizard never raises the deadline alarm', async () => {
+    // The deadline is armed by a RUN, never by the page. A zero lifetime makes
+    // the difference observable without a sleep: were the timer armed at mount,
+    // it would fire on the very next macrotask and an operator who has not
+    // paired anything would be told "no result arrived".
+    const harness = await renderWithDevice([], { runLifetimeMs: 0 })
+
+    // `findByText` flushes a macrotask, so a mount-armed timer has fired by here.
+    await screen.findByText('配对向导')
+    const alerts = screen.queryAllByRole('alert').map((node) => node.textContent ?? '')
+    expect(alerts.some((text) => text.includes('没有等到配对结果'))).toBe(false)
+    expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(harness.calls.filter((call) => call.url.endsWith('/devices'))).toHaveLength(1)
+  })
+
+  it('①d a terminal frame that arrives after the deadline replaces the alarm', async () => {
+    // The deadline is a BACKSTOP, not a verdict: `POST /pair` is fire-and-forget
+    // (`src/httpApi.ts`), so the run keeps going after the wizard stops waiting
+    // and its frames still carry this run's claimId. A truth that arrives late
+    // must win, or a slow-but-successful pairing would read as a timeout forever.
+    await renderWithDevice([['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-late' })]], {
+      runLifetimeMs: 80,
+    })
+
+    submitPayload()
+    await waitFor(() => {
+      const alerts = screen.getAllByRole('alert').map((node) => node.textContent ?? '')
+      expect(alerts.some((text) => text.includes('没有等到配对结果'))).toBe(true)
+    })
+
+    stream().emit({ event: 'pairing-progress', data: { stage: 'rejected', claimId: 'claim-late' } })
+
+    const settled = await screen.findByText(/配对失败：/)
+    expect(settled.textContent).toContain(STAGE_LABELS['rejected']!)
+    expect(screen.queryByText(/没有等到配对结果/)).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------

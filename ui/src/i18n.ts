@@ -129,6 +129,11 @@ const zh: Dict = {
   // keep matching.
   'wizard.failed': '配对失败：{stage}',
   'wizard.unknownError': '未知错误',
+  // NO VERDICT WORDING. This is the run deadline, not a stage: the pairing may
+  // have been approved while its frame was lost, so it points at the list right
+  // below (which the settle refreshes) instead of asserting an outcome.
+  'wizard.timedOut':
+    '没有等到配对结果——若桌面端已批准，下面的设备列表里会出现该设备；否则请在 Cherry Studio 重新生成配对码后重试',
   'wizard.error.payloadRequired': '请先粘贴扫码页显示的配对信息',
   // The stages the wizard narrates while a run is in flight.
   'wizard.stage.validate': '正在校验配对信息…',
@@ -277,6 +282,9 @@ const en: Dict = {
   'wizard.succeeded': 'Paired',
   'wizard.failed': 'Pairing failed: {stage}',
   'wizard.unknownError': 'Unknown error',
+  // See the zh entry: the run deadline is not a verdict.
+  'wizard.timedOut':
+    'No pairing result arrived. If the desktop approved it, the device appears in the list below; otherwise generate a new pairing code in Cherry Studio and try again.',
   'wizard.error.payloadRequired': 'Paste the pairing payload shown on the scan page first',
   'wizard.stage.validate': 'Validating the pairing payload…',
   'wizard.stage.connect': 'Connecting to Cherry Studio…',

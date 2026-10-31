@@ -18,6 +18,14 @@ with its source. Loaded automatically when a file tool touches `ui/**`.
 - **HTTP lives in `api.ts`** (same-origin `/cherry-remote/api`); a component
   never fetches directly. Both seams are injected for tests
   (`eventSourceFactory`, `scopeClient`), so no test stands up a server.
+- **A run always ends, and the deadline is not a verdict.** The server publishes
+  a terminal stage on every outcome, but the stream has no replay, so one lost
+  frame would otherwise park the wizard on 「配对进行中」 with the submit button
+  disabled and no cancel. The run deadline (`runLifetimeMs`, same injection
+  style as `codeLifetimeMs`) restores the form and re-reads the device list;
+  its copy points at that list instead of claiming failure, and it keeps
+  `claimId` so a terminal frame that arrives late still wins. Arm it on the
+  `waiting` phase only — never at mount.
 - **jsdom only.** `tests/unit/ui.test.ts` and `uiScopePanel.test.ts` render the
   page; a browser-only API needs a fake in the test, not a guard in the page.
 

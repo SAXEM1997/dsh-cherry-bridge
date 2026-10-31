@@ -24,6 +24,28 @@ import type { PairingPhase, PairingProgressEvent } from './types'
 /** The countdown the transient code display gets, in seconds. */
 export const DEFAULT_CODE_LIFETIME_MS = 120_000
 
+/**
+ * How long one run may sit in `waiting` before the wizard gives the form back.
+ *
+ * The server publishes a terminal stage on EVERY outcome (`src/httpApi.ts`
+ * `startPairing`), but the event stream carries no replay, so a single dropped
+ * frame loses the verdict for good — and nothing else clears `busy`: only a
+ * terminal frame or a refused POST does, and there is no cancel control. Without
+ * this bound a lost frame parks the wizard on 「配对进行中」 until a page reload.
+ *
+ * The bound must be comfortably past a REALISTIC live run: `src/pairing.ts`
+ * bounds the candidate walk to 30 s (`dialBudgetMs`) and the claim/poll phase to
+ * a FRESH 120 s anchored at the claim, so 150 s plus 30 s of margin.
+ *
+ * It is NOT past a pathological one, and it says so rather than pretending: two
+ * round trips inside that walk (`hello`, then the claim) are bounded only by
+ * JsonRpcClient's 60 s default request timeout, so a peer that stalls each just
+ * under it can keep a run legitimately working for ~270 s. A premature alarm is
+ * acceptable because it is not a verdict — it points at the device list, and a
+ * terminal frame arriving later replaces it (see `claimId` below).
+ */
+export const DEFAULT_RUN_LIFETIME_MS = 180_000
+
 export interface PairingWizardProps {
   /** True while a stream is open; submitting with no stream would lose the code. */
   subscribed: boolean
@@ -31,6 +53,8 @@ export interface PairingWizardProps {
   progress: PairingProgressEvent | undefined
   /** How long the verification code stays on screen. Injectable for tests. */
   codeLifetimeMs?: number
+  /** How long a run may wait for its terminal frame. Injectable for tests. */
+  runLifetimeMs?: number
   /**
    * Called when a NEW run is submitted, before `POST /pair`: the app retires the
    * previous run's frame here, so the settled render never has to compete with a
@@ -45,6 +69,7 @@ export function PairingWizard({
   subscribed,
   progress,
   codeLifetimeMs = DEFAULT_CODE_LIFETIME_MS,
+  runLifetimeMs = DEFAULT_RUN_LIFETIME_MS,
   onRunStart,
   onSettled,
 }: PairingWizardProps): ReturnType<typeof Object> {
@@ -66,6 +91,11 @@ export function PairingWizard({
   // unreachable. The verdict must be an INPUT to the settled render rather than
   // derived from a frame that is being cleared underneath it.
   const [verdict, setVerdict] = useState<string | undefined>(undefined)
+  // Set ONLY by the run deadline: `phase === 'failed'` with no stage behind it.
+  // Its own flag rather than an empty verdict, because the settled paragraph must
+  // NOT read as a verdict — the run may have been approved while its frame was
+  // lost, and the device list right below would contradict a "配对失败".
+  const [timedOut, setTimedOut] = useState(false)
 
   const stage = progress?.stage
   const frameClaimId = progress?.claimId
@@ -94,6 +124,10 @@ export function PairingWizard({
     // Terminal frame: the code is a transient display and goes away with it.
     if ((TERMINAL_STAGES as readonly string[]).includes(stage)) {
       setCode(undefined)
+      // A LATE frame outranks the deadline: `POST /pair` is fire-and-forget, so a
+      // frame can still arrive after the run deadline and the stage it carries is
+      // the truth — retiring the flag here is what lets that copy win the render.
+      setTimedOut(false)
       // Capture FIRST: `onSettled` is the app's chance to clear the frame, and
       // everything below must already be independent of it.
       setVerdict(stage)
@@ -111,6 +145,28 @@ export function PairingWizard({
     return () => clearTimeout(timer)
   }, [code, codeLifetimeMs])
 
+  useEffect(() => {
+    if (phase !== 'waiting') return undefined
+    // The countdown above bounds the CODE DISPLAY; this bounds the RUN. Same
+    // failure mode, different casualty: the code goes away on time, but `busy`
+    // would stay true forever and leave the submit button disabled with no
+    // cancel control. Everything the terminal branch does to the form is done
+    // here too, minus the verdict — and `claimId` is deliberately KEPT, so a
+    // terminal frame that arrives after the deadline still replaces this message
+    // with the truth instead of being filtered out as a stranger's.
+    const timer = setTimeout(() => {
+      setCode(undefined)
+      setTimedOut(true)
+      setPhase('failed')
+      setBusy(false)
+      // The same callback a terminal frame runs: it re-reads the device list,
+      // which is what makes "look below" honest — an approved pairing whose
+      // frame was lost shows up there.
+      onSettled?.()
+    }, runLifetimeMs)
+    return () => clearTimeout(timer)
+  }, [phase, runLifetimeMs, onSettled])
+
   const submit = (event: FormEvent): void => {
     event.preventDefault()
     const trimmed = payload.trim()
@@ -126,6 +182,7 @@ export function PairingWizard({
     // when the frame arrives. Clearing it at start (rather than relying on the
     // frame going away) keeps the settled paragraph correct for exactly one run.
     setVerdict(undefined)
+    setTimedOut(false)
     // ...and the APP retires the previous run's frame here rather than on settle,
     // so a batched terminal commit cannot take the label away with it.
     onRunStart?.()
@@ -206,9 +263,14 @@ export function PairingWizard({
           paragraph renders (see the `verdict` state above). */}
       {phase === 'failed' && (
         <p className="cherry-error" role="alert">
-          {t('wizard.failed', {
-            stage: STAGE_KEYS[verdict ?? ''] === undefined ? t('wizard.unknownError') : t(STAGE_KEYS[verdict ?? '']!),
-          })}
+          {timedOut
+            ? t('wizard.timedOut')
+            : t('wizard.failed', {
+                stage:
+                  STAGE_KEYS[verdict ?? ''] === undefined
+                    ? t('wizard.unknownError')
+                    : t(STAGE_KEYS[verdict ?? '']!),
+              })}
         </p>
       )}
       {error !== undefined && (
