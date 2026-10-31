@@ -29,7 +29,7 @@ import { createElement } from 'react'
 import type { ComponentType } from 'react'
 import { App } from '../../ui/src/App'
 import { ToolScopePanel } from '../../ui/src/ToolScopePanel'
-import { ApiError } from '../../ui/src/api'
+import { ApiError, REQUEST_TIMEOUT } from '../../ui/src/api'
 import { apply } from '../../ui/src/main'
 import type { SlotRegistration, SlotsService } from '../../ui/src/main'
 import type {
@@ -791,5 +791,40 @@ describe('启用范围面板 (§6.4)', () => {
     expect(screen.getByText('正在读取启用范围…')).toBeTruthy()
     expect(slotText('[data-scope-empty]')).toBe('')
     expect(saveButton().disabled).toBe(true)
+  })
+  it('⑰ a READ that never answers says so, instead of echoing the marker', async () => {
+    // The panel's read goes through `describeCause` too (issue #180's ceiling is
+    // page-wide). Without a case here, dropping ONLY the read arm's mapping keeps
+    // the whole suite green — the same partial-revert hole the save case closed
+    // for the other arm.
+    const stub = installScope(snapshot())
+    stub.client = { ...stub.client, get: () => Promise.reject(new Error(REQUEST_TIMEOUT)) }
+    renderPanel(stub)
+
+    const failed = await screen.findByText(/读取启用范围失败/)
+    expect(failed.textContent).toContain('请求长时间没有回应')
+    expect(failed.textContent).not.toContain(REQUEST_TIMEOUT)
+  })
+
+  it('⑯ a save that never answers says so, instead of echoing the marker', async () => {
+    // The page-wide ceiling (`api.ts` `request()`) surfaces on this panel's two
+    // surfaces — the read and the save — and both route through `describeCause`.
+    // The marker is an internal token, so what a user reads here must be the
+    // dictionary's sentence, and it lands where the server's own message goes.
+    const stub = installScope(snapshot())
+    stub.client = { ...stub.client, put: () => Promise.reject(new Error(REQUEST_TIMEOUT)) }
+    renderPanel(stub)
+    await loaded()
+
+    // A dirty draft, so the save actually writes.
+    fireEvent.click(screen.getByRole('radio', { name: '全局' }))
+    fireEvent.click(saveButton())
+
+    const failed = await screen.findByText(/请求长时间没有回应/)
+    expect(failed.textContent).not.toContain(REQUEST_TIMEOUT)
+    // The control comes back: a failed save must not leave 保存 disabled.
+    await waitFor(() => {
+      expect(saveButton().disabled).toBe(false)
+    })
   })
 })

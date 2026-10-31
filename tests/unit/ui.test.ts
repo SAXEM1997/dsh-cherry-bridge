@@ -32,7 +32,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { createElement } from 'react'
 import type { ComponentProps, ComponentType } from 'react'
 import type { DeviceSummary, EventSourceLike } from '../../ui/src/types'
-import { ApiError, PAIRING_REQUEST_TIMEOUT, startPairing } from '../../ui/src/api'
+import { ApiError, REQUEST_TIMEOUT, listDevices, startPairing } from '../../ui/src/api'
 import { App } from '../../ui/src/App'
 import { DeviceCard } from '../../ui/src/DeviceCard'
 import { dictionaries } from '../../ui/src/i18n'
@@ -631,7 +631,7 @@ describe('pairing wizard', () => {
     await renderWithDevice([])
     // Only the pairing POST is left to run: devices and scope were answered above.
     vi.stubGlobal('fetch', async () => {
-      throw new Error(PAIRING_REQUEST_TIMEOUT)
+      throw new Error(REQUEST_TIMEOUT)
     })
 
     submitPayload()
@@ -639,7 +639,7 @@ describe('pairing wizard', () => {
     const alert = await screen.findByText('配对请求迟迟没有回应，已中止——请重试；若反复出现，宿主可能已卡住，重启后再试')
     // The token must never reach a page: the user reads the dictionary, not the
     // string the transport happened to throw.
-    expect(alert.textContent).not.toContain(PAIRING_REQUEST_TIMEOUT)
+    expect(alert.textContent).not.toContain(REQUEST_TIMEOUT)
     expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
   })
 })
@@ -770,6 +770,26 @@ describe('device card actions', () => {
     const patch = calls.find((call) => call.method === 'PATCH')
     expect(patch?.url).toBe('/cherry-remote/api/devices/dev-1')
     expect(patch?.body).toEqual({ enabled: false })
+  })
+
+  it('⑰ a card action that never answers says so, and hands the card back', async () => {
+    // A card action is a bounded call (`api.ts` `request()`, issue #180), so it
+    // can fail with the internal marker. The card is a real surface: rendering
+    // `cherry-remote.request-timeout` at a Chinese user is what api.ts's own
+    // "NEVER copy" contract forbids — and `busy` must clear, or the card's
+    // buttons stay dead for the life of the page.
+    await renderWithDevice([])
+    // The list and the scope were answered above; the PATCH lands on this stub.
+    vi.stubGlobal('fetch', async () => {
+      throw new Error(REQUEST_TIMEOUT)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: '停用' }))
+
+    const alert = await screen.findByText('请求长时间没有回应，已中止——请稍后重试')
+    expect(alert.textContent).not.toContain(REQUEST_TIMEOUT)
+    // The card is usable again: `busy` cleared in the mutation's `finally`.
+    expect((screen.getByRole('button', { name: '停用' }) as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('re-enables a disabled device through PATCH enabled:true', async () => {
@@ -1204,7 +1224,7 @@ describe('the pairing request ceiling', () => {
     const hang = hangingFetch()
     vi.stubGlobal('fetch', hang.handler)
 
-    await expect(startPairing('payload', { timeoutMs: 10 })).rejects.toThrow(PAIRING_REQUEST_TIMEOUT)
+    await expect(startPairing('payload', { timeoutMs: 10 })).rejects.toThrow(REQUEST_TIMEOUT)
     // The ceiling produced it, not a stray rejection.
     expect(hang.aborted()).toBe(true)
   })
@@ -1221,7 +1241,7 @@ describe('the pairing request ceiling', () => {
     // signal still clear must keep both its type and its code.
     expect(cause).toBeInstanceOf(ApiError)
     expect((cause as ApiError).code).toBe('invalid-payload')
-    expect((cause as Error).message).not.toContain(PAIRING_REQUEST_TIMEOUT)
+    expect((cause as Error).message).not.toContain(REQUEST_TIMEOUT)
   })
 
   it('⑨c the PRODUCTION ceiling fires with nothing injected', async () => {
@@ -1246,10 +1266,49 @@ describe('the pairing request ceiling', () => {
 
       await vi.advanceTimersByTimeAsync(59_999)
       const cause = await settled
-      expect((cause as Error).message).toBe(PAIRING_REQUEST_TIMEOUT)
+      expect((cause as Error).message).toBe(REQUEST_TIMEOUT)
       expect(hang.aborted()).toBe(true)
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('⑨d the ceiling is in request(), not on the pairing call', async () => {
+    // Every call the page makes passes through `request()`, so a hang there
+    // strands a control on every surface — the device list and the scope save as
+    // well as the wizard (issue #180). This case is about the OTHER call sites:
+    // it would go red if the ceiling were still bolted onto `startPairing` alone.
+    vi.useFakeTimers()
+    try {
+      const hang = hangingFetch()
+      vi.stubGlobal('fetch', hang.handler)
+
+      const settled = listDevices().catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      const cause = await settled
+      expect((cause as Error).message).toBe(REQUEST_TIMEOUT)
+      expect(hang.aborted()).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('⑨e the device list reports a timed-out read, and stops claiming to load', async () => {
+    // The page-level sentence plus the state that follows it. Two surfaces time
+    // out here — the device list and the scope panel's own read — so the query
+    // names the app's sentence by its distinctive clause, and the list must have
+    // left 「正在读取设备列表…」 behind (`listed` turns true on failure).
+    vi.stubGlobal('fetch', async () => {
+      throw new Error(REQUEST_TIMEOUT)
+    })
+    render(createElement(App, { eventSourceFactory: (url: string) => new FakeEventSource(url) }))
+
+    const alert = await screen.findByText(/请确认宿主仍在运行/)
+    expect(alert.textContent).not.toContain(REQUEST_TIMEOUT)
+    expect(screen.queryByText('正在读取设备列表…')).toBeNull()
+    // And it claims NOTHING about devices: the list is unknown, not empty, so
+    // the empty sentence must not appear beside the error that explains why.
+    expect(screen.queryByText(/暂无已配对设备/)).toBeNull()
   })
 })

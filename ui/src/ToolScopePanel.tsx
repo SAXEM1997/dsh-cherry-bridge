@@ -29,7 +29,7 @@
  * no tools" that changes nothing and triggers no write.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ApiError, defaultScopeClient } from './api'
+import { ApiError, REQUEST_TIMEOUT, defaultScopeClient } from './api'
 import { useT } from './i18n'
 import type { T } from './i18n'
 import type {
@@ -148,7 +148,20 @@ interface SaveFailure {
   detail?: string
 }
 
-const describeCause = (cause: unknown): string => (cause instanceof Error ? cause.message : String(cause))
+/**
+ * The panel's own description of a failure.
+ *
+ * A request that never answered arrives as `api.ts`'s internal marker (the
+ * page-wide ceiling, issue #180), which must become a sentence before it reaches
+ * any of the three places this feeds — the read error, the save failure and the
+ * re-read error. Everything else is the server's own message, interpolated.
+ */
+const describeCause = (t: T, cause: unknown): string =>
+  cause instanceof Error && cause.message === REQUEST_TIMEOUT
+    ? t('scope.error.timeout')
+    : cause instanceof Error
+      ? cause.message
+      : String(cause)
 
 /**
  * D11's empty state for the current draft, or `undefined` when nothing may be
@@ -227,7 +240,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
         seedFromDocument(response)
       },
       (cause: unknown) => {
-        if (live) setLoadError(describeCause(cause))
+        if (live) setLoadError(describeCause(t, cause))
       },
     )
     return () => {
@@ -310,8 +323,8 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
           // An unknown code therefore falls to `SAVE_FAILED_KEY`'s template with
           // `{cause}` filled, not to a bare `保存失败：`.
           label: code === undefined
-            ? t(SAVE_FAILED_KEY, { cause: describeCause(cause) })
-            : t(SAVE_FAILURE_KEYS[code] ?? SAVE_FAILED_KEY, { cause: describeCause(cause) }),
+            ? t(SAVE_FAILED_KEY, { cause: describeCause(t, cause) })
+            : t(SAVE_FAILURE_KEYS[code] ?? SAVE_FAILED_KEY, { cause: describeCause(t, cause) }),
           detail: status === undefined ? undefined : t('scope.serverSaid', { code: code!, status }),
         })
       },
@@ -344,7 +357,7 @@ export function ToolScopePanel({ client = defaultScopeClient }: ToolScopePanelPr
       },
       (cause: unknown) => {
         setBusy(false)
-        setLoadError(describeCause(cause))
+        setLoadError(describeCause(t, cause))
       },
     )
   }, [client, seedFromDocument])

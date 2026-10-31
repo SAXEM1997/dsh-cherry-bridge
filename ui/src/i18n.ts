@@ -95,6 +95,8 @@ const zh: Dict = {
   'device.remove.confirm': '确认移除',
   'device.remove.warning': '移除后本机将不再连接该设备，凭据保留在对方一侧。',
   'device.cancel': '取消',
+  // The page-wide request ceiling (`api.ts`) reached a card action.
+  'device.error.timeout': '请求长时间没有回应，已中止——请稍后重试',
   'device.error.nameRequired': '设备名称不能为空',
   'device.error.hostsRequired': '至少需要一个主机地址',
   'device.error.portInvalid': '端口必须是 1..65535 之间的整数',
@@ -132,6 +134,8 @@ const zh: Dict = {
   // NO VERDICT WORDING. This is the run deadline, not a stage: the pairing may
   // have been approved while its frame was lost, so it points at the list right
   // below (which the settle refreshes) instead of asserting an outcome.
+  // The page-wide request ceiling (`api.ts`): the device list gave up waiting.
+  'app.error.timeout': '请求长时间没有回应，已中止——请确认宿主仍在运行；若反复出现，请重启宿主后再试',
   'wizard.timedOut':
     '没有等到配对结果——若桌面端已批准，下面的设备列表里会出现该设备；否则请在 Cherry Studio 重新生成配对码后重试',
   'wizard.error.payloadRequired': '请先粘贴扫码页显示的配对信息',
@@ -190,6 +194,9 @@ const zh: Dict = {
   // A refusal whose code this panel has no copy for: the server's own message is
   // the best available explanation, so it is interpolated verbatim.
   'scope.saveFailed': '保存失败：{cause}',
+  // The page-wide request ceiling (`api.ts`), rendered where the server's own
+  // message would go: there is no server message when nothing answered.
+  'scope.error.timeout': '请求长时间没有回应，已中止——请稍后重试',
   'scope.serverSaid': '服务端返回 {code}（HTTP {status}）。',
   'scope.degraded.install': '隐藏层应用曾失败（install）：相关 agent 的隐藏层未生效或无法确认，启用范围对它可能不适用',
   'scope.degraded.workspace-list': '注册表列表当前读不到',
@@ -259,6 +266,8 @@ const en: Dict = {
   'device.remove.confirm': 'Confirm removal',
   'device.remove.warning': 'This machine will stop connecting to the device. Its credentials stay on the peer.',
   'device.cancel': 'Cancel',
+  // See the zh entry: the page-wide request ceiling.
+  'device.error.timeout': 'The request stopped answering and was abandoned. Try again in a moment.',
   'device.error.nameRequired': 'Device name cannot be empty',
   'device.error.hostsRequired': 'At least one host address is required',
   'device.error.portInvalid': 'Port must be an integer between 1 and 65535',
@@ -286,6 +295,8 @@ const en: Dict = {
   'wizard.failed': 'Pairing failed: {stage}',
   'wizard.unknownError': 'Unknown error',
   // See the zh entry: the run deadline is not a verdict.
+  // See the zh entry: the page-wide request ceiling.
+  'app.error.timeout': 'The request stopped answering and was abandoned. Check that the host is still running; if it keeps happening, restart it and try again.',
   'wizard.timedOut':
     'No pairing result arrived. If the desktop approved it, the device appears in the list below; otherwise generate a new pairing code in Cherry Studio and try again.',
   'wizard.error.payloadRequired': 'Paste the pairing payload shown on the scan page first',
@@ -340,6 +351,7 @@ const en: Dict = {
   'scope.savedPruned': 'Saved. The server pruned these stale selections: {list}.',
   'scope.reread': 'Reload',
   'scope.saveFailed': 'Save failed: {cause}',
+  'scope.error.timeout': 'The request stopped answering and was abandoned. Try again in a moment.',
   'scope.serverSaid': 'The server answered {code} (HTTP {status}).',
   'scope.degraded.install':
     'Applying a hidden layer failed earlier (install): the affected agent’s hidden layer is not in effect or cannot be confirmed, so the tool scope may not apply to it',
