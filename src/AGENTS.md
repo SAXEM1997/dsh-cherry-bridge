@@ -816,12 +816,14 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 Neither reference is published with this repository.
 
 - **`.scratch-csa`** (gitignored) — the official Cherry Studio **app**
-  (`CherryHQ/cherry-studio-app` @ v0.5.1, read 2026-10-28), the **same role we
+  (`CherryHQ/cherry-studio-app` @ v0.5.2, read 2026-10-31), the **same role we
   play** (protocol *client* against the desktop's server). Its remote layer is
   `src/backend/services/remoteAgent/`; "what the official client does" comes
-  from there. v0.5.1 changed nothing on that face (`remoteAgent/**` zero diff,
-  pins still 0.7.0 / 0.2.5); v0.5.0 moved onto them, whose one behavioural
-  change is the versioned pairing QR.
+  from there. v0.5.0 moved onto the pinned generation, whose one behavioural
+  change is the versioned pairing QR; v0.5.1 and v0.5.2 changed NOTHING on that
+  face — `git rev-parse <tag>:src/backend/services/remoteAgent` is
+  `16e505fe…` at all three tags, and the pins are still 0.7.0 / 0.2.5. Check
+  that tree hash before believing a new app version changed the wire.
 - **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
   read alongside v2.1.7, the protocol **server** of record. The faces we depend
   on are `src/main/services/remoteAccess/` and
