@@ -17,12 +17,24 @@ import { peerIdFromString } from "@libp2p/peer-id";
 *    its scheme. The peer's snapshot describes where it listens NOW, while a
 *    record entry may be an operator's choice (a pinned port, a TLS proxy) that
 *    every reconnect must keep honouring; re-pointing it would silently rewrite
-*    the operator's address book on a schedule;
-*  - nothing is ever removed. A stale address costs one dial per reconnect,
-*    while dropping a live one costs the device;
+*    the operator's address book on a schedule. "Already dials" is judged
+*    CASE-INSENSITIVELY: a hostname is case-insensitive, the peer's schema
+*    lowercases what it advertises, and a PATCHed record stores what the
+*    operator typed — without this, `MyNAS.example` and `mynas.example` would
+*    both hold a dial slot. (An IPv6 literal in a different EXPANSION is NOT
+*    reconciled here; the PATCH path owns the archive's spelling, and it does
+*    not canonicalize either.)
+*  - nothing is ever removed, and nothing is remembered as removed: a host the
+*    peer still advertises is re-learned after an operator PATCH drops it. The
+*    peer is the source of truth for where it listens, so this is the intended
+*    reading of "add-only" — to make a removal stick, stop the desktop
+*    advertising the address (or disable the device);
 *  - host, port and scheme are appended TOGETHER, which is what keeps the v4
-*    one-entry-per-host invariant true — `assertValidSecurity` and
-*    `assertValidPorts` would otherwise quarantine the archive on its next read;
+*    one-entry-per-host invariant true. That invariant is enforced on the READ
+*    path by `assertValidSecurity`/`assertValidPorts`, and a semantic failure
+*    there is NOT a quarantine (that class covers unreadable bytes): the throw
+*    escapes `parseArchive` out of `list()`, so a split entry would break every
+*    tool until an operator repaired the file;
 *  - past {@link MAX_CANDIDATE_HOSTS} nothing is added, and the loop stops
 *    rather than scanning the rest.
 *
@@ -32,13 +44,16 @@ import { peerIdFromString } from "@libp2p/peer-id";
 * second validation pass.
 */
 function mergeAdvertisedEndpoints(record, endpoints) {
+	const dialed = new Set(record.hosts.map((host) => host.toLowerCase()));
 	let added = 0;
 	for (const endpoint of endpoints) {
-		if (record.hosts.includes(endpoint.host)) continue;
+		const key = endpoint.host.toLowerCase();
+		if (dialed.has(key)) continue;
 		if (record.hosts.length >= 32) break;
 		record.hosts.push(endpoint.host);
 		record.ports[endpoint.host] = endpoint.port;
 		record.security[endpoint.host] = endpoint.security;
+		dialed.add(key);
 		added += 1;
 	}
 	return added;
@@ -526,13 +541,20 @@ var DeviceStore = class {
 	* graph, and a write refused at {@link #persist}'s own gate cannot have
 	* half-edited the record the archive still holds.
 	*
+	* `desktopIdentity` is the pin the answering connection belongs to: the
+	* record must still name that desktop. A RE-PAIR under the same `deviceId`
+	* (the desktop regenerated its identity) would otherwise take an address
+	* learned from the previous pairing — a stale candidate whose every dial then
+	* fails the Noise pin, permanently, because learning never removes.
+	*
 	* An unknown `deviceId` is a no-op — the record may have been removed (or
 	* re-paired) between the RPC and this write.
 	*/
-	learnEndpoints(deviceId, endpoints) {
+	learnEndpoints(deviceId, endpoints, desktopIdentity) {
 		const devices = this.#load();
 		const index = devices.findIndex((record) => record.deviceId === deviceId);
 		if (index < 0) return 0;
+		if (devices[index].desktopIdentity !== desktopIdentity) return 0;
 		const merged = structuredClone(devices[index]);
 		const added = mergeAdvertisedEndpoints(merged, endpoints);
 		if (added === 0) return 0;
@@ -2725,12 +2747,17 @@ const DEFAULT_PROTOCOL_VERSIONS = [1];
 * WHY 2 s. The peer's handler is a local computation
 * (`getRemoteEndpoint()`: `networkInterfaces()` plus two config reads), so a
 * round trip is sub-millisecond on a LAN and 2 s is ~4 orders of magnitude of
-* slack. The UPPER bound is derived, not chosen: it must stay BELOW
-* `DEVICE_SETTLE_WAIT_MS` (5 s, `defaults.ts`), because a tool that finds the
-* device `connecting` waits for the state to leave it — a learn bound above
-* that window would let `connected` arrive after the caller was already told
-* the device was unavailable. A timeout costs one reconnect's worth of
-* enrichment and says nothing about the device.
+* slack.
+*
+* The UPPER bound is NOT derived from a claim about the whole handshake: a dial
+* already burns up to `DEFAULT_CONNECT_TIMEOUT_MS` (10 s) and hello/authenticate
+* ride the rpc layer's 60 s default, so `connected` can arrive long after a
+* tool's `DEVICE_SETTLE_WAIT_MS` (5 s) wait whatever this constant is. What is
+* derived is narrower and true: THIS wait alone must stay below that window, so
+* a peer that advertises the capability and then hangs on this one call cannot
+* by itself push the state flip past the window a tool already waited out. A
+* timeout costs one reconnect's worth of enrichment and says nothing about the
+* device.
 */
 const ENDPOINTS_LEARN_TIMEOUT_MS = 2e3;
 /** Ping-silence multiplier: 2×heartbeatMs without a pong judges the line dead. */
@@ -3018,7 +3045,8 @@ function businessWindowFor(reportedInFlightRequests) {
 *    was regenerated, a future protocol that answers for more than one host):
 *    the list decides where this client dials, so a list that cannot be
 *    attributed to our own desktop may not change it;
-*  - **a non-array `endpoints`**, which is a shape the protocol does not have.
+*  - a MISSING or NON-STRING `desktopIdentity`: `undefined !== pin`, and a
+*    number is not the pin either, so both fall out of the same comparison.
 *
 * One refusal is per ENTRY: `advertisedEndpointSchema`, the peer's own
 * destination schema, rejects a LOOPBACK destination (a shared address that
@@ -3026,16 +3054,23 @@ function businessWindowFor(reportedInFlightRequests) {
 * and normalizes the host (case, IPv6), so the archive never stores a spelling
 * the dial cannot use. One unusable row must not discard its neighbours.
 *
+* NOT total on the wire shape, deliberately: a non-object answer or a non-array
+* `endpoints` throws here, and `#learnEndpoints`' one structural `catch` is what
+* turns that into the silent no-op the contract promises. Defending each shape
+* twice would look safer and be worse: the redundancy masks which guard a test
+* actually pins (issue #114's lesson), and the whole ANSWER is untrusted
+* anyway, so the boundary belongs at the caller, where the handshake can see
+* it. `endpoints ?? []` is the one shape that needs no throw: it is the legal
+* "no addresses right now" answer (the desktop's `addresses` can be empty).
+*
 * No length bound is needed here: one JSON-RPC record is capped at 64 KiB by
 * the transport, and the desktop's own snapshot is `addresses.slice(0, 32)`.
 */
 function advertisedEndpoints(result, desktopIdentity) {
-	if (result === null || typeof result !== "object") return [];
 	const answer = result;
-	if (typeof answer.desktopIdentity !== "string" || answer.desktopIdentity !== desktopIdentity) return [];
-	if (!Array.isArray(answer.endpoints)) return [];
+	if (answer.desktopIdentity !== desktopIdentity) return [];
 	const accepted = [];
-	for (const raw of answer.endpoints) {
+	for (const raw of answer.endpoints ?? []) {
 		const parsed = advertisedEndpointSchema.safeParse(raw);
 		if (parsed.success) accepted.push(parsed.data);
 	}
@@ -3546,32 +3581,37 @@ var DeviceConnection = class {
 	* comes from the QR or the operator.
 	*
 	* EVERY failure here is SILENT and non-fatal, because this is an enrichment,
-	* not a verdict: a peer that does not advertise the capability (through
-	* 2.1.x the field is absent), one advertising a version this client cannot
-	* speak (strictly `1` — a higher number is not evidence that it speaks 1,
-	* the same rule the paged-summaries bit took), a refused call (the desktop
-	* throws when its gateway is not running), a wedged one (bounded by
-	* {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an unattributable answer, or a store
-	* that cannot write all leave the connection exactly as it was.
+	* not a verdict: a peer that does not advertise the capability (`connection`
+	* through 2.1.3 has neither the hello bit nor this method), one advertising a
+	* version this client cannot speak (strictly `1` — a higher number is not
+	* evidence that it speaks 1, the same rule the paged-summaries bit took), a
+	* refused call (the desktop throws when its gateway is not running), a wedged
+	* one (bounded by {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an unattributable
+	* answer, or a store that cannot write. None of them is a CONNECTION failure:
+	* the link comes up either way, and only the archive is left without the new
+	* addresses — this instance's own record may already carry them, because the
+	* merge runs before the callback (see the paragraph below).
 	*
 	* The MERGE happens in two places on purpose: here (this instance's record,
 	* so its next reconnect dials the new address) and through the callback (the
 	* assembly's archive, so a restart keeps it). They are the same pure rule
 	* against two copies of the record, and each is idempotent.
+	*
+	* ONE `catch` covers everything after the gate, and that is the contract, not
+	* laziness: a refused call, a wedged one (bounded by
+	* {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an answer of the wrong SHAPE (the
+	* parser throws rather than defending every field twice), a throwing assembly
+	* hook (an unwritable archive), or a bug in the merge must all land here —
+	* none of them may fail the handshake. The observable promise is therefore
+	* structural: this method cannot reject.
 	*/
 	async #learnEndpoints(link, capability) {
 		if (capability !== 1) return;
-		let answer;
 		try {
-			answer = await this.#houseCall(link, "connection.endpoints", { domain: "agent" }, ENDPOINTS_LEARN_TIMEOUT_MS);
-		} catch {
-			return;
-		}
-		const endpoints = advertisedEndpoints(answer, this.record.desktopIdentity);
-		if (endpoints.length === 0) return;
-		const added = mergeAdvertisedEndpoints(this.record, endpoints);
-		if (added > 0) console.info(`[cherry-remote] device ${this.record.deviceId} learned ${added} advertised endpoint(s)`);
-		try {
+			const endpoints = advertisedEndpoints(await this.#houseCall(link, "connection.endpoints", { domain: "agent" }, ENDPOINTS_LEARN_TIMEOUT_MS), this.record.desktopIdentity);
+			if (endpoints.length === 0) return;
+			const added = mergeAdvertisedEndpoints(this.record, endpoints);
+			if (added > 0) console.info(`[cherry-remote] device ${this.record.deviceId} learned ${added} advertised endpoint(s)`);
 			this.#onAdvertisedEndpoints?.(endpoints);
 		} catch {}
 	}
@@ -12100,7 +12140,7 @@ function connectionFor(deviceId) {
 		rateBudgetPerSecond: state.rateBudgetPerSecond,
 		...state.wsTls === void 0 ? {} : { wsOptions: state.wsTls },
 		onAdvertisedEndpoints: (endpoints) => {
-			state.store.learnEndpoints(deviceId, endpoints);
+			state.store.learnEndpoints(deviceId, endpoints, record.desktopIdentity);
 		}
 	});
 	state.connectionsBuilt += 1;

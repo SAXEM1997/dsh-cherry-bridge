@@ -497,7 +497,10 @@ function connectionFor(deviceId: string): DeviceConnection {
     // one, and an `upsert` of the connection's copy would put a
     // connection-scoped credential into the archive.
     onAdvertisedEndpoints: (endpoints) => {
-      state.store.learnEndpoints(deviceId, endpoints)
+      // `record` is THIS connection's clone: its `desktopIdentity` is the pin the
+      // answer was validated against, so a re-pair under the same deviceId cannot
+      // receive an address learned from the previous pairing.
+      state.store.learnEndpoints(deviceId, endpoints, record.desktopIdentity)
     },
   })
   state.connectionsBuilt += 1

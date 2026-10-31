@@ -299,12 +299,17 @@ const DEFAULT_PROTOCOL_VERSIONS: readonly number[] = [1]
  * WHY 2 s. The peer's handler is a local computation
  * (`getRemoteEndpoint()`: `networkInterfaces()` plus two config reads), so a
  * round trip is sub-millisecond on a LAN and 2 s is ~4 orders of magnitude of
- * slack. The UPPER bound is derived, not chosen: it must stay BELOW
- * `DEVICE_SETTLE_WAIT_MS` (5 s, `defaults.ts`), because a tool that finds the
- * device `connecting` waits for the state to leave it — a learn bound above
- * that window would let `connected` arrive after the caller was already told
- * the device was unavailable. A timeout costs one reconnect's worth of
- * enrichment and says nothing about the device.
+ * slack.
+ *
+ * The UPPER bound is NOT derived from a claim about the whole handshake: a dial
+ * already burns up to `DEFAULT_CONNECT_TIMEOUT_MS` (10 s) and hello/authenticate
+ * ride the rpc layer's 60 s default, so `connected` can arrive long after a
+ * tool's `DEVICE_SETTLE_WAIT_MS` (5 s) wait whatever this constant is. What is
+ * derived is narrower and true: THIS wait alone must stay below that window, so
+ * a peer that advertises the capability and then hangs on this one call cannot
+ * by itself push the state flip past the window a tool already waited out. A
+ * timeout costs one reconnect's worth of enrichment and says nothing about the
+ * device.
  */
 export const ENDPOINTS_LEARN_TIMEOUT_MS = 2_000
 
@@ -692,7 +697,8 @@ function businessWindowFor(reportedInFlightRequests: number): number {
  *    was regenerated, a future protocol that answers for more than one host):
  *    the list decides where this client dials, so a list that cannot be
  *    attributed to our own desktop may not change it;
- *  - **a non-array `endpoints`**, which is a shape the protocol does not have.
+ *  - a MISSING or NON-STRING `desktopIdentity`: `undefined !== pin`, and a
+ *    number is not the pin either, so both fall out of the same comparison.
  *
  * One refusal is per ENTRY: `advertisedEndpointSchema`, the peer's own
  * destination schema, rejects a LOOPBACK destination (a shared address that
@@ -700,16 +706,23 @@ function businessWindowFor(reportedInFlightRequests: number): number {
  * and normalizes the host (case, IPv6), so the archive never stores a spelling
  * the dial cannot use. One unusable row must not discard its neighbours.
  *
+ * NOT total on the wire shape, deliberately: a non-object answer or a non-array
+ * `endpoints` throws here, and `#learnEndpoints`' one structural `catch` is what
+ * turns that into the silent no-op the contract promises. Defending each shape
+ * twice would look safer and be worse: the redundancy masks which guard a test
+ * actually pins (issue #114's lesson), and the whole ANSWER is untrusted
+ * anyway, so the boundary belongs at the caller, where the handshake can see
+ * it. `endpoints ?? []` is the one shape that needs no throw: it is the legal
+ * "no addresses right now" answer (the desktop's `addresses` can be empty).
+ *
  * No length bound is needed here: one JSON-RPC record is capped at 64 KiB by
  * the transport, and the desktop's own snapshot is `addresses.slice(0, 32)`.
  */
 function advertisedEndpoints(result: unknown, desktopIdentity: string): DirectEndpoint[] {
-  if (result === null || typeof result !== 'object') return []
-  const answer = result as { desktopIdentity?: unknown; endpoints?: unknown }
-  if (typeof answer.desktopIdentity !== 'string' || answer.desktopIdentity !== desktopIdentity) return []
-  if (!Array.isArray(answer.endpoints)) return []
+  const answer = result as { desktopIdentity?: unknown; endpoints?: readonly unknown[] | null }
+  if (answer.desktopIdentity !== desktopIdentity) return []
   const accepted: DirectEndpoint[] = []
-  for (const raw of answer.endpoints) {
+  for (const raw of answer.endpoints ?? []) {
     const parsed = advertisedEndpointSchema.safeParse(raw)
     if (parsed.success) accepted.push(parsed.data)
   }
@@ -1480,51 +1493,57 @@ export class DeviceConnection {
    * comes from the QR or the operator.
    *
    * EVERY failure here is SILENT and non-fatal, because this is an enrichment,
-   * not a verdict: a peer that does not advertise the capability (through
-   * 2.1.x the field is absent), one advertising a version this client cannot
-   * speak (strictly `1` — a higher number is not evidence that it speaks 1,
-   * the same rule the paged-summaries bit took), a refused call (the desktop
-   * throws when its gateway is not running), a wedged one (bounded by
-   * {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an unattributable answer, or a store
-   * that cannot write all leave the connection exactly as it was.
+   * not a verdict: a peer that does not advertise the capability (`connection`
+   * through 2.1.3 has neither the hello bit nor this method), one advertising a
+   * version this client cannot speak (strictly `1` — a higher number is not
+   * evidence that it speaks 1, the same rule the paged-summaries bit took), a
+   * refused call (the desktop throws when its gateway is not running), a wedged
+   * one (bounded by {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an unattributable
+   * answer, or a store that cannot write. None of them is a CONNECTION failure:
+   * the link comes up either way, and only the archive is left without the new
+   * addresses — this instance's own record may already carry them, because the
+   * merge runs before the callback (see the paragraph below).
    *
    * The MERGE happens in two places on purpose: here (this instance's record,
    * so its next reconnect dials the new address) and through the callback (the
    * assembly's archive, so a restart keeps it). They are the same pure rule
    * against two copies of the record, and each is idempotent.
+   *
+   * ONE `catch` covers everything after the gate, and that is the contract, not
+   * laziness: a refused call, a wedged one (bounded by
+   * {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an answer of the wrong SHAPE (the
+   * parser throws rather than defending every field twice), a throwing assembly
+   * hook (an unwritable archive), or a bug in the merge must all land here —
+   * none of them may fail the handshake. The observable promise is therefore
+   * structural: this method cannot reject.
    */
   async #learnEndpoints(link: LiveLink, capability: number | undefined): Promise<void> {
     if (capability !== 1) return
-    let answer: unknown
     try {
-      answer = await this.#houseCall<unknown>(
+      const answer = await this.#houseCall<unknown>(
         link,
         'connection.endpoints',
         { domain: 'agent' },
         ENDPOINTS_LEARN_TIMEOUT_MS,
       )
-    } catch {
-      // Silent by contract. The failure modes are all "this desktop does not
-      // want to tell us today", and a log line per reconnect would be noise on
-      // a device that is otherwise perfectly healthy.
-      return
-    }
-    const endpoints = advertisedEndpoints(answer, this.record.desktopIdentity)
-    if (endpoints.length === 0) return
-    const added = mergeAdvertisedEndpoints(this.record, endpoints)
-    if (added > 0) {
-      // Count only: a host is peer-supplied text, and the logging rule clips
-      // peer text at the render site (src/AGENTS.md). deviceId is exempt.
-      console.info(
-        `[cherry-remote] device ${this.record.deviceId} learned ${added} advertised endpoint(s)`,
-      )
-    }
-    try {
+      const endpoints = advertisedEndpoints(answer, this.record.desktopIdentity)
+      if (endpoints.length === 0) return
+      const added = mergeAdvertisedEndpoints(this.record, endpoints)
+      if (added > 0) {
+        // Count only: a host is peer-supplied text, and the logging rule clips
+        // peer text at the render site (src/AGENTS.md). deviceId is exempt.
+        console.info(
+          `[cherry-remote] device ${this.record.deviceId} learned ${added} advertised endpoint(s)`,
+        )
+      }
       this.#onAdvertisedEndpoints?.(endpoints)
     } catch {
-      // The assembly's write is LOCAL (fs, a quarantined archive). An archive
-      // that cannot take the enrichment is not a connection failure, and the
-      // store's own quarantine warning already names the cause.
+      // Silent by contract. The failure modes are all "this desktop does not
+      // want to tell us today" (or "this archive cannot take it"), and a log
+      // line per reconnect would be noise on a device that is otherwise
+      // perfectly healthy. One bounded line cannot be produced here anyway: the
+      // cause may be the peer's own answer text, which src/AGENTS.md clips at
+      // the render site — and this line would have to run on every connect.
     }
   }
 

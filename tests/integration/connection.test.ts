@@ -2436,6 +2436,9 @@ describe("the desktop's advertised endpoints (issue #143)", () => {
           // A record the client cannot use as-is (no port).
           { host: 'noport.example' } as unknown as { host: string; port: number },
           { host: '10.0.0.5', port: 9001, security: 'wss' },
+          // A mixed-case hostname: the peer's schema NORMALIZES it, and the
+          // archive must hold the normalized form.
+          { host: 'VPN.Example.COM', port: 9002 },
         ],
       },
     })
@@ -2445,9 +2448,15 @@ describe("the desktop's advertised endpoints (issue #143)", () => {
 
     await connection.connect()
 
-    // The filter is per ENTRY, so one junk row does not discard the answer.
-    expect(learned).toEqual([{ host: '10.0.0.5', port: 9001, security: 'wss' }])
-    expect(record.hosts).toEqual([fakeInfo.host, '10.0.0.5'])
+    // The filter is per ENTRY, so one junk row does not discard the answer —
+    // and the entries come back PARSED: `advertisedEndpointSchema` lowercases a
+    // hostname. Passing the frame through untouched would keep
+    // `VPN.Example.COM` and still satisfy every other assertion here.
+    expect(learned).toEqual([
+      { host: '10.0.0.5', port: 9001, security: 'wss' },
+      { host: 'vpn.example.com', port: 9002, security: 'ws' },
+    ])
+    expect(record.hosts).toEqual([fakeInfo.host, '10.0.0.5', 'vpn.example.com'])
   }, 15_000)
 
   it('⑱f a refused call is silent and does not disturb the link', async () => {
@@ -2468,10 +2477,16 @@ describe("the desktop's advertised endpoints (issue #143)", () => {
     expect(fakeInfo.fake.methodCount('connection.endpoints')).toBe(1)
     expect(learned).toEqual([])
     expect(record.hosts).toEqual([fakeInfo.host])
-    // SILENT: an enrichment that failed is not a state an operator can act on,
-    // so it must not add a line to every connect of an otherwise healthy device.
-    const lines = [...consoleWarn.mock.calls, ...consoleError.mock.calls].map((entry) => String(entry[0]))
-    expect(lines.some((line) => line.includes('connection.endpoints'))).toBe(false)
+    // SILENT on EVERY channel: an enrichment that failed is not a state an
+    // operator can act on, so it must not add a line to every connect of an
+    // otherwise healthy device. The check is not tied to the RPC's NAME — a
+    // paraphrase ("endpoint enrichment failed") is the shape a regression takes.
+    const lines = [
+      ...consoleWarn.mock.calls,
+      ...consoleError.mock.calls,
+      ...consoleInfo.mock.calls,
+    ].map((entry) => String(entry[0]))
+    expect(lines.some((line) => /endpoint/i.test(line))).toBe(false)
   }, 15_000)
 
   it('⑱g a peer that never answers it cannot hold the handshake: the wait is bounded and the link comes up', async () => {
@@ -2487,15 +2502,96 @@ describe("the desktop's advertised endpoints (issue #143)", () => {
     // Without a bound of its own the call inherits the rpc layer's 60 s default
     // and this await never returns inside the test's budget — which is the
     // regression this case exists for (the learn sits INSIDE the handshake).
+    const started = performance.now()
     await connection.connect()
+    const elapsed = performance.now() - started
 
     expect(connection.state).toBe('connected')
     expect(fakeInfo.fake.methodCount('connection.endpoints')).toBe(1)
     expect(learned).toEqual([])
     expect(record.hosts).toEqual([fakeInfo.host])
-    // The bound must fit INSIDE the window a tool waits for `connecting`
-    // (`DEVICE_SETTLE_WAIT_MS`): a longer one would let the state flip to
-    // `connected` after the caller was already told the device was unavailable.
+    // The wait that ENDED is this CONSTANT's, not merely some bound short
+    // enough to settle inside this case's budget: a hardcoded 10 s also returns
+    // here (at 10.2 s) and reintroduces exactly the failure named above. The
+    // slack absorbs timer skew on a loaded suite and is still far below the
+    // settle window asserted next.
+    expect(elapsed).toBeLessThan(ENDPOINTS_LEARN_TIMEOUT_MS + 1_500)
+    // ...and the constant must fit INSIDE the window a tool waits for
+    // `connecting` (`DEVICE_SETTLE_WAIT_MS`): a longer one would let the state
+    // flip to `connected` after the caller was already told the device was
+    // unavailable.
     expect(ENDPOINTS_LEARN_TIMEOUT_MS).toBeLessThan(DEVICE_SETTLE_WAIT_MS)
+  }, 15_000)
+
+  it('⑱h an answer of the wrong SHAPE cannot fail the handshake (the enrichment swallows its own parse errors)', async () => {
+    const identity = await createDeviceIdentity()
+    // Every shape advertises the capability, so the CALL happens and the answer
+    // is what differs — the case is about surviving the reply, not the gate.
+    const shapes: Array<[string, (pin: string) => unknown]> = [
+      // The pin holds; the body cannot be iterated.
+      ['a non-array `endpoints`', (pin) => ({ desktopIdentity: pin, endpoints: {} })],
+      // No identity at all: the whole answer is unattributable.
+      ['a missing `desktopIdentity`', () => ({ endpoints: [{ host: '192.168.1.8', port: 9001, security: 'ws' }] })],
+      ['a non-string `desktopIdentity`', () => ({ desktopIdentity: 7, endpoints: [] })],
+      // Not even an object.
+      ['a null answer', () => null],
+    ]
+
+    for (const [label, answer] of shapes) {
+      const fakeInfo = await makeFake({
+        hello: { capabilities: { connectionEndpointsVersion: 1 } },
+        endpoints: { answer },
+      })
+      const record = recordFor(fakeInfo)
+      const { learned, onAdvertisedEndpoints } = collector()
+      const connection = makeConnection({ identity, record, onAdvertisedEndpoints })
+
+      // A `catch` that lived only around the RPC would let the first two shapes
+      // throw out of `#handshake`: the device would go offline and reconnect
+      // forever over a reply it was right to distrust.
+      await connection.connect()
+
+      expect(connection.state, label).toBe('connected')
+      expect(fakeInfo.fake.methodCount('connection.endpoints'), label).toBe(1)
+      expect(learned, label).toEqual([])
+      expect(record.hosts, label).toEqual([fakeInfo.host])
+    }
+  }, 20_000)
+
+  it('⑱i a throwing persistence hook cannot fail the handshake either (only the archive missed it)', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({
+      hello: { capabilities: { connectionEndpointsVersion: 1 } },
+      endpoints: { endpoints: [{ host: '192.168.1.8', port: 9001 }] },
+    })
+    const record = recordFor(fakeInfo)
+    const connection = makeConnection({
+      identity,
+      record,
+      // The assembly's store: an fs error, a quarantined archive. The enrichment
+      // is already in the record by the time this runs, and the handshake must
+      // not care.
+      onAdvertisedEndpoints: () => {
+        throw new Error('device archive is not writable')
+      },
+    })
+
+    await connection.connect()
+
+    expect(connection.state).toBe('connected')
+    // The in-memory half SUCCEEDED: this instance's next reconnect dials it.
+    expect(record.hosts).toEqual([fakeInfo.host, '192.168.1.8'])
+    // The ONLY line the enrichment may write is the success one — no failure
+    // line, and no leak of the store's own error text.
+    const endpointLines = [
+      ...consoleInfo.mock.calls,
+      ...consoleWarn.mock.calls,
+      ...consoleError.mock.calls,
+    ]
+      .map((entry) => String(entry[0]))
+      .filter((line) => /endpoint/i.test(line))
+    expect(endpointLines).toEqual([
+      '[cherry-remote] device dev-test learned 1 advertised endpoint(s)',
+    ])
   }, 15_000)
 })

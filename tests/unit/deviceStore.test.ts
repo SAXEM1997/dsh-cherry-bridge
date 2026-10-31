@@ -893,6 +893,18 @@ describe('DeviceStore.learnEndpoints (issue #143)', () => {
     expect(record.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
     expect(record.ports).toEqual({ '10.0.0.5': 8765, '10.0.0.6': 8765 })
     expect(record.security).toEqual({ '10.0.0.5': 'ws', '10.0.0.6': 'ws' })
+
+    // A PATCHed record keeps the OPERATOR's spelling while the peer advertises
+    // the schema's lowercased form: the same host must not take a second dial
+    // slot (each slot is a `connectTimeoutMs` on every reconnect).
+    const patched = makeRecord({
+      hosts: ['MyNAS.example'],
+      security: { 'MyNAS.example': 'ws' },
+      ports: { 'MyNAS.example': 8765 },
+    })
+    expect(mergeAdvertisedEndpoints(patched, [{ host: 'mynas.example', port: 9001, security: 'ws' }])).toBe(0)
+    expect(patched.hosts).toEqual(['MyNAS.example'])
+    expect(patched.ports).toEqual({ 'MyNAS.example': 8765 })
   })
 
   it('⑱c stops at the candidate ceiling a pairing record can already reach', () => {
@@ -920,11 +932,11 @@ describe('DeviceStore.learnEndpoints (issue #143)', () => {
     const store = new DeviceStore(file)
     store.upsert(makeRecord())
 
-    expect(store.learnEndpoints('dev-alpha', [{ host: '192.168.1.8', port: 9001, security: 'wss' }])).toBe(1)
+    expect(store.learnEndpoints('dev-alpha', [{ host: '192.168.1.8', port: 9001, security: 'wss' }], 'desktop-identity-alpha')).toBe(1)
 
     // A SECOND store reads the file through the read path's exit validator: a
-    // merge that broke the one-entry-per-host invariant would quarantine the
-    // archive instead of answering these.
+    // merge that split host from port/scheme would not even answer this — a
+    // semantic failure there throws out of `list()` (it is not quarantined).
     const reread = new DeviceStore(file)
     const [record] = reread.list()
     expect(record?.hosts).toEqual(['10.0.0.5', '10.0.0.6', '192.168.1.8'])
@@ -941,7 +953,7 @@ describe('DeviceStore.learnEndpoints (issue #143)', () => {
 
     // Every connect asks again; without this guard a stable desktop would
     // rewrite the archive (and fsync it) on every reconnect.
-    expect(store.learnEndpoints('dev-alpha', [{ host: '10.0.0.5', port: 8765, security: 'ws' }])).toBe(0)
+    expect(store.learnEndpoints('dev-alpha', [{ host: '10.0.0.5', port: 8765, security: 'ws' }], 'desktop-identity-alpha')).toBe(0)
     expect(fs.fsyncSync).not.toHaveBeenCalled()
   })
 
@@ -953,8 +965,25 @@ describe('DeviceStore.learnEndpoints (issue #143)', () => {
 
     // The assembly looks the record up by id: the archive may have been PATCHed
     // or removed between the learn and the write.
-    expect(store.learnEndpoints('dev-vanished', [{ host: '192.168.1.8', port: 9001, security: 'ws' }])).toBe(0)
+    expect(store.learnEndpoints('dev-vanished', [{ host: '192.168.1.8', port: 9001, security: 'ws' }], 'desktop-identity-alpha')).toBe(0)
     expect(fs.fsyncSync).not.toHaveBeenCalled()
+  })
+
+  it('⑱g refuses an answer learned on a DIFFERENT pairing (the pin is re-checked at the write)', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // The connection validated its answer against ITS pin; the archive may have
+    // been re-paired under the same deviceId since then (a regenerated desktop
+    // identity). Writing here would add a candidate whose every dial then fails
+    // the Noise pin — permanently, because learning never removes.
+    expect(
+      store.learnEndpoints('dev-alpha', [{ host: '192.168.1.8', port: 9001, security: 'ws' }], 'another-desktop'),
+    ).toBe(0)
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
+    expect(store.list()[0]?.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
   })
 })
 

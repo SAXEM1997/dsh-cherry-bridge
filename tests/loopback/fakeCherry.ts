@@ -70,6 +70,16 @@ export interface FakeEndpointsOptions {
    * answer that does not name the desktop it is pinned to.
    */
   desktopIdentity?: string
+  /**
+   * A RAW answer that replaces the constructed one, built from the peer's own
+   * identity so a test can keep the PIN correct while breaking the body.
+   *
+   * The typed `endpoints` knob can only express the shapes the desktop actually
+   * sends; this one models the frames a client must survive without failing the
+   * handshake — `endpoints` that is not an array, a missing or non-string
+   * `desktopIdentity`, a non-object reply (issue #143 review).
+   */
+  answer?: (desktopIdentity: string) => unknown
   /** Every `connection.endpoints` fails with this protocol failure. */
   failure?: FakeFailure
   /**
@@ -77,6 +87,11 @@ export interface FakeEndpointsOptions {
    * peer's handler awaits `getRemoteEndpoint()`, which can sit behind a
    * gateway transition; a client that waited unbounded would hold the whole
    * handshake on it.
+   *
+   * NOTE for later cases: the pending handler never settles, so this fake's
+   * `inFlight`/`maxInFlight` stay elevated for the rest of its life — unlike
+   * `dropPings` (which returns and drops the reply) or `loseNextReply` (the
+   * handler runs, the reply is lost). Do not wait on `inFlight === 0` with it.
    */
   hang?: boolean
 }
@@ -2118,7 +2133,8 @@ export class FakeCherry {
   ): Promise<Record<string, unknown>> {
     this.#requireHello(live)
     if (!live.authenticated) {
-      throw new FakeRpcError({ reason: 'UNAUTHENTICATED', message: 'Device has no approved capabilities' })
+      // The real `requireAuthentication` wording (RemoteConnection.ts:212).
+      throw new FakeRpcError({ reason: 'UNAUTHENTICATED', message: 'Device authentication is required' })
     }
     // MVP grants are `agent` only, so any other domain is a capability the
     // desktop would refuse rather than a shape error.
@@ -2128,8 +2144,10 @@ export class FakeCherry {
     const options = this.#options.endpoints ?? {}
     if (options.failure !== undefined) throw new FakeRpcError(options.failure)
     if (options.hang === true) await new Promise<never>(() => {})
+    const desktopIdentity = await this.identityId
+    if (options.answer !== undefined) return options.answer(desktopIdentity) as Record<string, unknown>
     return {
-      desktopIdentity: options.desktopIdentity ?? (await this.identityId),
+      desktopIdentity: options.desktopIdentity ?? desktopIdentity,
       endpoints: (options.endpoints ?? []).map((endpoint) => ({
         host: endpoint.host,
         port: endpoint.port,
