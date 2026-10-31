@@ -26,6 +26,14 @@ with its source. Loaded automatically when a file tool touches `ui/**`.
   its copy points at that list instead of claiming failure, and it keeps
   `claimId` so a terminal frame that arrives late still wins. Arm it on the
   `waiting` phase only — never at mount.
+- **The bundle carries the SOURCE COMMENTS.** `ui/vite.config.ts` sets
+  `minify: false`, so the docblocks that hold most of this page's reasoning ship
+  inside `lib/client.js`: a comment-only edit in `ui/src/**` changes the
+  artifact's bytes and needs the rebuild in the same commit. Two follow-ons from
+  that: `artifactFreshness` compares against `git show HEAD:<path>`, so it only
+  goes green once the rebuild is COMMITTED — running the full suite before
+  committing reports it red for the same reason its sibling case ("neither check
+  mutates the committed artifacts") is red. Neither red is a real failure.
 - **jsdom only.** `tests/unit/ui.test.ts` and `uiScopePanel.test.ts` render the
   page; a browser-only API needs a fake in the test, not a guard in the page.
 
