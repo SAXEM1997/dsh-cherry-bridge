@@ -13,7 +13,7 @@
  */
 import { useEffect, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
-import { patchDevice, removeDevice } from './api'
+import { REQUEST_TIMEOUT, patchDevice, removeDevice } from './api'
 import { useT } from './i18n'
 import { STATE_KEYS } from './types'
 import type { DeviceState, DeviceSummary } from './types'
@@ -98,14 +98,28 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     setPortText(String(device.port))
   }, [device.displayName, device.hosts, device.port, editor])
 
-  /** Runs one mutation, mapping a refusal into the card's error line. */
+  /**
+   * Runs one mutation, mapping a refusal into the card's error line.
+   *
+   * A request that never answered arrives as `api.ts`'s internal marker — the
+   * page-wide ceiling (issue #180) — and a marker must never render. Every card
+   * action is a bounded call (停用 / 重命名 / 移除 are PATCH or DELETE), so this
+   * surface translates it like the other three do instead of echoing
+   * `cherry-remote.request-timeout` onto the page.
+   */
   const run = async (action: () => Promise<void>): Promise<void> => {
     setBusy(true)
     setError(undefined)
     try {
       await action()
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError(
+        cause instanceof Error && cause.message === REQUEST_TIMEOUT
+          ? t('device.error.timeout')
+          : cause instanceof Error
+            ? cause.message
+            : String(cause),
+      )
     } finally {
       setBusy(false)
     }

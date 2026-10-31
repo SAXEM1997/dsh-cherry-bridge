@@ -792,6 +792,20 @@ describe('启用范围面板 (§6.4)', () => {
     expect(slotText('[data-scope-empty]')).toBe('')
     expect(saveButton().disabled).toBe(true)
   })
+  it('⑰ a READ that never answers says so, instead of echoing the marker', async () => {
+    // The panel's read goes through `describeCause` too (issue #180's ceiling is
+    // page-wide). Without a case here, dropping ONLY the read arm's mapping keeps
+    // the whole suite green — the same partial-revert hole the save case closed
+    // for the other arm.
+    const stub = installScope(snapshot())
+    stub.client = { ...stub.client, get: () => Promise.reject(new Error(REQUEST_TIMEOUT)) }
+    renderPanel(stub)
+
+    const failed = await screen.findByText(/读取启用范围失败/)
+    expect(failed.textContent).toContain('请求长时间没有回应')
+    expect(failed.textContent).not.toContain(REQUEST_TIMEOUT)
+  })
+
   it('⑯ a save that never answers says so, instead of echoing the marker', async () => {
     // The page-wide ceiling (`api.ts` `request()`) surfaces on this panel's two
     // surfaces — the read and the save — and both route through `describeCause`.

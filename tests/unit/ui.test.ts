@@ -772,6 +772,26 @@ describe('device card actions', () => {
     expect(patch?.body).toEqual({ enabled: false })
   })
 
+  it('⑰ a card action that never answers says so, and hands the card back', async () => {
+    // A card action is a bounded call (`api.ts` `request()`, issue #180), so it
+    // can fail with the internal marker. The card is a real surface: rendering
+    // `cherry-remote.request-timeout` at a Chinese user is what api.ts's own
+    // "NEVER copy" contract forbids — and `busy` must clear, or the card's
+    // buttons stay dead for the life of the page.
+    await renderWithDevice([])
+    // The list and the scope were answered above; the PATCH lands on this stub.
+    vi.stubGlobal('fetch', async () => {
+      throw new Error(REQUEST_TIMEOUT)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: '停用' }))
+
+    const alert = await screen.findByText('请求长时间没有回应，已中止——请稍后重试')
+    expect(alert.textContent).not.toContain(REQUEST_TIMEOUT)
+    // The card is usable again: `busy` cleared in the mutation's `finally`.
+    expect((screen.getByRole('button', { name: '停用' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
   it('re-enables a disabled device through PATCH enabled:true', async () => {
     installFetch([
       ['GET', '/cherry-remote/api/devices', jsonResponse(200, [{ ...DEVICE, enabled: false, state: 'disabled' }])],
@@ -1287,8 +1307,8 @@ describe('the pairing request ceiling', () => {
     const alert = await screen.findByText(/请确认宿主仍在运行/)
     expect(alert.textContent).not.toContain(REQUEST_TIMEOUT)
     expect(screen.queryByText('正在读取设备列表…')).toBeNull()
-    // The empty state is what a failed read leaves: nothing is claimed about
-    // devices, which is honest — the list is unknown, not empty.
-    expect(screen.getByText(/暂无已配对设备/)).toBeTruthy()
+    // And it claims NOTHING about devices: the list is unknown, not empty, so
+    // the empty sentence must not appear beside the error that explains why.
+    expect(screen.queryByText(/暂无已配对设备/)).toBeNull()
   })
 })

@@ -199,8 +199,8 @@ export function PairingWizard({
         // internal token, so it becomes the dictionary's own sentence (the same
         // split as `app.eventSourceUnavailable`). Everything else is the
         // server's or the transport's message, interpolated verbatim. The
-        // ceiling lives in `api.ts` `request()`, so this marker can also arrive
-        // from a grade other than the POST — it is the same token either way.
+        // ceiling lives in `api.ts` `request()`, so the token is shared with the
+        // other surfaces; only this catch can see it for the pairing POST.
         setError(
           cause instanceof Error && cause.message === REQUEST_TIMEOUT
             ? t('wizard.error.timeout')

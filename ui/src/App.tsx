@@ -233,7 +233,11 @@ export function App({
 
       <section className="cherry-panel" aria-labelledby="cherry-devices-title">
         <h3 id="cherry-devices-title">{t('app.devices.heading')}</h3>
-        {sorted.length === 0 && (
+        {/* Three states, not two: the list is EMPTY only once a read said so.
+            After a failed read it is UNKNOWN, and claiming 「暂无已配对设备」 beside
+            the error that says the read failed would contradict that error — so the
+            error line speaks alone. */}
+        {sorted.length === 0 && error === undefined && (
           <p className="cherry-hint">{listed ? t('app.devices.empty') : t('app.devices.loading')}</p>
         )}
         <ul className="cherry-cards">

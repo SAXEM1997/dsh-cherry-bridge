@@ -95,6 +95,8 @@ const zh: Dict = {
   'device.remove.confirm': '确认移除',
   'device.remove.warning': '移除后本机将不再连接该设备，凭据保留在对方一侧。',
   'device.cancel': '取消',
+  // The page-wide request ceiling (`api.ts`) reached a card action.
+  'device.error.timeout': '请求长时间没有回应，已中止——请稍后重试',
   'device.error.nameRequired': '设备名称不能为空',
   'device.error.hostsRequired': '至少需要一个主机地址',
   'device.error.portInvalid': '端口必须是 1..65535 之间的整数',
@@ -264,6 +266,8 @@ const en: Dict = {
   'device.remove.confirm': 'Confirm removal',
   'device.remove.warning': 'This machine will stop connecting to the device. Its credentials stay on the peer.',
   'device.cancel': 'Cancel',
+  // See the zh entry: the page-wide request ceiling.
+  'device.error.timeout': 'The request stopped answering and was abandoned. Try again in a moment.',
   'device.error.nameRequired': 'Device name cannot be empty',
   'device.error.hostsRequired': 'At least one host address is required',
   'device.error.portInvalid': 'Port must be an integer between 1 and 65535',
