@@ -65,6 +65,19 @@ sends `partsMode: 'paged'` only at exactly `1`. Parts keep their clamp; only
 the message page widens (to the negotiated `pageItems`); a
 `RESOURCE_EXHAUSTED` with `details.retryable: false` says retrying cannot help.
 
+**Advertised endpoints (#143).** The hello `connectionEndpointsVersion` bit
+(strictly `1`; through 2.1.7 the field is absent) unlocks ONE best-effort
+`connection.endpoints` (`{domain:'agent'}` → `{desktopIdentity, endpoints}`) per
+handshake, awaited INSIDE it after authenticate and bounded by
+`ENDPOINTS_LEARN_TIMEOUT_MS` (2 s — derived, not chosen: it must stay below
+`DEVICE_SETTLE_WAIT_MS`, or a tool waiting for `connecting` is out-waited by the
+learn). The desktop gates the call on the authenticated session and can refuse
+it (gateway not running), so EVERY failure is silent. The answer is discarded
+WHOLE when it does not name the pinned `desktopIdentity`, and each entry is
+filtered by the peer's own `advertisedEndpointSchema` (rejects loopback,
+normalizes the host). Learned hosts join the archive as candidates — see
+[Device archive](#device-archive-schemeport-per-host).
+
 **Pacing: two tiers against the desktop's allowances.**
 
 | Tier | Methods | Desktop allowance | Default |
@@ -638,6 +651,17 @@ TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
 ignored (half-applied trust reaches some peers, not others). Never persisted,
 logged or reported; `ca` is PEM text.
+
+Addresses a peer ADVERTISES (`connection.endpoints`, #143) are ADD-ONLY
+(`mergeAdvertisedEndpoints`): only hosts the record does not already dial are
+appended, each with its OWN port and scheme (the one-entry-per-host invariant is
+never split), capped at `MAX_CANDIDATE_HOSTS` = 32 — what a v3 QR can produce, so
+learning cannot build a record no pairing could have. An existing entry — the
+operator's port, a TLS proxy — is never re-pointed and none is ever removed. The
+write goes through `DeviceStore.learnEndpoints`, which merges a clone of the
+STORED record (never the connection's: that one mirrors the live `accessToken`,
+which this archive deliberately does not keep) and writes only when a host was
+added, so a stable desktop costs no archive write per reconnect.
 
 ### Pairing: one dial budget across candidates
 

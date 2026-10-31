@@ -25,7 +25,13 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 import * as fs from 'node:fs'
-import { CURRENT_SCHEMA_VERSION, DeviceStore, type DeviceRecord } from '../../src/deviceStore.js'
+import {
+  CURRENT_SCHEMA_VERSION,
+  DeviceStore,
+  MAX_CANDIDATE_HOSTS,
+  mergeAdvertisedEndpoints,
+  type DeviceRecord,
+} from '../../src/deviceStore.js'
 
 const SCHEMA_VERSION = 4
 const DEVICES_FILENAME = 'devices.json'
@@ -843,6 +849,112 @@ describe('DeviceStore write validation', () => {
       // Nothing was persisted: a rejected write never touches the archive.
       await expect(readFile(file, 'utf8'), key).rejects.toThrow()
     }
+  })
+})
+
+describe('DeviceStore.learnEndpoints (issue #143)', () => {
+  // The desktop's `connection.endpoints` answer is an ENRICHMENT: it may only
+  // ADD candidate addresses, never re-point or remove one. These cases pin the
+  // four rules that make it safe to persist a peer-supplied list — one entry per
+  // host (the v4 invariant), existing entries untouched, a candidate ceiling no
+  // pairing record can exceed, and no write at all when nothing is new.
+
+  it('⑱a appends an unseen host as ONE unit: its host, its own port and its scheme', () => {
+    const record = makeRecord()
+
+    const added = mergeAdvertisedEndpoints(record, [
+      { host: '192.168.1.8', port: 9001, security: 'wss' },
+    ])
+
+    expect(added).toBe(1)
+    expect(record.hosts).toEqual(['10.0.0.5', '10.0.0.6', '192.168.1.8'])
+    // The v4 invariant is exact coverage: a host with no port/scheme entry, or a
+    // map entry with no host, makes the whole archive unreadable.
+    expect(record.ports['192.168.1.8']).toBe(9001)
+    expect(record.security['192.168.1.8']).toBe('wss')
+    // ...and the entries that were already there keep THEIR port and scheme,
+    // which is what "never re-point" means in practice.
+    expect(record.ports['10.0.0.5']).toBe(8765)
+    expect(record.security['10.0.0.6']).toBe('ws')
+  })
+
+  it('⑱b ignores a host the record already dials, whatever port or scheme the peer claims', () => {
+    const record = makeRecord()
+
+    const added = mergeAdvertisedEndpoints(record, [
+      { host: '10.0.0.5', port: 1, security: 'wss' },
+      // A duplicate WITHIN the same answer: the first one is the one that would
+      // have been added, so the second must be a no-op rather than a second entry.
+      { host: '10.0.0.6', port: 2, security: 'wss' },
+      { host: '10.0.0.6', port: 3, security: 'ws' },
+    ])
+
+    expect(added).toBe(0)
+    expect(record.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
+    expect(record.ports).toEqual({ '10.0.0.5': 8765, '10.0.0.6': 8765 })
+    expect(record.security).toEqual({ '10.0.0.5': 'ws', '10.0.0.6': 'ws' })
+  })
+
+  it('⑱c stops at the candidate ceiling a pairing record can already reach', () => {
+    // Unbounded growth is a DIAL cost, not a disk cost: every reconnect walks
+    // `hosts` with one `connectTimeoutMs` per address. A pairing record is
+    // bounded by the v3 QR (32 endpoints), so learning may not create a record
+    // that no pairing could have produced.
+    const record = makeRecord({ hosts: [], security: {}, ports: {} })
+    const endpoints = Array.from({ length: MAX_CANDIDATE_HOSTS + 8 }, (_, index) => ({
+      host: `10.9.0.${index}`,
+      port: 8765,
+      security: 'ws' as const,
+    }))
+
+    expect(mergeAdvertisedEndpoints(record, endpoints)).toBe(MAX_CANDIDATE_HOSTS)
+    expect(record.hosts).toHaveLength(MAX_CANDIDATE_HOSTS)
+    expect(record.hosts[0]).toBe('10.9.0.0')
+    expect(record.hosts.at(-1)).toBe(`10.9.0.${MAX_CANDIDATE_HOSTS - 1}`)
+    expect(Object.keys(record.ports)).toHaveLength(MAX_CANDIDATE_HOSTS)
+    expect(Object.keys(record.security)).toHaveLength(MAX_CANDIDATE_HOSTS)
+  })
+
+  it('⑱d persists the merged record, and a fresh store reads it back (so the write is archive-valid)', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+
+    expect(store.learnEndpoints('dev-alpha', [{ host: '192.168.1.8', port: 9001, security: 'wss' }])).toBe(1)
+
+    // A SECOND store reads the file through the read path's exit validator: a
+    // merge that broke the one-entry-per-host invariant would quarantine the
+    // archive instead of answering these.
+    const reread = new DeviceStore(file)
+    const [record] = reread.list()
+    expect(record?.hosts).toEqual(['10.0.0.5', '10.0.0.6', '192.168.1.8'])
+    expect(record?.ports['192.168.1.8']).toBe(9001)
+    expect(record?.security['192.168.1.8']).toBe('wss')
+    expect(reread.quarantined).toBe(false)
+  })
+
+  it('⑱e writes nothing when the answer adds nothing (no re-persist of an unchanged archive)', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // Every connect asks again; without this guard a stable desktop would
+    // rewrite the archive (and fsync it) on every reconnect.
+    expect(store.learnEndpoints('dev-alpha', [{ host: '10.0.0.5', port: 8765, security: 'ws' }])).toBe(0)
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
+  })
+
+  it('⑱f an unknown device id is a no-op, not a write of a synthetic record', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // The assembly looks the record up by id: the archive may have been PATCHed
+    // or removed between the learn and the write.
+    expect(store.learnEndpoints('dev-vanished', [{ host: '192.168.1.8', port: 9001, security: 'ws' }])).toBe(0)
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
   })
 })
 

@@ -5,8 +5,44 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
 import { createHash, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema } from "@cherrystudio/remote-protocol";
+import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema } from "@cherrystudio/remote-protocol";
 import { peerIdFromString } from "@libp2p/peer-id";
+/**
+* Adds the candidate addresses a peer ADVERTISED that this record does not
+* already dial, returning how many hosts were added (issue #143).
+*
+* The rule is ADD-ONLY, deliberately:
+*
+*  - a host already in `hosts` is left exactly as it is, INCLUDING its port and
+*    its scheme. The peer's snapshot describes where it listens NOW, while a
+*    record entry may be an operator's choice (a pinned port, a TLS proxy) that
+*    every reconnect must keep honouring; re-pointing it would silently rewrite
+*    the operator's address book on a schedule;
+*  - nothing is ever removed. A stale address costs one dial per reconnect,
+*    while dropping a live one costs the device;
+*  - host, port and scheme are appended TOGETHER, which is what keeps the v4
+*    one-entry-per-host invariant true — `assertValidSecurity` and
+*    `assertValidPorts` would otherwise quarantine the archive on its next read;
+*  - past {@link MAX_CANDIDATE_HOSTS} nothing is added, and the loop stops
+*    rather than scanning the rest.
+*
+* `endpoints` must already have passed the peer's own `advertisedEndpointSchema`
+* (which bounds the port to 1..65535, the scheme to `ws`/`wss`, and rejects a
+* loopback destination), so every value written here is archive-valid without a
+* second validation pass.
+*/
+function mergeAdvertisedEndpoints(record, endpoints) {
+	let added = 0;
+	for (const endpoint of endpoints) {
+		if (record.hosts.includes(endpoint.host)) continue;
+		if (record.hosts.length >= 32) break;
+		record.hosts.push(endpoint.host);
+		record.ports[endpoint.host] = endpoint.port;
+		record.security[endpoint.host] = endpoint.security;
+		added += 1;
+	}
+	return added;
+}
 const FILE_MODE = 384;
 /**
 * Version-to-version migrations, keyed by the version they upgrade from.
@@ -476,6 +512,34 @@ var DeviceStore = class {
 	remove(deviceId) {
 		const devices = this.#load().filter((record) => record.deviceId !== deviceId);
 		this.#persist(devices);
+	}
+	/**
+	* Merges freshly learned addresses into one record and writes ONLY when that
+	* record gained a host (issue #143), returning the number added.
+	*
+	* It exists so the enrichment is an ARCHIVE operation rather than an
+	* `upsert` the assembly assembles by hand, and so a merge that adds nothing
+	* never rewrites (and fsyncs) the archive: `connection.endpoints` is asked on
+	* every connect, and a stable desktop would otherwise pay a full atomic write
+	* per reconnect. The merge runs on a CLONE and is committed as a new list,
+	* mirroring `upsert`'s discipline — the store never adopts a caller's object
+	* graph, and a write refused at {@link #persist}'s own gate cannot have
+	* half-edited the record the archive still holds.
+	*
+	* An unknown `deviceId` is a no-op — the record may have been removed (or
+	* re-paired) between the RPC and this write.
+	*/
+	learnEndpoints(deviceId, endpoints) {
+		const devices = this.#load();
+		const index = devices.findIndex((record) => record.deviceId === deviceId);
+		if (index < 0) return 0;
+		const merged = structuredClone(devices[index]);
+		const added = mergeAdvertisedEndpoints(merged, endpoints);
+		if (added === 0) return 0;
+		const next = [...devices];
+		next[index] = merged;
+		this.#persist(next);
+		return added;
 	}
 	#load() {
 		if (this.#devices !== void 0) return this.#devices;
@@ -2647,6 +2711,28 @@ const DEFAULT_BACKOFF_MAX_MS = 6e4;
 const DEFAULT_REFRESH_GRACE_MS = 3e4;
 const DEFAULT_CONNECT_TIMEOUT_MS$1 = 1e4;
 const DEFAULT_PROTOCOL_VERSIONS = [1];
+/**
+* How long the optional `connection.endpoints` enrichment (issue #143) may hold
+* up ONE handshake before the connection gives up on it.
+*
+* The call runs INSIDE the handshake, so without a bound of its own it would
+* inherit the rpc layer's 60 s default: a peer that advertises
+* `connectionEndpointsVersion: 1` and then never answers (a wedged API gateway)
+* would keep the device in `connecting` for a minute, and every reconnect would
+* pay it again. THIS layer bounds it because the enrichment is worth
+* milliseconds, not a retry.
+*
+* WHY 2 s. The peer's handler is a local computation
+* (`getRemoteEndpoint()`: `networkInterfaces()` plus two config reads), so a
+* round trip is sub-millisecond on a LAN and 2 s is ~4 orders of magnitude of
+* slack. The UPPER bound is derived, not chosen: it must stay BELOW
+* `DEVICE_SETTLE_WAIT_MS` (5 s, `defaults.ts`), because a tool that finds the
+* device `connecting` waits for the state to leave it — a learn bound above
+* that window would let `connected` arrive after the caller was already told
+* the device was unavailable. A timeout costs one reconnect's worth of
+* enrichment and says nothing about the device.
+*/
+const ENDPOINTS_LEARN_TIMEOUT_MS = 2e3;
 /** Ping-silence multiplier: 2×heartbeatMs without a pong judges the line dead. */
 const SILENCE_FACTOR = 2;
 /** The deliberate local-shutdown face of a disposed client (see the replay path). */
@@ -2920,6 +3006,42 @@ function businessWindowFor(reportedInFlightRequests) {
 	return Math.max(1, Math.min(BUSINESS_MAX_IN_FLIGHT, Math.floor(reportedInFlightRequests / 2)));
 }
 /**
+* The destinations a `connection.endpoints` answer may contribute, in the order
+* the peer listed them (issue #143). Empty when the answer must be discarded.
+*
+* TWO answers are refused WHOLE:
+*
+*  - **the identity pin.** The answer must name the very desktop this record is
+*    pinned to (`DeviceRecord.desktopIdentity`). Noise already pins the peer's
+*    static key, so this is not the adversarial case it protects against — it
+*    is the defence against a CONFUSED answer (a proxy, a desktop whose identity
+*    was regenerated, a future protocol that answers for more than one host):
+*    the list decides where this client dials, so a list that cannot be
+*    attributed to our own desktop may not change it;
+*  - **a non-array `endpoints`**, which is a shape the protocol does not have.
+*
+* One refusal is per ENTRY: `advertisedEndpointSchema`, the peer's own
+* destination schema, rejects a LOOPBACK destination (a shared address that
+* resolves to our own machine would send the next reconnect to the wrong host)
+* and normalizes the host (case, IPv6), so the archive never stores a spelling
+* the dial cannot use. One unusable row must not discard its neighbours.
+*
+* No length bound is needed here: one JSON-RPC record is capped at 64 KiB by
+* the transport, and the desktop's own snapshot is `addresses.slice(0, 32)`.
+*/
+function advertisedEndpoints(result, desktopIdentity) {
+	if (result === null || typeof result !== "object") return [];
+	const answer = result;
+	if (typeof answer.desktopIdentity !== "string" || answer.desktopIdentity !== desktopIdentity) return [];
+	if (!Array.isArray(answer.endpoints)) return [];
+	const accepted = [];
+	for (const raw of answer.endpoints) {
+		const parsed = advertisedEndpointSchema.safeParse(raw);
+		if (parsed.success) accepted.push(parsed.data);
+	}
+	return accepted;
+}
+/**
 * The desktop's content-read allowance: 512/s, and the SAME in both generations
 * (`RemoteAccessService.ts` counts `agent.content.read` on its own counter,
 * 512 in v2.1.6 and v2.1.7 alike; only the shared line moved, 64 ⇒ 256).
@@ -3000,6 +3122,7 @@ var DeviceConnection = class {
 	#protocolVersions;
 	#helloProtocolVersions;
 	#transportRetryWaitMs;
+	#onAdvertisedEndpoints;
 	#stateListeners = /* @__PURE__ */ new Set();
 	/**
 	* Callers parked in {@link waitForSettled}. Separate from the state listeners
@@ -3062,6 +3185,7 @@ var DeviceConnection = class {
 		this.#protocolVersions = opts.protocolVersions ?? DEFAULT_PROTOCOL_VERSIONS;
 		this.#helloProtocolVersions = opts.helloProtocolVersions ?? this.#protocolVersions;
 		this.#transportRetryWaitMs = opts.transportRetryWaitMs ?? 5e3;
+		this.#onAdvertisedEndpoints = opts.onAdvertisedEndpoints;
 	}
 	/**
 	* The business RPC surface: rate-smoothed and gated on `connected`. Typed
@@ -3388,6 +3512,7 @@ var DeviceConnection = class {
 			if (reason === "GRANT_REVOKED" || reason === "UNAUTHENTICATED") throw new AuthRejectedError(reason);
 			throw error instanceof Error ? error : new Error(String(error));
 		}
+		await this.#learnEndpoints(link, hello.connectionEndpointsVersion);
 		if (epoch !== this.#epoch) {
 			client.dispose();
 			link.channel.close().catch(noop$1);
@@ -3409,6 +3534,46 @@ var DeviceConnection = class {
 		this.#scheduleRefresh(epoch);
 		this.#setState("connected");
 		console.info(`[cherry-remote] device ${this.record.deviceId} connected (${digestIdentity(link.channel.remoteIdentity)})`);
+	}
+	/**
+	* Best-effort enrichment of the dial list from the peer's advertised
+	* endpoints (issue #143).
+	*
+	* WHAT THIS BUYS: candidates the pairing never saw — a VPN or second-NIC
+	* address that appeared after the QR was minted. It does NOT heal a total
+	* address change (the list is captured on the old path) and can never carry
+	* TLS (the desktop's snapshot is `security: 'ws'`), so a `wss` route still
+	* comes from the QR or the operator.
+	*
+	* EVERY failure here is SILENT and non-fatal, because this is an enrichment,
+	* not a verdict: a peer that does not advertise the capability (through
+	* 2.1.x the field is absent), one advertising a version this client cannot
+	* speak (strictly `1` — a higher number is not evidence that it speaks 1,
+	* the same rule the paged-summaries bit took), a refused call (the desktop
+	* throws when its gateway is not running), a wedged one (bounded by
+	* {@link ENDPOINTS_LEARN_TIMEOUT_MS}), an unattributable answer, or a store
+	* that cannot write all leave the connection exactly as it was.
+	*
+	* The MERGE happens in two places on purpose: here (this instance's record,
+	* so its next reconnect dials the new address) and through the callback (the
+	* assembly's archive, so a restart keeps it). They are the same pure rule
+	* against two copies of the record, and each is idempotent.
+	*/
+	async #learnEndpoints(link, capability) {
+		if (capability !== 1) return;
+		let answer;
+		try {
+			answer = await this.#houseCall(link, "connection.endpoints", { domain: "agent" }, ENDPOINTS_LEARN_TIMEOUT_MS);
+		} catch {
+			return;
+		}
+		const endpoints = advertisedEndpoints(answer, this.record.desktopIdentity);
+		if (endpoints.length === 0) return;
+		const added = mergeAdvertisedEndpoints(this.record, endpoints);
+		if (added > 0) console.info(`[cherry-remote] device ${this.record.deviceId} learned ${added} advertised endpoint(s)`);
+		try {
+			this.#onAdvertisedEndpoints?.(endpoints);
+		} catch {}
 	}
 	/**
 	* authenticate with the stored token; a stale token (TOKEN_EXPIRED /
@@ -11933,7 +12098,10 @@ function connectionFor(deviceId) {
 		identity: requireIdentity(),
 		record,
 		rateBudgetPerSecond: state.rateBudgetPerSecond,
-		...state.wsTls === void 0 ? {} : { wsOptions: state.wsTls }
+		...state.wsTls === void 0 ? {} : { wsOptions: state.wsTls },
+		onAdvertisedEndpoints: (endpoints) => {
+			state.store.learnEndpoints(deviceId, endpoints);
+		}
 	});
 	state.connectionsBuilt += 1;
 	connection.onState((deviceState) => {

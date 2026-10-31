@@ -11,6 +11,7 @@ import {
   writeSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
+import type { DirectEndpoint } from '@cherrystudio/remote-protocol'
 
 /**
  * Crash-durable, corruption-safe archive of paired Cherry Studio desktop
@@ -106,6 +107,58 @@ export type DeviceResolution = DeviceRecord | AmbiguousDevice | UnresolvedDevice
 
 /** The only `schemaVersion` this build reads and writes. */
 export const CURRENT_SCHEMA_VERSION = 4
+
+/**
+ * The most candidate hosts one record may carry (issue #143).
+ *
+ * `hosts` is a DIAL list, not a table: every reconnect walks it with one
+ * `connectTimeoutMs` per address, so its LENGTH is a time cost — a 32-host
+ * record already allows a 320 s pass, which is the number the pairing walk's
+ * aggregate budget exists for. Pairing can only ever produce 32
+ * (`pairingQrSchema`'s `.max(32)`), and learning is held to the same bound: an
+ * enrichment may not build a record that no pairing could have produced.
+ */
+export const MAX_CANDIDATE_HOSTS = 32
+
+/**
+ * Adds the candidate addresses a peer ADVERTISED that this record does not
+ * already dial, returning how many hosts were added (issue #143).
+ *
+ * The rule is ADD-ONLY, deliberately:
+ *
+ *  - a host already in `hosts` is left exactly as it is, INCLUDING its port and
+ *    its scheme. The peer's snapshot describes where it listens NOW, while a
+ *    record entry may be an operator's choice (a pinned port, a TLS proxy) that
+ *    every reconnect must keep honouring; re-pointing it would silently rewrite
+ *    the operator's address book on a schedule;
+ *  - nothing is ever removed. A stale address costs one dial per reconnect,
+ *    while dropping a live one costs the device;
+ *  - host, port and scheme are appended TOGETHER, which is what keeps the v4
+ *    one-entry-per-host invariant true — `assertValidSecurity` and
+ *    `assertValidPorts` would otherwise quarantine the archive on its next read;
+ *  - past {@link MAX_CANDIDATE_HOSTS} nothing is added, and the loop stops
+ *    rather than scanning the rest.
+ *
+ * `endpoints` must already have passed the peer's own `advertisedEndpointSchema`
+ * (which bounds the port to 1..65535, the scheme to `ws`/`wss`, and rejects a
+ * loopback destination), so every value written here is archive-valid without a
+ * second validation pass.
+ */
+export function mergeAdvertisedEndpoints(
+  record: DeviceRecord,
+  endpoints: readonly DirectEndpoint[],
+): number {
+  let added = 0
+  for (const endpoint of endpoints) {
+    if (record.hosts.includes(endpoint.host)) continue
+    if (record.hosts.length >= MAX_CANDIDATE_HOSTS) break
+    record.hosts.push(endpoint.host)
+    record.ports[endpoint.host] = endpoint.port
+    record.security[endpoint.host] = endpoint.security
+    added += 1
+  }
+  return added
+}
 
 const FILE_MODE = 0o600
 
@@ -770,6 +823,35 @@ export class DeviceStore {
   remove(deviceId: string): void {
     const devices = this.#load().filter((record) => record.deviceId !== deviceId)
     this.#persist(devices)
+  }
+
+  /**
+   * Merges freshly learned addresses into one record and writes ONLY when that
+   * record gained a host (issue #143), returning the number added.
+   *
+   * It exists so the enrichment is an ARCHIVE operation rather than an
+   * `upsert` the assembly assembles by hand, and so a merge that adds nothing
+   * never rewrites (and fsyncs) the archive: `connection.endpoints` is asked on
+   * every connect, and a stable desktop would otherwise pay a full atomic write
+   * per reconnect. The merge runs on a CLONE and is committed as a new list,
+   * mirroring `upsert`'s discipline — the store never adopts a caller's object
+   * graph, and a write refused at {@link #persist}'s own gate cannot have
+   * half-edited the record the archive still holds.
+   *
+   * An unknown `deviceId` is a no-op — the record may have been removed (or
+   * re-paired) between the RPC and this write.
+   */
+  learnEndpoints(deviceId: string, endpoints: readonly DirectEndpoint[]): number {
+    const devices = this.#load()
+    const index = devices.findIndex((record) => record.deviceId === deviceId)
+    if (index < 0) return 0
+    const merged = structuredClone(devices[index]!)
+    const added = mergeAdvertisedEndpoints(merged, endpoints)
+    if (added === 0) return 0
+    const next = [...devices]
+    next[index] = merged
+    this.#persist(next)
+    return added
   }
 
   #load(): DeviceRecord[] {
