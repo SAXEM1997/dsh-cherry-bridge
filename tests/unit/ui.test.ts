@@ -32,6 +32,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { createElement } from 'react'
 import type { ComponentProps, ComponentType } from 'react'
 import type { DeviceSummary, EventSourceLike } from '../../ui/src/types'
+import { ApiError, PAIRING_REQUEST_TIMEOUT, startPairing } from '../../ui/src/api'
 import { App } from '../../ui/src/App'
 import { DeviceCard } from '../../ui/src/DeviceCard'
 import { dictionaries } from '../../ui/src/i18n'
@@ -621,6 +622,26 @@ describe('pairing wizard', () => {
     expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
     expect(screen.queryByText(/没有等到配对结果/)).toBeNull()
   })
+
+  it('①f a /pair request that never answers becomes a sentence, not a marker', async () => {
+    // The transport ceiling (`ui/src/api.ts`, issue #173) surfaces as an internal
+    // marker, exactly like a missing EventSource does. This is the ONE failure the
+    // run deadline cannot reach: the phase never leaves 'submitting', so nothing
+    // arms — which is why the request itself has to be bounded.
+    await renderWithDevice([])
+    // Only the pairing POST is left to run: devices and scope were answered above.
+    vi.stubGlobal('fetch', async () => {
+      throw new Error(PAIRING_REQUEST_TIMEOUT)
+    })
+
+    submitPayload()
+
+    const alert = await screen.findByText('配对请求迟迟没有回应，已中止——请重试；若反复出现，宿主可能已卡住，重启后再试')
+    // The token must never reach a page: the user reads the dictionary, not the
+    // string the transport happened to throw.
+    expect(alert.textContent).not.toContain(PAIRING_REQUEST_TIMEOUT)
+    expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -1151,3 +1172,84 @@ describe('settings page registration', () => {
 function harnessFactory(): (url: string) => EventSourceLike {
   return (url: string): EventSourceLike => new FakeEventSource(url)
 }
+
+// ---------------------------------------------------------------------------
+// ⑨ The `POST /pair` ceiling (`ui/src/api.ts`, issue #173)
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /pair` is not a slow call: the server answers 202 as soon as it has a
+ * claim id and does no I/O before that. A request still open is a wedged
+ * same-origin transport — and it is the ONE failure the run deadline cannot
+ * reach, because the phase never leaves 'submitting', so nothing arms.
+ *
+ * It lives in this file rather than its own because `tsconfig.json` and
+ * `tsconfig.ui.json` PARTITION `tests/**` (`tests/unit/projectCoverage.test.ts`
+ * enforces it), and a file importing `ui/src/**` belongs to the UI project.
+ */
+describe('the pairing request ceiling', () => {
+  /** A fetch that never answers on its own but OBEYS the signal it is handed. */
+  function hangingFetch(): { handler: typeof fetch; aborted: () => boolean } {
+    let signal: AbortSignal | undefined
+    const handler = ((_url: string, init?: RequestInit) => {
+      signal = init?.signal ?? undefined
+      return new Promise<Response>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+      })
+    }) as unknown as typeof fetch
+    return { handler, aborted: () => signal?.aborted === true }
+  }
+
+  it('⑨a a request that never answers becomes the timeout marker', async () => {
+    const hang = hangingFetch()
+    vi.stubGlobal('fetch', hang.handler)
+
+    await expect(startPairing('payload', { timeoutMs: 10 })).rejects.toThrow(PAIRING_REQUEST_TIMEOUT)
+    // The ceiling produced it, not a stray rejection.
+    expect(hang.aborted()).toBe(true)
+  })
+
+  it('⑨b a refusal keeps its ApiError, and never becomes a timeout', async () => {
+    vi.stubGlobal('fetch', async () =>
+      jsonResponse(400, { error: 'invalid-payload', message: 'payload does not decode' }),
+    )
+
+    const cause = await startPairing('payload', { timeoutMs: 10 }).catch((error: unknown) => error)
+
+    // The CODE is the contract (`api.ts`'s header): callers branch on
+    // `invalid-payload` vs `unreachable`, so a refusal that arrived with the
+    // signal still clear must keep both its type and its code.
+    expect(cause).toBeInstanceOf(ApiError)
+    expect((cause as ApiError).code).toBe('invalid-payload')
+    expect((cause as Error).message).not.toContain(PAIRING_REQUEST_TIMEOUT)
+  })
+
+  it('⑨c the PRODUCTION ceiling fires with nothing injected', async () => {
+    // Every other case passes `timeoutMs`, which leaves the default unwatched —
+    // and the default is the invariant the issue is about. Mutate it to
+    // `Infinity` and #173 ships unfixed; mutate it to 0 and every real pairing is
+    // aborted on the spot. Both leave the rest of this file green, so this case
+    // exists to see them.
+    //
+    // Fake timers make the default observable without waiting for it. The
+    // two-step advance pins the ORDER OF MAGNITUDE, not the exact number: 1 ms
+    // must not have fired (kills 0), a minute must have (kills `Infinity`).
+    vi.useFakeTimers()
+    try {
+      const hang = hangingFetch()
+      vi.stubGlobal('fetch', hang.handler)
+
+      const settled = startPairing('payload').catch((error: unknown) => error)
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(hang.aborted()).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(59_999)
+      const cause = await settled
+      expect((cause as Error).message).toBe(PAIRING_REQUEST_TIMEOUT)
+      expect(hang.aborted()).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})

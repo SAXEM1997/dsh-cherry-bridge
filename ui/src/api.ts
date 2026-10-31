@@ -34,6 +34,39 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * The marker a PAIRING request that never answered throws with.
+ *
+ * Internal token, never copy: the wizard renders `wizard.error.timeout` and this
+ * string only travels from here to the catch block that recognizes it — the same
+ * split as `app.eventSourceUnavailable` (see `App.tsx`), which is what keeps an
+ * English literal off a Chinese page.
+ */
+export const PAIRING_REQUEST_TIMEOUT = 'cherry-remote.pairing-request-timeout'
+
+/**
+ * How long `POST /pair` may stay open, in milliseconds.
+ *
+ * It is not a slow call. The server answers 202 as soon as it has a claim id and
+ * does no I/O before that (`src/httpApi.ts` `startPairing`), so a request still
+ * open after this long is a wedged same-origin transport, not a busy server.
+ * Without a ceiling the caller waits forever: the wizard's submit button stays
+ * disabled for the life of the page (issue #173).
+ *
+ * Only the PAIRING call carries the ceiling. It is the gate issue #173 names: the
+ * FIRST-RUN onboarding step, the one with no cancel control and no other exit —
+ * its phase never leaves `submitting`, so the run deadline (#170) cannot arm
+ * either.
+ *
+ * That is NOT a claim that the rest of the page degrades gracefully. A wedged
+ * transport strands the device cards (their own `busy`) and the scope panel's
+ * save just as completely, and a hung `GET /devices` leaves the list showing
+ * "loading" forever. Those are follow-up issues; a page-wide timeout is a
+ * separate decision, and this one deliberately bounds the request the issue
+ * names.
+ */
+const DEFAULT_PAIRING_REQUEST_TIMEOUT_MS = 10_000
+
 /** Reads a JSON body without throwing on an empty (204) or non-JSON response. */
 async function readBody(response: Response): Promise<unknown> {
   const text = await response.text()
@@ -72,13 +105,38 @@ export async function listDevices(): Promise<DeviceSummary[]> {
  * It deliberately does NOT wait for approval: the 6-digit code and the verdict
  * arrive as `pairing-progress` SSE frames, which is why the caller must already
  * be subscribed when this resolves.
+ *
+ * The call is bounded (see {@link DEFAULT_PAIRING_REQUEST_TIMEOUT_MS}): a hang
+ * here is the one transport failure that leaves the page waiting forever, so it
+ * becomes {@link PAIRING_REQUEST_TIMEOUT} instead. `timeoutMs` is the same
+ * injectable seam the components expose for their timers, so a test can prove
+ * the ceiling without waiting for it.
  */
-export async function startPairing(payload: string, name?: string): Promise<{ claimId?: string }> {
-  const body = await request(`${API_BASE}/pair`, {
-    method: 'POST',
-    body: JSON.stringify(name === undefined || name === '' ? { payload } : { payload, name }),
-  })
-  return (body ?? {}) as { claimId?: string }
+export async function startPairing(
+  payload: string,
+  options: { name?: string; timeoutMs?: number } = {},
+): Promise<{ claimId?: string }> {
+  const { name, timeoutMs = DEFAULT_PAIRING_REQUEST_TIMEOUT_MS } = options
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const body = await request(`${API_BASE}/pair`, {
+      method: 'POST',
+      body: JSON.stringify(name === undefined || name === '' ? { payload } : { payload, name }),
+      // We own this signal: no caller supplies one, and `request` spreads `init`
+      // into `fetch`, so the abort reaches the transport.
+      signal: controller.signal,
+    })
+    return (body ?? {}) as { claimId?: string }
+  } catch (cause) {
+    // An abort THIS function caused. A refusal or a transport error arrives with
+    // the signal still clear and travels untouched, so the caller's existing
+    // handling keeps deciding.
+    if (controller.signal.aborted) throw new Error(PAIRING_REQUEST_TIMEOUT)
+    throw cause
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /** `PATCH /devices/:id` — `hosts` is whole-replace; omitted fields are untouched. */
