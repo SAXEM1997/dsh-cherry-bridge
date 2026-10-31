@@ -35,37 +35,33 @@ export class ApiError extends Error {
 }
 
 /**
- * The marker a PAIRING request that never answered throws with.
+ * The marker a request that never answered throws with.
  *
- * Internal token, never copy: the wizard renders `wizard.error.timeout` and this
- * string only travels from here to the catch block that recognizes it — the same
- * split as `app.eventSourceUnavailable` (see `App.tsx`), which is what keeps an
- * English literal off a Chinese page.
+ * Internal token, NEVER copy: each surface renders its own sentence for it —
+ * `app.error.timeout`, `wizard.error.timeout`, `scope.error.timeout` — and this
+ * string only travels from `request()` to the catch block that recognizes it, the
+ * same split as `app.eventSourceUnavailable` (see `App.tsx`). That is what keeps
+ * an English literal off a Chinese page.
  */
-export const PAIRING_REQUEST_TIMEOUT = 'cherry-remote.pairing-request-timeout'
+export const REQUEST_TIMEOUT = 'cherry-remote.request-timeout'
 
 /**
- * How long `POST /pair` may stay open, in milliseconds.
+ * How long ANY call on this page may stay open, in milliseconds.
  *
- * It is not a slow call. The server answers 202 as soon as it has a claim id and
- * does no I/O before that (`src/httpApi.ts` `startPairing`), so a request still
- * open after this long is a wedged same-origin transport, not a busy server.
- * Without a ceiling the caller waits forever: the wizard's submit button stays
- * disabled for the life of the page (issue #173).
+ * None of these calls is slow: they are same-origin requests to the plugin's own
+ * HTTP face, and the one that looks slowest — a pairing START — does no I/O
+ * before it answers (`src/httpApi.ts` `startPairing` writes its 202 at once).
+ * A request still open after this long is a WEDGED transport, not a busy server,
+ * and it must not be allowed to strand a control: without a ceiling the pairing
+ * wizard's submit button (issue #173), a device card's buttons, the scope panel's
+ * save and the device list's "loading" state each wait for the life of the page
+ * (issue #180).
  *
- * Only the PAIRING call carries the ceiling. It is the gate issue #173 names: the
- * FIRST-RUN onboarding step, the one with no cancel control and no other exit —
- * its phase never leaves `submitting`, so the run deadline (#170) cannot arm
- * either.
- *
- * That is NOT a claim that the rest of the page degrades gracefully. A wedged
- * transport strands the device cards (their own `busy`) and the scope panel's
- * save just as completely, and a hung `GET /devices` leaves the list showing
- * "loading" forever. Those are follow-up issues; a page-wide timeout is a
- * separate decision, and this one deliberately bounds the request the issue
- * names.
+ * So the ceiling lives in `request()`, where every call passes, rather than on
+ * one call site. Each surface turns the {@link REQUEST_TIMEOUT} marker into its
+ * own sentence.
  */
-const DEFAULT_PAIRING_REQUEST_TIMEOUT_MS = 10_000
+export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000
 
 /** Reads a JSON body without throwing on an empty (204) or non-JSON response. */
 async function readBody(response: Response): Promise<unknown> {
@@ -78,19 +74,41 @@ async function readBody(response: Response): Promise<unknown> {
   }
 }
 
-async function request(url: string, init?: RequestInit): Promise<unknown> {
-  const response = await fetch(url, {
-    ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
-  })
-  const body = await readBody(response)
-  if (!response.ok) {
-    const record = (body ?? {}) as { error?: unknown; message?: unknown }
-    const code = typeof record.error === 'string' ? record.error : `http-${response.status}`
-    const message = typeof record.message === 'string' ? record.message : code
-    throw new ApiError(response.status, code, message)
+/**
+ * One bounded request. `timeoutMs` exists so a test can prove the ceiling
+ * without waiting for it; production always takes {@link DEFAULT_REQUEST_TIMEOUT_MS}.
+ */
+async function request(
+  url: string,
+  init?: RequestInit,
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+): Promise<unknown> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(url, {
+      ...init,
+      headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+      // We own this signal: no caller supplies one. An abort tears the body read
+      // down with the transport, which is why it sits inside the same `try`.
+      signal: controller.signal,
+    })
+    const body = await readBody(response)
+    if (!response.ok) {
+      const record = (body ?? {}) as { error?: unknown; message?: unknown }
+      const code = typeof record.error === 'string' ? record.error : `http-${response.status}`
+      const message = typeof record.message === 'string' ? record.message : code
+      throw new ApiError(response.status, code, message)
+    }
+    return body
+  } catch (cause) {
+    // An abort THIS function caused. A refusal arrives with the signal still
+    // clear and keeps its `ApiError` code, so nothing is masked as a timeout.
+    if (controller.signal.aborted) throw new Error(REQUEST_TIMEOUT)
+    throw cause
+  } finally {
+    clearTimeout(timer)
   }
-  return body
 }
 
 /** `GET /devices` — the full card list, states projected server-side. */
@@ -106,37 +124,22 @@ export async function listDevices(): Promise<DeviceSummary[]> {
  * arrive as `pairing-progress` SSE frames, which is why the caller must already
  * be subscribed when this resolves.
  *
- * The call is bounded (see {@link DEFAULT_PAIRING_REQUEST_TIMEOUT_MS}): a hang
- * here is the one transport failure that leaves the page waiting forever, so it
- * becomes {@link PAIRING_REQUEST_TIMEOUT} instead. `timeoutMs` is the same
- * injectable seam the components expose for their timers, so a test can prove
- * the ceiling without waiting for it.
+ * Bounded like every other call (see {@link DEFAULT_REQUEST_TIMEOUT_MS});
+ * `timeoutMs` exists only so a test can prove the ceiling without waiting.
  */
 export async function startPairing(
   payload: string,
   options: { name?: string; timeoutMs?: number } = {},
 ): Promise<{ claimId?: string }> {
-  const { name, timeoutMs = DEFAULT_PAIRING_REQUEST_TIMEOUT_MS } = options
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  try {
-    const body = await request(`${API_BASE}/pair`, {
-      method: 'POST',
-      body: JSON.stringify(name === undefined || name === '' ? { payload } : { payload, name }),
-      // We own this signal: no caller supplies one, and `request` spreads `init`
-      // into `fetch`, so the abort reaches the transport.
-      signal: controller.signal,
-    })
-    return (body ?? {}) as { claimId?: string }
-  } catch (cause) {
-    // An abort THIS function caused. A refusal or a transport error arrives with
-    // the signal still clear and travels untouched, so the caller's existing
-    // handling keeps deciding.
-    if (controller.signal.aborted) throw new Error(PAIRING_REQUEST_TIMEOUT)
-    throw cause
-  } finally {
-    clearTimeout(timer)
-  }
+  const { name } = options
+  // `undefined` deliberately falls through to `request`'s own default, so the
+  // production ceiling is exercised by the same parameter every other call uses.
+  const body = await request(
+    `${API_BASE}/pair`,
+    { method: 'POST', body: JSON.stringify(name === undefined || name === '' ? { payload } : { payload, name }) },
+    options.timeoutMs,
+  )
+  return (body ?? {}) as { claimId?: string }
 }
 
 /** `PATCH /devices/:id` — `hosts` is whole-replace; omitted fields are untouched. */

@@ -16,7 +16,7 @@
  */
 import { useEffect, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
-import { PAIRING_REQUEST_TIMEOUT, startPairing } from './api'
+import { REQUEST_TIMEOUT, startPairing } from './api'
 import { useT } from './i18n'
 import { APPROVED_STAGE, STAGE_KEYS, TERMINAL_STAGES, VERIFICATION_CODE_STAGE } from './types'
 import type { PairingPhase, PairingProgressEvent } from './types'
@@ -198,9 +198,11 @@ export function PairingWizard({
         // A HUNG request is not a refusal the user can read: its marker is an
         // internal token, so it becomes the dictionary's own sentence (the same
         // split as `app.eventSourceUnavailable`). Everything else is the
-        // server's or the transport's message, interpolated verbatim.
+        // server's or the transport's message, interpolated verbatim. The
+        // ceiling lives in `api.ts` `request()`, so this marker can also arrive
+        // from a grade other than the POST — it is the same token either way.
         setError(
-          cause instanceof Error && cause.message === PAIRING_REQUEST_TIMEOUT
+          cause instanceof Error && cause.message === REQUEST_TIMEOUT
             ? t('wizard.error.timeout')
             : cause instanceof Error
               ? cause.message

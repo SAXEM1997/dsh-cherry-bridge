@@ -20,8 +20,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { DeviceCard } from './DeviceCard'
 import { PairingWizard } from './PairingWizard'
 import { ToolScopePanel } from './ToolScopePanel'
-import { listDevices } from './api'
+import { REQUEST_TIMEOUT, listDevices } from './api'
 import { useT } from './i18n'
+import type { T } from './i18n'
 import { API_BASE } from './types'
 import type {
   DeviceState,
@@ -71,6 +72,19 @@ const defaultEventSourceFactory: EventSourceFactory = (url) => {
  */
 const EVENT_SOURCE_UNAVAILABLE = 'event-source-unavailable'
 
+/**
+ * One description for a cause, shared by the two catches below so they cannot
+ * drift. Two markers get the dictionary's own sentence — the missing
+ * `EventSource` and a request that never answered (`api.ts`'s ceiling) — because
+ * both are INTERNAL tokens that must never render; everything else is the
+ * foreign message, interpolated verbatim as data.
+ */
+function describeCause(t: T, cause: unknown): string {
+  if (cause instanceof Error && cause.message === EVENT_SOURCE_UNAVAILABLE) return t('app.eventSourceUnavailable')
+  if (cause instanceof Error && cause.message === REQUEST_TIMEOUT) return t('app.error.timeout')
+  return cause instanceof Error ? cause.message : String(cause)
+}
+
 /** Parses one SSE frame payload, ignoring a malformed one rather than crashing. */
 function parseFrame<T>(data: string): T | undefined {
   try {
@@ -104,13 +118,7 @@ export function App({
       // The opener's own token means "no EventSource here", which has a
       // sentence of its own in both dictionaries; anything else is a foreign
       // message and is interpolated verbatim (data, not copy).
-      setError(
-        cause instanceof Error && cause.message === EVENT_SOURCE_UNAVAILABLE
-          ? t('app.eventSourceUnavailable')
-          : cause instanceof Error
-            ? cause.message
-            : String(cause),
-      )
+      setError(describeCause(t, cause))
       return undefined
     }
 
@@ -145,7 +153,7 @@ export function App({
         setError(undefined)
       },
       (cause: unknown) => {
-        setError(cause instanceof Error ? cause.message : String(cause))
+        setError(describeCause(t, cause))
         setListed(true)
       },
     )
