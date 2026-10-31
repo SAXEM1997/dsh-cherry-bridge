@@ -53,9 +53,17 @@ export const PAIRING_REQUEST_TIMEOUT = 'cherry-remote.pairing-request-timeout'
  * Without a ceiling the caller waits forever: the wizard's submit button stays
  * disabled for the life of the page (issue #173).
  *
- * Only the PAIRING call carries the ceiling. It is the one request whose hang
- * strands a user-facing gate; the rest of the page's calls fail visibly when the
- * host is unreachable, and a page-wide timeout is a separate decision.
+ * Only the PAIRING call carries the ceiling. It is the gate issue #173 names: the
+ * FIRST-RUN onboarding step, the one with no cancel control and no other exit —
+ * its phase never leaves `submitting`, so the run deadline (#170) cannot arm
+ * either.
+ *
+ * That is NOT a claim that the rest of the page degrades gracefully. A wedged
+ * transport strands the device cards (their own `busy`) and the scope panel's
+ * save just as completely, and a hung `GET /devices` leaves the list showing
+ * "loading" forever. Those are follow-up issues; a page-wide timeout is a
+ * separate decision, and this one deliberately bounds the request the issue
+ * names.
  */
 const DEFAULT_PAIRING_REQUEST_TIMEOUT_MS = 10_000
 

@@ -137,7 +137,7 @@ const zh: Dict = {
   'wizard.error.payloadRequired': '请先粘贴扫码页显示的配对信息',
   // The pairing POST never answered. Names the LIKELY cause (a wedged host) and
   // nothing about pairing itself, so the user does not go re-scanning a QR code.
-  'wizard.error.timeout': '配对请求没有回应——请确认宿主仍在运行，然后重试',
+  'wizard.error.timeout': '配对请求迟迟没有回应，已中止——请重试；若反复出现，宿主可能已卡住，重启后再试',
   // The stages the wizard narrates while a run is in flight.
   'wizard.stage.validate': '正在校验配对信息…',
   'wizard.stage.connect': '正在连接 Cherry Studio…',
@@ -290,7 +290,7 @@ const en: Dict = {
     'No pairing result arrived. If the desktop approved it, the device appears in the list below; otherwise generate a new pairing code in Cherry Studio and try again.',
   'wizard.error.payloadRequired': 'Paste the pairing payload shown on the scan page first',
   // See the zh entry: the cause is the host, not the payload.
-  'wizard.error.timeout': 'The pairing request got no answer. Check that the host is still running, then try again.',
+  'wizard.error.timeout': 'The pairing request stopped answering and was abandoned. Try again; if it keeps happening the host may be stuck — restart it and retry.',
   'wizard.stage.validate': 'Validating the pairing payload…',
   'wizard.stage.connect': 'Connecting to Cherry Studio…',
   'wizard.stage.claim': 'Exchanging credentials…',

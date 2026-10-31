@@ -636,7 +636,7 @@ describe('pairing wizard', () => {
 
     submitPayload()
 
-    const alert = await screen.findByText('配对请求没有回应——请确认宿主仍在运行，然后重试')
+    const alert = await screen.findByText('配对请求迟迟没有回应，已中止——请重试；若反复出现，宿主可能已卡住，重启后再试')
     // The token must never reach a page: the user reads the dictionary, not the
     // string the transport happened to throw.
     expect(alert.textContent).not.toContain(PAIRING_REQUEST_TIMEOUT)
@@ -1222,5 +1222,34 @@ describe('the pairing request ceiling', () => {
     expect(cause).toBeInstanceOf(ApiError)
     expect((cause as ApiError).code).toBe('invalid-payload')
     expect((cause as Error).message).not.toContain(PAIRING_REQUEST_TIMEOUT)
+  })
+
+  it('⑨c the PRODUCTION ceiling fires with nothing injected', async () => {
+    // Every other case passes `timeoutMs`, which leaves the default unwatched —
+    // and the default is the invariant the issue is about. Mutate it to
+    // `Infinity` and #173 ships unfixed; mutate it to 0 and every real pairing is
+    // aborted on the spot. Both leave the rest of this file green, so this case
+    // exists to see them.
+    //
+    // Fake timers make the default observable without waiting for it. The
+    // two-step advance pins the ORDER OF MAGNITUDE, not the exact number: 1 ms
+    // must not have fired (kills 0), a minute must have (kills `Infinity`).
+    vi.useFakeTimers()
+    try {
+      const hang = hangingFetch()
+      vi.stubGlobal('fetch', hang.handler)
+
+      const settled = startPairing('payload').catch((error: unknown) => error)
+
+      await vi.advanceTimersByTimeAsync(1)
+      expect(hang.aborted()).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(59_999)
+      const cause = await settled
+      expect((cause as Error).message).toBe(PAIRING_REQUEST_TIMEOUT)
+      expect(hang.aborted()).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
