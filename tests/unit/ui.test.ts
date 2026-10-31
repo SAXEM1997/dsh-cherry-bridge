@@ -581,6 +581,46 @@ describe('pairing wizard', () => {
     expect(settled.textContent).toContain(STAGE_LABELS['rejected']!)
     expect(screen.queryByText(/没有等到配对结果/)).toBeNull()
   })
+
+  it('①e a terminal frame that BEATS the /pair response still settles the run', async () => {
+    // The mirror image of ①d, in a window nobody had pinned: the server writes
+    // the 202 before it can publish a verdict, but the two travel on different
+    // connections and the frame can reach the browser while this wizard still
+    // holds NO claimId to match it against.
+    //
+    // It is not dropped. The app keeps the newest frame in `progress` (its own
+    // state, never cleared on settle), and the stage effect lists `claimId` as a
+    // dependency — so the handle committing is what re-runs the effect with the
+    // frame already in hand. That dependency is the whole mechanism, and nothing
+    // tested it: drop it and this case goes red.
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await renderWithDevice([])
+    // The parallel calls (devices, scope) are already answered; from here on the
+    // ONLY request is the pairing POST, and it is held open on purpose.
+    vi.stubGlobal('fetch', async () => {
+      await gate
+      return jsonResponse(202, { claimId: 'claim-early' })
+    })
+
+    submitPayload()
+    // In flight and unidentifiable: the verdict is already here, the handle is not.
+    stream().emit({
+      event: 'pairing-progress',
+      data: { stage: 'invalid-payload', claimId: 'claim-early' },
+    })
+    expect(screen.queryByText(/配对失败/)).toBeNull()
+
+    release()
+
+    const settled = await screen.findByText(/配对失败/)
+    expect(settled.textContent).toContain(STAGE_LABELS['invalid-payload']!)
+    // Settled for real — the form is back and no deadline alarm was needed.
+    expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(false)
+    expect(screen.queryByText(/没有等到配对结果/)).toBeNull()
+  })
 })
 
 // ---------------------------------------------------------------------------
