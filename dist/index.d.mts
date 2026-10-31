@@ -1,4 +1,5 @@
 import { connectSecureChannel } from "@cherrystudio/remote-transport";
+import "@cherrystudio/remote-protocol";
 import "@cherrystudio/remote-protocol/agent";
 //#region src/connection.d.ts
 /**

@@ -50,6 +50,53 @@ export interface FakeHelloOptions {
 }
 
 /**
+ * Configuration of the `connection.endpoints` reply (issue #143).
+ *
+ * The real handler (`RemoteConnection.ts`) is gated on AUTHENTICATION and on the
+ * `agent` capability, and its snapshot comes from
+ * `RemoteAccessService.getConnectionEndpoints`: the desktop's own identity plus
+ * one `{host, port, security: 'ws'}` per current interface address. The laptop's
+ * list is bounded upstream (`getRemoteEndpoint` slices to 32), and it can FAIL
+ * even on a peer that advertises the capability — the API gateway must be
+ * running and bound to `0.0.0.0` — which is why the client treats the whole
+ * call as best-effort.
+ */
+export interface FakeEndpointsOptions {
+  /** Endpoints the peer advertises (default: none, i.e. an empty answer). */
+  endpoints?: Array<{ host: string; port: number; security?: 'ws' | 'wss' }>
+  /**
+   * Override the `desktopIdentity` in the answer (default: this peer's own).
+   * A different value models the one thing the client must never act on — an
+   * answer that does not name the desktop it is pinned to.
+   */
+  desktopIdentity?: string
+  /**
+   * A RAW answer that replaces the constructed one, built from the peer's own
+   * identity so a test can keep the PIN correct while breaking the body.
+   *
+   * The typed `endpoints` knob can only express the shapes the desktop actually
+   * sends; this one models the frames a client must survive without failing the
+   * handshake — `endpoints` that is not an array, a missing or non-string
+   * `desktopIdentity`, a non-object reply (issue #143 review).
+   */
+  answer?: (desktopIdentity: string) => unknown
+  /** Every `connection.endpoints` fails with this protocol failure. */
+  failure?: FakeFailure
+  /**
+   * Accept the call but never answer it — the client's bounded wait. The real
+   * peer's handler awaits `getRemoteEndpoint()`, which can sit behind a
+   * gateway transition; a client that waited unbounded would hold the whole
+   * handshake on it.
+   *
+   * NOTE for later cases: the pending handler never settles, so this fake's
+   * `inFlight`/`maxInFlight` stay elevated for the rest of its life — unlike
+   * `dropPings` (which returns and drops the reply) or `loseNextReply` (the
+   * handler runs, the reply is lost). Do not wait on `inFlight === 0` with it.
+   */
+  hang?: boolean
+}
+
+/**
  * Config surface of the fake desktop. Deliberately wide: Tasks 6/7/8/9/13
  * extend this harness (pairing, subscriptions, agent methods, rate-limit
  * semantics) rather than rewrite it, so every injection knob is optional and
@@ -61,6 +108,14 @@ export interface FakeCherryOptions {
   /** Versions offered in the Noise-prelude negotiation (default [1]). */
   protocolVersions?: number[]
   hello?: FakeHelloOptions
+  /**
+   * The `connection.endpoints` face (issue #143), modelled on the desktop's
+   * `RemoteConnection.ts` handler + `RemoteAccessService.getConnectionEndpoints`:
+   * authenticated state and the `agent` capability are required, the answer is
+   * `{desktopIdentity, endpoints}`, and every endpoint is `security: 'ws'` in
+   * practice (the snapshot's own `'ws' as const`).
+   */
+  endpoints?: FakeEndpointsOptions
   /** Token lifetime handed out by authenticate/refresh (default 600_000). */
   tokenTtlMs?: number
   /** Every `connection.authenticate` fails with this protocol failure. */
@@ -615,6 +670,13 @@ interface LiveConnection {
   controller: AbortController
   /** Set once `connection.hello` confirmed the prelude offer, like the peer's. */
   hello: boolean
+  /**
+   * Set once `connection.authenticate` ISSUED a token on this socket. The real
+   * desktop's `requireCapability` reads `this.authentication`, so every
+   * capability-gated face (`connection.endpoints`) is unreachable before
+   * authenticate — a client that asked earlier would get UNAUTHENTICATED.
+   */
+  authenticated: boolean
   /**
    * Arrival timestamps for THIS socket, which is the window the rate cap is
    * judged over. The real desktop's cap is per-connection: a second client
@@ -1820,7 +1882,14 @@ export class FakeCherry {
         socket.off('close', unpending)
         unpending()
         this.#connectionCount += 1
-        const live: LiveConnection = { socket, channel, controller, hello: false, arrivals: [] }
+        const live: LiveConnection = {
+          socket,
+          channel,
+          controller,
+          hello: false,
+          authenticated: false,
+          arrivals: [],
+        }
         this.#live.push(live)
         void this.#serve(live)
       })
@@ -1940,10 +2009,18 @@ export class FakeCherry {
     switch (method) {
       case 'connection.hello':
         return this.#handleHello(live)
-      case 'connection.authenticate':
-        return this.#handleAuthenticate(params)
+      case 'connection.authenticate': {
+        const result = this.#handleAuthenticate(params)
+        // Only an ISSUED token authenticates the socket: a refused
+        // authenticate (authenticateFailure) leaves the connection where the
+        // real peer's `this.authentication` would be — unset.
+        live.authenticated = true
+        return result
+      }
       case 'connection.refresh':
         return this.#handleRefresh()
+      case 'connection.endpoints':
+        return await this.#handleEndpoints(live, params)
       case 'connection.ping':
         return { nonce: params['nonce'], serverTime: new Date().toISOString() }
       case 'pairing.claim':
@@ -2042,6 +2119,40 @@ export class FakeCherry {
       accessToken: token.token,
       expiresAt: new Date(token.expiresAt).toISOString(),
       deviceId: params['deviceId'],
+    }
+  }
+
+  /**
+   * `connection.endpoints` (issue #143), with the desktop's own three gates in
+   * the desktop's order: hello, then authentication, then the DOMAIN's
+   * capability (`RemoteConnection.ts` → `requireCapability(domain)`).
+   */
+  async #handleEndpoints(
+    live: LiveConnection,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    this.#requireHello(live)
+    if (!live.authenticated) {
+      // The real `requireAuthentication` wording (RemoteConnection.ts:212).
+      throw new FakeRpcError({ reason: 'UNAUTHENTICATED', message: 'Device authentication is required' })
+    }
+    // MVP grants are `agent` only, so any other domain is a capability the
+    // desktop would refuse rather than a shape error.
+    if (params['domain'] !== 'agent') {
+      throw new FakeRpcError({ reason: 'FORBIDDEN', message: 'Capability is not granted' })
+    }
+    const options = this.#options.endpoints ?? {}
+    if (options.failure !== undefined) throw new FakeRpcError(options.failure)
+    if (options.hang === true) await new Promise<never>(() => {})
+    const desktopIdentity = await this.identityId
+    if (options.answer !== undefined) return options.answer(desktopIdentity) as Record<string, unknown>
+    return {
+      desktopIdentity: options.desktopIdentity ?? desktopIdentity,
+      endpoints: (options.endpoints ?? []).map((endpoint) => ({
+        host: endpoint.host,
+        port: endpoint.port,
+        security: endpoint.security ?? 'ws',
+      })),
     }
   }
 

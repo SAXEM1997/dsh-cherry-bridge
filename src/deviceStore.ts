@@ -11,6 +11,7 @@ import {
   writeSync,
 } from 'node:fs'
 import { dirname } from 'node:path'
+import type { DirectEndpoint } from '@cherrystudio/remote-protocol'
 
 /**
  * Crash-durable, corruption-safe archive of paired Cherry Studio desktop
@@ -106,6 +107,76 @@ export type DeviceResolution = DeviceRecord | AmbiguousDevice | UnresolvedDevice
 
 /** The only `schemaVersion` this build reads and writes. */
 export const CURRENT_SCHEMA_VERSION = 4
+
+/**
+ * The most candidate hosts one record may carry (issue #143).
+ *
+ * `hosts` is a DIAL list, not a table: every reconnect walks it with one
+ * `connectTimeoutMs` per address, so its LENGTH is a time cost — a 32-host
+ * record already allows a 320 s pass, which is the number the pairing walk's
+ * aggregate budget exists for. Pairing can only ever produce 32
+ * (`pairingQrSchema`'s `.max(32)`), and learning is held to the same bound: an
+ * enrichment may not build a record that no pairing could have produced.
+ */
+export const MAX_CANDIDATE_HOSTS = 32
+
+/**
+ * Adds the candidate addresses a peer ADVERTISED that this record does not
+ * already dial, returning how many hosts were added (issue #143).
+ *
+ * The rule is ADD-ONLY, deliberately:
+ *
+ *  - a host already in `hosts` is left exactly as it is, INCLUDING its port and
+ *    its scheme. The peer's snapshot describes where it listens NOW, while a
+ *    record entry may be an operator's choice (a pinned port, a TLS proxy) that
+ *    every reconnect must keep honouring; re-pointing it would silently rewrite
+ *    the operator's address book on a schedule. "Already dials" is judged
+ *    CASE-INSENSITIVELY: a hostname is case-insensitive, the peer's schema
+ *    lowercases what it advertises, and a PATCHed record stores what the
+ *    operator typed — without this, `MyNAS.example` and `mynas.example` would
+ *    both hold a dial slot. (An IPv6 literal in a different EXPANSION is NOT
+ *    reconciled here; the PATCH path owns the archive's spelling, and it does
+ *    not canonicalize either.)
+ *  - nothing is ever removed, and nothing is remembered as removed: a host the
+ *    peer still advertises is re-learned after an operator PATCH drops it. The
+ *    peer is the source of truth for where it listens, so this is the intended
+ *    reading of "add-only" — to make a removal stick, stop the desktop
+ *    advertising the address (or disable the device);
+ *  - host, port and scheme are appended TOGETHER, which is what keeps the v4
+ *    one-entry-per-host invariant true. That invariant is enforced on the READ
+ *    path by `assertValidSecurity`/`assertValidPorts`, and a semantic failure
+ *    there is NOT a quarantine (that class covers unreadable bytes): the throw
+ *    escapes `parseArchive` out of `list()`, so a split entry would break every
+ *    tool until an operator repaired the file;
+ *  - past {@link MAX_CANDIDATE_HOSTS} nothing is added, and the loop stops
+ *    rather than scanning the rest.
+ *
+ * `endpoints` must already have passed the peer's own `advertisedEndpointSchema`
+ * (which bounds the port to 1..65535, the scheme to `ws`/`wss`, and rejects a
+ * loopback destination), so every value written here is archive-valid without a
+ * second validation pass.
+ */
+export function mergeAdvertisedEndpoints(
+  record: DeviceRecord,
+  endpoints: readonly DirectEndpoint[],
+): number {
+  // One comparison rule, applied to what the record already dials AND to what
+  // this answer has added so far: a duplicate inside one answer must not take a
+  // second slot either.
+  const dialed = new Set(record.hosts.map((host) => host.toLowerCase()))
+  let added = 0
+  for (const endpoint of endpoints) {
+    const key = endpoint.host.toLowerCase()
+    if (dialed.has(key)) continue
+    if (record.hosts.length >= MAX_CANDIDATE_HOSTS) break
+    record.hosts.push(endpoint.host)
+    record.ports[endpoint.host] = endpoint.port
+    record.security[endpoint.host] = endpoint.security
+    dialed.add(key)
+    added += 1
+  }
+  return added
+}
 
 const FILE_MODE = 0o600
 
@@ -770,6 +841,42 @@ export class DeviceStore {
   remove(deviceId: string): void {
     const devices = this.#load().filter((record) => record.deviceId !== deviceId)
     this.#persist(devices)
+  }
+
+  /**
+   * Merges freshly learned addresses into one record and writes ONLY when that
+   * record gained a host (issue #143), returning the number added.
+   *
+   * It exists so the enrichment is an ARCHIVE operation rather than an
+   * `upsert` the assembly assembles by hand, and so a merge that adds nothing
+   * never rewrites (and fsyncs) the archive: `connection.endpoints` is asked on
+   * every connect, and a stable desktop would otherwise pay a full atomic write
+   * per reconnect. The merge runs on a CLONE and is committed as a new list,
+   * mirroring `upsert`'s discipline — the store never adopts a caller's object
+   * graph, and a write refused at {@link #persist}'s own gate cannot have
+   * half-edited the record the archive still holds.
+   *
+   * `desktopIdentity` is the pin the answering connection belongs to: the
+   * record must still name that desktop. A RE-PAIR under the same `deviceId`
+   * (the desktop regenerated its identity) would otherwise take an address
+   * learned from the previous pairing — a stale candidate whose every dial then
+   * fails the Noise pin, permanently, because learning never removes.
+   *
+   * An unknown `deviceId` is a no-op — the record may have been removed (or
+   * re-paired) between the RPC and this write.
+   */
+  learnEndpoints(deviceId: string, endpoints: readonly DirectEndpoint[], desktopIdentity: string): number {
+    const devices = this.#load()
+    const index = devices.findIndex((record) => record.deviceId === deviceId)
+    if (index < 0) return 0
+    if (devices[index]!.desktopIdentity !== desktopIdentity) return 0
+    const merged = structuredClone(devices[index]!)
+    const added = mergeAdvertisedEndpoints(merged, endpoints)
+    if (added === 0) return 0
+    const next = [...devices]
+    next[index] = merged
+    this.#persist(next)
+    return added
   }
 
   #load(): DeviceRecord[] {

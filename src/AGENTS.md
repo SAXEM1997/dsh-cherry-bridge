@@ -65,6 +65,25 @@ sends `partsMode: 'paged'` only at exactly `1`. Parts keep their clamp; only
 the message page widens (to the negotiated `pageItems`); a
 `RESOURCE_EXHAUSTED` with `details.retryable: false` says retrying cannot help.
 
+**Advertised endpoints (#143).** The hello `connectionEndpointsVersion` bit
+(strictly `1`; absent through 2.1.3 — 2.1.4 already answers both the bit and
+the method) unlocks ONE best-effort
+`connection.endpoints` (`{domain:'agent'}` → `{desktopIdentity, endpoints}`) per
+handshake, awaited INSIDE it after authenticate and bounded by
+`ENDPOINTS_LEARN_TIMEOUT_MS` (2 s). That bound is derived in ONE narrow sense:
+this wait alone stays below `DEVICE_SETTLE_WAIT_MS` (5 s), so a peer that hangs
+on this one call cannot by itself outlive the window a tool waits for
+`connecting` — the handshake's other waits (a 10 s dial, hello/authenticate on
+the 60 s rpc default) already can, and are not this constant's business. The
+desktop gates the call on the authenticated session and can refuse it (gateway
+not running), so EVERY failure is silent — structurally: `#learnEndpoints` wraps
+everything after the capability gate in one `catch` (a refused or wedged call, a
+malformed answer, a throwing assembly hook), and cannot reject. The answer is discarded
+WHOLE when it does not name the pinned `desktopIdentity`, and each entry is
+filtered by the peer's own `advertisedEndpointSchema` (rejects loopback,
+normalizes the host). Learned hosts join the archive as candidates — see
+[Device archive](#device-archive-schemeport-per-host).
+
 **Pacing: two tiers against the desktop's allowances.**
 
 | Tier | Methods | Desktop allowance | Default |
@@ -638,6 +657,26 @@ TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
 ignored (half-applied trust reaches some peers, not others). Never persisted,
 logged or reported; `ca` is PEM text.
+
+Addresses a peer ADVERTISES (`connection.endpoints`, #143) are ADD-ONLY
+(`mergeAdvertisedEndpoints`): only hosts the record does not already dial are
+appended, each with its OWN port and scheme (the one-entry-per-host invariant is
+never split), capped at `MAX_CANDIDATE_HOSTS` = 32 — what a pairing QR can
+produce (BOTH arms cap at 32), so learning cannot build a record no pairing
+could have. An existing entry — the operator's port, a TLS proxy — is never
+re-pointed and none is ever removed; comparison is CASE-INSENSITIVE (a PATCHed
+record keeps the operator's spelling), and an IPv6 literal in another expansion
+is not reconciled — the PATCH path owns that spelling. Two consequences are
+accepted, not bugs: a host the peer still advertises is re-learned after an
+operator PATCH drops it (the peer is the source of truth for its own addresses),
+and a learned host is therefore only removable by stopping the desktop
+advertising it or disabling the device. The write goes through
+`DeviceStore.learnEndpoints`, which merges a clone of the STORED record (never
+the connection's: that one mirrors the live `accessToken`, which this archive
+deliberately does not keep), refuses when the record's `desktopIdentity` is no
+longer the pin the answer was validated against (a re-pair), and writes only
+when a host was added, so a stable desktop costs no archive write per
+reconnect.
 
 ### Pairing: one dial budget across candidates
 

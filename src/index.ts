@@ -489,6 +489,19 @@ function connectionFor(deviceId: string): DeviceConnection {
     // Spread-if-present, never `wsOptions: undefined`: the option is optional,
     // and an absent key is the honest "no override" (Node's trust store).
     ...(state.wsTls === undefined ? {} : { wsOptions: state.wsTls }),
+    // The archive write-back (issue #143). The connection has already merged the
+    // addresses into its OWN record — this instance's next reconnect dials them
+    // — so the only job here is durability. It goes through
+    // `DeviceStore.learnEndpoints`, NOT `upsert(record)`: the store's record
+    // carries the token of the PAIRING while the connection's mirrors the live
+    // one, and an `upsert` of the connection's copy would put a
+    // connection-scoped credential into the archive.
+    onAdvertisedEndpoints: (endpoints) => {
+      // `record` is THIS connection's clone: its `desktopIdentity` is the pin the
+      // answer was validated against, so a re-pair under the same deviceId cannot
+      // receive an address learned from the previous pairing.
+      state.store.learnEndpoints(deviceId, endpoints, record.desktopIdentity)
+    },
   })
   state.connectionsBuilt += 1
   connection.onState((deviceState: DeviceState) => {

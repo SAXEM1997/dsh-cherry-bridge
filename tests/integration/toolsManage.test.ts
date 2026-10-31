@@ -1724,6 +1724,44 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     ).toBe(true)
     expectBoundedWarn(prefix, `Subscribe refused (${longReason})`)
   }, 30_000)
+
+  // -------------------------------------------------------------------------
+  // issue #143: the pooled connection learns the desktop's advertised endpoints,
+  // and the ASSEMBLY is what persists them. Every connection-level case injects
+  // its own callback, so without this one a `connectionFor` that forgot to wire
+  // the seam would leave the feature dead in production with the suite green.
+  // -------------------------------------------------------------------------
+  it('③x persists the endpoints the pooled connection learns, without overwriting the archive\'s own fields', async () => {
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake({
+      hello: { capabilities: { connectionEndpointsVersion: 1 } },
+      endpoints: { endpoints: [{ host: '192.168.1.8', port: 9001 }] },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    const file = join(dataDir, 'devices.json')
+
+    // Before: the archive knows only the address the pairing recorded.
+    expect(new DeviceStore(file).list()[0]?.hosts).toEqual([fakeInfo.host])
+
+    await connectPool(ctx, fakeInfo)
+
+    // The learn runs INSIDE the handshake, before `connected` is published, so
+    // the archive already carries it when the state settles.
+    const learned = new DeviceStore(file).list()[0]!
+    expect(learned.hosts).toEqual([fakeInfo.host, '192.168.1.8'])
+    expect(learned.ports['192.168.1.8']).toBe(9001)
+    expect(learned.security['192.168.1.8']).toBe('ws')
+    // The write went through the STORE's record, not the connection's: the
+    // connection mirrors the token it just authenticated with, and persisting
+    // that mirror would put a connection-scoped credential in the archive.
+    expect(learned.accessToken).toBe('token-1')
+    expect(learned.desktopIdentity).toBe(fakeInfo.desktopIdentity)
+  }, 30_000)
 })
 
 /** A minimal valid record for the store-level assertions. */
