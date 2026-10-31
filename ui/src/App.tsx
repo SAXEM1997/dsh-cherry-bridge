@@ -40,6 +40,8 @@ export interface AppProps {
   eventSourceFactory?: EventSourceFactory
   /** Transient verification-code lifetime, forwarded to the wizard. */
   codeLifetimeMs?: number
+  /** Run deadline (the exit for a lost terminal frame), forwarded to the wizard. */
+  runLifetimeMs?: number
   /**
    * The scope panel's HTTP seam. Defaults to the real same-origin client;
    * injected by tests in the same style as `eventSourceFactory`, so no test has
@@ -81,6 +83,7 @@ function parseFrame<T>(data: string): T | undefined {
 export function App({
   eventSourceFactory = defaultEventSourceFactory,
   codeLifetimeMs,
+  runLifetimeMs,
   scopeClient,
 }: AppProps): ReturnType<typeof Object> {
   const t = useT()
@@ -211,6 +214,7 @@ export function App({
         subscribed={subscribed}
         progress={progress}
         {...(codeLifetimeMs === undefined ? {} : { codeLifetimeMs })}
+        {...(runLifetimeMs === undefined ? {} : { runLifetimeMs })}
         onRunStart={startRun}
         onSettled={onSettled}
       />
