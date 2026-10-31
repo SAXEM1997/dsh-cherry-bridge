@@ -16,7 +16,7 @@
  */
 import { useEffect, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
-import { startPairing } from './api'
+import { PAIRING_REQUEST_TIMEOUT, startPairing } from './api'
 import { useT } from './i18n'
 import { APPROVED_STAGE, STAGE_KEYS, TERMINAL_STAGES, VERIFICATION_CODE_STAGE } from './types'
 import type { PairingPhase, PairingProgressEvent } from './types'
@@ -194,7 +194,18 @@ export function PairingWizard({
       (cause: unknown) => {
         // A refusal leaves the wizard open with the payload intact: the user
         // fixes the paste rather than starting over.
-        setError(cause instanceof Error ? cause.message : String(cause))
+        //
+        // A HUNG request is not a refusal the user can read: its marker is an
+        // internal token, so it becomes the dictionary's own sentence (the same
+        // split as `app.eventSourceUnavailable`). Everything else is the
+        // server's or the transport's message, interpolated verbatim.
+        setError(
+          cause instanceof Error && cause.message === PAIRING_REQUEST_TIMEOUT
+            ? t('wizard.error.timeout')
+            : cause instanceof Error
+              ? cause.message
+              : String(cause),
+        )
         setPhase('idle')
         setBusy(false)
       },
