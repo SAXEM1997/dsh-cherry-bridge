@@ -337,3 +337,25 @@ A–G 各节要真人 + Electron 端批准，无法被 CI 化；下表只记录�
   被测设备是单主机同端口；需要造一条混合端口记录才能走。
 - **#161 `failureText`**：要制造一个 peer 可达的 caught failure（如 ack 失败）才会出现，
   本轮 `recentErrors` 为空。
+
+### 0.2.1（2026-11-01 · DSH profile `web` · 桌面端 ISV-ZYX 2.1.10）
+
+| 项 | 结果 | 观测 |
+| --- | --- | --- |
+| 装机生效 | 通过 | 版本 `0.2.1`；包 mtime `23:19:54` 早于宿主 PID 1 启动 `23:20:24`；装机 `dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`、`locale/zh.json` 与 npm `dsh-cherry-bridge@0.2.1` tarball（shasum `ae7ed02b…`）sha256 全同 |
+| 档案无迁移 | 通过 | `devices.json` 仍是 `schemaVersion: 4`（本轮没有触发任何迁移）；`forgottenHosts` 是**可选键、不升版本**（代码依据：档案校验器与视图），首次 `forget` 后出现在文件里。注：捕获里**没有 forget 之前的档案快照**，所以「之前不在文件里」不算本轮观测 |
+| `GET /cherry-remote/api/devices` 新键 | 通过 | 每台设备多出 `forgottenHosts`（无标记时是空数组 `[]`，不是缺键）；本机设备 `hosts` 两条、`security` / `ports` 各两条 |
+| 忘记一条非末位地址（#185 / #204） | 通过 | `POST …/devices/<id>/forget {"hosts":["172.17.14.36"]}` → 200；同一响应里 `hosts` 少一条、`forgottenHosts` 多一条、`state` 变 `connecting`（驱逐），`security` / `ports` 同步删掉该键；档案已落盘。注：forget 之前的「两条地址」由收尾/live 的原状锚定，捕获的第一条事件就是 forget |
+| **重连后不会学回来** | 通过 | 21 s 后 `state: connected`，`hosts` **仍是单条**（观测）。**推断**：桌面一直在广播两条、学习合并跳过了被标记者 —— 依据是下一行「恢复只摘标记」之后 18 s 地址就自己回来了，中间没有别的写入 |
+| 恢复只摘标记 | 通过 | `POST …/remember` → 200，`forgottenHosts: []` 而 `hosts` **未变**；再 18 s 后 `hosts` 回到两条，`security` / `ports` 里重新出现该键（`ws` / 23333，这两个值是否对端所报见下方「未覆盖」） |
+| 拒绝忘记最后一条 | 通过 | 只剩一条时 `forget` → `400` `{"error":"last-address","message":"… refusing to forget the last dial candidate — the record would have nothing to dial. Keep at least one address."}`；档案**未变**（`hosts` 与标记都保持原样；代码在持久化**之前**抛出） |
+| 驱逐的代价可观测 | 通过 | 四次改动 = 四次重建：`stats.connectionsBuilt` 收尾 **5**，两次改动后读到 **3**（故基线推为 1，`1` 本身没有直接读到）；`connections` / `sockets` 两次读到 1/1（23:25:00 那次没取到 `stats`）；`recentErrors` 恰好 **4** 条 `CONNECTION_OFFLINE`（`device transitioned to offline`，每次驱逐一条，无其他；捕获里第 4 条被截断，`/diagnostics` 现读为 4）；收尾回到原状（两条地址、无标记、`connected`） |
+
+**本轮未覆盖**（**不是通过**）：
+
+- **恢复后的端口 / 协议是否真来自对端**：本环境桌面广播的就是记录级默认（`ws` / 23333），
+  观测无法区分「对端说的」与「默认值」；由 `DeviceStore.learnEndpoints` 与
+  `advertisedEndpoints` 的单测覆盖（每个端点自带 port/scheme）。
+- **设置页那对按钮的点击**：需要能打开宿主的浏览器；本机渲染由 `tests/unit/ui.test.ts`
+  覆盖，地址编辑器打开时两个控件冻结由 `#204m` 覆盖。本轮走的是页面调用的同两条 HTTP 路由。
+- **驱逐时 in-flight 命令丢失**：需要一个正在执行的 command 才会出现，本轮没有。
