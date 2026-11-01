@@ -3020,7 +3020,8 @@ var SecondWindowRateLimiter = class {
 	async acquire() {
 		let release;
 		const ahead = this.#queue;
-		this.#queue = ahead.then(() => new Promise((resolve) => release = resolve));
+		const next = () => new Promise((resolve) => release = resolve);
+		this.#queue = ahead.then(next, next);
 		await ahead;
 		try {
 			for (;;) {

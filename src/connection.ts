@@ -422,7 +422,13 @@ class SecondWindowRateLimiter {
     // released strictly after the one before it reached the head.
     let release!: () => void
     const ahead = this.#queue
-    this.#queue = ahead.then(() => new Promise<void>((resolve) => (release = resolve)))
+    // Both arms hand off the same way: a rejected link must still open a slot
+    // for the next waiter. Today no link can reject (each is settled only by
+    // its own `release()` in the `finally` below), so this is a guard rather
+    // than a fix — the desktop learned the shape the hard way when one failed
+    // write silenced every later send on the connection (2.1.9, PR #22593).
+    const next = (): Promise<void> => new Promise<void>((resolve) => (release = resolve))
+    this.#queue = ahead.then(next, next)
     await ahead
     try {
       for (;;) {
