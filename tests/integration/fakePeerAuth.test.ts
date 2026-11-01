@@ -408,3 +408,106 @@ describe('the agent faces require the authenticated session (issue #187)', () =>
     expect(peer.fake.subscriptions).toHaveLength(1)
   })
 })
+
+/**
+ * The GRANT half of the same gate (issue #194). The desktop's `requireAgent()`
+ * is `requireCapability('agent')`, and `requireCapability` checks BOTH the
+ * authenticated state AND the grant the pairing approved
+ * (`RemoteConnection.ts:198-204`):
+ *
+ *     requireCapability(domain) {
+ *       const auth = this.requireAuthentication()
+ *       const grant = auth.authorization.grants.find((value) => value.domain === domain)
+ *       if (!grant) throw new RemoteRpcError('FORBIDDEN', 'Capability was not approved during pairing')
+ *       return { deviceId: auth.deviceId, grantId: grant.grantId }
+ *     }
+ *
+ * #187 modelled the authentication half only — an `authenticated` boolean — so a
+ * device the desktop approved NOTHING for was still served every agent face.
+ * `approvedGrants` is the knob that already produces that shape; these two cases
+ * make the fake able to tell a granted device from an ungranted one, one case per
+ * door into the authenticated state (#183 named them: `connection.authenticate`
+ * and the approved `pairing.get` branch).
+ */
+describe('the agent faces require the grant the pairing approved (issue #194)', () => {
+  it('#194a a socket holding a grant OTHER than agent answers FORBIDDEN, and reads nothing', async () => {
+    // `configuration` is a real domain of the pinned protocol
+    // (`remoteCapabilitySchema = ['configuration', 'agent']`), so this device
+    // HOLDS a grant. A gate that only asks "any grants?" answers here; only the
+    // domain check refuses — which is what `requireCapability('agent')` does.
+    const peer = await openRaw({ agent: agentFixture, approvedGrants: ['configuration'] })
+    await greet(peer.client)
+
+    // ORDER, before any session exists: the desktop's `requireCapability` runs
+    // `requireAuthentication()` FIRST, so an unauthenticated socket hears
+    // UNAUTHENTICATED even though it also holds no `agent` grant. A gate that
+    // judged the grant first would answer FORBIDDEN here.
+    const beforeAuth = await failureOf(peer.client.request('agent.sessions.get', { sessionId: 'session-1' }))
+    expect(beforeAuth).toBeInstanceOf(JsonRpcRequestError)
+    expect((beforeAuth as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
+    expect((beforeAuth as JsonRpcRequestError).message).toBe('Device authentication is required')
+    expect(peer.fake.readCalls).toHaveLength(0)
+
+    const issued = await peer.client.request<{ authorization: { grants: { domain: string }[] } }>(
+      'connection.authenticate',
+      { deviceId: 'dev-raw' },
+    )
+    // ONE SOURCE: the reply hands out the domains this socket is judged on. A
+    // reply hard-coded to `agent` beside a `configuration` socket is the peer
+    // contradicting itself, and a client would archive a grant it does not hold.
+    expect(issued.authorization.grants.map((grant) => grant.domain)).toEqual(['configuration'])
+    // The SESSION is real — a token was issued — so the refusal below can only
+    // be the grant. Without this, a fake that authenticated nothing would refuse
+    // for the wrong reason and still look green on the verdict alone.
+    expect(peer.fake.tokenIssues).toHaveLength(1)
+
+    const error = await failureOf(peer.client.request('agent.sessions.get', { sessionId: 'session-1' }))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'FORBIDDEN' })
+    expect((error as JsonRpcRequestError).message).toBe('Capability was not approved during pairing')
+    // POSITION: `session-1` EXISTS, so a handler-first implementation answers it.
+    expect(peer.fake.readCalls).toHaveLength(0)
+  })
+
+  it('#194b the pairing door records the grant: an agent-granted approval serves the agent face', async () => {
+    // The default grant (`['agent']`) through the OTHER door. Without recording
+    // the grants there, `live.grants` stays undefined and this answer becomes
+    // FORBIDDEN — the shape #194a pins from the opposite side. WHICH domains are
+    // recorded is #194a's claim (it supplies `configuration`); this case is the
+    // recording itself.
+    const peer = await openRaw({ agent: agentFixture })
+    await greet(peer.client)
+    await pairThrough(peer.client)
+
+    const answer = await peer.client.request<{ session: { sessionId: string } }>('agent.sessions.get', {
+      sessionId: 'session-1',
+    })
+    expect(answer.session.sessionId).toBe('session-1')
+    expect(peer.fake.readCalls).toHaveLength(1)
+  })
+
+  it('#194c connection.endpoints is judged per DOMAIN, not on the agent namespace', async () => {
+    // `connection.endpoints` runs `requireCapability(domain)` for the REQUESTED
+    // domain (RemoteConnection.ts:107-112). The fake hardcoded `agent` while
+    // grants were fixed, so a configuration-only device was refused the domain
+    // it holds and SERVED the one it does not (review finding on #194).
+    const peer = await openRaw({
+      approvedGrants: ['configuration'],
+      endpoints: { endpoints: [{ host: 'endpoint.example', port: 23333 }] },
+    })
+    await greet(peer.client)
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+
+    const refused = await failureOf(peer.client.request('connection.endpoints', { domain: 'agent' }))
+    expect(refused).toBeInstanceOf(JsonRpcRequestError)
+    expect((refused as JsonRpcRequestError).data).toMatchObject({ reason: 'FORBIDDEN' })
+    expect((refused as JsonRpcRequestError).message).toBe('Capability was not approved during pairing')
+
+    // The domain it HOLDS answers — the half a hardcoded `agent` gateway could
+    // never serve, so the two directions cannot both pass by accident.
+    const served = await peer.client.request<{ endpoints: { host: string }[] }>('connection.endpoints', {
+      domain: 'configuration',
+    })
+    expect(served.endpoints.map((endpoint) => endpoint.host)).toEqual(['endpoint.example'])
+  })
+})

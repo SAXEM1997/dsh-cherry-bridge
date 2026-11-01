@@ -704,6 +704,29 @@ interface LiveConnection {
    */
   authenticated: boolean
   /**
+   * The capability domains the pairing approved for this socket, SNAPSHOTTED
+   * from {@link FakeCherryOptions.approvedGrants} at the SAME door that set
+   * {@link authenticated} (the desktop's `authentication` object carries the
+   * authorization, so session and grants are one write there too). `undefined`
+   * before authentication; a `readonly string[]` after it.
+   *
+   * EMPTY is representable here but NOT a reachable desktop session: the
+   * protocol's authorization schema is `grants: min(1).max(2)`, so a device
+   * approved for nothing is refused at the DOOR (`UNAUTHENTICATED` / 'Device has
+   * no approved capabilities', RemoteConnection.ts:87-88) and never
+   * authenticates. `approvedGrants: []` therefore models a contradictory peer
+   * (the shape `pairing.test.ts` ④c makes the CLIENT refuse), not a live one.
+   *
+   * Snapshot rather than live read, so a test that mutates the fake's options
+   * cannot change the grants of a socket that already authenticated (the
+   * desktop re-reads the gateway instead and answers GRANT_REVOKED; the fake
+   * does not model revocation, so a stable snapshot is the honest shape).
+   *
+   * A socket that somehow authenticated without this field is judged UNGRANTED
+   * for `agent` — see the `?? []` in `#requireAgent`, the fail-closed direction.
+   */
+  grants?: readonly string[]
+  /**
    * Arrival timestamps for THIS socket, which is the window the rate cap is
    * judged over. The real desktop's cap is per-connection: a second client
    * dialing in has its own budget and cannot be starved by a noisy first one.
@@ -2053,16 +2076,16 @@ export class FakeCherry {
     const delay = this.#methodDelayMs.get(method) ?? this.#requestDelayMs ?? this.#options.requestDelayMs
     if (delay !== undefined) await sleep(delay)
     // The desktop wraps EVERY `agent.*` face in `requireAgent()` →
-    // `requireCapability('agent')` → `requireAuthentication()`
-    // (RemoteConnection.ts:50-52, 198-204), so the whole namespace is
-    // unreachable before the socket authenticates — one check here, not one per
-    // handler, which is also what a face added later inherits.
+    // `requireCapability('agent')` (RemoteConnection.ts:50-52, 198-204), so the
+    // whole namespace is unreachable before the socket authenticates AND holds
+    // the grant the pairing approved. One check here, not one per handler,
+    // which is also what a face added later inherits.
     //
     // An `agent.*` NAME this switch does not route still gets this verdict,
     // where the desktop answers method-not-found without looking at the
     // connection. That is STRICTER than the peer, never more permissive: it
     // cannot turn a broken client green.
-    if (method.startsWith('agent.')) this.#requireAuthentication(live)
+    if (method.startsWith('agent.')) this.#requireAgent(live)
     switch (method) {
       case 'connection.hello':
         return this.#handleHello(live)
@@ -2077,6 +2100,9 @@ export class FakeCherry {
         // authenticate (authenticateFailure) leaves the connection where the
         // real peer's `this.authentication` would be — unset.
         live.authenticated = true
+        // …and the session carries the approved grants with it, so the two
+        // doors into this state (issue #183) cannot disagree about either.
+        live.grants = this.#approvedDomains()
         return result
       }
       case 'connection.refresh':
@@ -2157,6 +2183,51 @@ export class FakeCherry {
     }
   }
 
+  /**
+   * The desktop's `requireAgent()` → `requireCapability('agent')`
+   * (`RemoteConnection.ts:198-204`), in its own order: the authenticated state
+   * FIRST, then the grant the pairing approved. A socket authenticated for a
+   * device the desktop approved no `agent` capability for is FORBIDDEN here,
+   * where the fake used to answer every face (issue #194).
+   */
+  #requireAgent(live: LiveConnection): void {
+    this.#requireCapability(live, 'agent')
+  }
+
+  /**
+   * The desktop's `requireCapability(domain)` (`RemoteConnection.ts:198-204`), in
+   * its own order: the authenticated state FIRST, then the grant the pairing
+   * approved for THAT domain. Every capability-gated face goes through here —
+   * the `agent.*` namespace and `connection.endpoints` alike.
+   */
+  #requireCapability(live: LiveConnection, domain: string): void {
+    this.#requireAuthentication(live)
+    // `?? []`: an authenticated socket with no recorded grants is judged
+    // UNGRANTED. Fail-closed — the alternative (`?? ['agent']`) would answer a
+    // socket whose door forgot to record, which is the bug this gate exists for.
+    if (!(live.grants ?? []).includes(domain)) {
+      throw new FakeRpcError({ reason: 'FORBIDDEN', message: 'Capability was not approved during pairing' })
+    }
+  }
+
+  /**
+   * The domains this peer's pairing approved — the `authorization.grants` the
+   * desktop returns from `pairing.get` and re-reads on every
+   * `requireAuthentication` (answering GRANT_REVOKED when it changed) — that
+   * re-read is what the fake does not model. Callers SNAPSHOT the value onto the
+   * socket (or into a reply); nothing here reads the live socket. Read from the
+   * option so both doors agree
+   * and `approvedGrants: []` is representable.
+   */
+  #approvedDomains(): readonly string[] {
+    return this.#options.approvedGrants ?? ['agent']
+  }
+
+  /** The reply's grant records, from the same domains the socket is judged on. */
+  #grantRecords(): { domain: string; grantId: string }[] {
+    return this.#approvedDomains().map((domain) => ({ domain, grantId: `grant-${domain}` }))
+  }
+
   #handleHello(live: LiveConnection): Record<string, unknown> {
     // Injected refusal FIRST: the peer never reads the echo at all, which is
     // the same wire shape as a real version rejection (one structured failure,
@@ -2223,7 +2294,10 @@ export class FakeCherry {
     if (this.#authenticateFailure !== undefined) throw new FakeRpcError(this.#authenticateFailure)
     const token = this.#issueToken()
     return {
-      authorization: { grants: [{ domain: 'agent', grantId: 'grant-1' }] },
+      // The reply's grants are the domains this socket will be judged on — one
+      // source, so an `approvedGrants: ['configuration']` peer cannot answer
+      // `agent` here and then deny it on the next call.
+      authorization: { grants: this.#grantRecords() },
       accessToken: token.token,
       expiresAt: new Date(token.expiresAt).toISOString(),
       deviceId: params['deviceId'],
@@ -2239,12 +2313,13 @@ export class FakeCherry {
     live: LiveConnection,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    this.#requireAuthentication(live)
-    // MVP grants are `agent` only, so any other domain is a capability the
-    // desktop would refuse rather than a shape error.
-    if (params['domain'] !== 'agent') {
-      throw new FakeRpcError({ reason: 'FORBIDDEN', message: 'Capability is not granted' })
-    }
+    // `connection.endpoints` is `requireCapability(domain)` for the REQUESTED
+    // domain (RemoteConnection.ts:107-112), not an agent-only face: the fake
+    // hardcoded `domain === 'agent'` while grants were fixed, which became a
+    // lie once `approvedGrants` made them configurable (issue #194). The desktop
+    // re-checks the same capability after `getEndpoints()`; that second check is
+    // unmodeled because nothing here can change grants mid-call.
+    this.#requireCapability(live, params['domain'] as string)
     const options = this.#options.endpoints ?? {}
     if (options.failure !== undefined) throw new FakeRpcError(options.failure)
     if (options.hang === true) await new Promise<never>(() => {})
@@ -2269,7 +2344,9 @@ export class FakeCherry {
     if (this.#refreshFailure !== undefined) throw new FakeRpcError(this.#refreshFailure)
     const token = this.#issueToken()
     return {
-      authorization: { grants: [{ domain: 'agent', grantId: 'grant-1' }] },
+      // Same source as authenticate's reply (and as the socket's own grants):
+      // a refresh re-issues the SAME authorization the desktop re-read.
+      authorization: { grants: this.#grantRecords() },
       accessToken: token.token,
       expiresAt: new Date(token.expiresAt).toISOString(),
     }
@@ -2344,15 +2421,16 @@ export class FakeCherry {
     const token = this.#issueToken()
     this.#issuedAccessToken = token.token
     this.#approvedTokenExpiresAt = this.#options.pairingApprovedExpiresAt ?? new Date(token.expiresAt).toISOString()
-    const grants = (this.#options.approvedGrants ?? ['agent']).map((domain) => ({
-      domain,
-      grantId: `grant-${domain}`,
-    }))
+    const grants = this.#grantRecords()
     // The approved branch AUTHENTICATES the socket, exactly like the desktop's
     // `pairing.get` → `authenticate(result.deviceId)` — which is what makes a
     // capability-gated call legal on the pairing socket. Set before the reply:
     // the client may issue its next request the moment this answer lands.
     live.authenticated = true
+    // The grants the reply hands out are the ones this socket will be judged
+    // against, from the same source — the desktop's `authenticate()` stores the
+    // authorization it just returned.
+    live.grants = this.#approvedDomains()
     return {
       status: 'approved',
       deviceId: this.#approvedDeviceId,
