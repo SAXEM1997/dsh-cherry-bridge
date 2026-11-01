@@ -120,6 +120,19 @@ export interface FakeCherryOptions {
   tokenTtlMs?: number
   /** Every `connection.authenticate` fails with this protocol failure. */
   authenticateFailure?: FakeFailure
+  /**
+   * Every `connection.authenticate` carrying an `accessToken` is refused with
+   * `TOKEN_EXPIRED` / `'Device token expired'`, while a tokenless one succeeds
+   * — the desktop's `tokens.validate` (RemoteConnection.ts:87) rejecting a
+   * stored token it does not hold, on a path that still issues a fresh one.
+   * The pinned params schema types the token as an opaque id (a non-empty
+   * string), so a PRESENT token is never the empty string the desktop's
+   * `if (accessToken)` would skip: presence and truthiness cannot diverge at
+   * this face. Added for #186: the client's stale-token retry needs the FIRST
+   * attempt to fail and the SECOND to succeed, which a static
+   * `authenticateFailure` cannot express.
+   */
+  staleAccessToken?: boolean
   /** Every `connection.refresh` fails with this protocol failure. */
   refreshFailure?: FakeFailure
   /**
@@ -664,6 +677,17 @@ interface IssuedToken {
   expiresAt: number
 }
 
+/** One `connection.authenticate` as the peer handled it (issue #186). */
+export interface AuthenticateAttempt {
+  /** The `deviceId` the client named. */
+  deviceId: unknown
+  /**
+   * The stored token this attempt carried, or `undefined` when it sent none.
+   * The client's stale-token retry is the token getting DROPPED here.
+   */
+  accessToken: string | undefined
+}
+
 interface LiveConnection {
   socket: WebSocket
   channel: SecureChannel
@@ -821,6 +845,8 @@ export class FakeCherry {
   // Runtime-mutable injection state (tests flip these mid-flight).
   #refreshFailure: FakeFailure | undefined
   #authenticateFailure: FakeFailure | undefined
+  /** Mirrors `FakeCherryOptions.staleAccessToken` (read at authenticate time). */
+  #staleAccessToken: boolean
   /** Mirrors `FakeCherryOptions.helloFailure` (read at hello time). */
   #helloFailure: FakeFailure | undefined
   /** Mirrors `FakeCherryOptions.pairingClaimFailure` (read at claim time). */
@@ -852,6 +878,7 @@ export class FakeCherry {
   #helloEchoMatchesOffer = false
   #offeredVersionsAtHello: readonly number[] = []
   #tokenIssues: IssuedToken[] = []
+  #authenticateAttempts: AuthenticateAttempt[] = []
   #refreshCalls: number[] = []
 
   // Pairing face observation (Task 6).
@@ -961,6 +988,7 @@ export class FakeCherry {
     this.#identity = options.identity !== undefined ? Promise.resolve(options.identity) : createDeviceIdentity()
     this.#refreshFailure = options.refreshFailure
     this.#authenticateFailure = options.authenticateFailure
+    this.#staleAccessToken = options.staleAccessToken ?? false
     this.#helloFailure = options.helloFailure
     this.#pairingClaimFailure = options.pairingClaimFailure
     this.#dropPings = options.dropPings ?? false
@@ -1097,6 +1125,22 @@ export class FakeCherry {
   /** Server-side record of every token issued (authenticate and refresh alike). */
   get tokenIssues(): readonly IssuedToken[] {
     return this.#tokenIssues
+  }
+
+  /**
+   * Every `connection.authenticate` the peer HANDLED, in order, with the token
+   * it carried (issue #186). The client's stale-token retry is visible only
+   * here: a re-sent token and a dropped one are indistinguishable from the
+   * reply alone.
+   *
+   * "Handled" means the request reached `#handleAuthenticate`: the hello and
+   * stale-token refusals INSIDE it are recorded (the retry's first attempt is
+   * one of them), while an attempt the dispatch arm refuses because the socket
+   * is already authenticated is not — it never reaches this handler. Arrival
+   * counting, which includes that refusal, is `authenticateCount`.
+   */
+  get authenticateAttempts(): readonly AuthenticateAttempt[] {
+    return this.#authenticateAttempts
   }
 
   /** Wall-clock times of refresh calls, for "refreshed before expiry" assertions. */
@@ -2017,7 +2061,7 @@ export class FakeCherry {
         // pairing approval is the OTHER door into that state. Without this the
         // fake accepted a re-authenticate the desktop would have rejected.
         this.#requireUnauthenticated(live)
-        const result = this.#handleAuthenticate(params)
+        const result = this.#handleAuthenticate(live, params)
         // Only an ISSUED token authenticates the socket: a refused
         // authenticate (authenticateFailure) leaves the connection where the
         // real peer's `this.authentication` would be — unset.
@@ -2025,7 +2069,7 @@ export class FakeCherry {
         return result
       }
       case 'connection.refresh':
-        return this.#handleRefresh()
+        return this.#handleRefresh(live)
       case 'connection.endpoints':
         return await this.#handleEndpoints(live, params)
       case 'connection.ping':
@@ -2065,7 +2109,7 @@ export class FakeCherry {
     }
   }
 
-  /** The real desktop's gate: pairing/authenticate require a confirmed hello. */
+  /** The real desktop's gate: pairing/authenticate/refresh require a confirmed hello. */
   #requireHello(live: LiveConnection): void {
     if (!live.hello) {
       throw new FakeRpcError({ reason: 'INVALID_CONNECTION_STATE', message: 'Hello is required' })
@@ -2084,6 +2128,21 @@ export class FakeCherry {
         reason: 'INVALID_CONNECTION_STATE',
         message: 'Connection is already authenticated',
       })
+    }
+  }
+
+  /**
+   * The desktop's `requireAuthentication(refresh)` as far as this fake models
+   * it (`RemoteConnection.ts:209-219`): hello first, then the authenticated
+   * state. The real helper ALSO judges token expiry (with the refresh grace)
+   * and re-reads the grant, which the fake does not model: its token ledger is
+   * observation only and its sockets carry no expiry.
+   */
+  #requireAuthentication(live: LiveConnection): void {
+    this.#requireHello(live)
+    if (!live.authenticated) {
+      // The real `requireAuthentication` wording (RemoteConnection.ts:212).
+      throw new FakeRpcError({ reason: 'UNAUTHENTICATED', message: 'Device authentication is required' })
     }
   }
 
@@ -2133,7 +2192,23 @@ export class FakeCherry {
     return reply
   }
 
-  #handleAuthenticate(params: Record<string, unknown>): Record<string, unknown> {
+  #handleAuthenticate(live: LiveConnection, params: Record<string, unknown>): Record<string, unknown> {
+    this.#authenticateAttempts.push({
+      deviceId: params['deviceId'],
+      accessToken: params['accessToken'] as string | undefined,
+    })
+    // The desktop's `authenticate()` helper runs `requireHello()` before it
+    // looks at grants or the token (RemoteConnection.ts:84) — the handler's
+    // already-authenticated check happened in the dispatch arm, above.
+    this.#requireHello(live)
+    // A stored token the peer no longer accepts. The desktop's
+    // `tokens.validate` refuses the TOKEN, never the reconnect: the same call
+    // without it is answered (and issues a fresh one). The desktop's own test
+    // is `if (accessToken)`, and the params schema already refuses the empty
+    // string, so PRESENCE is that test at this face.
+    if (this.#staleAccessToken && params['accessToken'] !== undefined) {
+      throw new FakeRpcError({ reason: 'TOKEN_EXPIRED', message: 'Device token expired' })
+    }
     if (this.#authenticateFailure !== undefined) throw new FakeRpcError(this.#authenticateFailure)
     const token = this.#issueToken()
     return {
@@ -2153,11 +2228,7 @@ export class FakeCherry {
     live: LiveConnection,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
-    this.#requireHello(live)
-    if (!live.authenticated) {
-      // The real `requireAuthentication` wording (RemoteConnection.ts:212).
-      throw new FakeRpcError({ reason: 'UNAUTHENTICATED', message: 'Device authentication is required' })
-    }
+    this.#requireAuthentication(live)
     // MVP grants are `agent` only, so any other domain is a capability the
     // desktop would refuse rather than a shape error.
     if (params['domain'] !== 'agent') {
@@ -2178,7 +2249,11 @@ export class FakeCherry {
     }
   }
 
-  #handleRefresh(): Record<string, unknown> {
+  #handleRefresh(live: LiveConnection): Record<string, unknown> {
+    // The desktop runs `requireAuthentication(true)` before `authenticate()`,
+    // so an unauthenticated socket is refused BEFORE the mint — and before
+    // this ledger records anything.
+    this.#requireAuthentication(live)
     this.#refreshCalls.push(Date.now())
     if (this.#refreshFailure !== undefined) throw new FakeRpcError(this.#refreshFailure)
     const token = this.#issueToken()

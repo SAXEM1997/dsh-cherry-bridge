@@ -1048,6 +1048,35 @@ describe('DeviceConnection over a real loopback channel', () => {
     expect(fakeInfo.fake.authenticateCount).toBe(1)
   })
 
+  it('⑩b retries a stored token the peer calls STALE exactly once, WITHOUT it, then connects', async () => {
+    const identity = await createDeviceIdentity()
+    // Every token-carrying authenticate is refused TOKEN_EXPIRED; a tokenless
+    // one is accepted — the peer-side shape of an expired stored token.
+    const fakeInfo = await makeFake({ staleAccessToken: true })
+    const connection = makeConnection({
+      identity,
+      record: recordFor(fakeInfo, {
+        accessToken: 'tok-stale',
+        tokenExpiresAt: Date.now() + 600_000,
+      }),
+    })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+
+    // The retry exists for a token the peer no longer accepts, so the second
+    // attempt must DROP it — a re-send of the same token would fail again.
+    expect(fakeInfo.fake.authenticateAttempts.map((attempt) => attempt.accessToken)).toEqual([
+      'tok-stale',
+      undefined,
+    ])
+    // Only the accepted attempt minted, and the session is genuinely usable.
+    expect(fakeInfo.fake.tokenIssues).toHaveLength(1)
+    await expect(
+      assemblyToolCall(connection, 'agent.sessions.list', { agentId: 'agent-1' }),
+    ).resolves.toBeDefined()
+  })
+
   it('⑪ invalidates every stored pairing after the local identity key is regenerated: all old records fail authentication and go offline', async () => {
     const regenerated = await createDeviceIdentity() // the NEW local identity
     const fakeInfo = await makeFake({
