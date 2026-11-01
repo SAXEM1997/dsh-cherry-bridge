@@ -222,3 +222,77 @@ describe('the fake peer after pairing.get approves a device (issue #183)', () =>
     expect((error as JsonRpcRequestError).message).toBe('Connection is already authenticated')
   })
 })
+
+/**
+ * The DESKTOP's other handshake gates (issue #186). #183 modelled the
+ * authenticated STATE; these pin the preconditions around it, which the fake
+ * used to skip:
+ *
+ *  - `connection.authenticate` runs its own `requireHello()` inside the
+ *    `authenticate()` helper (`RemoteConnection.ts:84`), AFTER the handler's
+ *    already-authenticated check;
+ *  - `connection.refresh` runs `requireAuthentication(true)`
+ *    (`RemoteConnection.ts:101-104, 209-219`), whose first act is
+ *    `requireHello()` and whose second is the unauthenticated refusal.
+ *
+ * Both gates sit BEFORE the mint, so "refused" and "refused after minting"
+ * are told apart by the peer's own ledgers, not by the error alone.
+ */
+describe("the fake peer's pre-authentication gates (issue #186)", () => {
+  it('#186a connection.authenticate on an un-greeted socket answers the hello verdict and authenticates nothing', async () => {
+    const peer = await openRaw({})
+
+    // The handler checks "already authenticated" FIRST (covered by #183b), so
+    // this fresh socket reaches the helper's hello gate, not that one.
+    const error = await failureOf(
+      peer.client.request('connection.authenticate', { deviceId: 'dev-raw' }),
+    )
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'INVALID_CONNECTION_STATE' })
+    expect((error as JsonRpcRequestError).message).toBe('Hello is required')
+    // POSITION: the gate sits before the mint, like the desktop's helper.
+    expect(peer.fake.tokenIssues).toHaveLength(0)
+
+    // …and the refusal must not have flipped the state it gates: if it had,
+    // this second call would be answered "already authenticated" instead.
+    await greet(peer.client)
+    const accepted = await peer.client.request<{ accessToken: string }>('connection.authenticate', {
+      deviceId: 'dev-raw',
+    })
+    expect(typeof accepted.accessToken).toBe('string')
+    expect(peer.fake.tokenIssues).toHaveLength(1)
+  })
+
+  it('#186b connection.refresh requires the authenticated state: a helloed-but-unauthenticated socket is refused before the mint', async () => {
+    const peer = await openRaw({})
+    await greet(peer.client)
+
+    const error = await failureOf(peer.client.request('connection.refresh', {}))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
+    // The desktop's own `requireAuthentication` wording (RemoteConnection.ts).
+    expect((error as JsonRpcRequestError).message).toBe('Device authentication is required')
+    // `requireAuthentication` runs before `tokens.issue`, so a refused refresh
+    // leaves no trace in either of the peer's ledgers.
+    expect(peer.fake.refreshCalls).toHaveLength(0)
+    expect(peer.fake.tokenIssues).toHaveLength(0)
+
+    // The same call is legal ONCE the socket is authenticated, and it mints.
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+    const refreshed = await peer.client.request<{ accessToken: string }>('connection.refresh', {})
+    expect(typeof refreshed.accessToken).toBe('string')
+    expect(peer.fake.refreshCalls).toHaveLength(1)
+  })
+
+  it('#186c connection.refresh on an un-greeted socket answers the hello verdict first', async () => {
+    const peer = await openRaw({})
+
+    // `requireAuthentication` is hello THEN authentication; a socket missing
+    // both must be judged by the earlier gate.
+    const error = await failureOf(peer.client.request('connection.refresh', {}))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'INVALID_CONNECTION_STATE' })
+    expect((error as JsonRpcRequestError).message).toBe('Hello is required')
+    expect(peer.fake.refreshCalls).toHaveLength(0)
+  })
+})
