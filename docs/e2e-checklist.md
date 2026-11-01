@@ -46,6 +46,11 @@
 **权威来源**；实时 `interaction.updated` 流是**加速器/保鲜器**——它让插件不必为每张卡都
 回查一次，但**不保证**送达，也不构成资格依据。任何一张卡都必须仅凭 list 快照可应答。
 
+**上游实证**：2.1.9 之前，桌面的通知发送链会被一次失败**永久毒死**——`RemoteConnection.send()`
+把可 rejected 的 Promise 直接存回链头，此后该连接上的 `interaction.updated` 等通知静默停发，
+而请求-应答不受影响（应答不走这条链）。2.1.9 由 PR #22593 修复。这就是「实时流只是加速器、
+list 快照才是权威」的实证来源：一条健康的连接随时可能不再推送任何通知。
+
 **手动核验步骤**（与 `CONTRACT_DIFFERENCES[1].checklistStep` 同源）：
 
 - [ ] approval-card-not-realtime: trigger a tool call on the real desktop that raises an approval card; confirm `cherry_interactions` finds it through `agent.interactions.list` even when no `interaction.updated` event arrived, and that `cherry_respond` still accepts the listed snapshot.
@@ -269,7 +274,7 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
 - [ ] 该端点同样受信任 fence 约束：非回环 Host、非同源 Origin、`sec-fetch-site: cross-site`
       一律 403；无 Origin 的非浏览器客户端放行。
 - [ ] 全流程日志不含 token / invitationSecret / accessToken / 消息文本 / part 文本。
-- [ ] **上游版本核验**（桌面端为 2.1.4–2.1.8 或已比对过的更新版本；依据见
+- [ ] **上游版本核验**（桌面端为 2.1.4–2.1.10 或已比对过的更新版本；依据见
       src/AGENTS.md「Protocol basis」）：
       - [ ] 桌面端**升级后无需重新配对**：设备档案直接连上，`desktopIdentity` 未变。
       - [ ] 桌面端为 2.1.5+ 且会话里有**来自手机上传的附件**时：该 part 为 `kind:"file"`
