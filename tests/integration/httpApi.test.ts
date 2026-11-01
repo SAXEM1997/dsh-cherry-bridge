@@ -1137,6 +1137,36 @@ describe('④ PATCH address maintenance', () => {
     expect(status).toBe(200)
     expect(json.security).toEqual({ 'nas.example': 'ws' })
     expect(json.ports).toEqual({ 'nas.example': 4444 })
+    // The PERSISTED record, not just the reply: the response is projected from
+    // the same `next` object the store just accepted, so only a re-read proves
+    // the map that survives is the one the next handshake will dial with.
+    expect(store.list()[0]!.security).toEqual({ 'nas.example': 'ws' })
+    expect(store.list()[0]!.ports).toEqual({ 'nas.example': 4444 })
+  })
+
+  it('a THIRD spelling inherits the FIRST listed spelling when the archive holds two', async () => {
+    mount()
+    // The collision rule has to be a CONTRACT, not an implementation accident:
+    // the exact lookup misses (a third spelling), so the fallback decides, and
+    // it takes the first-listed entry — deterministic for a given archive.
+    store.upsert(
+      record({
+        hosts: ['NAS.example', 'nas.example'],
+        security: { 'NAS.example': 'wss', 'nas.example': 'ws' },
+        ports: { 'NAS.example': 4443, 'nas.example': 4444 },
+      }),
+    )
+
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['Nas.example'] }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.security).toEqual({ 'Nas.example': 'wss' })
+    expect(json.ports).toEqual({ 'Nas.example': 4443 })
+    expect(store.list()[0]!.security).toEqual({ 'Nas.example': 'wss' })
+    expect(store.list()[0]!.ports).toEqual({ 'Nas.example': 4443 })
   })
 
   it('refuses a hosts replacement holding two spellings of one host', async () => {

@@ -1546,10 +1546,12 @@ function sameHosts(a: readonly string[], b: readonly string[]): boolean {
  * address edit, not a scheme edit — re-typing the same host must not silently
  * demote a TLS-proxied desktop to a plain dial.
  *
- * "The same host" is CASE-INSENSITIVE (issue #189), matching every other host
- * comparison on this face: `NAS.example` and `nas.example` are one address, so
- * a PATCH that re-types the case keeps the remembered scheme instead of
- * resetting it to `ws`.
+ * "The same host" is CASE-INSENSITIVE (issue #189), the same comparison the
+ * learn merge, the forget/remember actions and the mark clearing already use:
+ * `NAS.example` and `nas.example` are one address, so a PATCH that re-types
+ * the case keeps the remembered scheme instead of resetting it to `ws`.
+ * `sameHosts`/`sameSecurity` stay EXACT on purpose — they decide whether an
+ * address edit happened at all, and a new spelling IS a change to persist.
  */
 function securityFor(
   hosts: readonly string[],
