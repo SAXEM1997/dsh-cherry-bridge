@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
-import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
+import { LastCandidateHostError, QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import {
   DEVICE_SETTLE_WAIT_MS,
   INTERACTIONS_LIST_PAGE_CLAMP,
@@ -111,6 +111,13 @@ export interface CherryDeviceView {
   enabled: boolean
   hosts: string[]
   port: number
+  /**
+   * The addresses the operator has FORGOTTEN (issue #185): not dialed, and not
+   * re-learned from the desktop's advertisements until they are remembered.
+   * Always present on a view (empty when nothing was ever forgotten) so a
+   * caller never has to distinguish "absent" from "none".
+   */
+  forgottenHosts: string[]
 }
 
 /** The shared `{device, state}` verdict (spec §6: 设备离线). */
@@ -1643,6 +1650,40 @@ function optionalString(value: unknown): string | undefined {
 }
 
 /**
+ * The `hosts` argument of `cherry_devices`' write actions (issue #185): a
+ * non-empty list of non-empty host names, with no case-variant duplicate.
+ *
+ * Each rule is a state the store would have to interpret: an empty name can
+ * never match a dialed host, and two spellings of one host would make "is this
+ * address forgotten?" depend on which entry a comparison hit first. Values are
+ * TRIMMED here (the model-facing surface is where a stray space is caught);
+ * the archive then stores the spelling it already had for a dialed host.
+ */
+function hostListArgument(value: unknown): string[] | Record<string, unknown> {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { error: 'invalid-hosts', message: '`hosts` must be a non-empty array of host names' }
+  }
+  const hosts: string[] = []
+  const seen = new Set<string>()
+  for (const entry of value) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      return { error: 'invalid-hosts', message: '`hosts` entries must be non-empty strings' }
+    }
+    const host = entry.trim()
+    const key = host.toLowerCase()
+    if (seen.has(key)) {
+      return {
+        error: 'invalid-hosts',
+        message: `\`hosts\` names "${host}" more than once (host names are case-insensitive)`,
+      }
+    }
+    seen.add(key)
+    hosts.push(host)
+  }
+  return hosts
+}
+
+/**
  * The peer's `agent.messages.send` refusal for a STALE `expectedIdleRevision`,
  * in the exact shape Cherry Studio answers it: a `rejected` receipt whose
  * `error` is `{reason: 'CONFLICT', message: 'Session is not idle at the
@@ -2729,25 +2770,100 @@ export class CherryToolEngine {
       description:
         'List every paired Cherry Studio desktop with its connection state ' +
         '(connected/connecting/offline/disabled/identity-mismatch). An optional `device` ' +
-        'narrows the list to one device (display name prefix or deviceId).',
+        'narrows the list to one device (display name prefix or deviceId). ' +
+        '`action: "forget"` removes the named `hosts` from that device\'s dial candidates AND ' +
+        'stops the desktop\'s advertisements from adding them back; `action: "remember"` lifts ' +
+        'that mark, so the next handshake may learn them again. Both write actions require ' +
+        '`device` and `hosts`.',
       parameters: {
         type: 'object',
         properties: {
           device: { type: 'string', description: 'Optional device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
+          action: {
+            type: 'string',
+            enum: ['list', 'forget', 'remember'],
+            description:
+              'What to do: `list` (the default) reads the devices; `forget`/`remember` edit ONE ' +
+              "device's forgotten addresses and require `device` and `hosts`.",
+          },
+          hosts: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'For `forget`/`remember`: the host names to act on, matched case-insensitively. ' +
+              '`forget` refuses to remove the last remaining address.',
+          },
         },
         additionalProperties: false,
       },
       execute: async (args) => {
+        const action = optionalString(args['action']) ?? 'list'
+        if (action !== 'list' && action !== 'forget' && action !== 'remember') {
+          return {
+            error: 'invalid-action',
+            message: '`action` accepts exactly "list", "forget" or "remember"',
+          } satisfies Record<string, unknown>
+        }
         const selector = optionalString(args['device'])
+        if (action === 'list') {
+          const quarantined = this.#quarantineVerdict()
+          if (quarantined !== undefined) return quarantined
+          if (selector === undefined) {
+            const records = this.#deps.store.list()
+            return { devices: await Promise.all(records.map((record) => this.#deviceView(record))) }
+          }
+          const selected = this.#selectRecords(selector)
+          if (!Array.isArray(selected)) return selected
+          return { devices: await Promise.all(selected.map((record) => this.#deviceView(record))) }
+        }
+        if (selector === undefined) {
+          return {
+            error: 'device-required',
+            message:
+              '`action` "forget"/"remember" needs `device`: a selector that names exactly one device',
+          } satisfies Record<string, unknown>
+        }
+        const hosts = hostListArgument(args['hosts'])
+        if (!Array.isArray(hosts)) return hosts
         const quarantined = this.#quarantineVerdict()
         if (quarantined !== undefined) return quarantined
-        if (selector === undefined) {
-          const records = this.#deps.store.list()
-          return { devices: await Promise.all(records.map((record) => this.#deviceView(record))) }
-        }
         const selected = this.#selectRecords(selector)
         if (!Array.isArray(selected)) return selected
-        return { devices: await Promise.all(selected.map((record) => this.#deviceView(record))) }
+        const record = selected[0]!
+        let removed: string[] = []
+        let marked: string[] = []
+        let restored: string[] = []
+        try {
+          if (action === 'forget') {
+            ;({ removed, marked } = this.#deps.store.forgetEndpoints(record.deviceId, hosts))
+          } else {
+            ;({ restored } = this.#deps.store.rememberEndpoints(record.deviceId, hosts))
+          }
+        } catch (error) {
+          if (error instanceof LastCandidateHostError) {
+            return {
+              error: 'last-address',
+              device: record.deviceId,
+              message: error.message,
+            } satisfies Record<string, unknown>
+          }
+          throw error
+        }
+        const changed = removed.length > 0 || marked.length > 0 || restored.length > 0
+        // ADDRESS MAINTENANCE reaches the LIVE connection, exactly like the HTTP
+        // PATCH's eviction: a pooled `DeviceConnection` captures its record at
+        // construction, so an instance built before this write would keep
+        // dialing the forgotten host and locally re-adding it on every
+        // reconnect. Evicting drops that socket and makes the next `connect()`
+        // rebuild from the archive we just wrote.
+        if (changed) await this.#deps.evict(record.deviceId)
+        // The resolved record is STALE (hosts/forgottenHosts moved), so the
+        // view is built from the archive's current row, never from the object
+        // the selector handed us.
+        const fresh = this.#deps.store.list().find((entry) => entry.deviceId === record.deviceId)
+        if (fresh === undefined) return this.#notFoundVerdict(selector)
+        const device = await this.#deviceView(fresh)
+        return action === 'forget' ? { device, removed, marked } : { device, restored }
       },
     })
   }
@@ -2814,6 +2930,7 @@ export class CherryToolEngine {
       enabled: record.enabled,
       hosts: record.hosts,
       port: record.port,
+      forgottenHosts: record.forgottenHosts ?? [],
     }
   }
 

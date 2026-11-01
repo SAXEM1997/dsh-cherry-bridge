@@ -76,6 +76,21 @@ export interface DeviceRecord {
    * `ports` from `port`; `port` itself stays the record-level fallback.
    */
   ports: Record<string, number>
+  /**
+   * Addresses the operator has FORGOTTEN (issue #185): never dialed and never
+   * learned again, matched CASE-INSENSITIVELY and disjoint from `hosts` — a
+   * record may not dial what it has forgotten, and `assertValidRecord` refuses
+   * the overlap rather than picking a winner at read time.
+   *
+   * OPTIONAL on purpose, and therefore not in {@link REQUIRED_KEYS}. Absence is
+   * the total default ("nothing forgotten"); no invariant depends on the key
+   * being present, unlike `security`/`ports` whose absence would make a host
+   * undialable; and an older build ignores an unknown key instead of refusing
+   * the archive. A `schemaVersion` bump would invalidate every v4 archive (and
+   * every fixture built from the v4 shape) for a list whose empty value needs
+   * no migration.
+   */
+  forgottenHosts?: string[]
   desktopIdentity: string
   grants: 'agent'[]
   /** Paired with `tokenExpiresAt`: present together or absent together. */
@@ -137,11 +152,11 @@ export const MAX_CANDIDATE_HOSTS = 32
  *    both hold a dial slot. (An IPv6 literal in a different EXPANSION is NOT
  *    reconciled here; the PATCH path owns the archive's spelling, and it does
  *    not canonicalize either.)
- *  - nothing is ever removed, and nothing is remembered as removed: a host the
- *    peer still advertises is re-learned after an operator PATCH drops it. The
- *    peer is the source of truth for where it listens, so this is the intended
- *    reading of "add-only" — to make a removal stick, stop the desktop
- *    advertising the address (or disable the device);
+ *  - nothing is removed HERE: a host the peer still advertises is re-learned
+ *    after an operator PATCH drops it, because the peer is the source of truth
+ *    for where it listens. The operator's answer to that is `forgetEndpoints`
+ *    (issue #185), whose mark this function honours — addition stays add-only,
+ *    and forgetting is a separate, explicit decision;
  *  - host, port and scheme are appended TOGETHER, which is what keeps the v4
  *    one-entry-per-host invariant true. That invariant is enforced on the READ
  *    path by `assertValidSecurity`/`assertValidPorts`, and a semantic failure
@@ -164,10 +179,14 @@ export function mergeAdvertisedEndpoints(
   // this answer has added so far: a duplicate inside one answer must not take a
   // second slot either.
   const dialed = new Set(record.hosts.map((host) => host.toLowerCase()))
+  // A FORGOTTEN address is skipped here, not removed afterwards: the operator's
+  // decision outranks the peer's snapshot, and an answer that names it must not
+  // even spend a dial slot on it.
+  const forgotten = new Set((record.forgottenHosts ?? []).map((host) => host.toLowerCase()))
   let added = 0
   for (const endpoint of endpoints) {
     const key = endpoint.host.toLowerCase()
-    if (dialed.has(key)) continue
+    if (dialed.has(key) || forgotten.has(key)) continue
     if (record.hosts.length >= MAX_CANDIDATE_HOSTS) break
     record.hosts.push(endpoint.host)
     record.ports[endpoint.host] = endpoint.port
@@ -346,6 +365,7 @@ function assertValidRecord(disk: DeviceRecordOnDisk): DeviceRecord {
   }
   assertValidSecurity(disk.hosts, disk.security)
   assertValidPorts(disk.hosts, disk.ports)
+  assertValidForgotten(disk.hosts, disk.forgottenHosts)
 
   // accessToken / tokenExpiresAt live and die together.
   const hasToken = disk.accessToken !== undefined
@@ -431,6 +451,38 @@ function assertValidPorts(hosts: string[], ports: unknown): void {
         `device archive entry field ports["${host}"] must be an integer in 1..65535`,
       )
     }
+  }
+}
+
+/**
+ * `forgottenHosts`, when present, must be a list of non-empty strings with no
+ * case-variant duplicates and no overlap with `hosts`.
+ *
+ * Each rule refuses a state whose MEANING is ambiguous: two spellings of one
+ * host make "is this address suppressed?" depend on which entry the comparison
+ * hit first, and a host that is both dialed and forgotten makes the dial list
+ * and the suppression list disagree about the same address. The message names
+ * the offending host — these are addresses an operator chose, not secrets.
+ */
+function assertValidForgotten(hosts: string[], forgotten: unknown): void {
+  if (forgotten === undefined) return
+  if (!Array.isArray(forgotten)) {
+    throw new Error('device archive entry field forgottenHosts must be an array')
+  }
+  const dialed = new Set(hosts.map((host) => host.toLowerCase()))
+  const seen = new Set<string>()
+  for (const entry of forgotten) {
+    if (typeof entry !== 'string' || entry.length === 0) {
+      throw new Error('device archive entry field forgottenHosts must list non-empty strings')
+    }
+    const key = entry.toLowerCase()
+    if (seen.has(key)) {
+      throw new Error(`device archive entry lists host "${entry}" in forgottenHosts more than once`)
+    }
+    if (dialed.has(key)) {
+      throw new Error(`device archive entry names host "${entry}" in both hosts and forgottenHosts`)
+    }
+    seen.add(key)
   }
 }
 
@@ -647,6 +699,31 @@ export class QuarantinedArchiveError extends Error {
    */
   withCorruptPath(corruptPath: string | undefined): QuarantinedArchiveError {
     return new QuarantinedArchiveError(this.file, this.cause, corruptPath)
+  }
+}
+
+/**
+ * Refusal raised by {@link DeviceStore.forgetEndpoints} when the operation
+ * would leave a record with NO dial candidate.
+ *
+ * A record with nothing to dial is worse than the stale address the operator
+ * wanted gone: every tool would answer `offline` until a re-pair (the only
+ * operation that writes a fresh `hosts` list), and the archive would look
+ * healthy the whole time. The check is ATOMIC — the whole call refuses, so a
+ * name for the last host cannot remove a different host on its way to failing.
+ * Nothing is written when this is thrown.
+ */
+export class LastCandidateHostError extends Error {
+  readonly deviceId: string
+
+  constructor(deviceId: string) {
+    super(
+      `device ${deviceId}: refusing to forget the last dial candidate — the record would have ` +
+        'nothing to dial. Keep at least one address.',
+    )
+    this.name = 'LastCandidateHostError'
+    this.deviceId = deviceId
+    Object.setPrototypeOf(this, new.target.prototype)
   }
 }
 
@@ -877,6 +954,99 @@ export class DeviceStore {
     next[index] = merged
     this.#persist(next)
     return added
+  }
+
+  /**
+   * FORGETS addresses (issue #185): drops each named host from the dial list —
+   * host, scheme and port as one unit — and records it so the next
+   * advertisement cannot put it back. Returns the hosts that left the dial list
+   * (`removed`) and the marks this call added (`marked`).
+   *
+   * This is the operation learning cannot provide. `connection.endpoints` is
+   * asked on every handshake, so an address the desktop still advertises
+   * returns after any removal the operator makes by PATCH; forgetting is the
+   * explicit decision that outranks it.
+   *
+   * - Matching is CASE-INSENSITIVE (a PATCHed record keeps the operator's
+   *   spelling, the peer's schema lowercases what it advertises), and the mark
+   *   records the ARCHIVE's spelling when the host was dialed, the caller's
+   *   otherwise.
+   * - Naming an address the record does not dial is legal and still marks it:
+   *   suppression is the point, and a pre-emptive forget must survive until
+   *   the peer advertises the address.
+   * - Removing the LAST candidate throws {@link LastCandidateHostError} and
+   *   writes NOTHING — no host, no scheme, no port, no mark.
+   * - A call that changes no byte (the host was already forgotten) does not
+   *   rewrite (or fsync) the archive.
+   *
+   * The write goes through `#persist` on a CLONE with the result re-validated,
+   * so a caller-supplied junk host can never land a record the next read would
+   * refuse. An unknown `deviceId` is a no-op, like {@link learnEndpoints}.
+   */
+  forgetEndpoints(deviceId: string, hosts: readonly string[]): { removed: string[]; marked: string[] } {
+    const devices = this.#load()
+    const index = devices.findIndex((record) => record.deviceId === deviceId)
+    if (index < 0) return { removed: [], marked: [] }
+    const merged = structuredClone(devices[index]!)
+    const wanted = new Set(hosts.map((host) => host.toLowerCase()))
+    const removed = merged.hosts.filter((host) => wanted.has(host.toLowerCase()))
+    if (removed.length > 0 && removed.length === merged.hosts.length) {
+      throw new LastCandidateHostError(deviceId)
+    }
+    for (const host of removed) {
+      delete merged.security[host]
+      delete merged.ports[host]
+    }
+    merged.hosts = merged.hosts.filter((host) => !wanted.has(host.toLowerCase()))
+    const forgotten = merged.forgottenHosts ?? []
+    const known = new Set(forgotten.map((host) => host.toLowerCase()))
+    const marked: string[] = []
+    for (const host of hosts) {
+      const key = host.toLowerCase()
+      if (known.has(key)) continue
+      const spelling = removed.find((entry) => entry.toLowerCase() === key) ?? host
+      forgotten.push(spelling)
+      known.add(key)
+      marked.push(spelling)
+    }
+    if (removed.length === 0 && marked.length === 0) return { removed: [], marked: [] }
+    merged.forgottenHosts = forgotten
+    assertValidRecord(merged)
+    const next = [...devices]
+    next[index] = merged
+    this.#persist(next)
+    return { removed, marked }
+  }
+
+  /**
+   * Lifts a forget mark (issue #185), returning the marks that were removed.
+   *
+   * It does NOT dial the host again: it only lets the next handshake's
+   * advertisement add it back through the ordinary learning path, with the
+   * port and scheme the peer reports at that moment. An operator who wants the
+   * address back immediately PATCHes it into `hosts`, which clears the mark on
+   * the same write.
+   *
+   * No-op (and no write) when the device is unknown, nothing is forgotten, or
+   * none of the named hosts is marked.
+   */
+  rememberEndpoints(deviceId: string, hosts: readonly string[]): { restored: string[] } {
+    const devices = this.#load()
+    const index = devices.findIndex((record) => record.deviceId === deviceId)
+    if (index < 0) return { restored: [] }
+    const current = devices[index]!.forgottenHosts ?? []
+    if (current.length === 0) return { restored: [] }
+    const wanted = new Set(hosts.map((host) => host.toLowerCase()))
+    const restored = current.filter((host) => wanted.has(host.toLowerCase()))
+    if (restored.length === 0) return { restored: [] }
+    const merged = structuredClone(devices[index]!)
+    merged.forgottenHosts = (merged.forgottenHosts ?? []).filter(
+      (host) => !wanted.has(host.toLowerCase()),
+    )
+    const next = [...devices]
+    next[index] = merged
+    this.#persist(next)
+    return { restored }
   }
 
   #load(): DeviceRecord[] {

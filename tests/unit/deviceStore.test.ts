@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
+import { existsSync } from 'node:fs'
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -28,6 +29,7 @@ import * as fs from 'node:fs'
 import {
   CURRENT_SCHEMA_VERSION,
   DeviceStore,
+  LastCandidateHostError,
   MAX_CANDIDATE_HOSTS,
   mergeAdvertisedEndpoints,
   type DeviceRecord,
@@ -984,6 +986,196 @@ describe('DeviceStore.learnEndpoints (issue #143)', () => {
     ).toBe(0)
     expect(fs.fsyncSync).not.toHaveBeenCalled()
     expect(store.list()[0]?.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
+  })
+})
+
+
+describe('DeviceStore.forgetEndpoints / rememberEndpoints (issue #185)', () => {
+  // Learning is ADD-ONLY, so the only thing that could ever remove an address was
+  // an external edit of the archive — and the next handshake put it straight back
+  // (the peer is the source of truth for where it listens). These cases pin the
+  // missing half: an operator (through `cherry_devices`) can FORGET a named
+  // address, which both drops it from the dial list and stops it being learned,
+  // and REMEMBER it again when the peer's story becomes true once more.
+
+  it('⑲a forget drops the host, its scheme and its port as ONE unit, and marks it', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(
+      makeRecord({
+        hosts: ['10.0.0.5', '10.0.0.6'],
+        security: { '10.0.0.5': 'ws', '10.0.0.6': 'wss' },
+        ports: { '10.0.0.5': 1111, '10.0.0.6': 2222 },
+      }),
+    )
+
+    expect(store.forgetEndpoints('dev-alpha', ['10.0.0.6'])).toEqual({
+      removed: ['10.0.0.6'],
+      marked: ['10.0.0.6'],
+    })
+
+    const record = store.list()[0]!
+    expect(record.hosts).toEqual(['10.0.0.5'])
+    // The v4 invariant is exact coverage in BOTH directions: a scheme or port
+    // entry naming a host the record no longer dials is a semantic failure on
+    // the next read, not a harmless leftover.
+    expect(record.security).toEqual({ '10.0.0.5': 'ws' })
+    expect(record.ports).toEqual({ '10.0.0.5': 1111 })
+    expect(record.forgottenHosts).toEqual(['10.0.0.6'])
+
+    // A SECOND store reads the archive itself — the mark is persisted, not just
+    // remembered by this handle.
+    const reread = new DeviceStore(file)
+    expect(reread.list()[0]?.forgottenHosts).toEqual(['10.0.0.6'])
+    expect(reread.list()[0]?.hosts).toEqual(['10.0.0.5'])
+    expect(reread.quarantined).toBe(false)
+  })
+
+  it('⑲b forgetting an address the record does NOT dial still marks it, and writes (suppression is the point)', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // A pre-emptive forget: the peer has not advertised it yet (or the operator
+    // is removing an address a previous session learned). Nothing to remove, but
+    // the mark is real state and must be persisted.
+    expect(store.forgetEndpoints('dev-alpha', ['192.168.1.8'])).toEqual({ removed: [], marked: ['192.168.1.8'] })
+    expect(fs.fsyncSync).toHaveBeenCalledTimes(1)
+    expect(store.list()[0]?.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
+    expect(store.list()[0]?.forgottenHosts).toEqual(['192.168.1.8'])
+  })
+
+  it('⑲c refuses to remove the LAST dial candidate, and writes nothing at all', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord({ hosts: ['10.0.0.5'], security: { '10.0.0.5': 'ws' }, ports: { '10.0.0.5': 1111 } }))
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // A record with nothing to dial is worse than one stale address: every tool
+    // would answer `offline` forever, and only a re-pair would repair it. The
+    // refusal is ATOMIC — naming the only host while another host is present in
+    // the same call must not remove the other one first.
+    expect(() => store.forgetEndpoints('dev-alpha', ['10.0.0.5'])).toThrow(LastCandidateHostError)
+    expect(() => store.forgetEndpoints('dev-alpha', ['10.0.0.5', 'nope.example'])).toThrow(LastCandidateHostError)
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
+    expect(store.list()[0]?.hosts).toEqual(['10.0.0.5'])
+    expect(store.list()[0]?.forgottenHosts).toBeUndefined()
+  })
+
+  it('⑲d matches the host case-INSENSITIVELY, removes the archive spelling and marks the host that was dialed', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    // A PATCHed record keeps the operator's spelling; the peer advertises the
+    // schema's lowercased form. Both name the same host, and the archive must
+    // lose the entry it actually held.
+    store.upsert(
+      makeRecord({
+        hosts: ['MyNAS.example', '10.0.0.5'],
+        security: { 'MyNAS.example': 'ws', '10.0.0.5': 'ws' },
+        ports: { 'MyNAS.example': 9001, '10.0.0.5': 8765 },
+      }),
+    )
+
+    expect(store.forgetEndpoints('dev-alpha', ['mynas.example'])).toEqual({
+      removed: ['MyNAS.example'],
+      marked: ['MyNAS.example'],
+    })
+    expect(store.list()[0]?.hosts).toEqual(['10.0.0.5'])
+    expect(store.list()[0]?.forgottenHosts).toEqual(['MyNAS.example'])
+  })
+
+  it('⑲e the learn merge SKIPS a forgotten host (in any case) and still adds the rest', () => {
+    const record = makeRecord({ forgottenHosts: ['MyNAS.example'] })
+
+    const added = mergeAdvertisedEndpoints(record, [
+      // The peer re-advertises the forgotten address in its own lowercased
+      // spelling: this is exactly the resurrection the mark exists to stop.
+      { host: 'mynas.example', port: 9001, security: 'ws' },
+      { host: '192.168.1.8', port: 9002, security: 'ws' },
+    ])
+
+    expect(added).toBe(1)
+    expect(record.hosts).toEqual(['10.0.0.5', '10.0.0.6', '192.168.1.8'])
+    expect(record.ports).toEqual({ '10.0.0.5': 8765, '10.0.0.6': 8765, '192.168.1.8': 9002 })
+    expect(record.security).toEqual({ '10.0.0.5': 'ws', '10.0.0.6': 'ws', '192.168.1.8': 'ws' })
+  })
+
+  it('⑲f remember clears the mark, and the next advertisement may take the host again', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    store.forgetEndpoints('dev-alpha', ['10.0.0.6'])
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    expect(store.rememberEndpoints('dev-alpha', ['10.0.0.6'])).toEqual({ restored: ['10.0.0.6'] })
+    expect(fs.fsyncSync).toHaveBeenCalledTimes(1)
+    const record = store.list()[0]!
+    expect(record.forgottenHosts).toEqual([])
+    // Remembering does not dial the host again by itself — it lifts the
+    // suppression, and the NEXT handshake's advertisement is what re-adds it.
+    expect(mergeAdvertisedEndpoints(record, [{ host: '10.0.0.6', port: 8765, security: 'ws' }])).toBe(1)
+    expect(record.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
+  })
+
+  it('⑲g a no-op forget/remember writes nothing (the archive is not rewritten for a redundant call)', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    store.forgetEndpoints('dev-alpha', ['192.168.1.8'])
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // Forgetting the SAME undialed host twice changes no byte.
+    expect(store.forgetEndpoints('dev-alpha', ['192.168.1.8'])).toEqual({ removed: [], marked: [] })
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
+    // Remembering a host that was never forgotten changes no byte either.
+    expect(store.rememberEndpoints('dev-alpha', ['10.0.0.5'])).toEqual({ restored: [] })
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
+  })
+
+  it('⑲h upsert rejects a record that DIALS a host it has forgotten (the two lists are disjoint)', async () => {
+    const store = new DeviceStore(await makeStoreFile())
+
+    // `hosts` and `forgottenHosts` are the two halves of one decision. A record
+    // holding both would make "is this host dialed?" depend on which list the
+    // reader consulted, so the invariant is refused where the write happens.
+    expect(() => store.upsert(makeRecord({ forgottenHosts: ['10.0.0.5'] }))).toThrow(/forgottenHosts/)
+    // A disjoint list — a host the record does not dial — is valid.
+    expect(() => store.upsert(makeRecord({ forgottenHosts: ['192.168.1.8'] }))).not.toThrow()
+  })
+
+  it('⑲i the read path rejects junk in forgottenHosts instead of repairing it silently', async () => {
+    const cases: Array<[string, unknown, RegExp]> = [
+      // A host that is BOTH dialed and forgotten: contradictory state.
+      ['overlap', ['10.0.0.5'], /both/],
+      ['non-string', [42], /forgottenHosts/],
+      // Two spellings of one host would let the same address be suppressed and
+      // re-learned depending on which entry the comparison hit first.
+      ['case-duplicate', ['MyNAS.example', 'mynas.example'], /more than once/],
+    ]
+    for (const [label, value, matcher] of cases) {
+      const file = await makeStoreFile()
+      await writeArchive(file, [{ ...makeRecord(), forgottenHosts: value } as unknown as DeviceRecord])
+      const store = new DeviceStore(file)
+      // A semantic failure is NOT a quarantine (that class is unreadable bytes):
+      // it throws out of `list()` so the operator sees the file it must repair
+      // — and, unlike a quarantine, it does not preserve a `.corrupt` copy.
+      expect(() => store.list(), label).toThrow(matcher)
+      expect(existsSync(`${file}.corrupt`), label).toBe(false)
+    }
+  })
+
+  it('⑲j a v4 archive WITHOUT the field is valid and is not rewritten (the field is optional, no migration)', async () => {
+    const file = await makeStoreFile()
+    await writeArchive(file, [makeRecord()])
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    const store = new DeviceStore(file)
+    // Absence means "nothing forgotten". Making the field required would have
+    // forced a schemaVersion 5 on every existing archive (and on the ~25 test
+    // fixtures) for a list whose empty value needs no migration.
+    expect(store.list()[0]?.forgottenHosts).toBeUndefined()
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
   })
 })
 

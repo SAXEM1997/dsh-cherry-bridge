@@ -431,13 +431,26 @@ describe('① REST round-trip', () => {
       // (issues #126/#135).
       security: { '192.168.1.20': 'ws' },
       ports: { '192.168.1.20': 8765 },
+      // The forgotten addresses are part of the archive's public projection
+      // (issue #185); an empty list is the honest "none", not an absent key.
+      forgottenHosts: [],
     })
     // The credential never reaches the browser: asserted on the parsed object
     // AND on the raw wire bytes (a nested/renamed copy would still leak).
     expect(json[0]).not.toHaveProperty('accessToken')
     expect(json[0]).not.toHaveProperty('tokenExpiresAt')
     expect(Object.keys(json[0]).sort()).toEqual(
-      ['deviceId', 'displayName', 'enabled', 'hosts', 'port', 'ports', 'security', 'state'].sort(),
+      [
+        'deviceId',
+        'displayName',
+        'enabled',
+        'forgottenHosts',
+        'hosts',
+        'port',
+        'ports',
+        'security',
+        'state',
+      ].sort(),
     )
     expect(res.body).not.toContain('super-secret-token')
     expect(res.body).not.toContain('accessToken')
@@ -1131,6 +1144,33 @@ describe('④ PATCH address maintenance', () => {
     const badHosts = await call('/devices/dev-1', { method: 'PATCH', body: JSON.stringify({ hosts: [] }) })
     expect(badHosts.status).toBe(400)
     expect(store.list()[0]!.port).toBe(9000)
+  })
+
+  it('clears a forget mark only when the PATCH dials that host again', async () => {
+    mount()
+    store.upsert(record({ forgottenHosts: ['MyNAS.example', '10.0.0.8'] }))
+
+    // A PATCH that does not touch `hosts` keeps every mark: a display name or
+    // an enable flag is not an address decision.
+    const renamed = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ displayName: 'Renamed' }),
+    })
+    expect(renamed.status).toBe(200)
+    expect(renamed.json.forgottenHosts).toEqual(['MyNAS.example', '10.0.0.8'])
+    expect(store.list()[0]!.forgottenHosts).toEqual(['MyNAS.example', '10.0.0.8'])
+
+    // Putting an address back into `hosts` is intent to DIAL it, so its mark
+    // goes — case-insensitively, because the operator's spelling and the one
+    // the archive kept can differ. The mark for a host NOT re-added stays.
+    const readded = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['192.168.1.20', 'mynas.example'] }),
+    })
+    expect(readded.status).toBe(200)
+    expect(readded.json.hosts).toEqual(['192.168.1.20', 'mynas.example'])
+    expect(readded.json.forgottenHosts).toEqual(['10.0.0.8'])
+    expect(store.list()[0]!.forgottenHosts).toEqual(['10.0.0.8'])
   })
 
   it('evicts the pooled connection on an address change, but not on an unrelated edit', async () => {

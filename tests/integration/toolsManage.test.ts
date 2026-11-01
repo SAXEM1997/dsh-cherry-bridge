@@ -1762,6 +1762,152 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     expect(learned.accessToken).toBe('token-1')
     expect(learned.desktopIdentity).toBe(fakeInfo.desktopIdentity)
   }, 30_000)
+
+  // -------------------------------------------------------------------------
+  // issue #185: forgetting a learned address. The unit cases pin the archive
+  // half; these pin the ASSEMBLY — the tool is wired to the store, the
+  // eviction reaches the LIVE connection, and a real handshake that keeps
+  // advertising the address cannot put it back.
+  // -------------------------------------------------------------------------
+  it('③y forgets a learned address for good: the next handshake advertising it does not re-learn it', async () => {
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake({
+      hello: { capabilities: { connectionEndpointsVersion: 1 } },
+      endpoints: { endpoints: [{ host: '192.168.1.8', port: 9001 }] },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    const file = join(dataDir, 'devices.json')
+    const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
+
+    // The first connect LEARNS it: the archive starts from the pairing address
+    // and gains the advertised one inside the handshake.
+    await connectPool(ctx, fakeInfo)
+    expect(new DeviceStore(file).list()[0]?.hosts).toEqual([fakeInfo.host, '192.168.1.8'])
+    const socketsBefore = fakeInfo.fake.socketCount
+
+    const result = (await devices.execute({
+      device: 'dev-A',
+      action: 'forget',
+      hosts: ['192.168.1.8'],
+    })) as {
+      device: { hosts: string[]; forgottenHosts: string[]; state: string }
+      removed: string[]
+      marked: string[]
+    }
+
+    expect(result.removed).toEqual(['192.168.1.8'])
+    expect(result.marked).toEqual(['192.168.1.8'])
+    // The VIEW is read AFTER the write: the record the selector resolved still
+    // carried the forgotten host, so reporting that stale list would tell the
+    // caller the opposite of what the call did.
+    expect(result.device.hosts).toEqual([fakeInfo.host])
+    expect(result.device.forgottenHosts).toEqual(['192.168.1.8'])
+    expect(result.device.state).toBe('connected')
+
+    const archived = new DeviceStore(file).list()[0]!
+    expect(archived.hosts).toEqual([fakeInfo.host])
+    expect(archived.forgottenHosts).toEqual(['192.168.1.8'])
+
+    // EVICTION reached the LIVE connection. A pooled `DeviceConnection` captures
+    // its record at construction, so a forget that only rewrote the archive would
+    // keep dialing (and locally re-adding) the address until something else
+    // rebuilt it. The fresh instance dialed once, and THAT handshake advertised
+    // the address again — this is the resurrection case, end to end.
+    expect(fakeInfo.fake.socketCount).toBe(socketsBefore + 1)
+    expect(fakeInfo.fake.methodCount('connection.endpoints')).toBe(2)
+    // ...and the archive still does not have it: the mark outranks the peer.
+    expect(new DeviceStore(file).list()[0]?.hosts).toEqual([fakeInfo.host])
+  }, 30_000)
+
+  it('③z remembers it: the next handshake may learn the address again', async () => {
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake({
+      hello: { capabilities: { connectionEndpointsVersion: 1 } },
+      endpoints: { endpoints: [{ host: '192.168.1.8', port: 9001 }] },
+    })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    // Seeded ALREADY forgotten, so the connect below proves the suppression and
+    // the remember is the only thing that changes the outcome.
+    new DeviceStore(join(dataDir, 'devices.json')).upsert({
+      ...recordFor('dev-A', 'Desk Alpha'),
+      hosts: [fakeInfo.host],
+      port: fakeInfo.port,
+      ports: { [fakeInfo.host]: fakeInfo.port },
+      desktopIdentity: fakeInfo.desktopIdentity,
+      forgottenHosts: ['192.168.1.8'],
+    })
+    await waitForIdentity(dataDir)
+    const file = join(dataDir, 'devices.json')
+    const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
+
+    await connectPool(ctx, fakeInfo)
+    expect(new DeviceStore(file).list()[0]?.hosts).toEqual([fakeInfo.host])
+
+    const result = (await devices.execute({
+      device: 'dev-A',
+      action: 'remember',
+      hosts: ['192.168.1.8'],
+    })) as { device: { forgottenHosts: string[] }; restored: string[] }
+
+    expect(result.restored).toEqual(['192.168.1.8'])
+    expect(result.device.forgottenHosts).toEqual([])
+    // Remembering does not dial the address itself: the fresh connection's
+    // handshake is what adds it back, through the ordinary learning path.
+    const archived = new DeviceStore(file).list()[0]!
+    expect(archived.forgottenHosts).toEqual([])
+    expect(archived.hosts).toEqual([fakeInfo.host, '192.168.1.8'])
+    expect(archived.ports['192.168.1.8']).toBe(9001)
+  }, 30_000)
+
+  it('③aa refuses an unknown action, a missing selector, unusable hosts, and the LAST address', async () => {
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake()
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
+
+    // Argument validation happens BEFORE any device work: none of these dials.
+    expect(await devices.execute({ device: 'dev-A', action: 'nope' })).toMatchObject({
+      error: 'invalid-action',
+    })
+    expect(await devices.execute({ action: 'forget', hosts: ['10.0.0.9'] })).toMatchObject({
+      error: 'device-required',
+    })
+    expect(await devices.execute({ device: 'dev-A', action: 'forget' })).toMatchObject({
+      error: 'invalid-hosts',
+    })
+    expect(await devices.execute({ device: 'dev-A', action: 'forget', hosts: [] })).toMatchObject({
+      error: 'invalid-hosts',
+    })
+    expect(
+      await devices.execute({ device: 'dev-A', action: 'forget', hosts: ['10.0.0.9', '  '] }),
+    ).toMatchObject({ error: 'invalid-hosts' })
+    expect(
+      await devices.execute({ device: 'dev-A', action: 'forget', hosts: ['a.example', 'A.example'] }),
+    ).toMatchObject({ error: 'invalid-hosts' })
+    expect(await devices.execute({ device: 'nope', action: 'forget', hosts: ['10.0.0.9'] })).toMatchObject({
+      error: 'not-found',
+    })
+
+    // The seeded record has ONE host: forgetting it would leave the record with
+    // nothing to dial, so the STORE refuses (and the tool reports its verdict).
+    expect(
+      await devices.execute({ device: 'dev-A', action: 'forget', hosts: [fakeInfo.host] }),
+    ).toMatchObject({ error: 'last-address' })
+    // Nothing was written by any of the refusals.
+    expect(new DeviceStore(join(dataDir, 'devices.json')).list()[0]?.forgottenHosts).toBeUndefined()
+  })
 })
 
 /** A minimal valid record for the store-level assertions. */
