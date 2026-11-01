@@ -295,4 +295,22 @@ describe("the fake peer's pre-authentication gates (issue #186)", () => {
     expect((error as JsonRpcRequestError).message).toBe('Hello is required')
     expect(peer.fake.refreshCalls).toHaveLength(0)
   })
+
+  it('#186d a stored token the peer does not hold is refused with the desktop\'s TOKEN_EXPIRED verdict, before the mint', async () => {
+    const peer = await openRaw({ staleAccessToken: true })
+    await greet(peer.client)
+
+    // The exact verdict matters: the client retries on TOKEN_EXPIRED *or*
+    // UNAUTHENTICATED, so a retry-only case (⑩b) cannot tell the two apart.
+    // `tokens.validate` says both the reason and the message (RemoteTokens.ts).
+    const error = await failureOf(
+      peer.client.request('connection.authenticate', { deviceId: 'dev-raw', accessToken: 'tok-held-by-nobody' }),
+    )
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'TOKEN_EXPIRED' })
+    expect((error as JsonRpcRequestError).message).toBe('Device token expired')
+    // The refusal is the PEER's, not a mint: no token exists afterwards.
+    expect(peer.fake.tokenIssues).toHaveLength(0)
+    expect(peer.fake.authenticateAttempts.map((attempt) => attempt.accessToken)).toEqual(['tok-held-by-nobody'])
+  })
 })

@@ -121,12 +121,16 @@ export interface FakeCherryOptions {
   /** Every `connection.authenticate` fails with this protocol failure. */
   authenticateFailure?: FakeFailure
   /**
-   * Every `connection.authenticate` that CARRIES an `accessToken` is refused
-   * with `TOKEN_EXPIRED`, while a tokenless one succeeds — the desktop's
-   * `tokens.validate` (RemoteConnection.ts) rejecting an expired stored token
-   * on a path that still issues a fresh one. Added for #186: the client's
-   * stale-token retry needs the FIRST attempt to fail and the SECOND to
-   * succeed, which a static `authenticateFailure` cannot express.
+   * Every `connection.authenticate` carrying an `accessToken` is refused with
+   * `TOKEN_EXPIRED` / `'Device token expired'`, while a tokenless one succeeds
+   * — the desktop's `tokens.validate` (RemoteConnection.ts:87) rejecting a
+   * stored token it does not hold, on a path that still issues a fresh one.
+   * The pinned params schema types the token as an opaque id (a non-empty
+   * string), so a PRESENT token is never the empty string the desktop's
+   * `if (accessToken)` would skip: presence and truthiness cannot diverge at
+   * this face. Added for #186: the client's stale-token retry needs the FIRST
+   * attempt to fail and the SECOND to succeed, which a static
+   * `authenticateFailure` cannot express.
    */
   staleAccessToken?: boolean
   /** Every `connection.refresh` fails with this protocol failure. */
@@ -1128,6 +1132,12 @@ export class FakeCherry {
    * it carried (issue #186). The client's stale-token retry is visible only
    * here: a re-sent token and a dropped one are indistinguishable from the
    * reply alone.
+   *
+   * "Handled" means the request reached `#handleAuthenticate`: the hello and
+   * stale-token refusals INSIDE it are recorded (the retry's first attempt is
+   * one of them), while an attempt the dispatch arm refuses because the socket
+   * is already authenticated is not — it never reaches this handler. Arrival
+   * counting, which includes that refusal, is `authenticateCount`.
    */
   get authenticateAttempts(): readonly AuthenticateAttempt[] {
     return this.#authenticateAttempts
@@ -2193,7 +2203,9 @@ export class FakeCherry {
     this.#requireHello(live)
     // A stored token the peer no longer accepts. The desktop's
     // `tokens.validate` refuses the TOKEN, never the reconnect: the same call
-    // without it is answered (and issues a fresh one).
+    // without it is answered (and issues a fresh one). The desktop's own test
+    // is `if (accessToken)`, and the params schema already refuses the empty
+    // string, so PRESENCE is that test at this face.
     if (this.#staleAccessToken && params['accessToken'] !== undefined) {
       throw new FakeRpcError({ reason: 'TOKEN_EXPIRED', message: 'Device token expired' })
     }
