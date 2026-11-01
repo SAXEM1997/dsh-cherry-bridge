@@ -11,6 +11,7 @@ import {
 import type { SecureChannel } from '@cherrystudio/remote-transport'
 import { connectionMethods, pairingMethods, remoteLimits } from '@cherrystudio/remote-protocol'
 import { agentAuthorizationSchema, agentMethods } from '@cherrystudio/remote-protocol/agent'
+import { configurationMethods } from '@cherrystudio/remote-protocol/configuration'
 import type { AgentCheckpointPage, AgentCursor } from '@cherrystudio/remote-protocol/agent'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 
@@ -221,8 +222,41 @@ export interface FakeCherryOptions {
    * comes from the approval itself, so it cannot be unapproved.
    */
   approvedDeviceIds?: readonly string[]
+  /**
+   * The `configuration.*` faces (issue #201). The desktop exports the operator's
+   * provider configuration as ONE JSON document per connection
+   * (`RemoteConnection.ts:131-161`); the fake exports a fixed document, with the
+   * three dimensions a test moves named here.
+   */
+  configurationExport?: FakeConfigurationExportOptions
   /** Agent face (Task 7): journal replay/checkpoint/subscription-limit knobs. */
   agent?: FakeAgentOptions
+}
+
+/**
+ * Injection surface of the `configuration.*` faces. Every knob defaults to the
+ * REAL peer's behaviour, so a test only states the dimension it is moving.
+ */
+export interface FakeConfigurationExportOptions {
+  /**
+   * The bytes the fake exports (default {@link DEFAULT_CONFIGURATION_EXPORT}).
+   * The desktop's document is the operator's provider list; the fake has no
+   * providers, and a test needs bytes it can hash.
+   */
+  payload?: string
+  /**
+   * Ceiling a prepared export must fit under. Defaults to, and is CLAMPED TO,
+   * `remoteLimits.globalCheckpointBytes` (32 MiB) — the desktop's ceiling is not
+   * configurable, so this knob can only make the fake STRICTER. Lower it to
+   * drive the desktop's RESOURCE_EXHAUSTED arm without building 32 MiB of bytes.
+   */
+  limitBytes?: number
+  /**
+   * How long a prepared export stays readable (default
+   * `remoteLimits.checkpointMs`, 300 s). `0` expires it on the next call, with
+   * no sleep.
+   */
+  ttlMs?: number
 }
 
 /**
@@ -740,6 +774,13 @@ interface LiveConnection {
    */
   grants?: readonly string[]
   /**
+   * The ONE configuration export this socket prepared, mirroring the desktop's
+   * per-connection `this.exported` (`RemoteConnection.ts:137`): a second
+   * `prepare` REPLACES it, and `read` answers NOT_FOUND for an id that is not
+   * the stored one.
+   */
+  exported?: { exportId: string; bytes: Buffer; expiresAt: number }
+  /**
    * Arrival timestamps for THIS socket, which is the window the rate cap is
    * judged over. The real desktop's cap is per-connection: a second client
    * dialing in has its own budget and cannot be starved by a noisy first one.
@@ -767,6 +808,8 @@ const INVITATION_MS = 120_000
 const CLAIM_ID = 'claim-1'
 /** The real peer's `INLINE_TEXT_LIMIT`: above it, part text travels as a `{ref}`. */
 const INLINE_TEXT_LIMIT = 4096
+/** The document `configuration.export.prepare` hands out when none is injected. */
+const DEFAULT_CONFIGURATION_EXPORT = '{"providers":[],"version":1}'
 /** The protocol's per-slice ceiling for `agent.content.read` (`contentBytes`). */
 const CONTENT_READ_MAX_BYTES = 24 * 1024
 
@@ -808,12 +851,17 @@ function sleep(ms: number): Promise<void> {
 /**
  * Inbound params schemas come from the real protocol package so the fake
  * rejects malformed requests exactly like the real desktop face. The agent
- * face (Task 7) is validated against `agentMethods` too.
+ * face (Task 7) is validated against `agentMethods`, and the `configuration.*`
+ * face (issue #201) against `configurationMethods` — without the latter the
+ * fake ACCEPTED what the desktop refuses: `maxBytes` past its 24,576 cap,
+ * `offset: '-1'` (a digit-string `decimal`), a numeric `offset`, and non-empty
+ * `prepare` params.
  */
 const methodSchemas = {
   ...connectionMethods(agentAuthorizationSchema),
   ...pairingMethods(agentAuthorizationSchema),
   ...agentMethods,
+  ...configurationMethods,
 } as unknown as Record<
   string,
   { params: { safeParse: (input: unknown) => { success: boolean } } }
@@ -2135,6 +2183,10 @@ export class FakeCherry {
         return this.#handlePairingClaim(params, live)
       case 'pairing.get':
         return this.#handlePairingGet(params, live)
+      case 'configuration.export.prepare':
+        return this.#handleExportPrepare(live)
+      case 'configuration.export.read':
+        return this.#handleExportRead(live, params)
       case 'agent.sessions.subscribe':
         return this.#handleAgentSubscribe(params)
       case 'agent.agents.list':
@@ -2335,6 +2387,59 @@ export class FakeCherry {
    * the desktop's order: hello, then authentication, then the DOMAIN's
    * capability (`RemoteConnection.ts` → `requireCapability(domain)`).
    */
+  /**
+   * `configuration.export.prepare` (`RemoteConnection.ts:131-139`): the
+   * capability gate, then the size ceiling, then one stored export per
+   * connection. The ceiling is judged on the BYTES, so a test can lower
+   * {@link FakeConfigurationExportOptions.limitBytes} instead of building the
+   * real 32 MiB.
+   */
+  #handleExportPrepare(live: LiveConnection): Record<string, unknown> {
+    this.#requireCapability(live, 'configuration')
+    const options = this.#options.configurationExport ?? {}
+    const bytes = Buffer.from(options.payload ?? DEFAULT_CONFIGURATION_EXPORT, 'utf8')
+    // Clamped: the knob may only LOWER the peer's fixed ceiling, never raise it.
+    const limit = Math.min(options.limitBytes ?? remoteLimits.globalCheckpointBytes, remoteLimits.globalCheckpointBytes)
+    if (bytes.length > limit) {
+      throw new FakeRpcError({
+        reason: 'RESOURCE_EXHAUSTED',
+        message: 'Configuration export exceeds the size limit',
+      })
+    }
+    const exportId = randomUUID()
+    live.exported = { exportId, bytes, expiresAt: Date.now() + (options.ttlMs ?? remoteLimits.checkpointMs) }
+    return {
+      exportId,
+      byteLength: String(bytes.length),
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    }
+  }
+
+  /**
+   * `configuration.export.read` (`RemoteConnection.ts:140-160`): the same
+   * capability gate FIRST (before the id is even looked at), then the desktop's
+   * two NOT_FOUND verdicts, then the slice.
+   */
+  #handleExportRead(live: LiveConnection, params: Record<string, unknown>): Record<string, unknown> {
+    this.#requireCapability(live, 'configuration')
+    const exported = live.exported
+    const offset = String(params['offset'])
+    if (exported === undefined || exported.exportId !== params['exportId'] || exported.expiresAt <= Date.now()) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Configuration export expired' })
+    }
+    if (BigInt(offset) > BigInt(exported.bytes.length)) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Offset exceeds export length' })
+    }
+    const bytes = exported.bytes.subarray(Number(offset), Number(offset) + Number(params['maxBytes']))
+    return {
+      exportId: exported.exportId,
+      offset,
+      nextOffset: String(Number(offset) + bytes.length),
+      dataBase64: bytes.toString('base64'),
+      eof: Number(offset) + bytes.length === exported.bytes.length,
+    }
+  }
+
   async #handleEndpoints(
     live: LiveConnection,
     params: Record<string, unknown>,

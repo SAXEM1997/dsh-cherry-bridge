@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import type { ComponentLogger, Logger } from '@libp2p/interface'
 import { WebSocket } from 'ws'
@@ -573,5 +574,192 @@ describe('the agent faces require the grant the pairing approved (issue #194)', 
       domain: 'configuration',
     })
     expect(served.endpoints.map((endpoint) => endpoint.host)).toEqual(['endpoint.example'])
+  })
+})
+
+/**
+ * The `configuration.*` faces (issue #201). The desktop serves exactly two —
+ * `configuration.export.prepare` and `configuration.export.read`
+ * (`RemoteConnection.ts:131-161`), each opening with
+ * `requireCapability('configuration')`. The fake answered both `NOT_FOUND` /
+ * `unknown method` from its default arm, so the export walk could not be driven
+ * at all and the per-domain gate had no second domain to prove itself on.
+ */
+const configPayload = '{"providers":[{"id":"p1"}],"version":2}'
+
+describe('the configuration faces require the configuration grant (issue #201)', () => {
+  it('#201a a configuration-granted socket prepares an export and reads it back in slices', async () => {
+    // A payload that differs from the fake's default in both length and bytes:
+    // a case fed the default cannot tell the knob's wiring from a literal.
+    const peer = await openRaw({
+      approvedGrants: ['configuration'],
+      configurationExport: { payload: configPayload },
+    })
+    await greet(peer.client)
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+
+    const prepared = await peer.client.request<{ exportId: string; byteLength: string; sha256: string }>(
+      'configuration.export.prepare',
+      {},
+    )
+    const bytes = Buffer.from(configPayload, 'utf8')
+    expect(prepared.byteLength).toBe(String(bytes.length))
+    expect(prepared.sha256).toBe(createHash('sha256').update(bytes).digest('hex'))
+
+    // Two slices, so `eof`/`nextOffset` are read off the peer's own arithmetic
+    // rather than a whole-payload shortcut.
+    const first = await peer.client.request<{
+      nextOffset: string
+      dataBase64: string
+      eof: boolean
+    }>('configuration.export.read', { exportId: prepared.exportId, offset: '0', maxBytes: 5 })
+    expect(Buffer.from(first.dataBase64, 'base64').toString('utf8')).toBe(configPayload.slice(0, 5))
+    expect(first.nextOffset).toBe('5')
+    expect(first.eof).toBe(false)
+
+    const rest = await peer.client.request<{ dataBase64: string; eof: boolean }>('configuration.export.read', {
+      exportId: prepared.exportId,
+      offset: first.nextOffset,
+      maxBytes: 4096,
+    })
+    expect(Buffer.from(rest.dataBase64, 'base64').toString('utf8')).toBe(configPayload.slice(5))
+    expect(rest.eof).toBe(true)
+
+    // Offset EXACTLY at the end is legal and empty (the desktop's own
+    // `offset > length` guard is strict), not an overshoot.
+    const atEnd = await peer.client.request<{ dataBase64: string; eof: boolean }>('configuration.export.read', {
+      exportId: prepared.exportId,
+      offset: String(bytes.length),
+      maxBytes: 16,
+    })
+    expect(atEnd.dataBase64).toBe('')
+    expect(atEnd.eof).toBe(true)
+
+    // ONE export per connection: a second prepare REPLACES it, so the first id
+    // is no longer readable (the desktop assigns `this.exported` unconditionally).
+    const replaced = await peer.client.request<{ exportId: string }>('configuration.export.prepare', {})
+    expect(replaced.exportId).not.toBe(prepared.exportId)
+    const stale = await failureOf(
+      peer.client.request('configuration.export.read', { exportId: prepared.exportId, offset: '0', maxBytes: 8 }),
+    )
+    expect(stale).toBeInstanceOf(JsonRpcRequestError)
+    expect((stale as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+    expect((stale as JsonRpcRequestError).message).toBe('Configuration export expired')
+  })
+
+  it('#201b both arms run the capability gate BEFORE they look at the export', async () => {
+    const peer = await openRaw({ approvedGrants: ['agent'], configurationExport: { payload: configPayload } })
+    await greet(peer.client)
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+
+    const prepare = await failureOf(peer.client.request('configuration.export.prepare', {}))
+    expect(prepare).toBeInstanceOf(JsonRpcRequestError)
+    expect((prepare as JsonRpcRequestError).data).toMatchObject({ reason: 'FORBIDDEN' })
+    expect((prepare as JsonRpcRequestError).message).toBe('Capability was not approved during pairing')
+
+    // A bogus id on purpose: an ungranted socket that hears NOT_FOUND here ran
+    // the lookup first, and the desktop never gets that far.
+    const read = await failureOf(
+      peer.client.request('configuration.export.read', { exportId: 'no-such-export', offset: '0', maxBytes: 8 }),
+    )
+    expect(read).toBeInstanceOf(JsonRpcRequestError)
+    expect((read as JsonRpcRequestError).data).toMatchObject({ reason: 'FORBIDDEN' })
+  })
+
+  it('#201c a granted socket still hears the desktop NOT_FOUND verdicts: unknown id, overlong offset, expiry', async () => {
+    const peer = await openRaw({
+      approvedGrants: ['configuration'],
+      configurationExport: { payload: configPayload },
+    })
+    await greet(peer.client)
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+
+    const unknown = await failureOf(
+      peer.client.request('configuration.export.read', { exportId: 'no-such-export', offset: '0', maxBytes: 8 }),
+    )
+    expect(unknown).toBeInstanceOf(JsonRpcRequestError)
+    expect((unknown as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+    expect((unknown as JsonRpcRequestError).message).toBe('Configuration export expired')
+
+    const prepared = await peer.client.request<{ exportId: string }>('configuration.export.prepare', {})
+    const overlong = await failureOf(
+      peer.client.request('configuration.export.read', {
+        exportId: prepared.exportId,
+        offset: String(configPayload.length + 1),
+        maxBytes: 8,
+      }),
+    )
+    expect(overlong).toBeInstanceOf(JsonRpcRequestError)
+    expect((overlong as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+    expect((overlong as JsonRpcRequestError).message).toBe('Offset exceeds export length')
+
+    // A second peer whose export expires on issue: `ttlMs: 0` makes
+    // `expiresAt <= Date.now()` true at the next call without any sleep.
+    const expiredPeer = await openRaw({
+      approvedGrants: ['configuration'],
+      configurationExport: { payload: configPayload, ttlMs: 0 },
+    })
+    await greet(expiredPeer.client)
+    await expiredPeer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+    const live = await expiredPeer.client.request<{ exportId: string }>('configuration.export.prepare', {})
+    const expired = await failureOf(
+      expiredPeer.client.request('configuration.export.read', { exportId: live.exportId, offset: '0', maxBytes: 8 }),
+    )
+    expect(expired).toBeInstanceOf(JsonRpcRequestError)
+    expect((expired as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+    expect((expired as JsonRpcRequestError).message).toBe('Configuration export expired')
+  })
+
+  it('#201d the pinned schemas judge the frame first: maxBytes past its cap, a negative or numeric offset, extra prepare params', async () => {
+    const peer = await openRaw({ approvedGrants: ['configuration'], configurationExport: { payload: configPayload } })
+    await greet(peer.client)
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+    const prepared = await peer.client.request<{ exportId: string }>('configuration.export.prepare', {})
+
+    // Each of these is something the desktop's `addMethod(schema, …)` refuses
+    // BEFORE the handler; without `configurationMethods` in the fake's schema
+    // seam it was SERVED (`maxBytes` unchecked, `'-1'` reading from the buffer's
+    // end through `subarray`).
+    const malformed = [
+      { exportId: prepared.exportId, offset: '0', maxBytes: 100_000 },
+      { exportId: prepared.exportId, offset: '-1', maxBytes: 8 },
+      { exportId: prepared.exportId, offset: 0, maxBytes: 8 },
+    ]
+    for (const params of malformed) {
+      const error = await failureOf(peer.client.request('configuration.export.read', params))
+      expect(error).toBeInstanceOf(JsonRpcRequestError)
+      expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'INVALID_CONNECTION_STATE' })
+      expect((error as JsonRpcRequestError).message).toBe('malformed params for configuration.export.read')
+    }
+
+    // `prepare` takes a STRICT empty object, so a field the desktop never
+    // declared is malformed rather than ignored.
+    const extra = await failureOf(peer.client.request('configuration.export.prepare', { extra: 1 }))
+    expect(extra).toBeInstanceOf(JsonRpcRequestError)
+    expect((extra as JsonRpcRequestError).data).toMatchObject({ reason: 'INVALID_CONNECTION_STATE' })
+    expect((extra as JsonRpcRequestError).message).toBe('malformed params for configuration.export.prepare')
+  })
+
+  it('#201e an export above the ceiling answers RESOURCE_EXHAUSTED, and stores nothing', async () => {
+    // `limitBytes` only ever LOWERS the peer's fixed 32 MiB ceiling, which is
+    // what lets this arm run without building 32 MiB of bytes.
+    const peer = await openRaw({
+      approvedGrants: ['configuration'],
+      configurationExport: { payload: configPayload, limitBytes: 8 },
+    })
+    await greet(peer.client)
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+
+    const refused = await failureOf(peer.client.request('configuration.export.prepare', {}))
+    expect(refused).toBeInstanceOf(JsonRpcRequestError)
+    expect((refused as JsonRpcRequestError).data).toMatchObject({ reason: 'RESOURCE_EXHAUSTED' })
+    expect((refused as JsonRpcRequestError).message).toBe('Configuration export exceeds the size limit')
+
+    // POSITION: a refused prepare stores nothing, so no id can be read back.
+    const read = await failureOf(
+      peer.client.request('configuration.export.read', { exportId: 'whatever', offset: '0', maxBytes: 8 }),
+    )
+    expect(read).toBeInstanceOf(JsonRpcRequestError)
+    expect((read as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
   })
 })
