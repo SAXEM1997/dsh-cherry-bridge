@@ -316,6 +316,31 @@ describe("the fake peer's pre-authentication gates (issue #186)", () => {
 })
 
 /**
+ * The desktop's ping handler starts with `requireHello()`
+ * (`RemoteConnection.ts:111-114`), so a ping on a socket that never helloed is
+ * refused with INVALID_CONNECTION_STATE there and was ANSWERED here — the last
+ * method in the fake that the desktop gates and this peer did not (issue #192).
+ *
+ * Unobservable through `DeviceConnection`, which pings only on an established
+ * link; the divergence still matters, because a fixture that pings early would
+ * be asserting the fake's permissiveness rather than the desktop's contract.
+ */
+describe("the fake peer's ping gate (issue #192)", () => {
+  it('#192a connection.ping answers the hello verdict on an un-greeted socket, and the nonce after it', async () => {
+    const peer = await openRaw({})
+
+    const error = await failureOf(peer.client.request('connection.ping', { nonce: 'n-early' }))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'INVALID_CONNECTION_STATE' })
+    expect((error as JsonRpcRequestError).message).toBe('Hello is required')
+
+    await greet(peer.client)
+    const answer = await peer.client.request<{ nonce: string }>('connection.ping', { nonce: 'n-late' })
+    expect(answer.nonce).toBe('n-late')
+  })
+})
+
+/**
  * Every `agent.*` face is wrapped in the desktop's `requireAgent()` →
  * `requireCapability('agent')` → `requireAuthentication()`
  * (`RemoteConnection.ts:50-52, 198-204`), so the WHOLE namespace is

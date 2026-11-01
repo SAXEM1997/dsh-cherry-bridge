@@ -471,6 +471,9 @@ describe('DeviceConnection over a real loopback channel', () => {
     })()
     const channel = await channelPromise
     const client = new JsonRpcClient(channel, { maxInFlight: 3 })
+    // The desktop's ping requires a confirmed hello (RemoteConnection.ts:111-114),
+    // and the fake models that gate since issue #192 — this rig never greeted.
+    await client.request('connection.hello', { protocolVersions: [1] })
 
     const results = await Promise.all(
       Array.from({ length: 10 }, (_, i) => client.request<{ nonce: string }>('connection.ping', { nonce: `raw${i}` })),

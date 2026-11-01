@@ -2110,6 +2110,10 @@ export class FakeCherry {
       case 'connection.endpoints':
         return await this.#handleEndpoints(live, params)
       case 'connection.ping':
+        // The desktop's ping handler starts with `requireHello()`
+        // (RemoteConnection.ts:111-114). Answering an un-greeted socket here was
+        // the last divergence of this class in the fake (issue #192).
+        this.#requireHello(live)
         return { nonce: params['nonce'], serverTime: new Date().toISOString() }
       case 'pairing.claim':
         return this.#handlePairingClaim(params, live)
