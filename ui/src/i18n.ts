@@ -95,6 +95,13 @@ const zh: Dict = {
   'device.remove.confirm': '确认移除',
   'device.remove.warning': '移除后本机将不再连接该设备，凭据保留在对方一侧。',
   'device.cancel': '取消',
+  // -- forgotten addresses (issue #204) --------------------------------------
+  'device.forget': '忘记',
+  'device.remember': '恢复',
+  'device.field.forgotten': '已忘记地址',
+  'device.forgotten.hint':
+    '已忘记的地址不会再被连接；「恢复」只解除标记，桌面下次广播该地址时会重新加入。',
+  'device.error.lastAddress': '不能忘记最后一个候选地址——先补一个地址，再忘记这个',
   // The page-wide request ceiling (`api.ts`) reached a card action.
   'device.error.timeout': '请求长时间没有回应，已中止——请稍后重试',
   'device.error.nameRequired': '设备名称不能为空',
@@ -266,6 +273,13 @@ const en: Dict = {
   'device.remove.confirm': 'Confirm removal',
   'device.remove.warning': 'This machine will stop connecting to the device. Its credentials stay on the peer.',
   'device.cancel': 'Cancel',
+  // -- forgotten addresses (issue #204) --------------------------------------
+  'device.forget': 'Forget',
+  'device.remember': 'Restore',
+  'device.field.forgotten': 'Forgotten addresses',
+  'device.forgotten.hint':
+    'Forgotten addresses are never dialed. Restore only lifts the mark — the address comes back the next time the desktop advertises it.',
+  'device.error.lastAddress': 'The last candidate address cannot be forgotten. Add one first.',
   // See the zh entry: the page-wide request ceiling.
   'device.error.timeout': 'The request stopped answering and was abandoned. Try again in a moment.',
   'device.error.nameRequired': 'Device name cannot be empty',

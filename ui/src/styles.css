@@ -227,6 +227,30 @@
   overflow-wrap: anywhere;
 }
 
+/* A per-host action list (issue #204): the address, then its own control. The
+   buttons stay small so a record with a dozen candidates stays ONE fact row
+   instead of a column of chrome. */
+.cherry-address-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cherry-address-list li {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cherry-address-list button {
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 .cherry-inline-form {
   display: flex;
   flex-direction: column;

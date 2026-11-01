@@ -151,6 +151,39 @@ export async function patchDevice(deviceId: string, patch: DevicePatch): Promise
   return body as DeviceSummary
 }
 
+/**
+ * `POST /devices/:id/forget` — stop dialing these addresses AND record them so
+ * the desktop cannot advertise them back (issue #185).
+ *
+ * The answer is the SAME record shape {@link patchDevice} returns, which is why
+ * the card hands either body to the same `onSaved`. The action is its own
+ * request on purpose: folding it into the PATCH would make "replace the dial
+ * list" and "forget one address" one body with an ordering to define.
+ */
+export async function forgetHosts(deviceId: string, hosts: string[]): Promise<DeviceSummary> {
+  const body = await request(`${API_BASE}/devices/${encodeURIComponent(deviceId)}/forget`, {
+    method: 'POST',
+    body: JSON.stringify({ hosts }),
+  })
+  return body as DeviceSummary
+}
+
+/**
+ * `POST /devices/:id/remember` — lift the marks.
+ *
+ * It does NOT dial the address again: the record's `hosts` is untouched, and
+ * the address returns when the desktop next advertises it. Putting it back into
+ * the dial list immediately stays the PATCH's job (that PATCH clears the mark in
+ * the same write).
+ */
+export async function rememberHosts(deviceId: string, hosts: string[]): Promise<DeviceSummary> {
+  const body = await request(`${API_BASE}/devices/${encodeURIComponent(deviceId)}/remember`, {
+    method: 'POST',
+    body: JSON.stringify({ hosts }),
+  })
+  return body as DeviceSummary
+}
+
 /** `DELETE /devices/:id` — 204, no body. */
 export async function removeDevice(deviceId: string): Promise<void> {
   await request(`${API_BASE}/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' })

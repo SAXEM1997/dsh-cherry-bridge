@@ -10,10 +10,20 @@
  * `onSaved`, so the card shows what the archive holds rather than what the
  * browser hoped for. The live `state` keeps coming from SSE; the patch response
  * only seeds it.
+ *
+ * The addresses row is also where an address is FORGOTTEN (issue #204), and the
+ * marks it leaves are listed under their own label with a 恢复 each. One click
+ * is one committed action, never a draft: the two controls are INERT while the
+ * address editor is open, because that form PATCHes the whole host list and its
+ * draft is unconditionally sacred (see the resync effect) — a mark chosen
+ * underneath it would be re-sent by the next 保存地址, and the PATCH that names a
+ * forgotten host clears its mark in the same write. Freezing the controls is
+ * what keeps "commit or discard the edit first" true; it is not a stylistic
+ * preference.
  */
 import { useEffect, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
-import { REQUEST_TIMEOUT, patchDevice, removeDevice } from './api'
+import { ApiError, REQUEST_TIMEOUT, forgetHosts, patchDevice, rememberHosts, removeDevice } from './api'
 import { useT } from './i18n'
 import { STATE_KEYS } from './types'
 import type { DeviceState, DeviceSummary } from './types'
@@ -113,16 +123,46 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     try {
       await action()
     } catch (cause) {
-      setError(
-        cause instanceof Error && cause.message === REQUEST_TIMEOUT
-          ? t('device.error.timeout')
-          : cause instanceof Error
-            ? cause.message
-            : String(cause),
-      )
+      setError(describeCause(cause))
     } finally {
       setBusy(false)
     }
+  }
+
+  /**
+   * One refusal for a cause, so the two markers and the one translated code
+   * cannot drift between this card's arms.
+   *
+   * `ApiError` renders as `<code>: <server message>`, which is right for a
+   * diagnostic and wrong for `last-address`: forgetting the only candidate is a
+   * thing the operator can fix here, and the server's own prose is English on a
+   * Chinese page. Everything else keeps the server's verdict verbatim — that is
+   * what tells `invalid-payload` from `unreachable`.
+   */
+  const describeCause = (cause: unknown): string => {
+    if (cause instanceof ApiError && cause.code === 'last-address') return t('device.error.lastAddress')
+    if (cause instanceof Error && cause.message === REQUEST_TIMEOUT) return t('device.error.timeout')
+    return cause instanceof Error ? cause.message : String(cause)
+  }
+
+  /** Forgets ONE address: the store drops it and records the mark in one write. */
+  const forget = (host: string): void => {
+    void run(async () => {
+      onSaved(await forgetHosts(device.deviceId, [host]))
+    })
+  }
+
+  /**
+   * Lifts ONE mark. The server also drops the pooled connection on a change, so
+   * the very handshake that follows re-learns the address if the desktop still
+   * advertises it — without that, a desktop that stays connected would not
+   * re-handshake for as long as the link holds, and this button would look
+   * inert.
+   */
+  const remember = (host: string): void => {
+    void run(async () => {
+      onSaved(await rememberHosts(device.deviceId, [host]))
+    })
   }
 
   const toggleEnabled = (): void => {
@@ -171,6 +211,14 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
     })
   }
 
+  /**
+   * A defensive empty list, the same choice `dialPort` makes for the required
+   * `ports` map: `GET /devices` always emits the key, but this card is one row
+   * in a list, and a record missing one field must not take the whole page down
+   * with a render throw — it shows a card without the mark instead.
+   */
+  const forgottenHosts = device.forgottenHosts ?? []
+
   // The record-level `port` alone would claim every host dials it, which is
   // false for a record whose map disagrees. `mixedPorts` decides whether the
   // card has anything to say beyond that single number; `addressList` is the
@@ -217,7 +265,45 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
 
       <dl className="cherry-card-facts">
         <dt>{t('device.field.addresses')}</dt>
-        <dd>{device.hosts.join(', ')}</dd>
+        <dd>
+          <ul className="cherry-address-list">
+            {device.hosts.map((host) => (
+              <li key={host}>
+                <span>{host}</span>
+                <button
+                  type="button"
+                  onClick={() => forget(host)}
+                  disabled={busy || editor === 'address'}
+                >
+                  {t('device.forget')}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </dd>
+        {/* Only when the archive actually holds a mark: an empty row on every
+            card would be noise, and absence is the honest "none". */}
+        {forgottenHosts.length > 0 && (
+          <>
+            <dt>{t('device.field.forgotten')}</dt>
+            <dd>
+              <ul className="cherry-address-list">
+                {forgottenHosts.map((host) => (
+                  <li key={host}>
+                    <span>{host}</span>
+                    <button
+                      type="button"
+                      onClick={() => remember(host)}
+                      disabled={busy || editor === 'address'}
+                    >
+                      {t('device.remember')}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </dd>
+          </>
+        )}
         <dt>{t('device.field.port')}</dt>
         <dd>{device.port}</dd>
         {mixedPorts && (
@@ -229,6 +315,8 @@ export function DeviceCard({ device, state, onSaved, onRemoved }: DeviceCardProp
         <dt>{t('device.field.id')}</dt>
         <dd className="cherry-mono">{device.deviceId}</dd>
       </dl>
+
+      {forgottenHosts.length > 0 && <p className="cherry-hint">{t('device.forgotten.hint')}</p>}
 
       {mixedPorts && <p className="cherry-hint">{t('device.ports.hint')}</p>}
 

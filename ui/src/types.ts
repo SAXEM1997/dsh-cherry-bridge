@@ -39,6 +39,13 @@ export interface DeviceSummary {
   hosts: string[]
   port: number
   ports: Record<string, number>
+  /**
+   * The addresses the operator has FORGOTTEN (issues #185/#204): not dialed, and
+   * not re-learned from the desktop's own advertisement until 恢复 lifts the
+   * mark. Required — `GET /devices` emits an empty list rather than omitting the
+   * key — so the card branches on `length`, never on presence.
+   */
+  forgottenHosts: string[]
 }
 
 /** A `PATCH /devices/:id` body; every field optional, `hosts` is whole-replace. */

@@ -1305,6 +1305,247 @@ describe('④ PATCH address maintenance', () => {
 })
 
 // ---------------------------------------------------------------------------
+// ⑨ forget / remember (issue #204): #185's endpoint maintenance, from the page
+// ---------------------------------------------------------------------------
+
+/**
+ * #185 made an address able to STAY gone: dropping it from `hosts` is undone by
+ * the next handshake (the desktop keeps advertising it and the learn merge
+ * re-adds it), so the explicit decision has to be recorded — in
+ * `forgottenHosts`, which the merge skips in every case.
+ *
+ * Until issue #204 that decision was reachable only through the
+ * `cherry_devices` tool. The settings page had to open the same door, and the
+ * cases below pin the two properties that matter for a SECOND door onto one
+ * write: it answers the same projection the PATCH does (so the page's record
+ * state is one shape, not two), and it inherits the store's refusals unchanged
+ * (last candidate, quarantine) instead of re-implementing them.
+ */
+describe('⑨ forget / remember addresses', () => {
+  it('#204a forget drops one address, records the mark, and evicts the pooled connection', async () => {
+    const evicted: string[] = []
+    mount({
+      evict: (deviceId) => {
+        evicted.push(deviceId)
+      },
+    })
+    store.upsert(record({ hosts: ['10.0.0.1', '10.0.0.2'], port: 4343 }))
+
+    const { status, json } = await call('/devices/dev-1/forget', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+    })
+    expect(status).toBe(200)
+    // The SAME flat projection `PATCH /devices/:id` answers — not a `{device}`
+    // envelope: the page hands the body straight to its own record state, and a
+    // second shape would be a second thing to keep in step.
+    expect(Object.keys(json).sort()).toEqual(
+      [
+        'deviceId',
+        'displayName',
+        'enabled',
+        'forgottenHosts',
+        'hosts',
+        'port',
+        'ports',
+        'security',
+        'state',
+      ].sort(),
+    )
+    expect(json.hosts).toEqual(['10.0.0.1'])
+    expect(json.forgottenHosts).toEqual(['10.0.0.2'])
+    // The host-keyed maps are rewritten as one unit with `hosts` (the store's
+    // own contract); leaving the forgotten entry behind would make the record
+    // undialable AND unreachable by any later PATCH.
+    expect(json.ports).toEqual({ '10.0.0.1': 4343 })
+    expect(json.security).toEqual({ '10.0.0.1': 'ws' })
+    expect(json).not.toHaveProperty('accessToken')
+
+    // The store, not just the echo of the request.
+    const listed = await call('/devices')
+    expect(listed.json[0].hosts).toEqual(['10.0.0.1'])
+    expect(listed.json[0].forgottenHosts).toEqual(['10.0.0.2'])
+
+    // ADDRESS MAINTENANCE reaches the live connection, exactly like a PATCH's:
+    // a pooled `DeviceConnection` captured the record it was built from.
+    expect(evicted).toEqual(['dev-1'])
+
+    // A call that changes no byte neither rewrites nor drops the socket: the
+    // host is already forgotten, so `forgetEndpoints` returns two empty lists.
+    const again = await call('/devices/dev-1/forget', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+    })
+    expect(again.status).toBe(200)
+    expect(again.json.forgottenHosts).toEqual(['10.0.0.2'])
+    expect(evicted).toEqual(['dev-1'])
+  })
+
+  it("#204b forgetting the LAST candidate answers the tool's own last-address refusal and writes nothing", async () => {
+    const evicted: string[] = []
+    mount({
+      evict: (deviceId) => {
+        evicted.push(deviceId)
+      },
+    })
+    store.upsert(record({ hosts: ['10.0.0.1'], port: 4343, forgottenHosts: ['10.9.9.9'] }))
+
+    const refused = await call('/devices/dev-1/forget', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['10.0.0.1'] }),
+    })
+    expect(refused.status).toBe(400)
+    // The SAME code the tool answers (`{error: 'last-address'}`): one refusal
+    // vocabulary across the two doors, so the page can translate it by code.
+    expect(refused.json.error).toBe('last-address')
+    expect(refused.json.message).toMatch(/last dial candidate/i)
+    // POSITION: the throw happens before any write, so neither half moved.
+    expect(store.list()[0]!.hosts).toEqual(['10.0.0.1'])
+    expect(store.list()[0]!.forgottenHosts).toEqual(['10.9.9.9'])
+    expect(evicted).toEqual([])
+    expect(refused.res.body).not.toContain('super-secret-token')
+  })
+
+  it('#204c remember lifts the mark WITHOUT touching hosts, and a mark-less call is a no-op', async () => {
+    const evicted: string[] = []
+    mount({
+      evict: (deviceId) => {
+        evicted.push(deviceId)
+      },
+    })
+    store.upsert(record({ hosts: ['10.0.0.1'], port: 4343, forgottenHosts: ['10.0.0.2', '10.9.9.9'] }))
+
+    const restored = await call('/devices/dev-1/remember', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+    })
+    expect(restored.status).toBe(200)
+    expect(restored.json.forgottenHosts).toEqual(['10.9.9.9'])
+    // Remembering is NOT dialing: the host list is untouched, and the address
+    // returns only when the desktop next advertises it (through the ordinary
+    // learn merge). A PATCH that names it is the way to dial it immediately.
+    expect(restored.json.hosts).toEqual(['10.0.0.1'])
+    expect(evicted).toEqual(['dev-1'])
+
+    // Nothing left to lift: no write, no eviction — but still a 200 with the
+    // current record, because "already true" is an answer, not a failure.
+    const noop = await call('/devices/dev-1/remember', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+    })
+    expect(noop.status).toBe(200)
+    expect(noop.json.forgottenHosts).toEqual(['10.9.9.9'])
+    expect(evicted).toEqual(['dev-1'])
+  })
+
+  it('#204d an IPv6 literal arrives bracketed and every malformed door answers a structured verdict', async () => {
+    mount()
+    store.upsert(record({ hosts: ['::1', '10.0.0.1'], port: 4343 }))
+
+    // A browser copy-pastes an IPv6 literal WITH brackets; the archive stores
+    // it bare. Reusing the PATCH's `normalizeHost` is what makes the two doors
+    // agree on the same spelling — the store matches case-insensitively but
+    // would treat `[::1]` as a host it never dialed.
+    const bracketed = await call('/devices/dev-1/forget', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['[::1]'] }),
+    })
+    expect(bracketed.status).toBe(200)
+    expect(bracketed.json.hosts).toEqual(['10.0.0.1'])
+    expect(bracketed.json.forgottenHosts).toEqual(['::1'])
+
+    for (const body of ['{}', '{"hosts":[]}', '{"hosts":"10.0.0.1"}', '{"hosts":[42]}', 'not json']) {
+      const bad = await call('/devices/dev-1/forget', { method: 'POST', body })
+      expect(bad.status).toBe(400)
+      expect(bad.json.error).toBe('invalid-request')
+    }
+    // None of those touched the archive.
+    expect(store.list()[0]!.hosts).toEqual(['10.0.0.1'])
+    expect(store.list()[0]!.forgottenHosts).toEqual(['::1'])
+
+    const unknown = await call('/devices/nope/remember', {
+      method: 'POST',
+      body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+    })
+    expect(unknown.status).toBe(404)
+    expect(unknown.json.error).toBe('not-found')
+
+    // The method verdict, and the one that must NOT become one: a third
+    // segment that names no action is an unknown route.
+    expect((await call('/devices/dev-1/forget')).json.error).toBe('method-not-allowed')
+    expect((await call('/devices/dev-1/forget')).status).toBe(405)
+    const other = await call('/devices/dev-1/explode', { method: 'POST', body: '{}' })
+    expect(other.status).toBe(404)
+    expect(other.json.error).toBe('not-found')
+  })
+
+  /**
+   * A STUB store, and the case is named for what that can actually show.
+   *
+   * A genuinely quarantined archive serves an EMPTY view (`DeviceStore.#load`),
+   * so the `list()` at the top of the route answers 404 `not-found` and neither
+   * write — nor this mapping — is ever reached. The route therefore keeps the
+   * arm as the same defence PATCH and DELETE carry (a store that begins
+   * refusing after that read must not be reported as a bad request), and this
+   * case pins the MAPPING with a collaborator that can throw — once per action,
+   * because the two arms are different calls into the store (`#204n` below
+   * pins the precedence a REAL damaged archive actually produces).
+   */
+  it('#204e both actions map a write refusal onto the PATCH 503 shape (stub store: a real quarantine answers 404 first)', async () => {
+    const refusal = (): never => {
+      throw new QuarantinedArchiveError('/data/devices.json', new Error('bad json'), '/data/devices.json.corrupt')
+    }
+    mount({
+      store: {
+        list: () => [record()],
+        resolve: () => record(),
+        forgetEndpoints: refusal,
+        rememberEndpoints: refusal,
+      } as never,
+    })
+
+    for (const action of ['forget', 'remember']) {
+      const { status, json } = await call(`/devices/dev-1/${action}`, {
+        method: 'POST',
+        body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+      })
+      expect(status).toBe(503)
+      expect(json.error).toBe('archive-quarantined')
+      expect(json.corrupt).toBe('/data/devices.json.corrupt')
+      expect(json.recovery).toMatch(/move it aside|restart/i)
+    }
+  })
+
+  /**
+   * The PRECEDENCE a real damaged archive produces, with the real store.
+   *
+   * `#204e` can only pin the mapping (its collaborator throws on call); the
+   * shipped store never gets that far — `#load` turns a quarantined archive
+   * into an EMPTY view, so the route's first `list()` misses and the answer is
+   * 404 `not-found`. That is the same precedence PATCH and DELETE have, and it
+   * is why the page cannot offer the action on a damaged archive at all (the
+   * card list is empty). Named so nobody reads the 503 arm as the observable.
+   */
+  it('#204n a REAL quarantined archive answers 404 before any write', async () => {
+    const file = join(dataDir, 'devices.json')
+    writeFileSync(file, '{ this is not json', 'utf8')
+    const poisoned = new DeviceStore(file)
+    // Prime the quarantine exactly as the FIRST read does on a live host.
+    expect(poisoned.list()).toEqual([])
+    mount({ store: poisoned })
+
+    for (const action of ['forget', 'remember']) {
+      const { status, json } = await call(`/devices/dev-1/${action}`, {
+        method: 'POST',
+        body: JSON.stringify({ hosts: ['10.0.0.2'] }),
+      })
+      expect(status).toBe(404)
+      expect(json.error).toBe('not-found')
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // ⑤ disable → enable state flow
 // ---------------------------------------------------------------------------
 

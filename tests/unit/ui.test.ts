@@ -178,6 +178,9 @@ const DEVICE = {
   // Uniform on purpose: every host dials the record port, so the per-address
   // row stays hidden and every existing card assertion renders the same tree.
   ports: { '192.168.1.10': 4343 },
+  // Nothing forgotten: the card's 已忘记地址 row stays hidden too, so the
+  // shared fixture renders the tree every pre-#204 assertion expects.
+  forgottenHosts: [],
 }
 
 type AppProps = ComponentProps<typeof App>
@@ -847,7 +850,11 @@ describe('device card actions', () => {
     const patch = calls.find((call) => call.method === 'PATCH')
     // hosts is WHOLE-REPLACE by contract: the list is sent, never a diff.
     expect(patch?.body).toEqual({ hosts: ['10.0.0.5', '10.0.0.6'], port: 5555 })
-    expect(await screen.findByText('10.0.0.5, 10.0.0.6')).toBeTruthy()
+    // Each address is its own row since issue #204 (a per-host 忘记 button
+    // sits beside it), so the assertion is per host rather than on one joined
+    // string the card no longer prints.
+    expect(await screen.findByText('10.0.0.5')).toBeTruthy()
+    expect(screen.getByText('10.0.0.6')).toBeTruthy()
   })
 
   it('removes through DELETE and drops the card', async () => {
@@ -888,6 +895,7 @@ describe('device card per-host ports', () => {
     hosts: ['a.local', 'b.local'],
     port: 65001,
     ports: { 'a.local': 65001, 'b.local': 65002 },
+    forgottenHosts: [],
   }
 
   const mixedHint = '部分候选地址的端口与上方的端口不同；在「地址维护」里改动端口会把所有候选地址改为同一端口。'
@@ -982,6 +990,248 @@ describe('device card per-host ports', () => {
     })
     const patch = harness.calls.find((call) => call.method === 'PATCH')
     expect(patch?.body).toEqual({ hosts: ['a.local', 'b.local'], port: 65001 })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ④ forgotten addresses (issue #204)
+// ---------------------------------------------------------------------------
+
+/**
+ * #185 gave the archive a way to make a removed address STAY gone. Until issue
+ * #204 the page could not even see the marks, let alone lift one: the record
+ * type had no field for it, so this whole surface was the tool's alone.
+ *
+ * The literals are asserted as WORDS, not read off the dictionary — the same
+ * style as every other card case here: a copy edit should redden the test that
+ * names the control.
+ */
+describe('device card forgotten addresses', () => {
+  const forgetLabel = '忘记'
+  const rememberLabel = '恢复'
+  const forgottenRow = '已忘记地址'
+
+  const base: DeviceSummary = {
+    deviceId: 'dev-forget',
+    displayName: '忘记地址设备',
+    state: 'offline',
+    enabled: true,
+    hosts: ['10.0.0.1', '10.0.0.2'],
+    port: 4343,
+    ports: { '10.0.0.1': 4343, '10.0.0.2': 4343 },
+    forgottenHosts: [],
+  }
+
+  /** Renders the page for ONE record; extra responses answer the action POSTs. */
+  async function renderRecord(
+    device: DeviceSummary,
+    responses: Array<[string, string, Response]> = [],
+  ): Promise<Harness> {
+    const harness = installFetch([
+      ['GET', '/cherry-remote/api/devices', jsonResponse(200, [device])],
+      ...responses,
+    ])
+    render(createElement(App, { eventSourceFactory: harness.eventSourceFactory }))
+    stream().emit({ event: 'device-state', data: { deviceId: device.deviceId, state: device.state } })
+    await screen.findByText(device.displayName)
+    return harness
+  }
+
+  it('#204f the forgotten row is absent until the archive holds a mark', async () => {
+    await renderRecord(base)
+
+    expect(screen.queryByText(forgottenRow)).toBeNull()
+    // Forgetting is an action on an ADDRESS, so every dialed host carries its
+    // own control, and nothing offers a restore while nothing is marked.
+    expect(screen.getAllByRole('button', { name: forgetLabel })).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: rememberLabel })).toBeNull()
+  })
+
+  it('#204k a record with the key ABSENT still renders (the defensive empty list)', async () => {
+    // Not a wire shape — `GET /devices` always emits the list — so the cast is
+    // what pins the card's fallback arm, the same way ①c pins `ports`'s. This
+    // card is one row in a list: throwing here takes every device down for one
+    // missing key, which is the failure the `?? []` prevents.
+    const { forgottenHosts: _omitted, ...withoutKey } = base
+    await renderRecord(withoutKey as DeviceSummary)
+
+    expect(screen.queryByText(forgottenRow)).toBeNull()
+    expect(screen.getAllByRole('button', { name: forgetLabel })).toHaveLength(2)
+  })
+
+  it('#204g lists every marked address with its own restore action', async () => {
+    await renderRecord({
+      ...base,
+      hosts: ['10.0.0.1'],
+      ports: { '10.0.0.1': 4343 },
+      forgottenHosts: ['10.0.0.2', 'nas.example'],
+    })
+
+    expect(screen.getByText(forgottenRow)).toBeTruthy()
+    expect(screen.getByText('10.0.0.2')).toBeTruthy()
+    expect(screen.getByText('nas.example')).toBeTruthy()
+    // One per mark: restoring is not an all-or-nothing list action.
+    expect(screen.getAllByRole('button', { name: rememberLabel })).toHaveLength(2)
+    // The hint the issue names — what 恢复 does NOT promise — is rendered with
+    // the row: lifting a mark is not dialing the address.
+    expect(
+      screen.getByText('已忘记的地址不会再被连接；「恢复」只解除标记，桌面下次广播该地址时会重新加入。'),
+    ).toBeTruthy()
+    // …and only the dialed host can be forgotten.
+    expect(screen.getAllByRole('button', { name: forgetLabel })).toHaveLength(1)
+  })
+
+  it('#204h forgetting one address POSTs that host and renders the server record back', async () => {
+    // The response's PORT deliberately differs from the record on screen: a
+    // card that synthesised its own update (filter the host, append the mark)
+    // would keep 4343, so the assertion below tells "the server's record" from
+    // "the browser's guess" — the half of the sentence the row alone cannot
+    // distinguish.
+    const flushed: DeviceSummary = {
+      ...base,
+      hosts: ['10.0.0.1'],
+      port: 5555,
+      ports: { '10.0.0.1': 5555 },
+      forgottenHosts: ['10.0.0.2'],
+    }
+    const harness = await renderRecord(base, [
+      ['POST', '/cherry-remote/api/devices/dev-forget/forget', jsonResponse(200, flushed)],
+    ])
+
+    // The second 忘记 belongs to the second host.
+    fireEvent.click(screen.getAllByRole('button', { name: forgetLabel })[1]!)
+
+    await waitFor(() => {
+      expect(harness.calls.some((call) => call.method === 'POST')).toBe(true)
+    })
+    const post = harness.calls.find((call) => call.method === 'POST')
+    expect(post?.url).toContain('/devices/dev-forget/forget')
+    expect(post?.body).toEqual({ hosts: ['10.0.0.2'] })
+
+    // The card shows the SERVER's record: the address left the dial list and
+    // now appears as a mark (a card that only removed it locally would claim a
+    // forget the archive had refused).
+    await waitFor(() => {
+      expect(screen.getByText(forgottenRow)).toBeTruthy()
+    })
+    expect(screen.getAllByRole('button', { name: forgetLabel })).toHaveLength(1)
+    expect(screen.getByText('5555')).toBeTruthy()
+  })
+
+  it('#204i restoring a marked address POSTs it and drops the row when nothing is left', async () => {
+    const forgotten: DeviceSummary = {
+      ...base,
+      hosts: ['10.0.0.1'],
+      ports: { '10.0.0.1': 4343 },
+      forgottenHosts: ['10.0.0.2'],
+    }
+    // The port moves too: the row disappearing is not proof on its own, since a
+    // locally synthesised "clear the marks" would produce the same tree.
+    const harness = await renderRecord(forgotten, [
+      [
+        'POST',
+        '/cherry-remote/api/devices/dev-forget/remember',
+        jsonResponse(200, { ...forgotten, forgottenHosts: [], port: 6666, ports: { '10.0.0.1': 6666 } }),
+      ],
+    ])
+
+    fireEvent.click(screen.getByRole('button', { name: rememberLabel }))
+
+    await waitFor(() => {
+      expect(harness.calls.some((call) => call.method === 'POST')).toBe(true)
+    })
+    const post = harness.calls.find((call) => call.method === 'POST')
+    expect(post?.url).toContain('/devices/dev-forget/remember')
+    expect(post?.body).toEqual({ hosts: ['10.0.0.2'] })
+    await waitFor(() => {
+      expect(screen.queryByText(forgottenRow)).toBeNull()
+    })
+    expect(screen.getByText('6666')).toBeTruthy()
+  })
+
+  it('#204j a last-address refusal renders the dictionary sentence, never the server code', async () => {
+    await renderRecord(
+      { ...base, hosts: ['10.0.0.1'], ports: { '10.0.0.1': 4343 } },
+      [
+        [
+          'POST',
+          '/cherry-remote/api/devices/dev-forget/forget',
+          jsonResponse(400, {
+            error: 'last-address',
+            message: 'device dev-forget: refusing to forget the last dial candidate',
+          }),
+        ],
+      ],
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: forgetLabel }))
+
+    // `ApiError` prefixes its message with the CODE, so echoing `cause.message`
+    // would put `last-address: …` (and the peer's own English) on the page.
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toBe(
+        '不能忘记最后一个候选地址——先补一个地址，再忘记这个',
+      )
+    })
+    // The card is still there to take the correction.
+    expect(screen.getByRole('button', { name: forgetLabel })).toBeTruthy()
+  })
+
+  it('#204l a refusal the dictionary has no sentence for keeps its code verbatim', async () => {
+    // The translation is scoped by CODE, not by error CLASS: an `ApiError` the
+    // dictionary has no sentence for must keep `<code>: <server message>`, which
+    // is how an operator tells a damaged archive from a bad request.
+    await renderRecord(
+      { ...base, hosts: ['10.0.0.1'], ports: { '10.0.0.1': 4343 } },
+      [
+        [
+          'POST',
+          '/cherry-remote/api/devices/dev-forget/forget',
+          jsonResponse(400, { error: 'invalid-device', message: 'device archive entry has no hosts' }),
+        ],
+      ],
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: forgetLabel }))
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toBe(
+        'invalid-device: device archive entry has no hosts',
+      )
+    })
+  })
+
+  it('#204m the two endpoint actions are inert while the address editor is open', async () => {
+    // The editor's draft is sacred (the resync effect bails while an editor is
+    // open), so a mark chosen under it would be re-sent by 保存地址 — and the
+    // PATCH that names a forgotten host clears its mark in the same write. The
+    // forget would be silently undone, which is exactly the failure the
+    // one-click design exists to avoid; freezing the controls is what keeps
+    // "commit or discard the edit first" true.
+    await renderRecord({
+      ...base,
+      hosts: ['10.0.0.1'],
+      ports: { '10.0.0.1': 4343 },
+      forgottenHosts: ['10.0.0.2'],
+    })
+
+    const forgetButton = (): HTMLButtonElement =>
+      screen.getByRole('button', { name: forgetLabel }) as HTMLButtonElement
+    const rememberButton = (): HTMLButtonElement =>
+      screen.getByRole('button', { name: rememberLabel }) as HTMLButtonElement
+
+    expect(forgetButton().disabled).toBe(false)
+    expect(rememberButton().disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: '地址维护' }))
+    expect(forgetButton().disabled).toBe(true)
+    expect(rememberButton().disabled).toBe(true)
+
+    // Closing the editor releases BOTH again: the freeze is the open FORM, not
+    // a mode the card gets stuck in.
+    fireEvent.click(screen.getByRole('button', { name: '地址维护' }))
+    expect(forgetButton().disabled).toBe(false)
+    expect(rememberButton().disabled).toBe(false)
   })
 })
 
