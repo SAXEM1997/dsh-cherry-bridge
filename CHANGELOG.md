@@ -17,6 +17,193 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.2.1 (2026-11-01)
+
+Addresses stay where the operator puts them. A desktop has advertised its own
+endpoints since 2.1.4 (`connection.endpoints`, hello bit
+`connectionEndpointsVersion: 1`) and this client consumed neither of them, so an
+address that appeared after the QR was minted — a VPN, a second NIC — stayed
+unreachable until someone edited the device card. Every handshake now asks once and learns
+the answer into the dial list. The other half is the refusal to undo an
+operator: an address can be FORGOTTEN, which drops it from the dial list **and**
+keeps every later advertisement from adding it back, from the settings page or
+from the `cherry_devices` tool.
+
+Verified against desktop **2.1.4 – 2.1.10** (the range is unchanged from 0.2.0;
+2.1.9 and 2.1.10 differ from 2.1.8 on this face by one robustness fix in the
+desktop's own write chain, PR #22593, with the protocol packages still
+`0.7.0` / `0.2.5`). The peer protocol surface, the protocol pins and the tool
+COUNT are unchanged — still 14 `cherry_*` tools. What moved is the DEVICE face:
+`cherry_devices` gained `action: "forget" | "remember"`, every device view gained
+`forgottenHosts`, and the page gained two matching routes. The version preamble
+above reserves "new capability" for the minor digit; this ships as a patch by the
+maintainer's decision, with the new capability on the LOCAL faces only.
+
+### Upgrade notes
+
+- **The archive is still `schemaVersion` 4.** 0.2.1 adds one OPTIONAL key
+  (`forgottenHosts`): nothing migrates, and 0.2.0 reads the file unchanged.
+- **A downgrade to 0.2.0 keeps the key and ignores it.** An address the operator
+  forgot is dialed and re-learned again, and an edit that names one writes a
+  record holding it in BOTH `hosts` and `forgottenHosts`. 0.2.1 REPAIRS that one
+  cross-version state on read — the address is kept, the mark dropped, a warning
+  logged — instead of refusing the archive, because refusing it would take every
+  device tool down until someone edited `devices.json` by hand.
+- **A forgotten address returns only through `remember`, or through a PATCH that
+  names it.** `remember` lifts the mark and nothing more: the address comes back
+  on the next handshake the desktop advertises it on, at the port and scheme the
+  peer reports then, never from a copy that was captured before the forget.
+
+### Added
+
+- **The desktop's advertised endpoints are learned into the dial list** (#143,
+  PR #182). The call is made once per handshake, after `authenticate` (the
+  desktop gates it on the authenticated session) and bounded by its own 2 s
+  (`ENDPOINTS_LEARN_TIMEOUT_MS`, below `DEVICE_SETTLE_WAIT_MS`, so this wait
+  alone cannot outlive a tool's `connecting` window). The answer decides where
+  this client dials, so three gates stand between it and the archive: the hello
+  capability bit strictly `1` (a version this client cannot speak is not evidence
+  that it speaks 1), the identity pin (an answer that does not name our own
+  `desktopIdentity` is dropped WHOLE), and the peer's own
+  `advertisedEndpointSchema` per entry (which rejects a loopback destination and
+  normalizes the host). The merge is ADD-ONLY: unseen hosts only, compared
+  case-insensitively because a PATCHed record keeps the operator's spelling while
+  the peer's schema lowercases; an existing entry is never re-pointed, none is
+  ever removed, and the list is capped at the 32 candidates a pairing QR can
+  carry. Persistence goes through `DeviceStore.learnEndpoints`, which merges a
+  CLONE of the stored record — the connection's copy mirrors the live access
+  token and this archive deliberately keeps the pairing's — re-checks the
+  identity pin so a re-pair under the same `deviceId` cannot inherit an address
+  from the previous pairing, and writes only when a host was added. EVERY failure
+  is silent by construction: everything after the capability gate sits in one
+  catch, so a refused or wedged call, a malformed answer, or a throwing
+  persistence hook cannot fail the handshake.
+- **An address can be forgotten for good** (#185, PR #188). Removing a host from
+  the list never held: the desktop keeps advertising it on every handshake and
+  the learn merge re-added it, which made the address list a suggestion. One
+  per-host mark (`forgottenHosts`, case-insensitive, no duplicate) now makes the
+  merge skip that host in every case — a dialed host removed by `forget` is
+  marked in the same write, and its `security` / `ports` entries go with it.
+  `forget` refuses to remove the LAST candidate (`last-address`), because a
+  record with no address is a record that never dials. Reachable from
+  `cherry_devices` (`action: "forget"`, `hosts: [...]`) and, since PR #207, from
+  the settings page; a PATCH whose `hosts` names a forgotten host clears its mark
+  on the same write, so "put it back" needs no second request.
+- **The settings page forgets and restores addresses** (#204, PR #207). Every
+  dialed host carries a 忘记 button, and a non-empty 已忘记地址 row shows one 恢复
+  per mark plus the hint that restoring only lifts the mark. Two POST routes —
+  `POST /devices/:id/forget`, `POST /devices/:id/remember` — open the same door
+  the tool uses and call the same two store methods, so the refusal vocabulary,
+  the case-insensitive matching and the disjointness of the two lists stay the
+  store's; only the body parser differs (it inherits the PATCH's host
+  normalization, not its duplicate-spelling refusal). Both answer the SAME flat
+  projection `PATCH /devices/:id` answers, one builder now feeding all four
+  faces, and both EVICT the pooled connection on a change — for two different
+  reasons: a captured record would keep dialing a forgotten host, and a restored
+  host is only ever re-learned INSIDE a handshake, so without the eviction a
+  stably connected desktop would never re-handshake and 恢复 would look inert.
+  The cost is real and stated in the code: the subscription layer is disposed, a
+  healthy socket closes, and an in-flight command can be lost. The two controls
+  are INERT while the address editor is open, because that form PATCHes the
+  whole host list from a draft the card deliberately does not reseed — a mark
+  chosen underneath it would be silently reverted by the next 保存地址.
+
+### Fixed
+
+- **A PATCH that re-types a host's case keeps its scheme and port** (#189,
+  PR #195). `securityFor` / `portsFor` retained a staying host by exact string
+  match while every other host comparison on that face is case-insensitive, so
+  re-typing `NAS.example` as `nas.example` kept the address and reset its scheme
+  to `ws` and its port to the record-level one: a TLS proxy silently demoted to a
+  plaintext dial the desktop refuses, with the archive making it look like an
+  operator choice. Both helpers now consult a lowercased index built from the
+  previous map's OWN entries, AFTER the exact spelling (so a surviving spelling
+  keeps its own entry and the collision rule only decides what a third spelling
+  inherits); `Object.hasOwn` stays, so an inherited `constructor` is still not a
+  remembered scheme. The duplicate rule in `parsePatch` became case-insensitive
+  FIRST: two spellings of one host have no single map entry, and without that
+  guard a PATCH could WRITE the ambiguous record the new lookup would have to
+  resolve.
+- **A pairing run whose terminal frame never arrives now exits** (#171, PR #171).
+  The wizard cleared its submit gate only on a terminal `pairing-progress` frame
+  or a refused `POST /pair`, and the stream carries no replay, so one dropped
+  frame parked the page on 「配对进行中」 with no cancel control and a dead submit
+  button. A 180 s deadline now arms when the phase reaches `waiting` and on
+  expiry does what a settle does minus the verdict: restore the form, drop the
+  transient code, re-read the device list, and point the copy at that list
+  instead of claiming 配对失败 — the run may have been approved while its frame
+  was lost. `claimId` is deliberately kept, so a late terminal frame still
+  replaces the alarm with the truth.
+- **The pairing POST is bounded, and then every call on the page** (#177,
+  PR #177; #181, PR #181). A wedged transport used to strand the first-run gate
+  with nothing to click; there is now one bounded request helper
+  (`DEFAULT_REQUEST_TIMEOUT_MS` = 10 s) that every surface turns into a sentence
+  of its own, so a hung 停用/重命名/移除 says so instead of printing the internal
+  `cherry-remote.request-timeout` marker onto a Chinese page. The device list
+  became three-state — empty, loading, or UNKNOWN, where the error speaks alone —
+  because a failed read used to sit beside 「暂无已配对设备」 and contradict it.
+- **The per-tier pacing queue can no longer wedge** (#200, PR #202). This is a
+  guard, not a fix: both arms of the chain now hand off the same way, so a future
+  rejecting link (or a throwing `release`) cannot make every later link skip its
+  callback. No link can reject today, so no test can turn red for it — that is
+  stated here rather than left to look like a regression that was observed.
+
+### Tests
+
+- **The loopback fake now models the gates a real desktop applies**, one face at
+  a time, each change pinned by an observation from the peer's own ledger rather
+  than by an error alone: the pairing path's authenticated state (#183, PR #184);
+  `connection.authenticate` behind a confirmed hello and `connection.refresh`
+  behind an authenticated session, with a stale stored token made drivable
+  (#186, PR #190); every `agent.*` handler behind
+  `requireAgent()` → `requireCapability('agent')` (#187, PR #193);
+  `connection.ping` behind the hello (#192, PR #197); an approved-device lookup
+  before the token gate (#191, PR #198); a per-domain capability snapshot taken
+  at the same door that sets `authenticated`, with `connection.endpoints` no
+  longer hardcoding `domain === 'agent'` (#194, PR #196). Every new knob is
+  OPT-IN, so unset means "accept everything, as before".
+- **The `configuration.*` faces answer behind the `configuration` grant** (#201,
+  PR #203), reproducing the desktop's own arithmetic: a size ceiling on the
+  bytes, one export per connection, `byteLength` as a decimal string, `eof`
+  judged on the slice actually returned, and the params schema that refuses what
+  the desktop refuses (`maxBytes` past 24,576, a negative `offset`, non-empty
+  `prepare` params). The export's ownership is now asserted from both directions
+  — two sockets on one fake, neither able to read the other's export (#205,
+  PR #206).
+- **The pairing frame that beats the `/pair` response is pinned** (#176,
+  PR #176): the run settles from a frame that arrives while `claimId` is still
+  undefined, because the app keeps the newest frame and the effect re-runs when
+  the handle commits. No source change — the mechanism worked and nothing tested
+  it.
+- Making the fake stricter found two rigs that had been passing on its
+  permissiveness: a `SessionSubscriptions` fixture that drove 27 tests over a raw
+  socket which never helloed or authenticated, and a hand-built client that
+  pinged before greeting (#187, #192). The rigs were repaired, not the gates
+  relaxed.
+
+### Docs
+
+- **Both READMEs, this file and `src/AGENTS.md` state the range through desktop
+  2.1.10** (#199, PR #199), verified on a real 2.1.10 desktop — and the upstream
+  research note gained the one-command check (a tree hash) that settles "did a
+  new app version move the wire" without a 26-commit diff. The app baseline moves
+  to v0.5.2 (#175, PR #175).
+- **A contract test pins both README install specs to `package.json`'s version**
+  (#169, PR #169). Skipping that bump fails silently — npm serves the README
+  captured in the tarball — so the invariant is now a test: the two whole specs
+  must be present per README, and no OTHER version may be pinned anywhere.
+- **The release section names the three destinations and the retry discipline**
+  (#169), and the release commit is recorded as an integrator-reviewed tier
+  whose notes are still checked claim by claim (#166, PR #166), because the
+  section ships verbatim as the GitHub release body.
+- **`ui/AGENTS.md` records that the client bundle carries its source comments**
+  (#179, PR #179): `minify: false`, so a comment-only edit under `ui/src/**`
+  changes `lib/client.js`, and `artifactFreshness` compares against
+  `git show HEAD:<path>` — it stays red until the rebuild is committed.
+- **The e2e checklist gains the 0.2.0 machine-verifiable record** (#167,
+  PR #167): what an agent can assert alone, and what it cannot — named as
+  uncovered, not as passes.
+
 ## v0.2.0 (2026-10-27)
 
 Alignment with desktop **2.1.8**. The protocol pins move to `0.7.0` / `0.2.5` —
