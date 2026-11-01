@@ -2057,6 +2057,11 @@ export class FakeCherry {
     // (RemoteConnection.ts:50-52, 198-204), so the whole namespace is
     // unreachable before the socket authenticates — one check here, not one per
     // handler, which is also what a face added later inherits.
+    //
+    // An `agent.*` NAME this switch does not route still gets this verdict,
+    // where the desktop answers method-not-found without looking at the
+    // connection. That is STRICTER than the peer, never more permissive: it
+    // cannot turn a broken client green.
     if (method.startsWith('agent.')) this.#requireAuthentication(live)
     switch (method) {
       case 'connection.hello':

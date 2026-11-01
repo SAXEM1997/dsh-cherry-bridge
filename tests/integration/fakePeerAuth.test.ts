@@ -394,8 +394,10 @@ describe('the agent faces require the authenticated session (issue #187)', () =>
     expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
     expect((error as JsonRpcRequestError).message).toBe('Device authentication is required')
     // Checkpoint mode would have opened a real subscription and written its
-    // descriptor; neither may exist.
+    // descriptor before the ledger records the call, so `subscribeCalls` alone
+    // is not the entry-point pin on that path: the subscription set is.
     expect(peer.fake.subscribeCalls).toHaveLength(0)
+    expect(peer.fake.subscriptions).toHaveLength(0)
 
     await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
     const subscription = await peer.client.request<{ subscriptionId: string }>('agent.sessions.subscribe', {
@@ -403,5 +405,6 @@ describe('the agent faces require the authenticated session (issue #187)', () =>
     })
     expect(typeof subscription.subscriptionId).toBe('string')
     expect(peer.fake.subscribeCalls).toHaveLength(1)
+    expect(peer.fake.subscriptions).toHaveLength(1)
   })
 })
