@@ -74,10 +74,13 @@ afterEach(async () => {
  * One loopback socket, helloed by the caller. Noise-XX is the only handshake
  * here: no `DeviceConnection`, no pool, no record — just the client protocol
  * face the desktop answers.
+ *
+ * `openRaw` below is this helper plus a fresh fake; a case that needs TWO
+ * sockets on ONE desktop (issue #205) starts the fake itself and calls
+ * {@link openOn} twice. Both share one `stop()`, which is idempotent.
  */
-async function openRaw(options: FakeCherryOptions = {}): Promise<RawPeer> {
-  const fake = new FakeCherry({ pairingDecision: 'approved', ...options })
-  const { host, port } = await fake.start()
+async function openOn(fake: FakeCherry, address: { host: string; port: number }): Promise<RawPeer> {
+  const { host, port } = address
   const desktopIdentity = await fake.identityId
   const identity = await createDeviceIdentity()
   const controller = new AbortController()
@@ -113,6 +116,12 @@ async function openRaw(options: FakeCherryOptions = {}): Promise<RawPeer> {
     await fake.stop()
     throw error
   }
+}
+
+/** {@link openOn} against a fake this call starts: the ordinary one-socket case. */
+async function openRaw(options: FakeCherryOptions = {}): Promise<RawPeer> {
+  const fake = new FakeCherry({ pairingDecision: 'approved', ...options })
+  return openOn(fake, await fake.start())
 }
 
 /** The desktop refuses claim/get/authenticate until hello confirmed the offer. */
@@ -761,5 +770,61 @@ describe('the configuration faces require the configuration grant (issue #201)',
     )
     expect(read).toBeInstanceOf(JsonRpcRequestError)
     expect((read as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+  })
+
+  /**
+   * The export is held BY THE CONNECTION on both sides: the desktop keeps
+   * `this.exported` as a field of one socket (`RemoteConnection.ts:131-161`),
+   * and the fake mirrors that on `LiveConnection`. The consequence — a second
+   * socket never sees the first one's export — was declared as a coverage
+   * boundary in #201's review ("faithful by construction, unasserted"). This
+   * case asserts it, because "by construction" is exactly the claim that rots
+   * silently the day the state moves up a level: the fake's two methods would
+   * still pass every single-socket case while a real desktop had begun sharing.
+   */
+  it('#205a two sockets on ONE desktop never share a configuration export', async () => {
+    const fake = new FakeCherry({
+      pairingDecision: 'approved',
+      approvedGrants: ['configuration'],
+      configurationExport: { payload: configPayload },
+    })
+    const address = await fake.start()
+    const a = await openOn(fake, address)
+    const b = await openOn(fake, address)
+    await greet(a.client)
+    await greet(b.client)
+    await a.client.request('connection.authenticate', { deviceId: 'dev-a' })
+    await b.client.request('connection.authenticate', { deviceId: 'dev-b' })
+
+    const onA = await a.client.request<{ exportId: string }>('configuration.export.prepare', {})
+
+    // B does not hold it, so it is answered exactly like any unknown id is.
+    const crossRead = await failureOf(
+      b.client.request('configuration.export.read', { exportId: onA.exportId, offset: '0', maxBytes: 8 }),
+    )
+    expect(crossRead).toBeInstanceOf(JsonRpcRequestError)
+    expect((crossRead as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+    expect((crossRead as JsonRpcRequestError).message).toBe('Configuration export expired')
+
+    // B's own prepare mints a DIFFERENT handle, and A cannot see that one either
+    // — so the isolation is symmetric rather than "the first socket wins".
+    const onB = await b.client.request<{ exportId: string }>('configuration.export.prepare', {})
+    expect(onB.exportId).not.toBe(onA.exportId)
+    const reverse = await failureOf(
+      a.client.request('configuration.export.read', { exportId: onB.exportId, offset: '0', maxBytes: 8 }),
+    )
+    expect(reverse).toBeInstanceOf(JsonRpcRequestError)
+    expect((reverse as JsonRpcRequestError).data).toMatchObject({ reason: 'NOT_FOUND' })
+
+    // POSITION: neither refusal disturbed the survivor — A's export still reads
+    // whole — so the two NOT_FOUNDs above are about OWNERSHIP, not about B
+    // having replaced A's slot (the single-socket replacement case is #201a).
+    const readBack = await a.client.request<{ exportId: string; dataBase64: string; eof: boolean }>(
+      'configuration.export.read',
+      { exportId: onA.exportId, offset: '0', maxBytes: 4096 },
+    )
+    expect(readBack.exportId).toBe(onA.exportId)
+    expect(Buffer.from(readBack.dataBase64, 'base64').toString('utf8')).toBe(configPayload)
+    expect(readBack.eof).toBe(true)
   })
 })
