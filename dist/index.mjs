@@ -11386,7 +11386,12 @@ function parsePatch(body) {
 			if (typeof entry !== "string") throw new PatchError("hosts entries must be strings");
 			return normalizeHost(entry);
 		});
-		if (new Set(patch.hosts).size !== patch.hosts.length) throw new PatchError("hosts must not contain duplicates");
+		const seen = /* @__PURE__ */ new Set();
+		for (const host of patch.hosts) {
+			const key = host.toLowerCase();
+			if (seen.has(key)) throw new PatchError("hosts must not contain duplicates");
+			seen.add(key);
+		}
 	}
 	const port = body["port"];
 	if (port !== void 0) {
@@ -12078,9 +12083,37 @@ function sameHosts(a, b) {
 * `ws`, and hosts the list dropped leave no entry behind. An edit is an
 * address edit, not a scheme edit — re-typing the same host must not silently
 * demote a TLS-proxied desktop to a plain dial.
+*
+* "The same host" is CASE-INSENSITIVE (issue #189), matching every other host
+* comparison on this face: `NAS.example` and `nas.example` are one address, so
+* a PATCH that re-types the case keeps the remembered scheme instead of
+* resetting it to `ws`.
 */
 function securityFor(hosts, previous) {
-	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : "ws"]));
+	const remembered = indexByHost(previous);
+	return Object.fromEntries(hosts.map((host) => [host, exactOrRemembered(previous, remembered, host) ?? "ws"]));
+}
+/**
+* A case-insensitive index over a per-host map (issue #189).
+*
+* FIRST spelling wins on a collision. A hand-edited archive CAN hold two
+* spellings of one host (the store does not reject it, and this face does not
+* touch `previous`), so callers look their exact spelling up FIRST and consult
+* this index only as the fallback: a surviving spelling therefore keeps its
+* OWN entry, and the collision rule only decides what a THIRD spelling
+* inherits.
+*/
+function indexByHost(previous) {
+	const index = /* @__PURE__ */ new Map();
+	for (const [host, value] of Object.entries(previous)) {
+		const key = host.toLowerCase();
+		if (!index.has(key)) index.set(key, value);
+	}
+	return index;
+}
+/** The exact spelling's entry, else the case-insensitive one, else nothing. */
+function exactOrRemembered(previous, remembered, host) {
+	return Object.hasOwn(previous, host) ? previous[host] : remembered.get(host.toLowerCase());
 }
 /**
 * The port map for a host list (issue #135): each named host keeps the port it
@@ -12089,11 +12122,13 @@ function securityFor(hosts, previous) {
 *
 * `previous` is empty when the caller is re-pointing EVERY host (a CHANGED
 * `port` patch): there is no remembered entry to keep, by design — one port
-* field on this face must move the whole list. Same `Object.hasOwn` rule as
-* `securityFor`: an inherited function is not a remembered port.
+* field on this face must move the whole list. Same `Object.hasOwn`/
+* case-insensitive rules as `securityFor` (issue #189): a re-typed spelling
+* keeps its own port, and an inherited function is never a remembered port.
 */
 function portsFor(hosts, previous, fallback) {
-	return Object.fromEntries(hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : fallback]));
+	const remembered = indexByHost(previous);
+	return Object.fromEntries(hosts.map((host) => [host, exactOrRemembered(previous, remembered, host) ?? fallback]));
 }
 /** Order-insensitive comparison for two scheme maps. */
 function sameSecurity(a, b) {

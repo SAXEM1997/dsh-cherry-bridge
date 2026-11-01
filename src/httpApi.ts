@@ -600,11 +600,17 @@ function parsePatch(body: Record<string, unknown>): DevicePatch {
       if (typeof entry !== 'string') throw new PatchError('hosts entries must be strings')
       return normalizeHost(entry)
     })
-    // Checked AFTER normalization: `[::1]` and `::1` collapse to one host. The
-    // scheme/port maps are keyed by host, so a duplicate has no single entry
-    // and silently last-wins — an ambiguous record, not an edit.
-    if (new Set(patch.hosts).size !== patch.hosts.length) {
-      throw new PatchError('hosts must not contain duplicates')
+    // Checked AFTER normalization: `[::1]` and `::1` collapse to one host, and
+    // host comparison is CASE-INSENSITIVE everywhere else on this face (the
+    // learn merge, the forget/remember matching, the mark clearing), so
+    // `NAS.example` and `nas.example` are one address too. The scheme/port maps
+    // are keyed by host, so a duplicate has no single entry and silently
+    // last-wins — an ambiguous record, not an edit.
+    const seen = new Set<string>()
+    for (const host of patch.hosts) {
+      const key = host.toLowerCase()
+      if (seen.has(key)) throw new PatchError('hosts must not contain duplicates')
+      seen.add(key)
     }
   }
 
@@ -1539,6 +1545,11 @@ function sameHosts(a: readonly string[], b: readonly string[]): boolean {
  * `ws`, and hosts the list dropped leave no entry behind. An edit is an
  * address edit, not a scheme edit — re-typing the same host must not silently
  * demote a TLS-proxied desktop to a plain dial.
+ *
+ * "The same host" is CASE-INSENSITIVE (issue #189), matching every other host
+ * comparison on this face: `NAS.example` and `nas.example` are one address, so
+ * a PATCH that re-types the case keeps the remembered scheme instead of
+ * resetting it to `ws`.
  */
 function securityFor(
   hosts: readonly string[],
@@ -1546,10 +1557,40 @@ function securityFor(
 ): Record<string, 'ws' | 'wss'> {
   // `Object.hasOwn`, never `previous[host] ?? 'ws'`: a host named `constructor`
   // (or `__proto__`/`toString`) would otherwise inherit a FUNCTION from
-  // Object.prototype and poison the map the store then rejects.
+  // Object.prototype and poison the map the store then rejects. The index is
+  // built from OWN entries only, so it is safe for the same reason.
+  const remembered = indexByHost(previous)
   return Object.fromEntries(
-    hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : 'ws']),
+    hosts.map((host) => [host, exactOrRemembered(previous, remembered, host) ?? 'ws']),
   )
+}
+
+/**
+ * A case-insensitive index over a per-host map (issue #189).
+ *
+ * FIRST spelling wins on a collision. A hand-edited archive CAN hold two
+ * spellings of one host (the store does not reject it, and this face does not
+ * touch `previous`), so callers look their exact spelling up FIRST and consult
+ * this index only as the fallback: a surviving spelling therefore keeps its
+ * OWN entry, and the collision rule only decides what a THIRD spelling
+ * inherits.
+ */
+function indexByHost<T>(previous: Record<string, T>): Map<string, T> {
+  const index = new Map<string, T>()
+  for (const [host, value] of Object.entries(previous)) {
+    const key = host.toLowerCase()
+    if (!index.has(key)) index.set(key, value)
+  }
+  return index
+}
+
+/** The exact spelling's entry, else the case-insensitive one, else nothing. */
+function exactOrRemembered<T>(
+  previous: Record<string, T>,
+  remembered: Map<string, T>,
+  host: string,
+): T | undefined {
+  return Object.hasOwn(previous, host) ? previous[host] : remembered.get(host.toLowerCase())
 }
 
 /**
@@ -1559,16 +1600,18 @@ function securityFor(
  *
  * `previous` is empty when the caller is re-pointing EVERY host (a CHANGED
  * `port` patch): there is no remembered entry to keep, by design — one port
- * field on this face must move the whole list. Same `Object.hasOwn` rule as
- * `securityFor`: an inherited function is not a remembered port.
+ * field on this face must move the whole list. Same `Object.hasOwn`/
+ * case-insensitive rules as `securityFor` (issue #189): a re-typed spelling
+ * keeps its own port, and an inherited function is never a remembered port.
  */
 function portsFor(
   hosts: readonly string[],
   previous: Record<string, number>,
   fallback: number,
 ): Record<string, number> {
+  const remembered = indexByHost(previous)
   return Object.fromEntries(
-    hosts.map((host) => [host, Object.hasOwn(previous, host) ? previous[host] : fallback]),
+    hosts.map((host) => [host, exactOrRemembered(previous, remembered, host) ?? fallback]),
   )
 }
 
