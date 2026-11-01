@@ -671,10 +671,12 @@ interface LiveConnection {
   /** Set once `connection.hello` confirmed the prelude offer, like the peer's. */
   hello: boolean
   /**
-   * Set once `connection.authenticate` ISSUED a token on this socket. The real
-   * desktop's `requireCapability` reads `this.authentication`, so every
-   * capability-gated face (`connection.endpoints`) is unreachable before
-   * authenticate — a client that asked earlier would get UNAUTHENTICATED.
+   * Set once this socket reaches the desktop's authenticated state — either
+   * `connection.authenticate` ISSUED a token, or `pairing.get` returned
+   * `approved` (the desktop authenticates from that branch too; issue #183).
+   * The real desktop's `requireCapability` reads `this.authentication`, so every
+   * capability-gated face (`connection.endpoints`) is unreachable before it —
+   * and both faces that ESTABLISH it refuse to run twice.
    */
   authenticated: boolean
   /**
@@ -2010,6 +2012,11 @@ export class FakeCherry {
       case 'connection.hello':
         return this.#handleHello(live)
       case 'connection.authenticate': {
+        // The real desktop refuses a second authenticate on a live socket
+        // (RemoteConnection.ts: `if (this.authentication) throw …`), and the
+        // pairing approval is the OTHER door into that state. Without this the
+        // fake accepted a re-authenticate the desktop would have rejected.
+        this.#requireUnauthenticated(live)
         const result = this.#handleAuthenticate(params)
         // Only an ISSUED token authenticates the socket: a refused
         // authenticate (authenticateFailure) leaves the connection where the
@@ -2062,6 +2069,21 @@ export class FakeCherry {
   #requireHello(live: LiveConnection): void {
     if (!live.hello) {
       throw new FakeRpcError({ reason: 'INVALID_CONNECTION_STATE', message: 'Hello is required' })
+    }
+  }
+
+  /**
+   * The desktop's OTHER connection-state gate: both faces that establish
+   * authentication refuse to run on a socket that already has it
+   * (`RemoteConnection.ts`'s `connection.authenticate` and `pairing.claim`
+   * handlers, same `INVALID_CONNECTION_STATE` and message).
+   */
+  #requireUnauthenticated(live: LiveConnection): void {
+    if (live.authenticated) {
+      throw new FakeRpcError({
+        reason: 'INVALID_CONNECTION_STATE',
+        message: 'Connection is already authenticated',
+      })
     }
   }
 
@@ -2191,6 +2213,9 @@ export class FakeCherry {
     // The real desktop answers INVALID_CONNECTION_STATE without a confirmed
     // hello; the pairing client must therefore run the hello face too.
     this.#requireHello(live)
+    // …and it refuses to CLAIM on a socket that is already authenticated
+    // (pairing after a successful authenticate is not a pairing flow).
+    this.#requireUnauthenticated(live)
     // The injected failure rides AFTER the hello gate, exactly like
     // authenticate's/refresh's: the stage it models is a REACHABLE peer
     // refusing the claim, not a broken handshake.
@@ -2237,6 +2262,11 @@ export class FakeCherry {
       domain,
       grantId: `grant-${domain}`,
     }))
+    // The approved branch AUTHENTICATES the socket, exactly like the desktop's
+    // `pairing.get` → `authenticate(result.deviceId)` — which is what makes a
+    // capability-gated call legal on the pairing socket. Set before the reply:
+    // the client may issue its next request the moment this answer lands.
+    live.authenticated = true
     return {
       status: 'approved',
       deviceId: this.#approvedDeviceId,
