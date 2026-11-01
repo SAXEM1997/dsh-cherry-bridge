@@ -314,3 +314,94 @@ describe("the fake peer's pre-authentication gates (issue #186)", () => {
     expect(peer.fake.authenticateAttempts.map((attempt) => attempt.accessToken)).toEqual(['tok-held-by-nobody'])
   })
 })
+
+/**
+ * Every `agent.*` face is wrapped in the desktop's `requireAgent()` →
+ * `requireCapability('agent')` → `requireAuthentication()`
+ * (`RemoteConnection.ts:50-52, 198-204`), so the WHOLE namespace is
+ * unreachable before the socket authenticates (issue #187).
+ *
+ * One case per FACE CLASS (read / command / subscription) rather than per
+ * method: the gate is one namespace-wide check, and the dispatch arm is what a
+ * later face inherits. Each case seeds the peer with the fixture the handler
+ * WOULD have answered, so "refused" and "never reached the handler" are told
+ * apart by the peer's own ledger — not by the verdict alone.
+ */
+const agentFixture = {
+  agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+  sessions: [
+    {
+      sessionId: 'session-1',
+      agentId: 'agent-1',
+      workspaceId: 'workspace-1',
+      title: 'A session',
+      historyRevision: '1',
+    },
+  ],
+}
+
+describe('the agent faces require the authenticated session (issue #187)', () => {
+  it('#187a a READ face answers UNAUTHENTICATED before the handler reads the fixture', async () => {
+    const peer = await openRaw({ agent: agentFixture })
+    await greet(peer.client)
+
+    const error = await failureOf(peer.client.request('agent.sessions.get', { sessionId: 'session-1' }))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
+    expect((error as JsonRpcRequestError).message).toBe('Device authentication is required')
+    // POSITION: `session-1` EXISTS, so a handler-first implementation would
+    // have answered it. Only the gate can leave the read ledger empty.
+    expect(peer.fake.readCalls).toHaveLength(0)
+
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+    const answer = await peer.client.request<{ session: { sessionId: string } }>('agent.sessions.get', {
+      sessionId: 'session-1',
+    })
+    expect(answer.session.sessionId).toBe('session-1')
+    expect(peer.fake.readCalls).toHaveLength(1)
+  })
+
+  it('#187b a COMMAND face answers UNAUTHENTICATED before the command is recorded', async () => {
+    const peer = await openRaw({ agent: agentFixture })
+    await greet(peer.client)
+
+    const send = {
+      commandId: 'cmd-187',
+      sessionId: 'session-1',
+      text: 'hello',
+      expectedIdleRevision: '1',
+    }
+    const error = await failureOf(peer.client.request('agent.messages.send', send))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
+    expect((error as JsonRpcRequestError).message).toBe('Device authentication is required')
+    // A command that reached the handler would be in the ledger (and would
+    // have been APPLIED — the fixture admits this body).
+    expect(peer.fake.commandCalls).toHaveLength(0)
+
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+    const receipt = await peer.client.request<{ status: string }>('agent.messages.send', send)
+    expect(receipt.status).toBe('applied')
+    expect(peer.fake.commandCalls).toHaveLength(1)
+  })
+
+  it('#187c a SUBSCRIPTION face answers UNAUTHENTICATED before a subscription is opened', async () => {
+    const peer = await openRaw({ agent: agentFixture })
+    await greet(peer.client)
+
+    const error = await failureOf(peer.client.request('agent.sessions.subscribe', { sessionId: 'session-1' }))
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
+    expect((error as JsonRpcRequestError).message).toBe('Device authentication is required')
+    // Checkpoint mode would have opened a real subscription and written its
+    // descriptor; neither may exist.
+    expect(peer.fake.subscribeCalls).toHaveLength(0)
+
+    await peer.client.request('connection.authenticate', { deviceId: 'dev-raw' })
+    const subscription = await peer.client.request<{ subscriptionId: string }>('agent.sessions.subscribe', {
+      sessionId: 'session-1',
+    })
+    expect(typeof subscription.subscriptionId).toBe('string')
+    expect(peer.fake.subscribeCalls).toHaveLength(1)
+  })
+})

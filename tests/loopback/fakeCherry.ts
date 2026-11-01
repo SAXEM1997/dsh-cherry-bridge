@@ -2052,6 +2052,12 @@ export class FakeCherry {
   ): Promise<Record<string, unknown>> {
     const delay = this.#methodDelayMs.get(method) ?? this.#requestDelayMs ?? this.#options.requestDelayMs
     if (delay !== undefined) await sleep(delay)
+    // The desktop wraps EVERY `agent.*` face in `requireAgent()` →
+    // `requireCapability('agent')` → `requireAuthentication()`
+    // (RemoteConnection.ts:50-52, 198-204), so the whole namespace is
+    // unreachable before the socket authenticates — one check here, not one per
+    // handler, which is also what a face added later inherits.
+    if (method.startsWith('agent.')) this.#requireAuthentication(live)
     switch (method) {
       case 'connection.hello':
         return this.#handleHello(live)
