@@ -23,21 +23,22 @@ Addresses stay where the operator puts them. A desktop has advertised its own
 endpoints since 2.1.4 (`connection.endpoints`, hello bit
 `connectionEndpointsVersion: 1`) and this client consumed neither of them, so an
 address that appeared after the QR was minted — a VPN, a second NIC — stayed
-unreachable until someone edited the device card. Every handshake now asks once and learns
-the answer into the dial list. The other half is the refusal to undo an
+unreachable until someone edited the device card. Every handshake now asks once
+and learns the answer into the dial list. The other half is the refusal to undo an
 operator: an address can be FORGOTTEN, which drops it from the dial list **and**
 keeps every later advertisement from adding it back, from the settings page or
 from the `cherry_devices` tool.
 
-Verified against desktop **2.1.4 – 2.1.10** (the range is unchanged from 0.2.0;
-2.1.9 and 2.1.10 differ from 2.1.8 on this face by one robustness fix in the
-desktop's own write chain, PR #22593, with the protocol packages still
-`0.7.0` / `0.2.5`). The peer protocol surface, the protocol pins and the tool
-COUNT are unchanged — still 14 `cherry_*` tools. What moved is the DEVICE face:
-`cherry_devices` gained `action: "forget" | "remember"`, every device view gained
-`forgottenHosts`, and the page gained two matching routes. The version preamble
-above reserves "new capability" for the minor digit; this ships as a patch by the
-maintainer's decision, with the new capability on the LOCAL faces only.
+Verified against desktop **2.1.4 – 2.1.10**: the upper bound moves from 2.1.8 in
+this release (PR #199), where 2.1.9 and 2.1.10 differ from 2.1.8 on this
+face by one robustness fix in the desktop's own write chain (PR #22593, with the
+protocol packages still `0.7.0` / `0.2.5`). The peer protocol surface, the
+protocol pins and the tool COUNT are unchanged — still 14 `cherry_*` tools. What
+moved is the DEVICE face: `cherry_devices` gained `action: "forget" | "remember"`,
+every device view gained `forgottenHosts`, and the page gained two matching
+routes. The version preamble above reserves "new capability" for the minor
+digit; this ships as a patch by the maintainer's decision, with the new
+capability on the LOCAL faces only.
 
 ### Upgrade notes
 
@@ -124,7 +125,7 @@ maintainer's decision, with the new capability on the LOCAL faces only.
   FIRST: two spellings of one host have no single map entry, and without that
   guard a PATCH could WRITE the ambiguous record the new lookup would have to
   resolve.
-- **A pairing run whose terminal frame never arrives now exits** (#171, PR #171).
+- **A pairing run whose terminal frame never arrives now exits** (#170, PR #171).
   The wizard cleared its submit gate only on a terminal `pairing-progress` frame
   or a refused `POST /pair`, and the stream carries no replay, so one dropped
   frame parked the page on 「配对进行中」 with no cancel control and a dead submit
@@ -134,8 +135,8 @@ maintainer's decision, with the new capability on the LOCAL faces only.
   instead of claiming 配对失败 — the run may have been approved while its frame
   was lost. `claimId` is deliberately kept, so a late terminal frame still
   replaces the alarm with the truth.
-- **The pairing POST is bounded, and then every call on the page** (#177,
-  PR #177; #181, PR #181). A wedged transport used to strand the first-run gate
+- **The pairing POST is bounded, and then every call on the page** (#173,
+  PR #177; #180, PR #181). A wedged transport used to strand the first-run gate
   with nothing to click; there is now one bounded request helper
   (`DEFAULT_REQUEST_TIMEOUT_MS` = 10 s) that every surface turns into a sentence
   of its own, so a hung 停用/重命名/移除 says so instead of printing the internal
@@ -161,7 +162,9 @@ maintainer's decision, with the new capability on the LOCAL faces only.
   before the token gate (#191, PR #198); a per-domain capability snapshot taken
   at the same door that sets `authenticated`, with `connection.endpoints` no
   longer hardcoding `domain === 'agent'` (#194, PR #196). Every new knob is
-  OPT-IN, so unset means "accept everything, as before".
+  OPT-IN, so unset means "accept everything, as before"; the gates themselves are
+  unconditional, so an un-greeted or unauthenticated socket is refused whether a
+  case opted in or not.
 - **The `configuration.*` faces answer behind the `configuration` grant** (#201,
   PR #203), reproducing the desktop's own arithmetic: a size ceiling on the
   bytes, one export per connection, `byteLength` as a decimal string, `eof`
@@ -170,7 +173,7 @@ maintainer's decision, with the new capability on the LOCAL faces only.
   `prepare` params). The export's ownership is now asserted from both directions
   — two sockets on one fake, neither able to read the other's export (#205,
   PR #206).
-- **The pairing frame that beats the `/pair` response is pinned** (#176,
+- **The pairing frame that beats the `/pair` response is pinned** (#172,
   PR #176): the run settles from a frame that arrives while `claimId` is still
   undefined, because the app keeps the newest frame and the effect re-runs when
   the handle commits. No source change — the mechanism worked and nothing tested
@@ -184,25 +187,25 @@ maintainer's decision, with the new capability on the LOCAL faces only.
 ### Docs
 
 - **Both READMEs, this file and `src/AGENTS.md` state the range through desktop
-  2.1.10** (#199, PR #199), verified on a real 2.1.10 desktop — and the upstream
+  2.1.10** (PR #199), verified on a real 2.1.10 desktop — and the upstream
   research note gained the one-command check (a tree hash) that settles "did a
   new app version move the wire" without a 26-commit diff. The app baseline moves
-  to v0.5.2 (#175, PR #175).
+  to v0.5.2 (#174, PR #175).
 - **A contract test pins both README install specs to `package.json`'s version**
-  (#169, PR #169). Skipping that bump fails silently — npm serves the README
+  (#168, PR #169). Skipping that bump fails silently — npm serves the README
   captured in the tarball — so the invariant is now a test: the two whole specs
   must be present per README, and no OTHER version may be pinned anywhere.
 - **The release section names the three destinations and the retry discipline**
-  (#169), and the release commit is recorded as an integrator-reviewed tier
-  whose notes are still checked claim by claim (#166, PR #166), because the
+  (PR #169), and the release commit is recorded as an integrator-reviewed tier
+  whose notes are still checked claim by claim (PR #166), because the
   section ships verbatim as the GitHub release body.
 - **`ui/AGENTS.md` records that the client bundle carries its source comments**
-  (#179, PR #179): `minify: false`, so a comment-only edit under `ui/src/**`
+  (#178, PR #179): `minify: false`, so a comment-only edit under `ui/src/**`
   changes `lib/client.js`, and `artifactFreshness` compares against
   `git show HEAD:<path>` — it stays red until the rebuild is committed.
-- **The e2e checklist gains the 0.2.0 machine-verifiable record** (#167,
-  PR #167): what an agent can assert alone, and what it cannot — named as
-  uncovered, not as passes.
+- **The e2e checklist gains the 0.2.0 machine-verifiable record** (PR #167):
+  what an agent can assert alone, and what it cannot — named as uncovered, not
+  as passes.
 
 ## v0.2.0 (2026-10-27)
 
