@@ -104,6 +104,12 @@ async function makeRig(
     signal: controller.signal,
   })
   const client = new JsonRpcClient(channel)
+  // The desktop's `requireAgent()` runs `requireCapability('agent')` →
+  // `requireAuthentication()` on EVERY agent face (issue #187), so this raw
+  // rig must complete the handshake a real client completes — hello, then
+  // authenticate — before its first `agent.sessions.subscribe`.
+  await client.request('connection.hello', { protocolVersions: [1] })
+  await client.request('connection.authenticate', { deviceId: 'dev-subs-rig' })
 
   const subs = new SessionSubscriptions(client, {
     subscriptionsLimit: opts.subscriptionsLimit ?? (options.agent?.subscriptionLimit ?? 8),
