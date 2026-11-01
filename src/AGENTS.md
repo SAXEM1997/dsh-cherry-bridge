@@ -647,7 +647,9 @@ fallback. The steady-state dial uses `directEndpointUrl` + both maps (`??`):
 candidate's own host/port/scheme, never the record. v2→v3 backfills `ws`,
 v3→v4 `ports` from `port`, atomic on read. Scheme loss breaks a TLS proxy;
 port loss dials the right scheme at the wrong port. Re-typing keeps scheme
-(`securityFor`)/port (`portsFor`); whole-replace `hosts` defaults new hosts to
+(`securityFor`)/port (`portsFor`) CASE-INSENSITIVELY — a re-typed spelling is
+the same address (#189), and a PATCH refuses a list holding two spellings of
+one host; whole-replace `hosts` defaults new hosts to
 `ws`/port; a CHANGED `port` re-points EVERY final host, the current value a map
 no-op (the settings UI sends both on save). `GET /devices` reports both maps and
 `forgottenHosts` (addresses and intent, not credentials); tools/diagnostics show

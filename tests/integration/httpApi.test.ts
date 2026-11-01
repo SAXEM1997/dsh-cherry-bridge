@@ -1088,6 +1088,104 @@ describe('④ PATCH address maintenance', () => {
     expect(store.list()[0]!.security).toEqual({ '10.0.0.1': 'wss', '10.0.0.9': 'ws' })
   })
 
+  it('keeps a staying host\'s scheme and its OWN port when the PATCH re-types its case', async () => {
+    mount()
+    // One host is a TLS proxy with its own port. The PATCH face compares hosts
+    // case-insensitively everywhere else (the learn merge, forget/remember, the
+    // mark clearing), so a NEW SPELLING of a host already in the list is the
+    // same address: dropping its scheme turns the next reconnect into a
+    // plaintext dial the desktop refuses (issue #189).
+    store.upsert(
+      record({
+        hosts: ['NAS.example', 'nas2.example'],
+        security: { 'NAS.example': 'wss', 'nas2.example': 'ws' },
+        ports: { 'NAS.example': 4443, 'nas2.example': 8443 },
+      }),
+    )
+
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['nas.example', 'nas2.example'] }),
+    })
+
+    expect(status).toBe(200)
+    // The map keys follow the NEW spelling; the VALUES are the remembered ones.
+    expect(json.security).toEqual({ 'nas.example': 'wss', 'nas2.example': 'ws' })
+    expect(json.ports).toEqual({ 'nas.example': 4443, 'nas2.example': 8443 })
+    expect(store.list()[0]!.security).toEqual({ 'nas.example': 'wss', 'nas2.example': 'ws' })
+    expect(store.list()[0]!.ports).toEqual({ 'nas.example': 4443, 'nas2.example': 8443 })
+  })
+
+  it('an exact spelling wins over a case-insensitive one when a hand-edited archive holds both', async () => {
+    mount()
+    // The store does not reject two spellings of one host (a hand edit can),
+    // so the lookup must prefer the surviving spelling's OWN entry rather than
+    // whatever a case-insensitive index happens to hold.
+    store.upsert(
+      record({
+        hosts: ['NAS.example', 'nas.example'],
+        security: { 'NAS.example': 'wss', 'nas.example': 'ws' },
+        ports: { 'NAS.example': 4443, 'nas.example': 4444 },
+      }),
+    )
+
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['nas.example'] }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.security).toEqual({ 'nas.example': 'ws' })
+    expect(json.ports).toEqual({ 'nas.example': 4444 })
+    // The PERSISTED record, not just the reply: the response is projected from
+    // the same `next` object the store just accepted, so only a re-read proves
+    // the map that survives is the one the next handshake will dial with.
+    expect(store.list()[0]!.security).toEqual({ 'nas.example': 'ws' })
+    expect(store.list()[0]!.ports).toEqual({ 'nas.example': 4444 })
+  })
+
+  it('a THIRD spelling inherits the FIRST listed spelling when the archive holds two', async () => {
+    mount()
+    // The collision rule has to be a CONTRACT, not an implementation accident:
+    // the exact lookup misses (a third spelling), so the fallback decides, and
+    // it takes the first-listed entry — deterministic for a given archive.
+    store.upsert(
+      record({
+        hosts: ['NAS.example', 'nas.example'],
+        security: { 'NAS.example': 'wss', 'nas.example': 'ws' },
+        ports: { 'NAS.example': 4443, 'nas.example': 4444 },
+      }),
+    )
+
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['Nas.example'] }),
+    })
+
+    expect(status).toBe(200)
+    expect(json.security).toEqual({ 'Nas.example': 'wss' })
+    expect(json.ports).toEqual({ 'Nas.example': 4443 })
+    expect(store.list()[0]!.security).toEqual({ 'Nas.example': 'wss' })
+    expect(store.list()[0]!.ports).toEqual({ 'Nas.example': 4443 })
+  })
+
+  it('refuses a hosts replacement holding two spellings of one host', async () => {
+    mount()
+    store.upsert(record())
+
+    // The scheme/port maps are keyed by host, so two spellings of one address
+    // have no single entry and last-wins is not a contract — the same rule the
+    // IPv6 normalization case applies, now case-insensitively.
+    const { status, json } = await call('/devices/dev-1', {
+      method: 'PATCH',
+      body: JSON.stringify({ hosts: ['NAS.example', 'nas.example'] }),
+    })
+
+    expect(status).toBe(400)
+    expect(json.message).toMatch(/hosts must not contain duplicates/)
+    expect(store.list()[0]!.hosts).toEqual(['192.168.1.20'])
+  })
+
   it('re-points EVERY final host when port is patched, with or without a hosts replacement', async () => {
     mount()
     store.upsert(
