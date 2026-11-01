@@ -208,6 +208,19 @@ export interface FakeCherryOptions {
    * ['agent']). An empty array models a desktop that approved nothing usable.
    */
   approvedGrants?: readonly string[]
+  /**
+   * Device ids `connection.authenticate` will accept (unset = every id, the
+   * pre-#191 behaviour). When set, an id outside the list is refused
+   * `UNAUTHENTICATED` / `'Device has no approved capabilities'` — the desktop's
+   * lookup, which runs BEFORE the token gate (`RemoteConnection.ts:85-90`).
+   *
+   * OPT-IN because every existing fixture INVENTS a device id; an unset knob
+   * leaves every path byte-identical. The desktop looks the approval up by
+   * `(deviceId, channel.remoteIdentity)`; only the id half is modelled here.
+   * Applies to `connection.authenticate` alone: the pairing door's device id
+   * comes from the approval itself, so it cannot be unapproved.
+   */
+  approvedDeviceIds?: readonly string[]
   /** Agent face (Task 7): journal replay/checkpoint/subscription-limit knobs. */
   agent?: FakeAgentOptions
 }
@@ -870,6 +883,8 @@ export class FakeCherry {
   #authenticateFailure: FakeFailure | undefined
   /** Mirrors `FakeCherryOptions.staleAccessToken` (read at authenticate time). */
   #staleAccessToken: boolean
+  /** Mirrors `FakeCherryOptions.approvedDeviceIds`; `undefined` accepts any id. */
+  #approvedDeviceIds: readonly string[] | undefined
   /** Mirrors `FakeCherryOptions.helloFailure` (read at hello time). */
   #helloFailure: FakeFailure | undefined
   /** Mirrors `FakeCherryOptions.pairingClaimFailure` (read at claim time). */
@@ -1012,6 +1027,7 @@ export class FakeCherry {
     this.#refreshFailure = options.refreshFailure
     this.#authenticateFailure = options.authenticateFailure
     this.#staleAccessToken = options.staleAccessToken ?? false
+    this.#approvedDeviceIds = options.approvedDeviceIds
     this.#helloFailure = options.helloFailure
     this.#pairingClaimFailure = options.pairingClaimFailure
     this.#dropPings = options.dropPings ?? false
@@ -2287,6 +2303,12 @@ export class FakeCherry {
     // looks at grants or the token (RemoteConnection.ts:84) — the handler's
     // already-authenticated check happened in the dispatch arm, above.
     this.#requireHello(live)
+    // The desktop looks the APPROVAL up before it looks at the token
+    // (RemoteConnection.ts:85-90), so an unapproved device is refused here, not
+    // by the token gate below — and nothing is minted (issue #191).
+    if (this.#approvedDeviceIds !== undefined && !this.#approvedDeviceIds.includes(params['deviceId'] as string)) {
+      throw new FakeRpcError({ reason: 'UNAUTHENTICATED', message: 'Device has no approved capabilities' })
+    }
     // A stored token the peer no longer accepts. The desktop's
     // `tokens.validate` refuses the TOKEN, never the reconnect: the same call
     // without it is answered (and issues a fresh one). The desktop's own test
