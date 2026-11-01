@@ -21,8 +21,9 @@ Pinned at **exact versions**, no `^`, with contract assertions on the pins:
 | `ws` | `8.22.0` |
 | `zod` | `4.3.4` |
 
-These are the versions Cherry Studio **desktop 2.1.8** ships (verified at
-tag `v2.1.8`). Upgrading either protocol package means re-running
+These are the versions Cherry Studio **desktop 2.1.8** ships, and 2.1.9/2.1.10
+still ship the same pair (verified at tags `v2.1.8`, `v2.1.9`, `v2.1.10`).
+Upgrading either protocol package means re-running
 `tests/contract/contract.test.ts` against schema drift — the suite models the
 **six behavioral differences** between our loopback fake peer and a real
 desktop, each mapped to a manual step
@@ -891,15 +892,17 @@ Neither reference is published with this repository.
   face — `git rev-parse <tag>:src/backend/services/remoteAgent` is
   `16e505fe…` at all three tags, and the pins are still 0.7.0 / 0.2.5. Check
   that tree hash before believing a new app version changed the wire.
-- **`_research/cherry-studio`** — the **desktop** source at v2.1.6 (`90b234e`),
-  read alongside v2.1.7, the protocol **server** of record. The faces we depend
-  on are `src/main/services/remoteAccess/` and
+- **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
+  of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
+  through `v2.1.10` (`c60cd41a6`). Diff TREES between tags; attribute a change
+  with the GitHub API, not `git log` (the graft hides the range). The faces we
+  depend on are `src/main/services/remoteAccess/` and
   `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries both
   rate lines. Gitignored; treated as read-only research.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.8.** mDNS, protocol versions (`[1]`) and
+**Verified desktop range: 2.1.4 → 2.1.10.** mDNS, protocol versions (`[1]`) and
 Noise saw **zero changes**; pairing only ADDED the v3 QR arm (below). Notable
 faces:
 
@@ -913,6 +916,7 @@ faces:
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
 | 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |
 | 2.1.8: v3 pairing QR (`bc570d2b9`, PR #21387) — `pairingQrSchema` v2|v3 with custom host/port/security `endpoints`, tightened IPv6; paged message summaries (`54736dc9`/`8bf2fe28d`, PR #21992) advertised by the `agentMessageSummariesVersion` hello capability; server `PAGE_ITEM_BYTES = 62_279` per-item budget | Pairing consumes the published union (#124); summaries are consumed behind the hello capability (#105); a byte-budgeted page may come back SHORTER, which our walk already follows |
+| 2.1.9/2.1.10: **only** `RemoteConnection.send()`'s write chain changed (`16d9487a9`, PR #22593) — `this.writes` keeps its links resolved, so one rejected send no longer makes every later send skip `channel.write`; every other remote-access file and both protocol packages are byte-identical to 2.1.8 | No client change: our answers never depend on the notification stream (list snapshots are the authority), and our own serialized queue (`SecondWindowRateLimiter`) cannot reject |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
 
 **Traps in the official app (a cautionary list, not a spec).**
