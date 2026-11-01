@@ -696,9 +696,13 @@ honour it — the READ path repairs that one state
 refusing it would brick every device tool until a 0600 file was hand-edited,
 while `upsert`/`forgetEndpoints`/`rememberEndpoints` stay strict. Both write
 actions EVICT the pooled connection ON A CHANGE, exactly like a PATCH's address
-maintenance, because a `DeviceConnection` captures its record at construction. `GET /devices` reports
-`forgottenHosts` beside the address maps; the settings page does not show it
-yet, and re-admitting an address from the page is a PATCH that includes it.
+maintenance, because a `DeviceConnection` captures its record at construction.
+`GET /devices` reports `forgottenHosts` beside the address maps, and since issue
+#204 the settings page shows the marks with a 恢复 each, plus a 忘记 beside every
+dialed host: both ride the two POST routes in the table, call the SAME store
+methods the `cherry_devices` action does, and answer the PATCH's projection. A
+PATCH that includes a marked host still clears its mark, so re-admitting an
+address immediately stays the PATCH's job (恢复 only lifts the mark).
 The write goes through
 `DeviceStore.learnEndpoints`, which merges a clone of the STORED record (never
 the connection's: that one mirrors the live `accessToken`, which this archive
@@ -766,12 +770,25 @@ listener, no LAN exposure, no separate credentials**:
 | --- | --- |
 | `GET /devices` | Device list. |
 | `PATCH /devices/:id` | Update display name / enabled / addresses / port (`hosts` is **whole-replace**). |
+| `POST /devices/:id/forget` | Drop these `hosts` and record the forget marks (the `cherry_devices` action's face, #204). |
+| `POST /devices/:id/remember` | Lift these marks; `hosts` is untouched, so the address returns on the next advertisement. |
 | `DELETE /devices/:id` | Remove the device and tear down its connection. |
 | `GET /scope` | The whole scope state in one body (see below). |
 | `PUT /scope` | Save the scope — read-modify-write, `expectedRevision` required. |
 | `POST /pair` | Start a pairing run; returns `202 {claimId}` at once, progress over SSE. |
 | `GET /events` | SSE: `device-state` / `pairing-progress`. |
 | `GET /diagnostics` | Operations report (below). |
+
+Device-route refusals (`{error}`; the page branches on the CODE): `forbidden` 403
+(the fence, before routing) · `invalid-request` 400 (malformed body, or a device id
+that is not valid URL encoding) · `last-address` 400 (the action would leave nothing
+to dial; nothing written) · `invalid-device` 400 (the store refused) · `not-found`
+404 (unknown device OR action — also what a QUARANTINED archive answers, its view
+being empty) · `method-not-allowed` 405 (before the body) · `archive-quarantined`
+503 (`{file, corrupt, recovery}`; a damaged archive empties its view and 404s first,
+so this arm only covers a store that refuses after that read — unreachable for the
+shipped store, kept so the arm exists); anything else is the generic 500
+`internal-error`.
 
 > The minimal `pairing-progress` frame shape is `{stage, detail?}`; this plugin
 > **additionally** attaches the optional `claimId` (a cross-run isolation
@@ -929,6 +946,4 @@ faces:
   plus the cumulative arm.
 - Its read path never replays a read; we replay reads **once** (deliberate
   enhancement) while both sides keep commands receipt-recovered.
-- Its command journal backs command recovery, which is why our commands are
-  never replayed.
 

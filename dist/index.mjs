@@ -11748,6 +11748,23 @@ async function handleRequest(req, res, route) {
 			writeError(res, 405, "method-not-allowed", "DELETE or PATCH only");
 			return;
 		}
+		if (first === "devices" && match.segments.length === 3 && second !== void 0) {
+			const deviceId = decodeSegment(second);
+			if (deviceId === void 0) {
+				writeError(res, 400, "invalid-request", "device id is not valid URL encoding");
+				return;
+			}
+			const action = match.segments[2];
+			if (action !== "forget" && action !== "remember") {
+				writeError(res, 404, "not-found", "unknown route");
+				return;
+			}
+			if (method !== "POST") {
+				writeError(res, 405, "method-not-allowed", "POST only");
+				return;
+			}
+			return await changeEndpoints(req, res, route, deviceId, action);
+		}
 		if (first === "pair" && match.segments.length === 1) {
 			if (method !== "POST") {
 				writeError(res, 405, "method-not-allowed", "POST only");
@@ -11785,7 +11802,18 @@ async function handleRequest(req, res, route) {
 	}
 }
 function listDevices(res, route) {
-	writeJson(res, 200, route.deps.store.list().map((device) => ({
+	writeJson(res, 200, route.deps.store.list().map((device) => deviceSummary(route, device)));
+}
+/**
+* One device as the browser sees it: the public archive projection, never a
+* credential.
+*
+* ONE builder, because FOUR faces answer this shape — `GET /devices`, the
+* `PATCH`, and the two endpoint actions of issue #204 — and a hand-written copy
+* per face is how a field ends up on one and not the others.
+*/
+function deviceSummary(route, device) {
+	return {
 		deviceId: device.deviceId,
 		displayName: device.displayName,
 		state: projectState(device, route.deps.connect),
@@ -11795,7 +11823,7 @@ function listDevices(res, route) {
 		security: { ...device.security },
 		ports: { ...device.ports },
 		forgottenHosts: [...device.forgottenHosts ?? []]
-	})));
+	};
 }
 /**
 * The `GET /diagnostics` body (spec §5).
@@ -12052,22 +12080,12 @@ async function patchDevice(req, res, route, deviceId) {
 	} catch (error) {
 		console.warn(`[cherry-remote] device ${deviceId} reconnect failed`, error);
 	}
-	const state = projectState(next, route.deps.connect);
+	const summary = deviceSummary(route, next);
 	if (patch.enabled !== void 0 && patch.enabled !== previousEnabled) route.hub.publish("device-state", {
 		deviceId,
-		state
+		state: summary.state
 	});
-	writeJson(res, 200, {
-		deviceId: next.deviceId,
-		displayName: next.displayName,
-		state,
-		enabled: next.enabled,
-		hosts: [...next.hosts],
-		port: next.port,
-		security: { ...next.security },
-		ports: { ...next.ports },
-		forgottenHosts: [...next.forgottenHosts ?? []]
-	});
+	writeJson(res, 200, summary);
 }
 function warnConnect(deviceId) {
 	return (error) => {
@@ -12077,6 +12095,90 @@ function warnConnect(deviceId) {
 /** Order-sensitive host comparison: `hosts` is an ordered candidate list. */
 function sameHosts(a, b) {
 	return a.length === b.length && a.every((host, index) => host === b[index]);
+}
+/**
+* `POST /devices/:id/forget` and `POST /devices/:id/remember` (issue #204): the
+* settings page's door onto #185's endpoint maintenance, which until now only
+* the `cherry_devices` tool could open.
+*
+* One action per request, and the action IS the request: there is no composite
+* "patch the record AND forget a host" body whose ordering would have to be
+* defined. Every judgement is the store's — the last-candidate refusal, the
+* case-insensitive matching, the disjointness of `hosts`/`forgottenHosts` — so
+* the two doors share ONE set of STORE rules; this route only maps the verdicts
+* onto HTTP and answers the projection the PATCH answers. (The BODY PARSERS do
+* differ on purpose — see `parseEndpointHosts`.)
+*
+* EVICTION on a change, exactly like the tool's own arm and a PATCH's address
+* maintenance, and for a DIFFERENT reason on each action — which is why both
+* are stated here rather than waved through as "parity":
+*
+*  - FORGET: a pooled connection CAPTURES its record at construction, so the
+*    socket built before this write would keep dialing the host we just forgot.
+*    (The mark itself is honoured by the store's learn merge, so a reconnect is
+*    about the DIAL LIST, not about suppressing the address.)
+*  - REMEMBER: learning happens only INSIDE a handshake, against a clone of the
+*    stored record. Without the eviction a desktop that stays connected would
+*    not re-handshake for as long as the link holds, so the restored address
+*    would come back only after some later flap — the button would look inert.
+*
+* The cost is real and inherited from the tool's arm: an eviction disposes the
+* subscription layer and closes a healthy socket, so a write can drop an
+* in-flight command's link. One operator click now reaches that churn; that is
+* the price of "the archive is the truth" for a live connection.
+*/
+async function changeEndpoints(req, res, route, deviceId, action) {
+	const existing = route.deps.store.list().find((device) => device.deviceId === deviceId);
+	if (existing === void 0) {
+		writeError(res, 404, "not-found", `no device ${deviceId}`);
+		return;
+	}
+	let hosts;
+	try {
+		hosts = parseEndpointHosts(await readJsonBody(req));
+	} catch (error) {
+		writeError(res, 400, "invalid-request", error instanceof Error ? error.message : String(error));
+		return;
+	}
+	try {
+		if (action === "forget") {
+			const { removed, marked } = route.deps.store.forgetEndpoints(deviceId, hosts);
+			if (removed.length > 0 || marked.length > 0) evict(route, deviceId);
+		} else {
+			const { restored } = route.deps.store.rememberEndpoints(deviceId, hosts);
+			if (restored.length > 0) evict(route, deviceId);
+		}
+	} catch (error) {
+		if (writeQuarantineRefusal(res, route, error)) return;
+		if (error instanceof LastCandidateHostError) {
+			writeError(res, 400, "last-address", error.message);
+			return;
+		}
+		writeError(res, 400, "invalid-device", error instanceof Error ? error.message : String(error));
+		return;
+	}
+	writeJson(res, 200, deviceSummary(route, route.deps.store.list().find((device) => device.deviceId === deviceId) ?? existing));
+}
+/**
+* The body of an endpoint action: `{hosts: [...]}`, non-empty, every entry
+* normalized the same way the PATCH normalizes an address.
+*
+* The normalization is not cosmetic: an IPv6 literal is stored bare but a
+* browser copy-pastes it bracketed, and the store matches by host spelling —
+* so `[::1]` would be treated as an address the record does not dial and merely
+* marked, leaving the real `::1` in `hosts`. The PATCH's rule is reused for the
+* spelling (same `normalizeHost`), and deliberately NOT for its duplicate
+* refusal: a repeated host in an action body names one host twice, which the
+* store's own sets collapse, while the PATCH's duplicates would build an
+* ambiguous record (`hosts`, `security` and `ports` are keyed by host).
+*/
+function parseEndpointHosts(body) {
+	const hosts = body["hosts"];
+	if (!Array.isArray(hosts) || hosts.length === 0) throw new PatchError("hosts must be a non-empty array");
+	return hosts.map((entry) => {
+		if (typeof entry !== "string") throw new PatchError("hosts entries must be strings");
+		return normalizeHost(entry);
+	});
 }
 /**
 * The scheme map for a WHOLE-REPLACE host list (issue #126): each named host

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
+import { LastCandidateHostError, QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
 import type { DeviceState, EffectiveLimits } from './connection.js'
@@ -1031,6 +1031,28 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
       return
     }
 
+    // The two endpoint actions (issue #204) sit UNDER the device resource
+    // because that is what they act on: they are the page's door onto #185's
+    // forget/remember, one action per request, so a "patch AND forget" body
+    // with a contradictory ordering never exists.
+    if (first === 'devices' && match.segments.length === 3 && second !== undefined) {
+      const deviceId = decodeSegment(second)
+      if (deviceId === undefined) {
+        writeError(res, 400, 'invalid-request', 'device id is not valid URL encoding')
+        return
+      }
+      const action = match.segments[2]
+      if (action !== 'forget' && action !== 'remember') {
+        writeError(res, 404, 'not-found', 'unknown route')
+        return
+      }
+      if (method !== 'POST') {
+        writeError(res, 405, 'method-not-allowed', 'POST only')
+        return
+      }
+      return await changeEndpoints(req, res, route, deviceId, action)
+    }
+
     if (first === 'pair' && match.segments.length === 1) {
       if (method !== 'POST') {
         writeError(res, 405, 'method-not-allowed', 'POST only')
@@ -1085,7 +1107,23 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
 }
 
 function listDevices(res: HttpResponseLike, route: RouteContext): void {
-  const devices: DeviceSummary[] = route.deps.store.list().map((device) => ({
+  writeJson(
+    res,
+    200,
+    route.deps.store.list().map((device) => deviceSummary(route, device)),
+  )
+}
+
+/**
+ * One device as the browser sees it: the public archive projection, never a
+ * credential.
+ *
+ * ONE builder, because FOUR faces answer this shape — `GET /devices`, the
+ * `PATCH`, and the two endpoint actions of issue #204 — and a hand-written copy
+ * per face is how a field ends up on one and not the others.
+ */
+function deviceSummary(route: RouteContext, device: DeviceRecord): DeviceSummary {
+  return {
     deviceId: device.deviceId,
     displayName: device.displayName,
     state: projectState(device, route.deps.connect),
@@ -1094,9 +1132,10 @@ function listDevices(res: HttpResponseLike, route: RouteContext): void {
     port: device.port,
     security: { ...device.security },
     ports: { ...device.ports },
+    // An empty list is the honest "none", not an absent key: the page renders
+    // the forgotten row only when it is non-empty.
     forgottenHosts: [...(device.forgottenHosts ?? [])],
-  }))
-  writeJson(res, 200, devices)
+  }
 }
 
 /**
@@ -1500,23 +1539,14 @@ async function patchDevice(
 
   // The response and the SSE frame always report the projection of the record
   // we just wrote: a disabled device is `disabled` regardless of what its
-  // connection last said, and an enabled one reports its live state.
-  const state = projectState(next, route.deps.connect)
+  // connection last said, and an enabled one reports its live state. ONE
+  // projection feeds both, so the frame and the body cannot disagree.
+  const summary = deviceSummary(route, next)
   if (patch.enabled !== undefined && patch.enabled !== previousEnabled) {
-    route.hub.publish('device-state', { deviceId, state })
+    route.hub.publish('device-state', { deviceId, state: summary.state })
   }
 
-  writeJson(res, 200, {
-    deviceId: next.deviceId,
-    displayName: next.displayName,
-    state,
-    enabled: next.enabled,
-    hosts: [...next.hosts],
-    port: next.port,
-    security: { ...next.security },
-    ports: { ...next.ports },
-    forgottenHosts: [...(next.forgottenHosts ?? [])],
-  })
+  writeJson(res, 200, summary)
 }
 
 function warnConnect(deviceId: string): (error: unknown) => void {
@@ -1537,6 +1567,116 @@ function warnConnect(deviceId: string): (error: unknown) => void {
 /** Order-sensitive host comparison: `hosts` is an ordered candidate list. */
 function sameHosts(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((host, index) => host === b[index])
+}
+
+/**
+ * `POST /devices/:id/forget` and `POST /devices/:id/remember` (issue #204): the
+ * settings page's door onto #185's endpoint maintenance, which until now only
+ * the `cherry_devices` tool could open.
+ *
+ * One action per request, and the action IS the request: there is no composite
+ * "patch the record AND forget a host" body whose ordering would have to be
+ * defined. Every judgement is the store's — the last-candidate refusal, the
+ * case-insensitive matching, the disjointness of `hosts`/`forgottenHosts` — so
+ * the two doors share ONE set of STORE rules; this route only maps the verdicts
+ * onto HTTP and answers the projection the PATCH answers. (The BODY PARSERS do
+ * differ on purpose — see `parseEndpointHosts`.)
+ *
+ * EVICTION on a change, exactly like the tool's own arm and a PATCH's address
+ * maintenance, and for a DIFFERENT reason on each action — which is why both
+ * are stated here rather than waved through as "parity":
+ *
+ *  - FORGET: a pooled connection CAPTURES its record at construction, so the
+ *    socket built before this write would keep dialing the host we just forgot.
+ *    (The mark itself is honoured by the store's learn merge, so a reconnect is
+ *    about the DIAL LIST, not about suppressing the address.)
+ *  - REMEMBER: learning happens only INSIDE a handshake, against a clone of the
+ *    stored record. Without the eviction a desktop that stays connected would
+ *    not re-handshake for as long as the link holds, so the restored address
+ *    would come back only after some later flap — the button would look inert.
+ *
+ * The cost is real and inherited from the tool's arm: an eviction disposes the
+ * subscription layer and closes a healthy socket, so a write can drop an
+ * in-flight command's link. One operator click now reaches that churn; that is
+ * the price of "the archive is the truth" for a live connection.
+ */
+async function changeEndpoints(
+  req: HttpRequestLike,
+  res: HttpResponseLike,
+  route: RouteContext,
+  deviceId: string,
+  action: 'forget' | 'remember',
+): Promise<void> {
+  const existing = route.deps.store.list().find((device) => device.deviceId === deviceId)
+  if (existing === undefined) {
+    writeError(res, 404, 'not-found', `no device ${deviceId}`)
+    return
+  }
+
+  let hosts: string[]
+  try {
+    hosts = parseEndpointHosts(await readJsonBody(req))
+  } catch (error) {
+    writeError(res, 400, 'invalid-request', error instanceof Error ? error.message : String(error))
+    return
+  }
+
+  try {
+    if (action === 'forget') {
+      const { removed, marked } = route.deps.store.forgetEndpoints(deviceId, hosts)
+      if (removed.length > 0 || marked.length > 0) evict(route, deviceId)
+    } else {
+      const { restored } = route.deps.store.rememberEndpoints(deviceId, hosts)
+      if (restored.length > 0) evict(route, deviceId)
+    }
+  } catch (error) {
+    // Quarantine first, and distinctly: it is not the request's fault (the 400s
+    // below) and the browser cannot fix it — the archive is READ-ONLY until a
+    // human moves the bad file aside. A store that was ALREADY quarantined
+    // never reaches this arm: its view is empty, so the `list()` above answered
+    // 404 before any write — the same precedence PATCH and DELETE have. This is
+    // the defence for a store that begins refusing after that read, and it is
+    // what keeps a damaged archive from being reported as a bad request.
+    if (writeQuarantineRefusal(res, route, error)) return
+    // The tool's own code for the same refusal, so the page can translate it by
+    // code rather than by prose.
+    if (error instanceof LastCandidateHostError) {
+      writeError(res, 400, 'last-address', error.message)
+      return
+    }
+    writeError(res, 400, 'invalid-device', error instanceof Error ? error.message : String(error))
+    return
+  }
+
+  // The projection of the record we just wrote, never the object we read before
+  // the write: `REMOVED from a declined call` and `UNCHANGED by a no-op` are
+  // both answered from the archive's current row.
+  const fresh = route.deps.store.list().find((device) => device.deviceId === deviceId)
+  writeJson(res, 200, deviceSummary(route, fresh ?? existing))
+}
+
+/**
+ * The body of an endpoint action: `{hosts: [...]}`, non-empty, every entry
+ * normalized the same way the PATCH normalizes an address.
+ *
+ * The normalization is not cosmetic: an IPv6 literal is stored bare but a
+ * browser copy-pastes it bracketed, and the store matches by host spelling —
+ * so `[::1]` would be treated as an address the record does not dial and merely
+ * marked, leaving the real `::1` in `hosts`. The PATCH's rule is reused for the
+ * spelling (same `normalizeHost`), and deliberately NOT for its duplicate
+ * refusal: a repeated host in an action body names one host twice, which the
+ * store's own sets collapse, while the PATCH's duplicates would build an
+ * ambiguous record (`hosts`, `security` and `ports` are keyed by host).
+ */
+function parseEndpointHosts(body: Record<string, unknown>): string[] {
+  const hosts = body['hosts']
+  if (!Array.isArray(hosts) || hosts.length === 0) {
+    throw new PatchError('hosts must be a non-empty array')
+  }
+  return hosts.map((entry) => {
+    if (typeof entry !== 'string') throw new PatchError('hosts entries must be strings')
+    return normalizeHost(entry)
+  })
 }
 
 /**

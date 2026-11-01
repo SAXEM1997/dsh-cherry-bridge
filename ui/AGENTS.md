@@ -34,6 +34,11 @@ with its source. Loaded automatically when a file tool touches `ui/**`.
   goes green once the rebuild is COMMITTED — running the full suite before
   committing reports it red for the same reason its sibling case ("neither check
   mutates the committed artifacts") is red. Neither red is a real failure.
+- **A per-host action is INERT while a whole-list editor is open.** The address
+  editor's draft is sacred (the card does not reseed it while an editor is
+  open), so a 忘记/恢复 chosen under it would be re-sent by the next 保存地址 — and
+  that PATCH clears the mark for any host it names. Hence
+  `disabled={busy || editor === 'address'}` on both controls, pinned by `#204m`.
 - **jsdom only.** `tests/unit/ui.test.ts` and `uiScopePanel.test.ts` render the
   page; a browser-only API needs a fake in the test, not a guard in the page.
 

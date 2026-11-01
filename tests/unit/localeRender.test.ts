@@ -182,6 +182,7 @@ const DEVICE: DeviceSummary = {
   hosts: ['192.168.1.10'],
   port: 4343,
   ports: { '192.168.1.10': 4343 },
+  forgottenHosts: [],
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +326,44 @@ describe('DeviceCard renders its own copy in English', () => {
     fireEvent.click(screen.getByRole('button', { name: tr('device.save.addresses') }))
     expect(screen.getByRole('alert').textContent).toBe(tr('device.error.hostsRequired'))
     expect(screen.getByRole('alert').textContent).not.toContain('至少')
+  })
+
+  it('renders the forgotten-address row, its actions and its hint in English (issue #204)', () => {
+    // Four strings that exist only on a record CARRYING a mark, so the shared
+    // fixture (an empty list) would leave their English halves unrendered —
+    // the zh half is covered in `ui.test.ts`, and the dictionary parity test
+    // only says the keys exist in both.
+    localeStore.setLocale('en')
+    render(
+      createElement(DeviceCard, {
+        device: { ...DEVICE, forgottenHosts: ['nas.example'] },
+        state: 'connected',
+        onSaved: () => {},
+        onRemoved: () => {},
+      }),
+    )
+
+    expect(screen.getByText(tr('device.field.forgotten'))).toBeTruthy()
+    expect(screen.getByText('nas.example')).toBeTruthy()
+    expect(screen.getByRole('button', { name: tr('device.forget') })).toBeTruthy()
+    expect(screen.getByRole('button', { name: tr('device.remember') })).toBeTruthy()
+    expect(screen.getByText(tr('device.forgotten.hint'))).toBeTruthy()
+    // `tr()` reads the dictionary, so every line above would also pass with a
+    // Chinese VALUE under `en`. The direction that matters is the leak, so the
+    // words themselves are checked for CJK — a copy edit stays free, a
+    // mis-filed translation does not.
+    // `device.error.lastAddress` is included although THIS case cannot render it
+    // (a refusal needs a failed request): its only other test asserts the zh
+    // sentence, so a Chinese value under `en` would otherwise be invisible.
+    for (const word of [
+      tr('device.field.forgotten'),
+      tr('device.forget'),
+      tr('device.remember'),
+      tr('device.forgotten.hint'),
+      tr('device.error.lastAddress'),
+    ]) {
+      expect(word).not.toMatch(/[\u4e00-\u9fff]/)
+    }
   })
 
   it('translates the rename form and its empty-name refusal', () => {

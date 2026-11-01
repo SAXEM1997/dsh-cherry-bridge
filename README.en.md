@@ -217,9 +217,9 @@ subscription was lost and could not be rebuilt, so the outcome is
 The plugin is also a **web client bundle** (`package.json`'s `dsh.client`,
 exporting `./client`). Through the `settings.section` slot it registers a
 **`cherry-remote`** page (nav label “Cherry Bridge”): device cards
-(enable/disable/remove), a pairing wizard (paste → 6-digit code → verdict), a
-scope panel, and live state pushed over the same-origin SSE feed
-(`/cherry-remote/api/events`).
+(enable/disable/remove, plus forget/restore for an address), a pairing wizard
+(paste → 6-digit code → verdict), a scope panel, and live state pushed over the
+same-origin SSE feed (`/cherry-remote/api/events`).
 
 The 14 tools appear **per workspace**, by **hiding, not refusing** (in an
 out-of-scope session they never enter the tool table, saving context):
