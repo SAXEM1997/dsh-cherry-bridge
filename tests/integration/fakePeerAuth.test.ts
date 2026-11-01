@@ -325,6 +325,45 @@ describe("the fake peer's pre-authentication gates (issue #186)", () => {
  * link; the divergence still matters, because a fixture that pings early would
  * be asserting the fake's permissiveness rather than the desktop's contract.
  */
+/**
+ * The desktop's `authenticate()` looks the APPROVAL up before it looks at the
+ * token (`RemoteConnection.ts:84-90`):
+ *
+ *     this.requireHello()
+ *     const authorization = apiGatewayPairedDeviceService.getRemoteAuthorization(deviceId, channel.remoteIdentity)
+ *     if (!authorization) throw new RemoteRpcError('UNAUTHENTICATED', 'Device has no approved capabilities')
+ *     if (accessToken) tokens.validate(accessToken, deviceId, channel.remoteIdentity, authorization)
+ *
+ * so a device the desktop never approved is refused there, while the fake minted
+ * it a token and granted `agent` (issue #191). The knob is OPT-IN on purpose:
+ * every existing fixture invents a device id, and an unset knob must leave every
+ * path byte-identical.
+ */
+describe("the fake peer's device-approval gate on authenticate (issue #191)", () => {
+  it('#191a an id the peer never approved answers UNAUTHENTICATED before the token gate, and mints nothing', async () => {
+    const peer = await openRaw({ approvedDeviceIds: ['dev-approved'], staleAccessToken: true })
+    await greet(peer.client)
+
+    // The TOKEN gate would also reject this call (`staleAccessToken`), so the
+    // verdict pins the ORDER: the approval lookup speaks first, the token second.
+    const error = await failureOf(
+      peer.client.request('connection.authenticate', { deviceId: 'dev-invented', accessToken: 'tok-held-by-nobody' }),
+    )
+    expect(error).toBeInstanceOf(JsonRpcRequestError)
+    expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'UNAUTHENTICATED' })
+    expect((error as JsonRpcRequestError).message).toBe('Device has no approved capabilities')
+    // POSITION: refused before the mint — and the call DID reach the handler.
+    expect(peer.fake.tokenIssues).toHaveLength(0)
+    expect(peer.fake.authenticateAttempts.map((attempt) => attempt.deviceId)).toEqual(['dev-invented'])
+
+    const issued = await peer.client.request<{ deviceId: string }>('connection.authenticate', {
+      deviceId: 'dev-approved',
+    })
+    expect(issued.deviceId).toBe('dev-approved')
+    expect(peer.fake.tokenIssues).toHaveLength(1)
+  })
+})
+
 describe("the fake peer's ping gate (issue #192)", () => {
   it('#192a connection.ping answers the hello verdict on an un-greeted socket, and the nonce after it', async () => {
     const peer = await openRaw({})
