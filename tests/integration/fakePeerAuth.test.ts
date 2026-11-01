@@ -183,6 +183,11 @@ describe('the fake peer after pairing.get approves a device (issue #183)', () =>
     expect((error as JsonRpcRequestError).data).toMatchObject({ reason: 'INVALID_CONNECTION_STATE' })
     // The desktop's own wording (RemoteConnection.ts), not a paraphrase.
     expect((error as JsonRpcRequestError).message).toBe('Connection is already authenticated')
+    // POSITION, not just the verdict: the desktop's guard sits BEFORE the
+    // `authenticate()` helper, so a refused second call mints NO token. A gate
+    // moved after the mint would still throw and still pass the assertions
+    // above, so the peer's own ledger is what pins the order (review finding).
+    expect(peer.fake.tokenIssues).toHaveLength(1)
   })
 
   it('#183c pairing.get is the other door into that state: connection.authenticate is refused after it', async () => {
