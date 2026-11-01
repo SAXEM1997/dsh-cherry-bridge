@@ -487,6 +487,40 @@ function assertValidForgotten(hosts: string[], forgotten: unknown): void {
 }
 
 /**
+ * Repairs ONE cross-build state on the READ path: a host listed in both
+ * `hosts` and `forgottenHosts` (issue #185).
+ *
+ * A build that predates the field PRESERVES it but cannot honour it, so a
+ * downgrade followed by a still-advertising desktop appends the host to
+ * `hosts` while the mark stays. Upgrading again then yields a record that says
+ * both "dial it" and "never dial it". Refusing it would brick every device tool
+ * until an operator hand-edits a 0600 file, so the READ path keeps the DIAL
+ * list — what the running build actually did — and drops the mark, with a
+ * warning naming the device and host (addresses are not secrets).
+ *
+ * The WRITE paths stay strict: `upsert`, `forgetEndpoints` and
+ * `rememberEndpoints` never produce the overlap, and `assertValidRecord`
+ * refuses it. This runs ONLY on the read path, before that assertion.
+ */
+function reconcileForgottenMarks(disk: DeviceRecordOnDisk): DeviceRecordOnDisk {
+  const forgotten = disk.forgottenHosts
+  if (!Array.isArray(forgotten) || !Array.isArray(disk.hosts)) return disk
+  const dialed = new Set(disk.hosts.map((host) => host.toLowerCase()))
+  const kept = forgotten.filter(
+    (host) => !(typeof host === 'string' && dialed.has(host.toLowerCase())),
+  )
+  if (kept.length === forgotten.length) return disk
+  for (const host of forgotten) {
+    if (typeof host !== 'string' || !dialed.has(host.toLowerCase())) continue
+    console.warn(
+      `device archive entry ${String(disk.deviceId)} lists host "${host}" as both dialed and ` +
+        `forgotten; keeping it dialed and dropping the mark (a plugin downgrade can produce this)`,
+    )
+  }
+  return { ...disk, forgottenHosts: kept }
+}
+
+/**
  * Read path, fixed order: loose parse -> completeness gate -> version judgement
  * -> migration -> assert the required `DeviceRecord` type.
  *
@@ -548,7 +582,9 @@ function parseRecord(raw: unknown, archiveVersion: number): DeviceRecord {
     migrated = migrate(migrated)
   }
 
-  return assertValidRecord(migrated)
+  // A cross-build repair, never a write-path policy: see
+  // `reconcileForgottenMarks` for why the read path is the forgiving one.
+  return assertValidRecord(reconcileForgottenMarks(migrated))
 }
 
 function parseArchive(parsed: unknown): ArchiveFile {
@@ -707,8 +743,8 @@ export class QuarantinedArchiveError extends Error {
  * would leave a record with NO dial candidate.
  *
  * A record with nothing to dial is worse than the stale address the operator
- * wanted gone: every tool would answer `offline` until a re-pair (the only
- * operation that writes a fresh `hosts` list), and the archive would look
+ * wanted gone: every tool would answer `offline` until a RE-PAIR or a PATCH
+ * with a non-empty `hosts` list writes a fresh one, and the archive would look
  * healthy the whole time. The check is ATOMIC — the whole call refuses, so a
  * name for the last host cannot remove a different host on its way to failing.
  * Nothing is written when this is thrown.

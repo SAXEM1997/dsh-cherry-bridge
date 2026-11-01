@@ -679,12 +679,21 @@ then re-add it), and a PATCH whose `hosts` names a forgotten host clears that
 host's mark in the same write: an explicit operator list is intent to dial, and
 `hosts`/`forgottenHosts` are disjoint (`assertValidRecord` refuses the overlap).
 Forgetting the LAST candidate is refused (`LastCandidateHostError`) and writes
-nothing — a record with nothing to dial answers `offline` until a re-pair.
+nothing — a record with nothing to dial answers `offline` until a re-pair or a
+PATCH writes a fresh `hosts` list.
 `forgottenHosts` is optional and versionless on purpose: absence means "nothing
 forgotten", an older build ignores the key instead of refusing the archive, and
-no migration (or `schemaVersion` 5) was needed. Both write actions EVICT the
-pooled connection, exactly like a PATCH's address maintenance, because a
-`DeviceConnection` captures its record at construction. `GET /devices` reports
+no migration (or `schemaVersion` 5) was needed. TWO consequences of that
+compatibility are stated, not implied: a RE-PAIR replaces the record wholesale,
+so it clears every mark (a fresh pairing is a fresh decision — the QR's own
+candidates may reintroduce the address), and a DOWNGRADE can produce the overlap
+the write paths refuse, because the older build preserves the key but cannot
+honour it — the READ path repairs that one state
+(`reconcileForgottenMarks`: keeps the dial list, drops the mark, warns), since
+refusing it would brick every device tool until a 0600 file was hand-edited,
+while `upsert`/`forgetEndpoints`/`rememberEndpoints` stay strict. Both write
+actions EVICT the pooled connection ON A CHANGE, exactly like a PATCH's address
+maintenance, because a `DeviceConnection` captures its record at construction. `GET /devices` reports
 `forgottenHosts` beside the address maps; the settings page does not show it
 yet, and re-admitting an address from the page is a PATCH that includes it.
 The write goes through

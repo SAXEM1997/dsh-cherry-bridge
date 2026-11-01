@@ -1905,8 +1905,42 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     expect(
       await devices.execute({ device: 'dev-A', action: 'forget', hosts: [fakeInfo.host] }),
     ).toMatchObject({ error: 'last-address' })
-    // Nothing was written by any of the refusals.
+    // Nothing was written by any of the refusals…
     expect(new DeviceStore(join(dataDir, 'devices.json')).list()[0]?.forgottenHosts).toBeUndefined()
+    // …and none of them even dialed: argument and store refusals come before
+    // the connection/view work.
+    expect(fakeInfo.fake.socketCount).toBe(0)
+  })
+
+  it('③ab unwraps a bracketed IPv6 literal and refuses an over-long host, like the PATCH path', async () => {
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake()
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    seedConnectedDevice(dataDir, fakeInfo)
+    await waitForIdentity(dataDir)
+    const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
+
+    // The archive stores BARE hosts (the PATCH path unwraps the brackets). A
+    // mark for `[fd00::1]` would never match the `fd00::1` a dial or an
+    // advertisement carries, so it would be a mark with no effect.
+    const forgotten = (await devices.execute({
+      device: 'dev-A',
+      action: 'forget',
+      hosts: ['[fd00::1]'],
+    })) as { marked: string[] }
+    expect(forgotten.marked).toEqual(['fd00::1'])
+    expect(new DeviceStore(join(dataDir, 'devices.json')).list()[0]?.forgottenHosts).toEqual([
+      'fd00::1',
+    ])
+
+    // The ceiling mirrors the PATCH path's HOST_MAX: junk of that size must not
+    // become an archive entry nobody can remove by matching it.
+    expect(
+      await devices.execute({ device: 'dev-A', action: 'remember', hosts: ['x'.repeat(300)] }),
+    ).toMatchObject({ error: 'invalid-hosts' })
   })
 })
 

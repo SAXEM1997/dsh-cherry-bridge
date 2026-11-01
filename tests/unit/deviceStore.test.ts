@@ -1134,20 +1134,26 @@ describe('DeviceStore.forgetEndpoints / rememberEndpoints (issue #185)', () => {
   })
 
   it('⑲h upsert rejects a record that DIALS a host it has forgotten (the two lists are disjoint)', async () => {
-    const store = new DeviceStore(await makeStoreFile())
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
 
     // `hosts` and `forgottenHosts` are the two halves of one decision. A record
     // holding both would make "is this host dialed?" depend on which list the
     // reader consulted, so the invariant is refused where the write happens.
     expect(() => store.upsert(makeRecord({ forgottenHosts: ['10.0.0.5'] }))).toThrow(/forgottenHosts/)
-    // A disjoint list — a host the record does not dial — is valid.
+    // A disjoint list — a host the record does not dial — is valid, and it
+    // really lands (a refusal that silently swallowed the next call would pass
+    // a bare `not.toThrow`).
     expect(() => store.upsert(makeRecord({ forgottenHosts: ['192.168.1.8'] }))).not.toThrow()
+    expect(new DeviceStore(file).list()[0]?.forgottenHosts).toEqual(['192.168.1.8'])
   })
 
   it('⑲i the read path rejects junk in forgottenHosts instead of repairing it silently', async () => {
+    // The OVERLAP shape is not in this table on purpose: the read path REPAIRS
+    // it instead of refusing it (⑲k) — it is the state a downgrade can produce,
+    // and refusing it would brick every tool. What must still be refused is
+    // junk no build can produce.
     const cases: Array<[string, unknown, RegExp]> = [
-      // A host that is BOTH dialed and forgotten: contradictory state.
-      ['overlap', ['10.0.0.5'], /both/],
       ['non-string', [42], /forgottenHosts/],
       // Two spellings of one host would let the same address be suppressed and
       // re-learned depending on which entry the comparison hit first.
@@ -1175,6 +1181,47 @@ describe('DeviceStore.forgetEndpoints / rememberEndpoints (issue #185)', () => {
     // forced a schemaVersion 5 on every existing archive (and on the ~25 test
     // fixtures) for a list whose empty value needs no migration.
     expect(store.list()[0]?.forgottenHosts).toBeUndefined()
+    expect(fs.fsyncSync).not.toHaveBeenCalled()
+  })
+
+  it('⑲k repairs a DOWNGRADE overlap on read: keeps the dial list, drops the mark, and warns', async () => {
+    const file = await makeStoreFile()
+    // The exact state a downgrade produces: the older build preserves the key
+    // but cannot honour it, so a still-advertising desktop appends the host to
+    // `hosts` while the mark stays. Refusing would brick every device tool
+    // until an operator hand-edited a 0600 file.
+    await writeArchive(file, [{ ...makeRecord(), forgottenHosts: ['10.0.0.5'] }])
+    vi.mocked(console.warn).mockClear()
+
+    const store = new DeviceStore(file)
+    const record = store.list()[0]!
+    expect(record.hosts).toEqual(['10.0.0.5', '10.0.0.6'])
+    expect(record.forgottenHosts).toEqual([])
+    // Repaired LOUDLY, never silently: the operator can see which address and
+    // device lost its mark.
+    const warned = vi.mocked(console.warn).mock.calls.map((call) => String(call[0]))
+    expect(
+      warned.some((line) => line.includes('dev-alpha') && line.includes('10.0.0.5')),
+    ).toBe(true)
+
+    // The repair is carried into the next write, like a migration: the archive
+    // no longer contains the overlap.
+    store.forgetEndpoints('dev-alpha', ['192.168.1.8'])
+    expect(new DeviceStore(file).list()[0]?.forgottenHosts).toEqual(['192.168.1.8'])
+  })
+
+  it('⑲l unknown device ids are no-ops for both writers, and remember on a mark-less record writes nothing', async () => {
+    const file = await makeStoreFile()
+    const store = new DeviceStore(file)
+    store.upsert(makeRecord())
+    vi.mocked(fs.fsyncSync).mockClear()
+
+    // The tool resolves first, so these arms are defensive: the record may have
+    // been removed (or re-paired) between the selector and the write.
+    expect(store.forgetEndpoints('dev-vanished', ['10.0.0.5'])).toEqual({ removed: [], marked: [] })
+    expect(store.rememberEndpoints('dev-vanished', ['10.0.0.5'])).toEqual({ restored: [] })
+    // A record that never carried a mark: nothing to lift, and no rewrite.
+    expect(store.rememberEndpoints('dev-alpha', ['10.0.0.5'])).toEqual({ restored: [] })
     expect(fs.fsyncSync).not.toHaveBeenCalled()
   })
 })

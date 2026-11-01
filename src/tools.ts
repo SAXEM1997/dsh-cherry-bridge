@@ -1223,8 +1223,11 @@ export interface CherryToolsDeps {
    * `DeviceConnection` captures its record at construction, so a pooled
    * instance can never observe an edited address or a flipped `enabled` flag.
    *
-   * `cherry_unpair` is the other caller: it evicts (drop + close) and then
-   * removes the archive entry, so no live socket outlives its record.
+   * `cherry_unpair` evicts (drop + close) and then removes the archive entry,
+   * so no live socket outlives its record, and `cherry_devices`' `forget` /
+   * `remember` actions evict ON A CHANGE for the same reason: a pooled
+   * connection captured the pre-write record, so a forget that only rewrote the
+   * archive would keep dialing the address (and locally re-learning it).
    */
   evict(deviceId: string): void | Promise<void>
   /**
@@ -1669,7 +1672,26 @@ function hostListArgument(value: unknown): string[] | Record<string, unknown> {
     if (typeof entry !== 'string' || entry.trim() === '') {
       return { error: 'invalid-hosts', message: '`hosts` entries must be non-empty strings' }
     }
-    const host = entry.trim()
+    let host = entry.trim()
+    // The archive stores BARE hosts, and the PATCH path unwraps a bracketed
+    // IPv6 literal (`normalizeHost`). This face must agree: a mark for
+    // `[fd00::1]` would never match the `fd00::1` a dial or an advertisement
+    // carries, so it would be a mark with no effect. The ceiling mirrors the
+    // PATCH path's `HOST_MAX`.
+    if (host.startsWith('[') && host.endsWith(']')) {
+      try {
+        new URL(`http://${host}/`)
+      } catch {
+        return {
+          error: 'invalid-hosts',
+          message: `\`hosts\` entry "${host}" is not a valid IPv6 literal`,
+        }
+      }
+      host = host.slice(1, -1)
+    }
+    if (host.length > 256) {
+      return { error: 'invalid-hosts', message: '`hosts` entry exceeds 256 characters' }
+    }
     const key = host.toLowerCase()
     if (seen.has(key)) {
       return {

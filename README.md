@@ -98,7 +98,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 
 | 工具 | 作用 |
 | --- | --- |
-| `cherry_devices` | 列出已配对设备及连接状态（`connected`/`connecting`/`offline`/`disabled`/`identity-mismatch`）。`action: "forget"` 可永久遗忘指定地址（从拨号列表移除，且桌面再广播也不会被重新学习）；`action: "remember"` 撤销该标记（下次握手可重新学习）；两者都需要 `device` 与 `hosts`。 |
+| `cherry_devices` | 列出已配对设备及连接状态（`connected`/`connecting`/`offline`/`disabled`/`identity-mismatch`）。`action: "forget"` 可遗忘指定地址（从拨号列表移除，且桌面再广播也不会被重新学习，直到 `remember` 或重新配对）；`action: "remember"` 撤销该标记（下次握手可重新学习）；两者都需要 `device` 与 `hosts`。 |
 | `cherry_agents` | 列出某设备上可用的 agent（分页）。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`，后者是 1000 条内部上限）；停点可命名时还给出 `resumeCursor`——用同一 device 与过滤条件把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**，不会转发给对端。 |
 | `cherry_workspaces` | 列出某 agent 的**已注册**工作区，以及是否存在系统工作区。被截断时必带 `truncated`+`truncationReason`；停点可命名时还给出 `resumeCursor`——用相同过滤条件回传为 `cursor` 即可续读。 |
 | `cherry_sessions` | 列出某 agent 的会话，可按工作区过滤。被截断时必带 `truncated`+`truncationReason`（`limit` 或 `safety-bound`），停点可命名时还给出 `resumeCursor`——用同一 device 与**相同过滤条件**把它回传为 `cursor` 即可从停点继续（此时 `limit` 约束的是下一次回答）；跨工具/设备/过滤条件的令牌会被**本地拒绝**。 |
