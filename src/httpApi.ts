@@ -119,6 +119,14 @@ export interface DeviceSummary {
   security: Record<string, 'ws' | 'wss'>
   /** The port each host is dialed with (issue #135); see `DeviceRecord`. */
   ports: Record<string, number>
+  /**
+   * The addresses the operator has forgotten (issue #185): not dialed, and not
+   * re-learned until `cherry_devices` remembers them (or a PATCH puts one back
+   * into `hosts`, which clears its mark). Reported beside the address maps for
+   * the same reason they are: it is archive state an operator edits, not a
+   * credential.
+   */
+  forgottenHosts: string[]
 }
 
 /** The `device-state` SSE payload. */
@@ -1080,6 +1088,7 @@ function listDevices(res: HttpResponseLike, route: RouteContext): void {
     port: device.port,
     security: { ...device.security },
     ports: { ...device.ports },
+    forgottenHosts: [...(device.forgottenHosts ?? [])],
   }))
   writeJson(res, 200, devices)
 }
@@ -1407,8 +1416,20 @@ async function patchDevice(
       : patch.hosts === undefined
         ? previousPorts
         : portsFor(patch.hosts, previousPorts, previousPort)
+  // A host the operator puts BACK into `hosts` is dialed again, so its forget
+  // mark must go: `hosts` and `forgottenHosts` are disjoint by contract, and an
+  // explicit list is intent to dial. A PATCH that does not touch `hosts`
+  // (displayName/enabled/port) leaves every mark alone. Case-insensitive, the
+  // same comparison the learn merge uses.
+  const nextForgotten =
+    patch.hosts === undefined || existing.forgottenHosts === undefined
+      ? undefined
+      : existing.forgottenHosts.filter(
+          (host) => !patch.hosts!.some((nextHost) => nextHost.toLowerCase() === host.toLowerCase()),
+        )
   const next: DeviceRecord = {
     ...existing,
+    ...(nextForgotten === undefined ? {} : { forgottenHosts: nextForgotten }),
     ...(patch.displayName === undefined ? {} : { displayName: patch.displayName }),
     ...(patch.enabled === undefined ? {} : { enabled: patch.enabled }),
     // hosts is WHOLE-REPLACE: the patch wins outright, never merges. The
@@ -1488,6 +1509,7 @@ async function patchDevice(
     port: next.port,
     security: { ...next.security },
     ports: { ...next.ports },
+    forgottenHosts: [...(next.forgottenHosts ?? [])],
   })
 }
 

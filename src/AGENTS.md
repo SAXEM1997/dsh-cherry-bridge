@@ -649,8 +649,9 @@ v3→v4 `ports` from `port`, atomic on read. Scheme loss breaks a TLS proxy;
 port loss dials the right scheme at the wrong port. Re-typing keeps scheme
 (`securityFor`)/port (`portsFor`); whole-replace `hosts` defaults new hosts to
 `ws`/port; a CHANGED `port` re-points EVERY final host, the current value a map
-no-op (the settings UI sends both on save). `GET /devices` reports both maps
-(addresses, not credentials); tools/diagnostics show only `port`. The settings
+no-op (the settings UI sends both on save). `GET /devices` reports both maps and
+`forgottenHosts` (addresses and intent, not credentials); tools/diagnostics show
+only `port`. The settings
 page shows the per-host ports only when they differ from the record-level one.
 TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 `ca` only), forwarded to both dial sites (pool, pairing). `resolveBridgeConfig`
@@ -664,13 +665,38 @@ appended, each with its OWN port and scheme (the one-entry-per-host invariant is
 never split), capped at `MAX_CANDIDATE_HOSTS` = 32 — what a pairing QR can
 produce (BOTH arms cap at 32), so learning cannot build a record no pairing
 could have. An existing entry — the operator's port, a TLS proxy — is never
-re-pointed and none is ever removed; comparison is CASE-INSENSITIVE (a PATCHed
-record keeps the operator's spelling), and an IPv6 literal in another expansion
-is not reconciled — the PATCH path owns that spelling. Two consequences are
-accepted, not bugs: a host the peer still advertises is re-learned after an
-operator PATCH drops it (the peer is the source of truth for its own addresses),
-and a learned host is therefore only removable by stopping the desktop
-advertising it or disabling the device. The write goes through
+re-pointed and never removed by LEARNING; comparison is CASE-INSENSITIVE (a
+PATCHed record keeps the operator's spelling), and an IPv6 literal in another
+expansion is not reconciled — the PATCH path owns that spelling. A PATCH that
+drops a host therefore still lets a later handshake re-learn it (the peer is the
+source of truth for its own addresses); the operator's answer is **forgetting**
+(#185): `DeviceStore.forgetEndpoints` (through `cherry_devices`
+`action: "forget"`) removes each named host from `hosts`/`security`/`ports` as
+one unit and records it in the record's OPTIONAL `forgottenHosts`, which the
+merge skips in every case — so a desktop that keeps advertising the address
+cannot put it back. `action: "remember"` lifts the mark (the next handshake may
+then re-add it), and a PATCH whose `hosts` names a forgotten host clears that
+host's mark in the same write: an explicit operator list is intent to dial, and
+`hosts`/`forgottenHosts` are disjoint (`assertValidRecord` refuses the overlap).
+Forgetting the LAST candidate is refused (`LastCandidateHostError`) and writes
+nothing — a record with nothing to dial answers `offline` until a re-pair or a
+PATCH writes a fresh `hosts` list.
+`forgottenHosts` is optional and versionless on purpose: absence means "nothing
+forgotten", an older build ignores the key instead of refusing the archive, and
+no migration (or `schemaVersion` 5) was needed. TWO consequences of that
+compatibility are stated, not implied: a RE-PAIR replaces the record wholesale,
+so it clears every mark (a fresh pairing is a fresh decision — the QR's own
+candidates may reintroduce the address), and a DOWNGRADE can produce the overlap
+the write paths refuse, because the older build preserves the key but cannot
+honour it — the READ path repairs that one state
+(`reconcileForgottenMarks`: keeps the dial list, drops the mark, warns), since
+refusing it would brick every device tool until a 0600 file was hand-edited,
+while `upsert`/`forgetEndpoints`/`rememberEndpoints` stay strict. Both write
+actions EVICT the pooled connection ON A CHANGE, exactly like a PATCH's address
+maintenance, because a `DeviceConnection` captures its record at construction. `GET /devices` reports
+`forgottenHosts` beside the address maps; the settings page does not show it
+yet, and re-admitting an address from the page is a PATCH that includes it.
+The write goes through
 `DeviceStore.learnEndpoints`, which merges a clone of the STORED record (never
 the connection's: that one mirrors the live `accessToken`, which this archive
 deliberately does not keep), refuses when the record's `desktopIdentity` is no
