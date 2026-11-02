@@ -137,6 +137,7 @@ schema 已允许 `interrupted`，所以客户端**必须**处理，但当前服�
 - [ ] 长回复（>4096 单元）经 `{ref}` 外置，聚合结果仍包含完整文本。
 - [ ] `cherry_read` 能按 messageId 读到该轮消息与 parts。
 - [ ] `wait: false` 立即返回命令回执，随后 `cherry_wait` / `cherry_events` 能续查到同一终态。
+- [ ] 长回答（事件流超过 256 KiB，约 30 小节的一次长输出）时 `wait: true` 仍在终态后立即返回 `completed`；期间每 5 s 采一次 `GET /diagnostics` 的 `sessions[].cursor.seq`，确认它没有停住（修复前会冻结在窗口处，最终报 `timeout`）。
 - [ ] 同 `commandId` 同参重发 → 返回**同一回执**（幂等）；异参重发 → `IDEMPOTENCY_CONFLICT` 透传。
 
 ### C. 交互应答

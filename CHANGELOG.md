@@ -17,6 +17,22 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## Unreleased
+
+### Fixed
+
+- `cherry_send(wait: true)` no longer parks out its whole window when the run's
+  live event stream exceeds the peer's un-acked delivery budget
+  (`remoteLimits.unackedBytes`, 256 KiB). The desktop stops delivering — the
+  run's terminal included — once that much has been sent since the last
+  `agent.subscriptions.ack`, and the layer used to ack only from
+  `cherry_events`, so a 240 s wait could sit on a stream whose run had committed
+  its answer 22 s after the send. `SessionSubscriptions` now acks what it has
+  already buffered, at a quarter of the peer's hello-advertised window (the
+  pinned constant when it advertises none), one ack in flight per session. A
+  refused ack is surfaced as one bounded warning and retried by its own timer
+  with a doubling delay — a held stream sends nothing to retry on (#212).
+
 ## v0.2.1 (2026-11-01)
 
 Addresses stay where the operator puts them. A desktop has advertised its own

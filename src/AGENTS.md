@@ -36,6 +36,7 @@ in [`docs/e2e-checklist.md`](../docs/e2e-checklist.md).
 | `recordBytes` | 65,536 (64 KiB) | one JSON-RPC record above it **aborts the connection** — the transport answers by killing it, so every in-flight request fails |
 | `contentBytes` | 24,576 (24 KiB) | the slice size for one `agent.content.read` |
 | `pageItems` | 100 | the protocol's single-page hard cap; `hello` may negotiate smaller |
+| `unackedBytes` | 262,144 (256 KiB) | the peer HOLDS `agent.events` beyond this much un-acked delivery — terminal included; the layer acks at ¼ of it (hello value, else this) (issue #212) |
 
 Through 2.1.7 the desktop's `pageOf` pages by **count alone** (2.1.8's byte
 budget aside, still count-paged): `pageItems: 100` fat parts produced a record
@@ -187,8 +188,7 @@ projection. An unchanged message costs no repeat `agent.parts.list`
 RPC on send → wait → read rounds, while every read still re-fetches and
 sha256-verifies every `{ref}`'s bytes (a corrupted ref behind an unchanged
 revision fails with `ContentIntegrityError`; `toolsReadCache.test.ts` T1b pins
-this beside the cache). A hit is still not a zero-RPC read: 2.1.6+ externalizes
-every part over 4,096 characters.
+this beside the cache).
 
 - **Entry & key**: the `agent.parts.list` result — `{revision, page}` — keyed
   `<deviceId>\0<messageId>` (device-scoped: a message id is the peer's; two
@@ -654,8 +654,7 @@ one host; whole-replace `hosts` defaults new hosts to
 `ws`/port; a CHANGED `port` re-points EVERY final host, the current value a map
 no-op (the settings UI sends both on save). `GET /devices` reports both maps and
 `forgottenHosts` (addresses and intent, not credentials); tools/diagnostics show
-only `port`. The settings
-page shows the per-host ports only when they differ from the record-level one.
+only `port`.
 TLS trust is operator config (`wsTls`: FLAT `tls.connect` `rejectUnauthorized`/
 `ca` only), forwarded to both dial sites (pool, pairing). `resolveBridgeConfig`
 validates it: unknown key or unusable value warns by FIELD NAME, WHOLE object
@@ -785,9 +784,8 @@ that is not valid URL encoding) · `last-address` 400 (the action would leave no
 to dial; nothing written) · `invalid-device` 400 (the store refused) · `not-found`
 404 (unknown device OR action — also what a QUARANTINED archive answers, its view
 being empty) · `method-not-allowed` 405 (before the body) · `archive-quarantined`
-503 (`{file, corrupt, recovery}`; a damaged archive empties its view and 404s first,
-so this arm only covers a store that refuses after that read — unreachable for the
-shipped store, kept so the arm exists); anything else is the generic 500
+503 (`{file, corrupt, recovery}`; a damaged archive 404s first, so this arm covers
+only a store that refuses after that read); anything else is the generic 500
 `internal-error`.
 
 > The minimal `pairing-progress` frame shape is `{stage, detail?}`; this plugin
@@ -844,9 +842,8 @@ the error message).
   construction**, not by a deny-list. `limits` is re-projected from its four
   keys: a whitelist inside the whitelist.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
-  RPC requests — those belong to the transport; a same-named metric would be
-  misread. Counters and the error ring are zeroed on every `apply`: the
-  statistics describe **only** the current assembly.
+  RPC requests (those belong to the transport). Counters and the error ring are
+  zeroed on every `apply`: they describe **only** the current assembly.
 
 ### Logging: levels, identifiers, and what never appears
 
@@ -944,6 +941,4 @@ faces:
   answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
 - Its read path refuses an unusable `byteLength`; we fall back to a slice bound
   plus the cumulative arm.
-- Its read path never replays a read; we replay reads **once** (deliberate
-  enhancement) while both sides keep commands receipt-recovered.
 

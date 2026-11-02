@@ -4077,9 +4077,13 @@ export class CherryToolEngine {
           } satisfies CherryCursorOutOfWindow
         }
 
-        // ACK AFTER DELIVERY (controller ruling ④): the peer may only advance
-        // its view once the caller actually holds these events. A failing ack
-        // is logged, never allowed to swallow the delivered events.
+        // ACK AFTER DELIVERY (controller ruling ④): this EXPLICIT ack reports
+        // the position the caller has just been handed. The layer ALSO acks its
+        // own buffer on a byte watermark (issue #212, subscriptions
+        // `#maybeAutoAck`), because the peer holds the stream past its un-acked
+        // window. The peer keeps ONE `lastAck` and refuses a lower position, so
+        // both sites coalesce to the buffer frontier — see `ack()`.
+        // A failing ack is logged, never allowed to swallow the delivered events.
         // A FAILING ACK ALSO RE-ENSURES THE SESSION (v0.1.3 UltraReview P3-3).
         // The ack is the peer's verdict on the SUBSCRIPTION, not on the
         // delivery: a refused ack says the cursor is outside the window this
@@ -6041,8 +6045,9 @@ export class CherryToolEngine {
    * dimension and deliberately does NOT settle a wait (Task 13 asserts the two
    * layers separately).
    *
-   * Waiters never ack: they consume the projection and leave the peer's view
-   * untouched.
+   * Waiters do not ack what they fold. The subscription LAYER acks its own
+   * buffer on a byte watermark (issue #212) so the peer keeps delivering past
+   * its un-acked window; that ack is about flow control, not consumption.
    *
    * A wait can also end because the LINK went away — the plugin was torn down,
    * the device was unpaired, or the connection closed. That is not a timeout and

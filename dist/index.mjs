@@ -5,7 +5,7 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
 import { createHash, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema } from "@cherrystudio/remote-protocol";
+import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema, remoteLimits } from "@cherrystudio/remote-protocol";
 import { peerIdFromString } from "@libp2p/peer-id";
 /**
 * Adds the candidate addresses a peer ADVERTISED that this record does not
@@ -2414,10 +2414,11 @@ function projectMessageSummaries(raw) {
 	return typeof raw === "number" && Number.isFinite(raw) ? { messageSummaries: raw } : {};
 }
 /**
-* Re-projects the four numeric limit keys, dropping any foreign key that a
-* caller's `limits` object might carry. A whitelist inside the whitelist: the
-* shape is rebuilt field by field rather than spread, so a future addition to
-* `EffectiveLimits` cannot arrive here unvetted.
+* Re-projects the four numeric limit keys this report carries, dropping any
+* foreign key that a caller's `limits` object might carry — including
+* `EffectiveLimits`' newer `unackedBytes`, which no diagnostics consumer needs.
+* A whitelist inside the whitelist: the shape is rebuilt field by field rather
+* than spread, so a future addition cannot arrive here unvetted.
 */
 function projectLimits(raw) {
 	if (raw === null || typeof raw !== "object") return {};
@@ -3704,11 +3705,13 @@ var DeviceConnection = class {
 			if (rpcReason$1(error) === "INVALID_CONNECTION_STATE") throw new ProtocolVersionError(String(error));
 			throw error instanceof Error ? error : new Error(String(error));
 		}
+		const unackedBytes = positive$2(hello.limits?.["unackedBytes"]);
 		this.#limits = {
 			heartbeatMs: positive$2(hello.heartbeatMs) ?? FALLBACK_LIMITS.heartbeatMs,
 			subscriptions: positive$2(hello.limits?.["subscriptions"]) ?? FALLBACK_LIMITS.subscriptions,
 			pageItems: positive$2(hello.limits?.["pageItems"]) ?? FALLBACK_LIMITS.pageItems,
 			inFlightRequests: positive$2(hello.limits?.["inFlightRequests"]) ?? FALLBACK_LIMITS.inFlightRequests,
+			...unackedBytes === void 0 ? {} : { unackedBytes },
 			...typeof hello.agentMessageSummariesVersion === "number" ? { messageSummaries: hello.agentMessageSummariesVersion } : {}
 		};
 		link.client.updateMaxInFlight(businessWindowFor(this.#limits.inFlightRequests));
@@ -4716,6 +4719,26 @@ const DEFAULT_CHECKPOINT_MS = 3e5;
 * not a tuning knob.
 */
 const MAX_RECOVERY_ATTEMPTS = 4;
+/**
+* ACK WATERMARK (issue #212). The peer delivers `agent.events` only while the
+* bytes it has sent since our last `agent.subscriptions.ack` stay inside
+* `remoteLimits.unackedBytes`; past that it HOLDS the stream — silently, with
+* the subscription still live — and a held batch can be a run's terminal.
+*
+* This layer used to ack ONLY from `cherry_events`, so a waiter (which by
+* design consumes without acking) parked on a buffer that stopped advancing
+* just under one window: a real 240 s wait answered `timeout` with the finished
+* text, its cursor frozen at 666 events ≈ 262144 bytes.
+*
+* The layer therefore acks what it has ALREADY BUFFERED (the bytes are in
+* memory; acking does not lose them) once a quarter of the peer's window has
+* accumulated. A retry cooldown keeps a refusing peer from turning every batch
+* into a round trip.
+*/
+/** First retry delay after a refused auto-ack; doubles per attempt. */
+const AUTO_ACK_RETRY_MS = 3e3;
+/** Ceiling for the doubling retry, so a permanently refusing peer is quiet. */
+const AUTO_ACK_RETRY_MAX_MS = 3e4;
 function positive$1(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
@@ -4753,6 +4776,8 @@ var SessionSubscriptions = class {
 	#limit;
 	#perSessionCacheBytes;
 	#checkpointMs;
+	/** Where the peer's window comes from; see {@link SessionSubscriptionsOptions.unackedBytes}. */
+	#unackedSource;
 	#sessions = /* @__PURE__ */ new Map();
 	/**
 	* Insertion order IS the eviction order, and it is SUBSCRIPTION recency, not
@@ -4774,6 +4799,7 @@ var SessionSubscriptions = class {
 		this.#limit = Math.max(1, Math.floor(positive$1(opts.subscriptionsLimit, DEFAULT_SUBSCRIPTIONS_LIMIT)));
 		this.#perSessionCacheBytes = positive$1(opts.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES);
 		this.#checkpointMs = positive$1(opts.checkpointMs, DEFAULT_CHECKPOINT_MS);
+		this.#unackedSource = opts.unackedBytes;
 	}
 	/**
 	* Session ids with a live subscription, LRU-first. Task 10's reconnect
@@ -4873,6 +4899,7 @@ var SessionSubscriptions = class {
 		if (existing !== void 0) {
 			console.info(`[cherry-remote] re-subscribing session ${sessionId} (replacing its live subscription)`);
 			await this.#closeSubscription(existing.subscriptionId);
+			this.#cancelAckRetry(existing);
 			this.#rejectWaiters(existing, /* @__PURE__ */ new Error(`session ${sessionId} re-subscribed`));
 			this.#sessions.delete(sessionId);
 		}
@@ -4948,13 +4975,18 @@ var SessionSubscriptions = class {
 	/**
 	* Advances the peer's view of this session: `agent.subscriptions.ack` with
 	* the delivered cursor. The peer only accepts a cursor inside the window it
-	* actually delivered (an out-of-window ack is its CONFLICT), so this is
-	* called with the cursor a consumer has durably processed.
+	* actually delivered (an out-of-window ack is its CONFLICT).
+	*
+	* Two callers, one contract — "this position is accounted for, keep sending":
+	* `cherry_events` passes the cursor a CONSUMER has processed, and
+	* {@link #maybeAutoAck} passes the BUFFER frontier because the events are
+	* retained here (see that method for why an ack cannot lose replay).
 	*/
 	async ack(sessionId, cursor) {
 		const state = this.#sessions.get(sessionId);
 		if (state === void 0) return;
-		const applied = cursor ?? state.cursor;
+		const requested = cursor === void 0 ? state.cursor : cursor;
+		const applied = Number(requested.seq) > Number(state.cursor.seq) ? requested : state.cursor;
 		await this.#rpc.request("agent.subscriptions.ack", {
 			subscriptionId: state.subscriptionId,
 			cursor: applied
@@ -5006,6 +5038,7 @@ var SessionSubscriptions = class {
 		this.#closed = true;
 		const ids = [...this.#sessions.values()].map((state) => state.subscriptionId);
 		for (const state of this.#sessions.values()) {
+			this.#cancelAckRetry(state);
 			const error = /* @__PURE__ */ new Error("SessionSubscriptions disposed");
 			for (const waiter of state.waiters.splice(0)) waiter.reject(error);
 		}
@@ -5088,13 +5121,21 @@ var SessionSubscriptions = class {
 	*/
 	#installReplay(sessionId, descriptor) {
 		const previous = this.#sessions.get(sessionId);
-		if (previous !== void 0) this.#rejectWaiters(previous, /* @__PURE__ */ new Error(`session ${sessionId} re-subscribed`));
+		if (previous !== void 0) {
+			this.#cancelAckRetry(previous);
+			this.#rejectWaiters(previous, /* @__PURE__ */ new Error(`session ${sessionId} re-subscribed`));
+		}
 		this.#sessions.delete(sessionId);
 		this.#sessions.set(sessionId, {
 			subscriptionId: descriptor.subscriptionId,
 			cursor: descriptor.highWatermark,
 			buffer: [],
 			bytes: 0,
+			bytesSinceAck: 0,
+			ackInFlight: false,
+			ackRetryAt: 0,
+			ackRetryDelay: AUTO_ACK_RETRY_MS,
+			ackRetryTimer: void 0,
 			windowStart: Number(descriptor.highWatermark.seq),
 			evicted: false,
 			waiters: [],
@@ -5174,13 +5215,21 @@ var SessionSubscriptions = class {
 	*/
 	#installCheckpoint(sessionId, descriptor, items) {
 		const previous = this.#sessions.get(sessionId);
-		if (previous !== void 0) this.#rejectWaiters(previous, /* @__PURE__ */ new Error(`session ${sessionId} recovered`));
+		if (previous !== void 0) {
+			this.#cancelAckRetry(previous);
+			this.#rejectWaiters(previous, /* @__PURE__ */ new Error(`session ${sessionId} recovered`));
+		}
 		this.#sessions.delete(sessionId);
 		this.#sessions.set(sessionId, {
 			subscriptionId: descriptor.subscriptionId,
 			cursor: descriptor.checkpoint.cursor,
 			buffer: [],
 			bytes: 0,
+			bytesSinceAck: 0,
+			ackInFlight: false,
+			ackRetryAt: 0,
+			ackRetryDelay: AUTO_ACK_RETRY_MS,
+			ackRetryTimer: void 0,
 			windowStart: Number(descriptor.checkpoint.cursor.seq),
 			evicted: false,
 			waiters: [],
@@ -5226,6 +5275,7 @@ var SessionSubscriptions = class {
 		for (const [sessionId, state] of this.#sessions) {
 			if (sessionId === protectedSessionId) continue;
 			console.warn(`[cherry-remote] subscription limit (${this.#limit}) reached; evicting least-recently-used session ${sessionId}`);
+			this.#cancelAckRetry(state);
 			this.#rejectWaiters(state, /* @__PURE__ */ new Error(`session ${sessionId} evicted by LRU`));
 			this.#sessions.delete(sessionId);
 			await this.#closeSubscription(state.subscriptionId);
@@ -5307,11 +5357,86 @@ var SessionSubscriptions = class {
 				bytes
 			});
 			state.bytes += bytes;
+			state.bytesSinceAck += bytes;
 			state.cursor = cursor;
 			appended += 1;
 		}
 		this.#trimToBudget(sessionId, state);
 		if (appended > 0) this.#wakeWaiters(state);
+		if (appended > 0) this.#maybeAutoAck(sessionId, state);
+	}
+	/**
+	* Sends `agent.subscriptions.ack` once the un-acked bytes approach the peer's
+	* window, so the peer keeps delivering (issue #212).
+	*
+	* WHAT IS BEING ACKED is "everything in this layer's buffer", not "everything
+	* a caller has consumed". That is safe against the pinned peer because an ack
+	* does exactly one thing: it frees FLOW CONTROL — the desktop decrements its
+	* un-acked budget and advances `lastAck` (`agentSubscriptions.ts`). Replay
+	* retention lives on the journal (`replayBytes`/`replayMs`) and is not
+	* touched by an ack, so a `read`/`cherry_events`/re-subscribe from a cursor
+	* below the acked position is still served — by the local buffer here and by
+	* the journal there. The ack's own doc comment states the same contract.
+	*
+	* The ack is fire-and-forget with its failure SURFACED (a refused ack must be
+	* visible, not swallowed). A refusal also ARMS A TIMER: once the peer is
+	* holding at its window no further event arrives, so a retry that waited for
+	* traffic would never fire and the wait would time out exactly as in issue
+	* #212.
+	*/
+	#maybeAutoAck(sessionId, state) {
+		if (state.bytesSinceAck < this.#ackWatermark()) return;
+		if (state.ackInFlight) return;
+		if (Date.now() < state.ackRetryAt) return;
+		state.ackInFlight = true;
+		const covered = state.bytesSinceAck;
+		this.ack(sessionId).then(() => {
+			state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered);
+			state.ackRetryDelay = AUTO_ACK_RETRY_MS;
+		}).catch((error) => {
+			const delay = state.ackRetryDelay;
+			state.ackRetryAt = Date.now() + delay;
+			state.ackRetryDelay = Math.min(delay * 2, AUTO_ACK_RETRY_MAX_MS);
+			console.warn(`[cherry-remote] auto-ack for session ${sessionId} failed: ${failureText(error)}`);
+			this.#armAckRetry(sessionId, state, delay);
+		}).finally(() => {
+			state.ackInFlight = false;
+			if (this.#closed || this.#sessions.get(sessionId) !== state) return;
+			this.#maybeAutoAck(sessionId, state);
+		});
+	}
+	/**
+	* Quarter of the peer's window, read from the CURRENT source so a layer that
+	* outlives a reconnect follows the new hello instead of its first answer.
+	* Falls back to the pinned protocol constant when nothing is advertised.
+	*/
+	#ackWatermark() {
+		const source = this.#unackedSource;
+		const advertised = typeof source === "function" ? source() : source;
+		return Math.max(1, Math.floor(positive$1(advertised, remoteLimits.unackedBytes) / 4));
+	}
+	/** Disarms the retry, if any (idempotent; safe on a state being replaced). */
+	#cancelAckRetry(state) {
+		if (state.ackRetryTimer === void 0) return;
+		clearTimeout(state.ackRetryTimer);
+		state.ackRetryTimer = void 0;
+	}
+	/**
+	* One timer-driven retry after a refused ack. At most one is armed per
+	* session; it no-ops when the state it was armed for is no longer current
+	* (a re-subscribe, a checkpoint recovery or `dispose`).
+	*/
+	#armAckRetry(sessionId, state, delayMs) {
+		if (this.#closed) return;
+		if (state.ackRetryTimer !== void 0) return;
+		const timer = setTimeout(() => {
+			state.ackRetryTimer = void 0;
+			if (this.#closed || this.#sessions.get(sessionId) !== state) return;
+			state.ackRetryAt = 0;
+			this.#maybeAutoAck(sessionId, state);
+		}, delayMs);
+		timer.unref?.();
+		state.ackRetryTimer = timer;
 	}
 	/**
 	* `agent.subscriptions.resetRequired`: the peer tore the subscription down
@@ -5330,6 +5455,7 @@ var SessionSubscriptions = class {
 		for (const [sessionId, state] of this.#sessions) {
 			if (state.subscriptionId !== subscriptionId) continue;
 			console.warn(`[cherry-remote] subscription for session ${sessionId} reset by the peer (${String(params["reason"] ?? "unspecified")}); re-subscribe required`);
+			this.#cancelAckRetry(state);
 			this.#rejectWaiters(state, /* @__PURE__ */ new Error(`session ${sessionId} reset by the peer`));
 			this.#sessions.delete(sessionId);
 			return;
@@ -9160,8 +9286,9 @@ var CherryToolEngine = class {
 	* dimension and deliberately does NOT settle a wait (Task 13 asserts the two
 	* layers separately).
 	*
-	* Waiters never ack: they consume the projection and leave the peer's view
-	* untouched.
+	* Waiters do not ack what they fold. The subscription LAYER acks its own
+	* buffer on a byte watermark (issue #212) so the peer keeps delivering past
+	* its un-acked window; that ack is about flow control, not consumption.
 	*
 	* A wait can also end because the LINK went away — the plugin was torn down,
 	* the device was unpaired, or the connection closed. That is not a timeout and
@@ -12671,7 +12798,8 @@ function subsFor(deviceId) {
 	const connection = connectionFor(deviceId);
 	const created = new SessionSubscriptions(connection.rpc, {
 		subscriptionsLimit: connection.limits.subscriptions,
-		perSessionCacheBytes: state.perSessionCacheBytes
+		perSessionCacheBytes: state.perSessionCacheBytes,
+		unackedBytes: () => connection.limits.unackedBytes
 	});
 	state.subscriptions.set(deviceId, created);
 	console.info(`[cherry-remote] subscription layer established for ${deviceId} (peer limit ${connection.limits.subscriptions})`);
