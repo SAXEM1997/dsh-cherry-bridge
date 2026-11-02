@@ -522,6 +522,18 @@ export interface FakeAgentOptions {
    */
   runDelayMs?: number
   /**
+   * The peer's un-acked delivery window, in bytes (default
+   * `remoteLimits.unackedBytes` = 262144). The real desktop keeps this budget
+   * per subscription: it delivers `agent.events` until the bytes sent since the
+   * last `agent.subscriptions.ack` reach the window, then HOLDS everything —
+   * including a run's terminal — until an ack arrives.
+   *
+   * Modelled from the protocol's own `remoteLimits` (issue #212). The default
+   * reproduces the shipped constant, so a test that streams less than 256 KiB
+   * behaves exactly as before; override it to exercise the window cheaply.
+   */
+  unackedBytes?: number
+  /**
    * Terminal status the accepted run settles on (default `completed`). Set
    * `'interrupted'` for Task 9⑭ — the transition the CURRENT real server does
    * not produce but whose schema is already pinned (Task 13 asserts that
@@ -706,6 +718,17 @@ export interface FakeSubscriptionRecord {
   phase: 'prepared' | 'active' | 'reset'
   cursorSeq: number
   lastAck: number
+  /**
+   * The DELIVERED-but-un-acked ledger: one entry per `agent.events` element the
+   * peer actually put on the wire, carrying that element's own JSON byte cost.
+   *
+   * The real desktop stops delivering once this sum reaches
+   * `remoteLimits.unackedBytes` (256 KiB) and resumes on
+   * `agent.subscriptions.ack` — the flow control issue #212 was found through.
+   * Pruning at ack time is what makes the window slide; a held batch is
+   * re-delivered by {@link FakeCherry} when the ack arrives.
+   */
+  delivered: Array<{ seq: number; bytes: number }>
 }
 
 /** One `agent.sessions.subscribe` request as the peer received it. */
@@ -983,6 +1006,12 @@ export class FakeCherry {
   #journalEpoch: string
   #watermark: number
   #subscriptions = new Map<string, FakeSubscriptionRecord>()
+  /**
+   * `agent.events` batches the peer HELD because the subscription's un-acked
+   * window was full. Released oldest-first on the next ack for that
+   * subscription, dropped with the subscription itself (issue #212).
+   */
+  #held: Array<{ subscriptionId: string; params: unknown }> = []
   #subscribeCalls: FakeSubscribeCall[] = []
   /** When set, every `agent.sessions.subscribe` is refused with this reason. */
   #refuseSubscriptionsWith: string | undefined
@@ -1755,6 +1784,7 @@ export class FakeCherry {
     if (subscription === undefined) throw new Error(`no active subscription for ${sessionId}`)
     subscription.phase = 'reset'
     this.#subscriptions.delete(subscription.subscriptionId)
+    this.#dropHeld(subscription.subscriptionId)
     this.#notify('agent.subscriptions.resetRequired', { subscriptionId: subscription.subscriptionId, reason })
   }
 
@@ -1958,14 +1988,89 @@ export class FakeCherry {
    * Writes one JSON-RPC notification (no id) to every live connection. The
    * real peer's `send` is connection-scoped; every test here runs a single
    * client, so fanning out keeps the fake honest without modelling ownership.
+   *
+   * `agent.events` goes through the peer's UN-ACKED WINDOW first
+   * ({@link #deliverEvents}): the real desktop holds a batch once the bytes it
+   * has sent since the last ack reach `unackedBytes`, so a consumer that never
+   * acks stops receiving — terminal included (issue #212).
    */
   #notify(method: string, params: unknown): void {
+    if (method === 'agent.events') {
+      this.#deliverEvents(params)
+      return
+    }
+    this.#notifyNow(method, params)
+  }
+
+  /** The wire write itself, with no flow-control gate in front of it. */
+  #notifyNow(method: string, params: unknown): void {
     const frame = { jsonrpc: '2.0', method, params }
     for (const { channel } of this.#live) {
       void channel.write(frame).catch(() => {
         // The client vanished mid-notification; nothing to do.
       })
     }
+  }
+
+  /**
+   * The peer's flow control: deliver an `agent.events` batch only while the
+   * bytes delivered-but-un-acked stay inside the window, and HOLD it otherwise.
+   * A held batch is retried, in arrival order, when an ack frees budget
+   * ({@link #flushHeld}). A notification with no live subscription is dropped,
+   * exactly like a peer that has nobody to send to.
+   */
+  #deliverEvents(params: unknown): void {
+    if (params === null || typeof params !== 'object') return
+    const view = params as Record<string, unknown>
+    const subscriptionId = typeof view['subscriptionId'] === 'string' ? view['subscriptionId'] : undefined
+    const subscription = subscriptionId === undefined ? undefined : this.#subscriptions.get(subscriptionId)
+    // A frame the fake cannot attribute to one of ITS subscriptions (the
+    // `pushNotification` escape hatch, or a session the test never subscribed)
+    // is passed through untouched: the window is a property of a live
+    // subscription, and the notification-layer tests drive bare frames.
+    if (subscription === undefined) {
+      this.#notifyNow('agent.events', params)
+      return
+    }
+    const rawEvents = view['events']
+    const events = Array.isArray(rawEvents) ? rawEvents : []
+    const batchBytes = events.reduce<number>((sum, event) => sum + Buffer.byteLength(JSON.stringify(event)), 0)
+    // FIFO: once this subscription has a held batch, everything after it waits
+    // its turn — a small event must never overtake the backlog, which is what
+    // keeps a held TERMINAL behind the chunks that preceded it.
+    const backlogged = this.#held.some((entry) => entry.subscriptionId === subscription.subscriptionId)
+    if (backlogged || this.#unackedBytesOf(subscription) + batchBytes > this.#unackedWindow()) {
+      this.#held.push({ subscriptionId: subscription.subscriptionId, params })
+      return
+    }
+    for (const event of events) {
+      const seq = Number(
+        event !== null && typeof event === 'object' ? (event as Record<string, unknown>)['seq'] : NaN,
+      )
+      subscription.delivered.push({
+        seq: Number.isFinite(seq) ? seq : -1,
+        bytes: Buffer.byteLength(JSON.stringify(event)),
+      })
+    }
+    this.#notifyNow('agent.events', params)
+  }
+
+  /** Bytes delivered to this subscription but not yet acknowledged. */
+  #unackedBytesOf(subscription: FakeSubscriptionRecord): number {
+    return subscription.delivered.reduce((sum, entry) => sum + entry.bytes, 0)
+  }
+
+  /** The window itself: the protocol constant unless the fixture overrides it. */
+  #unackedWindow(): number {
+    return this.#agent().unackedBytes ?? remoteLimits.unackedBytes
+  }
+
+  /** Re-offers every batch held for `subscriptionId`, oldest first. */
+  #flushHeld(subscriptionId: string): void {
+    const mine = this.#held.filter((entry) => entry.subscriptionId === subscriptionId)
+    if (mine.length === 0) return
+    this.#held = this.#held.filter((entry) => entry.subscriptionId !== subscriptionId)
+    for (const entry of mine) this.#deliverEvents(entry.params)
   }
 
   /** Drop pending entries whose socket is already gone (a client-side hangup). */
@@ -2647,6 +2752,7 @@ export class FakeCherry {
         phase: 'active',
         cursorSeq: Number(cursor.seq),
         lastAck: Number(cursor.seq),
+        delivered: [],
       }
       this.#subscriptions.set(subscriptionId, record)
       this.#subscriptionPhases.push('active')
@@ -2681,6 +2787,7 @@ export class FakeCherry {
       phase: 'prepared',
       cursorSeq: Number(checkpointCursor.seq),
       lastAck: Number(checkpointCursor.seq),
+      delivered: [],
     })
     this.#subscriptionPhases.push('prepared')
     this.#subscribeCalls.push({ sessionId, cursor, mode: 'checkpoint', reason, subscriptionId })
@@ -2873,6 +2980,10 @@ export class FakeCherry {
       throw new FakeRpcError({ reason: 'CONFLICT', message: 'Cursor is outside the delivered window' })
     }
     subscription.lastAck = seq
+    // The window slides: everything at or below the ack is accounted for, and
+    // whatever the window was holding may now fit.
+    subscription.delivered = subscription.delivered.filter((entry) => entry.seq > seq)
+    this.#flushHeld(subscription.subscriptionId)
     return {
       acknowledged: { sessionId: subscription.sessionId, streamEpoch: this.#journalEpoch, seq: String(seq) },
     }
@@ -2892,6 +3003,7 @@ export class FakeCherry {
       this.#leaseDeadlines.delete(subscriptionId)
       this.#checkpointSequences.delete(subscriptionId)
       this.#checkpointCursorBySubscription.delete(subscriptionId)
+      this.#dropHeld(subscriptionId)
     }
     return { closed: true }
   }
@@ -2902,7 +3014,13 @@ export class FakeCherry {
     this.#subscriptionPhases.push('reset')
     this.#subscriptions.delete(subscription.subscriptionId)
     this.#leaseDeadlines.delete(subscription.subscriptionId)
+    this.#dropHeld(subscription.subscriptionId)
     this.#notify('agent.subscriptions.resetRequired', { subscriptionId: subscription.subscriptionId, reason })
+  }
+
+  /** Forgets every batch held for a subscription that no longer exists. */
+  #dropHeld(subscriptionId: string): void {
+    this.#held = this.#held.filter((entry) => entry.subscriptionId !== subscriptionId)
   }
 
   // -------------------------------------------------------------------------

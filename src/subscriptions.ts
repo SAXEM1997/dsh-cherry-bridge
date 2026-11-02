@@ -2,6 +2,7 @@ import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcClient } from './rpc/jsonRpcClient.js'
 import { DEFAULT_PER_SESSION_CACHE_BYTES } from './defaults.js'
 import { failureText } from './text.js'
+import { remoteLimits } from '@cherrystudio/remote-protocol'
 import type { AgentCursor, AgentEvent } from '@cherrystudio/remote-protocol/agent'
 
 /**
@@ -39,6 +40,26 @@ const DEFAULT_CHECKPOINT_MS = 300_000
  * not a tuning knob.
  */
 const MAX_RECOVERY_ATTEMPTS = 4
+
+/**
+ * ACK WATERMARK (issue #212). The peer delivers `agent.events` only while the
+ * bytes it has sent since our last `agent.subscriptions.ack` stay inside
+ * `remoteLimits.unackedBytes`; past that it HOLDS the stream — silently, with
+ * the subscription still live — and a held batch can be a run's terminal.
+ *
+ * This layer used to ack ONLY from `cherry_events`, so a waiter (which by
+ * design consumes without acking) parked on a buffer that stopped advancing
+ * just under one window: a real 240 s wait answered `timeout` with the finished
+ * text, its cursor frozen at 666 events ≈ 262144 bytes.
+ *
+ * The layer therefore acks what it has ALREADY BUFFERED (the bytes are in
+ * memory; acking does not lose them) once a quarter of the peer's window has
+ * accumulated. A retry cooldown keeps a refusing peer from turning every batch
+ * into a round trip.
+ */
+const AUTO_ACK_BYTES = Math.max(1, Math.floor(remoteLimits.unackedBytes / 4))
+/** Minimum spacing between auto-ack attempts after a refusal. */
+const AUTO_ACK_RETRY_MS = 10_000
 
 export type ReadResult = { events: AgentEvent[]; nextCursor: AgentCursor } | { error: 'cursor-out-of-window' }
 
@@ -108,6 +129,17 @@ interface SessionState {
   cursor: AgentCursor
   buffer: CachedEvent[]
   bytes: number
+  /**
+   * Bytes appended since the last ack we sent (issue #212). Drives
+   * {@link SessionSubscriptions.#maybeAutoAck}; kept separate from `bytes`,
+   * which measures what the CACHE holds rather than what the peer may still
+   * consider un-acknowledged.
+   */
+  bytesSinceAck: number
+  /** One auto-ack in flight at a time; a second would only duplicate a cursor. */
+  ackInFlight: boolean
+  /** Cooldown after a refused auto-ack (`AUTO_ACK_RETRY_MS`). */
+  ackRetryAt: number
   /**
    * The oldest stream position this session still TRACKS: the baseline the
    * subscription started from, advanced whenever old events are dropped. It is
@@ -598,6 +630,9 @@ export class SessionSubscriptions {
       cursor: descriptor.highWatermark,
       buffer: [],
       bytes: 0,
+      bytesSinceAck: 0,
+      ackInFlight: false,
+      ackRetryAt: 0,
       windowStart: Number(descriptor.highWatermark.seq),
       // A fresh window: nothing has been dropped from it, so the baseline is a
       // position this layer may serve (issue #2).
@@ -730,6 +765,9 @@ export class SessionSubscriptions {
       cursor: descriptor.checkpoint.cursor,
       buffer: [],
       bytes: 0,
+      bytesSinceAck: 0,
+      ackInFlight: false,
+      ackRetryAt: 0,
       windowStart: Number(descriptor.checkpoint.cursor.seq),
       // A fresh window: nothing has been dropped from it, so the baseline is a
       // position this layer may serve (issue #2).
@@ -907,6 +945,7 @@ export class SessionSubscriptions {
       const bytes = eventBytes(event)
       state.buffer.push({ cursor, event, bytes })
       state.bytes += bytes
+      state.bytesSinceAck += bytes
       state.cursor = cursor
       appended += 1
     }
@@ -915,6 +954,45 @@ export class SessionSubscriptions {
     // Waking on a wholly stale batch would make a parked waiter re-judge state
     // that has not moved; only real progress is a wake.
     if (appended > 0) this.#wakeWaiters(state)
+    // The wake comes FIRST: a waiter that can settle from what just arrived
+    // must not wait behind an ack round trip.
+    if (appended > 0) this.#maybeAutoAck(sessionId, state)
+  }
+
+  /**
+   * Sends `agent.subscriptions.ack` once the un-acked bytes approach the peer's
+   * window, so the peer keeps delivering (issue #212).
+   *
+   * WHAT IS BEING ACKED is "everything in this layer's buffer", not "everything
+   * a caller has consumed" — the events are retained in memory and `read`
+   * serves them from there, so the peer's durability view may safely advance.
+   * The one visible cost is the peer's replay window: a cursor below the acked
+   * position can only be resumed through the checkpoint chain, which the
+   * recovery path already handles.
+   *
+   * The ack is fire-and-forget with its failure SURFACED (a refused ack must be
+   * visible, not swallowed), and a refusal arms a cooldown so a peer that
+   * rejects every ack does not get one round trip per batch.
+   */
+  #maybeAutoAck(sessionId: string, state: SessionState): void {
+    if (state.bytesSinceAck < AUTO_ACK_BYTES) return
+    if (state.ackInFlight) return
+    if (Date.now() < state.ackRetryAt) return
+    state.ackInFlight = true
+    // The bytes covered by THIS ack. Events that arrive while it is in flight
+    // stay counted, so the next window starts from the right place.
+    const covered = state.bytesSinceAck
+    void this.ack(sessionId)
+      .then(() => {
+        state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered)
+      })
+      .catch((error: unknown) => {
+        state.ackRetryAt = Date.now() + AUTO_ACK_RETRY_MS
+        console.warn(`[cherry-remote] auto-ack for session ${sessionId} failed: ${failureText(error)}`)
+      })
+      .finally(() => {
+        state.ackInFlight = false
+      })
   }
 
   /**

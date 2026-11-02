@@ -5,7 +5,7 @@ import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
 import { createHash, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema } from "@cherrystudio/remote-protocol";
+import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema, remoteLimits } from "@cherrystudio/remote-protocol";
 import { peerIdFromString } from "@libp2p/peer-id";
 /**
 * Adds the candidate addresses a peer ADVERTISED that this record does not
@@ -4716,6 +4716,25 @@ const DEFAULT_CHECKPOINT_MS = 3e5;
 * not a tuning knob.
 */
 const MAX_RECOVERY_ATTEMPTS = 4;
+/**
+* ACK WATERMARK (issue #212). The peer delivers `agent.events` only while the
+* bytes it has sent since our last `agent.subscriptions.ack` stay inside
+* `remoteLimits.unackedBytes`; past that it HOLDS the stream — silently, with
+* the subscription still live — and a held batch can be a run's terminal.
+*
+* This layer used to ack ONLY from `cherry_events`, so a waiter (which by
+* design consumes without acking) parked on a buffer that stopped advancing
+* just under one window: a real 240 s wait answered `timeout` with the finished
+* text, its cursor frozen at 666 events ≈ 262144 bytes.
+*
+* The layer therefore acks what it has ALREADY BUFFERED (the bytes are in
+* memory; acking does not lose them) once a quarter of the peer's window has
+* accumulated. A retry cooldown keeps a refusing peer from turning every batch
+* into a round trip.
+*/
+const AUTO_ACK_BYTES = Math.max(1, Math.floor(remoteLimits.unackedBytes / 4));
+/** Minimum spacing between auto-ack attempts after a refusal. */
+const AUTO_ACK_RETRY_MS = 1e4;
 function positive$1(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
@@ -5095,6 +5114,9 @@ var SessionSubscriptions = class {
 			cursor: descriptor.highWatermark,
 			buffer: [],
 			bytes: 0,
+			bytesSinceAck: 0,
+			ackInFlight: false,
+			ackRetryAt: 0,
 			windowStart: Number(descriptor.highWatermark.seq),
 			evicted: false,
 			waiters: [],
@@ -5181,6 +5203,9 @@ var SessionSubscriptions = class {
 			cursor: descriptor.checkpoint.cursor,
 			buffer: [],
 			bytes: 0,
+			bytesSinceAck: 0,
+			ackInFlight: false,
+			ackRetryAt: 0,
 			windowStart: Number(descriptor.checkpoint.cursor.seq),
 			evicted: false,
 			waiters: [],
@@ -5307,11 +5332,43 @@ var SessionSubscriptions = class {
 				bytes
 			});
 			state.bytes += bytes;
+			state.bytesSinceAck += bytes;
 			state.cursor = cursor;
 			appended += 1;
 		}
 		this.#trimToBudget(sessionId, state);
 		if (appended > 0) this.#wakeWaiters(state);
+		if (appended > 0) this.#maybeAutoAck(sessionId, state);
+	}
+	/**
+	* Sends `agent.subscriptions.ack` once the un-acked bytes approach the peer's
+	* window, so the peer keeps delivering (issue #212).
+	*
+	* WHAT IS BEING ACKED is "everything in this layer's buffer", not "everything
+	* a caller has consumed" — the events are retained in memory and `read`
+	* serves them from there, so the peer's durability view may safely advance.
+	* The one visible cost is the peer's replay window: a cursor below the acked
+	* position can only be resumed through the checkpoint chain, which the
+	* recovery path already handles.
+	*
+	* The ack is fire-and-forget with its failure SURFACED (a refused ack must be
+	* visible, not swallowed), and a refusal arms a cooldown so a peer that
+	* rejects every ack does not get one round trip per batch.
+	*/
+	#maybeAutoAck(sessionId, state) {
+		if (state.bytesSinceAck < AUTO_ACK_BYTES) return;
+		if (state.ackInFlight) return;
+		if (Date.now() < state.ackRetryAt) return;
+		state.ackInFlight = true;
+		const covered = state.bytesSinceAck;
+		this.ack(sessionId).then(() => {
+			state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered);
+		}).catch((error) => {
+			state.ackRetryAt = Date.now() + AUTO_ACK_RETRY_MS;
+			console.warn(`[cherry-remote] auto-ack for session ${sessionId} failed: ${failureText(error)}`);
+		}).finally(() => {
+			state.ackInFlight = false;
+		});
 	}
 	/**
 	* `agent.subscriptions.resetRequired`: the peer tore the subscription down
