@@ -239,8 +239,8 @@ describe('DeviceConnection over a real loopback channel', () => {
       subscriptions: 5,
       pageItems: 60,
       inFlightRequests: 6,
-      // The fake advertises the WHOLE remoteLimits map, like the desktop, so
-      // the un-acked window (issue #212) is part of the effective projection.
+      // The fake advertises the window it ENFORCES (the desktop advertises its
+      // whole map), so the un-acked window (issue #212) joins the projection.
       unackedBytes: 262_144,
     } satisfies EffectiveLimits)
     await connection.close()
@@ -346,8 +346,8 @@ describe('DeviceConnection over a real loopback channel', () => {
       subscriptions: 5,
       pageItems: 60,
       inFlightRequests: 6,
-      // The fake advertises the WHOLE remoteLimits map, like the desktop, so
-      // the un-acked window (issue #212) is part of the effective projection.
+      // The fake advertises the window it ENFORCES (the desktop advertises its
+      // whole map), so the un-acked window (issue #212) joins the projection.
       unackedBytes: 262_144,
     } satisfies EffectiveLimits)
 

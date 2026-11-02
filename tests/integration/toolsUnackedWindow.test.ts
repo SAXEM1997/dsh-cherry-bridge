@@ -135,11 +135,9 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     const connection = connect(deviceId)
     const created = new SessionSubscriptions(connection.rpc, {
       subscriptionsLimit: options.agent?.subscriptionLimit ?? 8,
-      // Mirrors `src/index.ts`'s factory: the peer's OWN hello-advertised
-      // window, absent falling back to the pinned constant inside the layer.
-      ...(connection.limits.unackedBytes === undefined
-        ? {}
-        : { unackedBytes: connection.limits.unackedBytes }),
+      // Mirrors `src/index.ts`'s factory: a PROVIDER over the peer's own
+      // hello-advertised window, absent falling back to the pinned constant.
+      unackedBytes: () => connection.limits.unackedBytes,
     })
     connection.rpc.onNotification((method, params) => created.handleNotification(method, params))
     subscriptions.set(deviceId, created)
@@ -288,7 +286,7 @@ describe('#212: the peer’s un-acked delivery window cannot stall a wait', () =
     rig.fake.refuseAcks(undefined)
     await vi.waitFor(() => expect(rig.fake.ackCalls.length).toBe(2), 8_000)
     await vi.waitFor(() => expect(rig.fake.heldEventCount).toBe(0), 3_000)
-  })
+  }, 20_000)
 
   it('①d the ack watermark follows the peer’s hello-advertised window', async () => {
     // A peer whose window is 32 KiB — an eighth of the pinned constant. A
@@ -325,9 +323,47 @@ describe('#212: the peer’s un-acked delivery window cannot stall a wait', () =
       })
     }
 
+    // Same precondition as ①a: the peer must actually be HOLDING (the pushes
+    // are synchronous, so no ack has fired yet) or this proves nothing.
+    expect(rig.fake.heldEventCount).toBeGreaterThan(0)
+
     const result = await pending
     expect(result.status).toBe('completed')
     expect(result.text).toContain('the run reply')
+    expect(rig.fake.ackCalls.length).toBeGreaterThan(0)
+    expect(rig.fake.heldEventCount).toBe(0)
+  })
+
+  it('①e an explicit ack below the frontier is coalesced, not refused', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    await rig.subscriptions().ensure('s-1')
+    // JUST over one watermark (~82 KiB): one auto-ack, nothing held, and no
+    // second ack left in flight — so the explicit ack below is deterministic.
+    for (let index = 0; index < 80; index += 1) {
+      rig.fake.pushEvent('s-1', {
+        kind: 'part.append',
+        payload: {
+          messageId: 'm-assistant',
+          partId: 'p-1',
+          revision: String(index + 1),
+          offsetUtf8: String(index * 900),
+          text: CHUNK,
+        },
+      })
+    }
+    // An auto-ack has advanced the peer's single `lastAck`.
+    await vi.waitFor(() => expect(rig.fake.ackCalls.length).toBeGreaterThan(0), 3_000)
+    const layer = rig.subscriptions()
+    const frontier = layer.cursorOf('s-1')!
+    expect(Number(frontier.seq)).toBeGreaterThan(1)
+
+    // A LOWER position — what a read taken before the auto-ack would carry. The
+    // peer refuses a lower `lastAck` with CONFLICT, so the layer must coalesce
+    // to the frontier instead of racing itself into a re-subscribe.
+    await expect(
+      layer.ack('s-1', { sessionId: 's-1', streamEpoch: frontier.streamEpoch, seq: '1' }),
+    ).resolves.toBeUndefined()
+    expect(rig.fake.ackCalls.at(-1)?.cursor.seq).toBe(frontier.seq)
   })
 
   it('①b a refused auto-ack is surfaced once and does not storm the peer', async () => {
@@ -360,8 +396,14 @@ describe('#212: the peer’s un-acked delivery window cannot stall a wait', () =
         ),
       3_000,
     )
-    // Still one: the 3 s retry timer is longer than this test.
+    // Still one: the retry timer (3 s) is longer than this test.
     expect(rig.fake.ackCalls.length).toBe(1)
+    // BOUNDED, not merely present: the refusal text is clipped before it is
+    // rendered (`failureText`, LOG_TEXT_MAX), so one long peer message cannot
+    // flood a log line.
+    const warnLine = vi.mocked(console.warn).mock.calls.at(-1)?.[0]
+    expect(typeof warnLine).toBe('string')
+    expect(String(warnLine).length).toBeLessThan(320)
     // The refusal does not break delivery — the window holds it, honestly.
     expect(rig.fake.heldEventCount).toBeGreaterThan(0)
   })

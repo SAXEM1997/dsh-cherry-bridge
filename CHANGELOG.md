@@ -30,8 +30,8 @@ who never open this file.
   its answer 22 s after the send. `SessionSubscriptions` now acks what it has
   already buffered, at a quarter of the peer's hello-advertised window (the
   pinned constant when it advertises none), one ack in flight per session. A
-  refused ack is surfaced as one bounded warning and retried by its own timer —
-  a held stream sends nothing to retry on (#212).
+  refused ack is surfaced as one bounded warning and retried by its own timer
+  with a doubling delay — a held stream sends nothing to retry on (#212).
 
 ## v0.2.1 (2026-11-01)
 

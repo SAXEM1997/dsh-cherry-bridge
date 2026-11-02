@@ -57,7 +57,10 @@ const MAX_RECOVERY_ATTEMPTS = 4
  * accumulated. A retry cooldown keeps a refusing peer from turning every batch
  * into a round trip.
  */
+/** First retry delay after a refused auto-ack; doubles per attempt. */
 const AUTO_ACK_RETRY_MS = 3_000
+/** Ceiling for the doubling retry, so a permanently refusing peer is quiet. */
+const AUTO_ACK_RETRY_MAX_MS = 30_000
 
 export type ReadResult = { events: AgentEvent[]; nextCursor: AgentCursor } | { error: 'cursor-out-of-window' }
 
@@ -88,8 +91,11 @@ export interface SessionSubscriptionsOptions {
    * Omitted falls back to the pinned protocol constant. A peer that does not
    * advertise the key is treated as the pinned generation — the same
    * conservative rule the other negotiated limits follow.
+   *
+   * A FUNCTION is read at every watermark check, so a layer that outlives a
+   * reconnect picks up the new hello's value instead of pinning the first one.
    */
-  unackedBytes?: number
+  unackedBytes?: number | (() => number | undefined)
 }
 
 /** Peer-side subscription phases (mirrors the real peer's internal state). */
@@ -147,8 +153,14 @@ interface SessionState {
   bytesSinceAck: number
   /** One auto-ack in flight at a time; a second would only duplicate a cursor. */
   ackInFlight: boolean
-  /** Cooldown after a refused auto-ack (`AUTO_ACK_RETRY_MS`). */
+  /** Cooldown after a refused auto-ack (`AUTO_ACK_RETRY_MS`, doubling). */
   ackRetryAt: number
+  /**
+   * Current retry delay: `AUTO_ACK_RETRY_MS` after the first refusal, doubled
+   * on every further one up to `AUTO_ACK_RETRY_MAX_MS`. Reset on a success, so
+   * a peer that recovers is back to prompt retries.
+   */
+  ackRetryDelay: number
   /**
    * The ARMED retry behind `ackRetryAt`. An ack failure is the one case where
    * no further event will arrive to re-trigger the watermark check — the peer
@@ -238,8 +250,8 @@ export class SessionSubscriptions {
   readonly #limit: number
   readonly #perSessionCacheBytes: number
   readonly #checkpointMs: number
-  /** Quarter of the peer's window; see {@link SessionSubscriptionsOptions.unackedBytes}. */
-  readonly #autoAckBytes: number
+  /** Where the peer's window comes from; see {@link SessionSubscriptionsOptions.unackedBytes}. */
+  readonly #unackedSource: number | (() => number | undefined) | undefined
   readonly #sessions = new Map<string, SessionState>()
   /**
    * Insertion order IS the eviction order, and it is SUBSCRIPTION recency, not
@@ -262,7 +274,7 @@ export class SessionSubscriptions {
     this.#limit = Math.max(1, Math.floor(positive(opts.subscriptionsLimit, DEFAULT_SUBSCRIPTIONS_LIMIT)))
     this.#perSessionCacheBytes = positive(opts.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES)
     this.#checkpointMs = positive(opts.checkpointMs, DEFAULT_CHECKPOINT_MS)
-    this.#autoAckBytes = Math.max(1, Math.floor(positive(opts.unackedBytes, remoteLimits.unackedBytes) / 4))
+    this.#unackedSource = opts.unackedBytes
   }
 
   /**
@@ -368,6 +380,7 @@ export class SessionSubscriptions {
       // session that will not stay subscribed.
       console.info(`[cherry-remote] re-subscribing session ${sessionId} (replacing its live subscription)`)
       await this.#closeSubscription(existing.subscriptionId)
+      this.#cancelAckRetry(existing)
       this.#rejectWaiters(existing, new Error(`session ${sessionId} re-subscribed`))
       this.#sessions.delete(sessionId)
     }
@@ -486,7 +499,14 @@ export class SessionSubscriptions {
   async ack(sessionId: string, cursor?: AgentCursor): Promise<void> {
     const state = this.#sessions.get(sessionId)
     if (state === undefined) return
-    const applied = cursor ?? state.cursor
+    // COALESCED TO THE FRONTIER. The peer keeps ONE `lastAck` per subscription
+    // and refuses a lower position, so an explicit ack carrying what a consumer
+    // has processed would lose a race against the layer's own ack and be
+    // answered CONFLICT — which the caller treats as a broken subscription.
+    // The buffer already holds everything up to `state.cursor`, so acking the
+    // frontier is both safe (an ack only frees flow control) and monotone.
+    const requested = cursor === undefined ? state.cursor : cursor
+    const applied = Number(requested.seq) > Number(state.cursor.seq) ? requested : state.cursor
     await this.#rpc.request('agent.subscriptions.ack', {
       subscriptionId: state.subscriptionId,
       cursor: applied,
@@ -661,6 +681,7 @@ export class SessionSubscriptions {
       bytesSinceAck: 0,
       ackInFlight: false,
       ackRetryAt: 0,
+      ackRetryDelay: AUTO_ACK_RETRY_MS,
       ackRetryTimer: undefined,
       windowStart: Number(descriptor.highWatermark.seq),
       // A fresh window: nothing has been dropped from it, so the baseline is a
@@ -800,6 +821,7 @@ export class SessionSubscriptions {
       bytesSinceAck: 0,
       ackInFlight: false,
       ackRetryAt: 0,
+      ackRetryDelay: AUTO_ACK_RETRY_MS,
       ackRetryTimer: undefined,
       windowStart: Number(descriptor.checkpoint.cursor.seq),
       // A fresh window: nothing has been dropped from it, so the baseline is a
@@ -872,6 +894,7 @@ export class SessionSubscriptions {
           `${sessionId}`,
       )
       // The entry is removed outright, so no `live` flag needs clearing.
+      this.#cancelAckRetry(state)
       this.#rejectWaiters(state, new Error(`session ${sessionId} evicted by LRU`))
       this.#sessions.delete(sessionId)
       // AWAITED: the peer must observe the close before the next subscribe.
@@ -1012,7 +1035,7 @@ export class SessionSubscriptions {
    * #212.
    */
   #maybeAutoAck(sessionId: string, state: SessionState): void {
-    if (state.bytesSinceAck < this.#autoAckBytes) return
+    if (state.bytesSinceAck < this.#ackWatermark()) return
     if (state.ackInFlight) return
     if (Date.now() < state.ackRetryAt) return
     state.ackInFlight = true
@@ -1022,13 +1045,20 @@ export class SessionSubscriptions {
     void this.ack(sessionId)
       .then(() => {
         state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered)
+        // A peer that answers ack again gets prompt retries next time.
+        state.ackRetryDelay = AUTO_ACK_RETRY_MS
       })
       .catch((error: unknown) => {
-        state.ackRetryAt = Date.now() + AUTO_ACK_RETRY_MS
+        // THIS attempt's delay, then the next one doubles: a peer that refuses
+        // every ack (a wedged controller, a link about to drop) must not log a
+        // line every few seconds for the life of the layer.
+        const delay = state.ackRetryDelay
+        state.ackRetryAt = Date.now() + delay
+        state.ackRetryDelay = Math.min(delay * 2, AUTO_ACK_RETRY_MAX_MS)
         console.warn(`[cherry-remote] auto-ack for session ${sessionId} failed: ${failureText(error)}`)
         // ARMED HERE, not on the next batch: a peer holding at its window sends
         // nothing more, so traffic-driven retry is no retry at all.
-        this.#armAckRetry(sessionId, state)
+        this.#armAckRetry(sessionId, state, delay)
       })
       .finally(() => {
         state.ackInFlight = false
@@ -1040,6 +1070,17 @@ export class SessionSubscriptions {
         if (this.#closed || this.#sessions.get(sessionId) !== state) return
         this.#maybeAutoAck(sessionId, state)
       })
+  }
+
+  /**
+   * Quarter of the peer's window, read from the CURRENT source so a layer that
+   * outlives a reconnect follows the new hello instead of its first answer.
+   * Falls back to the pinned protocol constant when nothing is advertised.
+   */
+  #ackWatermark(): number {
+    const source = this.#unackedSource
+    const advertised = typeof source === 'function' ? source() : source
+    return Math.max(1, Math.floor(positive(advertised, remoteLimits.unackedBytes) / 4))
   }
 
   /** Disarms the retry, if any (idempotent; safe on a state being replaced). */
@@ -1054,13 +1095,18 @@ export class SessionSubscriptions {
    * session; it no-ops when the state it was armed for is no longer current
    * (a re-subscribe, a checkpoint recovery or `dispose`).
    */
-  #armAckRetry(sessionId: string, state: SessionState): void {
+  #armAckRetry(sessionId: string, state: SessionState, delayMs: number): void {
+    if (this.#closed) return
     if (state.ackRetryTimer !== undefined) return
     const timer = setTimeout(() => {
       state.ackRetryTimer = undefined
       if (this.#closed || this.#sessions.get(sessionId) !== state) return
+      // CLEARED HERE, not left to the wall clock: a clock stepped backwards
+      // would otherwise make `#maybeAutoAck` return early and arm nothing — a
+      // retry silently lost while the peer holds, which is #212 again.
+      state.ackRetryAt = 0
       this.#maybeAutoAck(sessionId, state)
-    }, AUTO_ACK_RETRY_MS)
+    }, delayMs)
     // Never hold the process open on a retry that is only about flow control.
     timer.unref?.()
     state.ackRetryTimer = timer
@@ -1086,6 +1132,7 @@ export class SessionSubscriptions {
         `[cherry-remote] subscription for session ${sessionId} reset by the peer ` +
           `(${String(params['reason'] ?? 'unspecified')}); re-subscribe required`,
       )
+      this.#cancelAckRetry(state)
       this.#rejectWaiters(state, new Error(`session ${sessionId} reset by the peer`))
       this.#sessions.delete(sessionId)
       return

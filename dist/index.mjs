@@ -2414,10 +2414,11 @@ function projectMessageSummaries(raw) {
 	return typeof raw === "number" && Number.isFinite(raw) ? { messageSummaries: raw } : {};
 }
 /**
-* Re-projects the four numeric limit keys, dropping any foreign key that a
-* caller's `limits` object might carry. A whitelist inside the whitelist: the
-* shape is rebuilt field by field rather than spread, so a future addition to
-* `EffectiveLimits` cannot arrive here unvetted.
+* Re-projects the four numeric limit keys this report carries, dropping any
+* foreign key that a caller's `limits` object might carry — including
+* `EffectiveLimits`' newer `unackedBytes`, which no diagnostics consumer needs.
+* A whitelist inside the whitelist: the shape is rebuilt field by field rather
+* than spread, so a future addition cannot arrive here unvetted.
 */
 function projectLimits(raw) {
 	if (raw === null || typeof raw !== "object") return {};
@@ -4734,7 +4735,10 @@ const MAX_RECOVERY_ATTEMPTS = 4;
 * accumulated. A retry cooldown keeps a refusing peer from turning every batch
 * into a round trip.
 */
+/** First retry delay after a refused auto-ack; doubles per attempt. */
 const AUTO_ACK_RETRY_MS = 3e3;
+/** Ceiling for the doubling retry, so a permanently refusing peer is quiet. */
+const AUTO_ACK_RETRY_MAX_MS = 3e4;
 function positive$1(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }
@@ -4772,8 +4776,8 @@ var SessionSubscriptions = class {
 	#limit;
 	#perSessionCacheBytes;
 	#checkpointMs;
-	/** Quarter of the peer's window; see {@link SessionSubscriptionsOptions.unackedBytes}. */
-	#autoAckBytes;
+	/** Where the peer's window comes from; see {@link SessionSubscriptionsOptions.unackedBytes}. */
+	#unackedSource;
 	#sessions = /* @__PURE__ */ new Map();
 	/**
 	* Insertion order IS the eviction order, and it is SUBSCRIPTION recency, not
@@ -4795,7 +4799,7 @@ var SessionSubscriptions = class {
 		this.#limit = Math.max(1, Math.floor(positive$1(opts.subscriptionsLimit, DEFAULT_SUBSCRIPTIONS_LIMIT)));
 		this.#perSessionCacheBytes = positive$1(opts.perSessionCacheBytes, DEFAULT_PER_SESSION_CACHE_BYTES);
 		this.#checkpointMs = positive$1(opts.checkpointMs, DEFAULT_CHECKPOINT_MS);
-		this.#autoAckBytes = Math.max(1, Math.floor(positive$1(opts.unackedBytes, remoteLimits.unackedBytes) / 4));
+		this.#unackedSource = opts.unackedBytes;
 	}
 	/**
 	* Session ids with a live subscription, LRU-first. Task 10's reconnect
@@ -4895,6 +4899,7 @@ var SessionSubscriptions = class {
 		if (existing !== void 0) {
 			console.info(`[cherry-remote] re-subscribing session ${sessionId} (replacing its live subscription)`);
 			await this.#closeSubscription(existing.subscriptionId);
+			this.#cancelAckRetry(existing);
 			this.#rejectWaiters(existing, /* @__PURE__ */ new Error(`session ${sessionId} re-subscribed`));
 			this.#sessions.delete(sessionId);
 		}
@@ -4980,7 +4985,8 @@ var SessionSubscriptions = class {
 	async ack(sessionId, cursor) {
 		const state = this.#sessions.get(sessionId);
 		if (state === void 0) return;
-		const applied = cursor ?? state.cursor;
+		const requested = cursor === void 0 ? state.cursor : cursor;
+		const applied = Number(requested.seq) > Number(state.cursor.seq) ? requested : state.cursor;
 		await this.#rpc.request("agent.subscriptions.ack", {
 			subscriptionId: state.subscriptionId,
 			cursor: applied
@@ -5128,6 +5134,7 @@ var SessionSubscriptions = class {
 			bytesSinceAck: 0,
 			ackInFlight: false,
 			ackRetryAt: 0,
+			ackRetryDelay: AUTO_ACK_RETRY_MS,
 			ackRetryTimer: void 0,
 			windowStart: Number(descriptor.highWatermark.seq),
 			evicted: false,
@@ -5221,6 +5228,7 @@ var SessionSubscriptions = class {
 			bytesSinceAck: 0,
 			ackInFlight: false,
 			ackRetryAt: 0,
+			ackRetryDelay: AUTO_ACK_RETRY_MS,
 			ackRetryTimer: void 0,
 			windowStart: Number(descriptor.checkpoint.cursor.seq),
 			evicted: false,
@@ -5267,6 +5275,7 @@ var SessionSubscriptions = class {
 		for (const [sessionId, state] of this.#sessions) {
 			if (sessionId === protectedSessionId) continue;
 			console.warn(`[cherry-remote] subscription limit (${this.#limit}) reached; evicting least-recently-used session ${sessionId}`);
+			this.#cancelAckRetry(state);
 			this.#rejectWaiters(state, /* @__PURE__ */ new Error(`session ${sessionId} evicted by LRU`));
 			this.#sessions.delete(sessionId);
 			await this.#closeSubscription(state.subscriptionId);
@@ -5376,22 +5385,35 @@ var SessionSubscriptions = class {
 	* #212.
 	*/
 	#maybeAutoAck(sessionId, state) {
-		if (state.bytesSinceAck < this.#autoAckBytes) return;
+		if (state.bytesSinceAck < this.#ackWatermark()) return;
 		if (state.ackInFlight) return;
 		if (Date.now() < state.ackRetryAt) return;
 		state.ackInFlight = true;
 		const covered = state.bytesSinceAck;
 		this.ack(sessionId).then(() => {
 			state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered);
+			state.ackRetryDelay = AUTO_ACK_RETRY_MS;
 		}).catch((error) => {
-			state.ackRetryAt = Date.now() + AUTO_ACK_RETRY_MS;
+			const delay = state.ackRetryDelay;
+			state.ackRetryAt = Date.now() + delay;
+			state.ackRetryDelay = Math.min(delay * 2, AUTO_ACK_RETRY_MAX_MS);
 			console.warn(`[cherry-remote] auto-ack for session ${sessionId} failed: ${failureText(error)}`);
-			this.#armAckRetry(sessionId, state);
+			this.#armAckRetry(sessionId, state, delay);
 		}).finally(() => {
 			state.ackInFlight = false;
 			if (this.#closed || this.#sessions.get(sessionId) !== state) return;
 			this.#maybeAutoAck(sessionId, state);
 		});
+	}
+	/**
+	* Quarter of the peer's window, read from the CURRENT source so a layer that
+	* outlives a reconnect follows the new hello instead of its first answer.
+	* Falls back to the pinned protocol constant when nothing is advertised.
+	*/
+	#ackWatermark() {
+		const source = this.#unackedSource;
+		const advertised = typeof source === "function" ? source() : source;
+		return Math.max(1, Math.floor(positive$1(advertised, remoteLimits.unackedBytes) / 4));
 	}
 	/** Disarms the retry, if any (idempotent; safe on a state being replaced). */
 	#cancelAckRetry(state) {
@@ -5404,13 +5426,15 @@ var SessionSubscriptions = class {
 	* session; it no-ops when the state it was armed for is no longer current
 	* (a re-subscribe, a checkpoint recovery or `dispose`).
 	*/
-	#armAckRetry(sessionId, state) {
+	#armAckRetry(sessionId, state, delayMs) {
+		if (this.#closed) return;
 		if (state.ackRetryTimer !== void 0) return;
 		const timer = setTimeout(() => {
 			state.ackRetryTimer = void 0;
 			if (this.#closed || this.#sessions.get(sessionId) !== state) return;
+			state.ackRetryAt = 0;
 			this.#maybeAutoAck(sessionId, state);
-		}, AUTO_ACK_RETRY_MS);
+		}, delayMs);
 		timer.unref?.();
 		state.ackRetryTimer = timer;
 	}
@@ -5431,6 +5455,7 @@ var SessionSubscriptions = class {
 		for (const [sessionId, state] of this.#sessions) {
 			if (state.subscriptionId !== subscriptionId) continue;
 			console.warn(`[cherry-remote] subscription for session ${sessionId} reset by the peer (${String(params["reason"] ?? "unspecified")}); re-subscribe required`);
+			this.#cancelAckRetry(state);
 			this.#rejectWaiters(state, /* @__PURE__ */ new Error(`session ${sessionId} reset by the peer`));
 			this.#sessions.delete(sessionId);
 			return;
@@ -12774,7 +12799,7 @@ function subsFor(deviceId) {
 	const created = new SessionSubscriptions(connection.rpc, {
 		subscriptionsLimit: connection.limits.subscriptions,
 		perSessionCacheBytes: state.perSessionCacheBytes,
-		...connection.limits.unackedBytes === void 0 ? {} : { unackedBytes: connection.limits.unackedBytes }
+		unackedBytes: () => connection.limits.unackedBytes
 	});
 	state.subscriptions.set(deviceId, created);
 	console.info(`[cherry-remote] subscription layer established for ${deviceId} (peer limit ${connection.limits.subscriptions})`);

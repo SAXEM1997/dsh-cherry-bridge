@@ -4078,10 +4078,11 @@ export class CherryToolEngine {
         }
 
         // ACK AFTER DELIVERY (controller ruling ④): this EXPLICIT ack reports
-        // the position the caller has just been handed. The subscription layer
-        // runs its own flow-control ack in parallel (issue #212, subscriptions
-        // `#maybeAutoAck`) because the peer holds the stream past its un-acked
-        // window — the two cursors are independent and both monotone.
+        // the position the caller has just been handed. The layer ALSO acks its
+        // own buffer on a byte watermark (issue #212, subscriptions
+        // `#maybeAutoAck`), because the peer holds the stream past its un-acked
+        // window. The peer keeps ONE `lastAck` and refuses a lower position, so
+        // both sites coalesce to the buffer frontier — see `ack()`.
         // A failing ack is logged, never allowed to swallow the delivered events.
         // A FAILING ACK ALSO RE-ENSURES THE SESSION (v0.1.3 UltraReview P3-3).
         // The ack is the peer's verdict on the SUBSCRIPTION, not on the

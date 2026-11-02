@@ -199,7 +199,7 @@ export interface DiagnosticsDevice {
    * `partsMode: 'paged'`.
    *
    * Its own field, not a fifth key inside `limits`: it is a VERSION, not a
-   * count, and `limits` is documented as the four numeric caps. Present only
+   * count, and `limits` here is the four numeric caps this report CARRIES. Present only
    * when a LIVE connection reported it (the same rule as `limits`: the endpoint
    * never dials to find out). ABSENT therefore means "not advertised **or** not
    * connected" — every desktop through 2.1.7, and any device whose link is
@@ -555,10 +555,11 @@ function projectMessageSummaries(raw: unknown): { messageSummaries?: number } {
 }
 
 /**
- * Re-projects the four numeric limit keys, dropping any foreign key that a
- * caller's `limits` object might carry. A whitelist inside the whitelist: the
- * shape is rebuilt field by field rather than spread, so a future addition to
- * `EffectiveLimits` cannot arrive here unvetted.
+ * Re-projects the four numeric limit keys this report carries, dropping any
+ * foreign key that a caller's `limits` object might carry — including
+ * `EffectiveLimits`' newer `unackedBytes`, which no diagnostics consumer needs.
+ * A whitelist inside the whitelist: the shape is rebuilt field by field rather
+ * than spread, so a future addition cannot arrive here unvetted.
  */
 function projectLimits(raw: unknown): { limits?: EffectiveLimits } {
   if (raw === null || typeof raw !== 'object') return {}

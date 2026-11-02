@@ -666,7 +666,9 @@ function subsFor(deviceId: string): SessionSubscriptions {
     perSessionCacheBytes: state.perSessionCacheBytes,
     // The peer's OWN un-acked window when hello advertised it (protocol 0.7.0
     // peers do); absent falls back to the pinned constant inside the layer.
-    ...(connection.limits.unackedBytes === undefined ? {} : { unackedBytes: connection.limits.unackedBytes }),
+    // A PROVIDER, not a value: the layer outlives a reconnect, and `limits` is
+    // rebuilt by every hello — a pinned number would freeze the first answer.
+    unackedBytes: () => connection.limits.unackedBytes,
   })
   state.subscriptions.set(deviceId, created)
   // INFO (spec §5 「订阅建立」): the layer is announced with the cap it was
