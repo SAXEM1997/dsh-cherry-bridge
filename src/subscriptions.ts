@@ -151,6 +151,20 @@ interface SessionState {
    * consider un-acknowledged.
    */
   bytesSinceAck: number
+  /**
+   * Event payload bytes received since this subscription was INSTALLED
+   * (issue #217). Monotone for the life of one subscription — unlike `bytes`
+   * (what the cache still holds) and `bytesSinceAck` (what the peer may still
+   * count) — so 「the stream exceeded the window」 becomes a measurement in
+   * diagnostics instead of an extrapolation from a frozen cursor.
+   */
+  deliveredBytes: number
+  /**
+   * Successful `agent.subscriptions.ack` calls for this subscription (issue
+   * #217). NOT a progress metric: every accepted call counts, including a
+   * repeated explicit ack at the cursor the peer already holds.
+   */
+  acks: number
   /** One auto-ack in flight at a time; a second would only duplicate a cursor. */
   ackInFlight: boolean
   /** Cooldown after a refused auto-ack (`AUTO_ACK_RETRY_MS`, doubling). */
@@ -318,6 +332,31 @@ export class SessionSubscriptions {
    */
   cursorOf(sessionId: string): AgentCursor | undefined {
     return this.#sessions.get(sessionId)?.cursor
+  }
+
+  /**
+   * The DELIVERY LEDGER of one subscription (issue #217): the payload bytes it
+   * has received since it was installed, how much of that the peer may still
+   * count as un-acknowledged, and how many acks it has taken. Undefined for a
+   * session this layer does not hold — never a fabricated zero.
+   *
+   * Diagnostics is the caller: these three numbers are what turns 「the stream
+   * exceeded the peer's window」 from an extrapolation into a measurement.
+   *
+   * A CLIENT-SIDE ledger, never the peer's: `unackedBytes` is this layer's
+   * model of what the peer may still count (bytes since its last accepted
+   * ack), not a reading of the peer's own window or ack position.
+   */
+  deliveryOf(
+    sessionId: string,
+  ): { deliveredBytes: number; unackedBytes: number; acks: number } | undefined {
+    const state = this.#sessions.get(sessionId)
+    if (state === undefined) return undefined
+    return {
+      deliveredBytes: state.deliveredBytes,
+      unackedBytes: state.bytesSinceAck,
+      acks: state.acks,
+    }
   }
 
   /**
@@ -507,10 +546,21 @@ export class SessionSubscriptions {
     // frontier is both safe (an ack only frees flow control) and monotone.
     const requested = cursor === undefined ? state.cursor : cursor
     const applied = Number(requested.seq) > Number(state.cursor.seq) ? requested : state.cursor
+    // What THIS ack covers: everything received up to the moment it is sent.
+    // Events arriving while it is in flight sit past the applied cursor, so
+    // they stay counted.
+    const covered = state.bytesSinceAck
     await this.#rpc.request('agent.subscriptions.ack', {
       subscriptionId: state.subscriptionId,
       cursor: applied,
     })
+    // COUNTED ONLY AFTER the peer accepted it: a refused ack frees no window,
+    // so a ledger that moved optimistically would claim progress the peer never
+    // granted. The SAME rule governs the byte side, which is why BOTH live here
+    // rather than in the auto-ack caller: an explicit ack frees the window just
+    // as well, and the ledger must not disagree with it.
+    state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered)
+    state.acks += 1
   }
 
   /**
@@ -679,6 +729,10 @@ export class SessionSubscriptions {
       buffer: [],
       bytes: 0,
       bytesSinceAck: 0,
+      // A fresh subscription owns a fresh ledger (issue #217): the counters
+      // describe THIS install, never a previous one.
+      deliveredBytes: 0,
+      acks: 0,
       ackInFlight: false,
       ackRetryAt: 0,
       ackRetryDelay: AUTO_ACK_RETRY_MS,
@@ -819,6 +873,10 @@ export class SessionSubscriptions {
       buffer: [],
       bytes: 0,
       bytesSinceAck: 0,
+      // A fresh subscription owns a fresh ledger (issue #217): the counters
+      // describe THIS install, never a previous one.
+      deliveredBytes: 0,
+      acks: 0,
       ackInFlight: false,
       ackRetryAt: 0,
       ackRetryDelay: AUTO_ACK_RETRY_MS,
@@ -1002,6 +1060,7 @@ export class SessionSubscriptions {
       state.buffer.push({ cursor, event, bytes })
       state.bytes += bytes
       state.bytesSinceAck += bytes
+      state.deliveredBytes += bytes
       state.cursor = cursor
       appended += 1
     }
@@ -1039,12 +1098,10 @@ export class SessionSubscriptions {
     if (state.ackInFlight) return
     if (Date.now() < state.ackRetryAt) return
     state.ackInFlight = true
-    // The bytes covered by THIS ack. Events that arrive while it is in flight
-    // stay counted, so the next window starts from the right place.
-    const covered = state.bytesSinceAck
     void this.ack(sessionId)
       .then(() => {
-        state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered)
+        // The BYTE ledger moved inside `ack()` itself — one place for remarks
+        // and explicit acks alike — so only the retry state is the auto-ack's.
         // A peer that answers ack again gets prompt retries next time.
         state.ackRetryDelay = AUTO_ACK_RETRY_MS
       })

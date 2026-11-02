@@ -2433,6 +2433,14 @@ function projectLimits(raw) {
 function numberOr(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
+/**
+* A delivery-ledger counter (issue #217): a NON-NEGATIVE finite number, or
+* nothing at all. Absence means "not reported"; a fabricated zero would read as
+* "nothing was delivered", which is a claim this projection has no evidence for.
+*/
+function countEntry(key, raw) {
+	return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? { [key]: raw } : {};
+}
 /** The loose-bag view every projection in this module takes of its input. */
 function bag(raw) {
 	return raw ?? {};
@@ -2550,7 +2558,10 @@ function sanitizeDiagnostics(source) {
 					sessionId: typeof cursor["sessionId"] === "string" ? cursor["sessionId"] : sessionId,
 					streamEpoch: typeof cursor["streamEpoch"] === "string" ? cursor["streamEpoch"] : "",
 					seq: typeof cursor["seq"] === "string" ? cursor["seq"] : ""
-				} }
+				} },
+				...countEntry("deliveredBytes", value["deliveredBytes"]),
+				...countEntry("unackedBytes", value["unackedBytes"]),
+				...countEntry("acks", value["acks"])
 			};
 		}),
 		recentErrors: (source.recentErrors ?? []).map((raw) => {
@@ -2611,7 +2622,10 @@ function buildDiagnostics(sources, identity = DEFAULT_IDENTITY) {
 			sessionId: entry.sessionId,
 			deviceId: entry.deviceId,
 			subscriptions: entry.subscriptions,
-			...entry.cursor === void 0 ? {} : { cursor: { ...entry.cursor } }
+			...entry.cursor === void 0 ? {} : { cursor: { ...entry.cursor } },
+			...entry.deliveredBytes === void 0 ? {} : { deliveredBytes: entry.deliveredBytes },
+			...entry.unackedBytes === void 0 ? {} : { unackedBytes: entry.unackedBytes },
+			...entry.acks === void 0 ? {} : { acks: entry.acks }
 		});
 	} catch {}
 	let recentErrors = [];
@@ -4842,6 +4856,28 @@ var SessionSubscriptions = class {
 		return this.#sessions.get(sessionId)?.cursor;
 	}
 	/**
+	* The DELIVERY LEDGER of one subscription (issue #217): the payload bytes it
+	* has received since it was installed, how much of that the peer may still
+	* count as un-acknowledged, and how many acks it has taken. Undefined for a
+	* session this layer does not hold — never a fabricated zero.
+	*
+	* Diagnostics is the caller: these three numbers are what turns 「the stream
+	* exceeded the peer's window」 from an extrapolation into a measurement.
+	*
+	* A CLIENT-SIDE ledger, never the peer's: `unackedBytes` is this layer's
+	* model of what the peer may still count (bytes since its last accepted
+	* ack), not a reading of the peer's own window or ack position.
+	*/
+	deliveryOf(sessionId) {
+		const state = this.#sessions.get(sessionId);
+		if (state === void 0) return void 0;
+		return {
+			deliveredBytes: state.deliveredBytes,
+			unackedBytes: state.bytesSinceAck,
+			acks: state.acks
+		};
+	}
+	/**
 	* The session's cache WINDOW START — the retention BOUNDARY of this layer's
 	* cache: the oldest position it still tracks — or undefined when the session
 	* is untracked.
@@ -4987,10 +5023,13 @@ var SessionSubscriptions = class {
 		if (state === void 0) return;
 		const requested = cursor === void 0 ? state.cursor : cursor;
 		const applied = Number(requested.seq) > Number(state.cursor.seq) ? requested : state.cursor;
+		const covered = state.bytesSinceAck;
 		await this.#rpc.request("agent.subscriptions.ack", {
 			subscriptionId: state.subscriptionId,
 			cursor: applied
 		});
+		state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered);
+		state.acks += 1;
 	}
 	/**
 	* Parks a resolver that settles when the session buffer advances past
@@ -5132,6 +5171,8 @@ var SessionSubscriptions = class {
 			buffer: [],
 			bytes: 0,
 			bytesSinceAck: 0,
+			deliveredBytes: 0,
+			acks: 0,
 			ackInFlight: false,
 			ackRetryAt: 0,
 			ackRetryDelay: AUTO_ACK_RETRY_MS,
@@ -5226,6 +5267,8 @@ var SessionSubscriptions = class {
 			buffer: [],
 			bytes: 0,
 			bytesSinceAck: 0,
+			deliveredBytes: 0,
+			acks: 0,
 			ackInFlight: false,
 			ackRetryAt: 0,
 			ackRetryDelay: AUTO_ACK_RETRY_MS,
@@ -5358,6 +5401,7 @@ var SessionSubscriptions = class {
 			});
 			state.bytes += bytes;
 			state.bytesSinceAck += bytes;
+			state.deliveredBytes += bytes;
 			state.cursor = cursor;
 			appended += 1;
 		}
@@ -5389,9 +5433,7 @@ var SessionSubscriptions = class {
 		if (state.ackInFlight) return;
 		if (Date.now() < state.ackRetryAt) return;
 		state.ackInFlight = true;
-		const covered = state.bytesSinceAck;
 		this.ack(sessionId).then(() => {
-			state.bytesSinceAck = Math.max(0, state.bytesSinceAck - covered);
 			state.ackRetryDelay = AUTO_ACK_RETRY_MS;
 		}).catch((error) => {
 			const delay = state.ackRetryDelay;
@@ -12924,11 +12966,13 @@ function assemblyDeps() {
 		}),
 		diagnosticsSessions: () => [...state.subscriptions.entries()].flatMap(([deviceId, layer]) => layer.activeSessions().map((sessionId) => {
 			const cursor = layer.cursorOf(sessionId);
+			const delivery = layer.deliveryOf(sessionId);
 			return {
 				deviceId,
 				sessionId,
 				subscriptions: 1,
-				...cursor === void 0 ? {} : { cursor }
+				...cursor === void 0 ? {} : { cursor },
+				...delivery === void 0 ? {} : delivery
 			};
 		})),
 		diagnosticsErrors: () => [...state.recentErrors],

@@ -455,3 +455,55 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
     expect(report.scope.pathUnmatched[0]!.cwd).toBe(LONG_CWD)
   })
 })
+
+describe('the per-session delivery ledger reaches the report', () => {
+  it('carries deliveredBytes / unackedBytes / acks for a subscribed session', () => {
+    // Issue #212 follow-up: the device record could only EXTRAPOLATE the
+    // 256 KiB window from a frozen cursor. The report now carries the layer's
+    // own ledger, so the next device run is a measurement.
+    const report = buildDiagnostics(
+      diagnosticsSources({
+        sessions: () => [
+          {
+            sessionId: 's-1',
+            deviceId: 'dev-1',
+            subscriptions: 1,
+            deliveredBytes: 300_000,
+            unackedBytes: 12,
+            acks: 4,
+          },
+        ],
+      }),
+    )
+    expect(report.sessions).toHaveLength(1)
+    expect(report.sessions[0]).toMatchObject({
+      deliveredBytes: 300_000,
+      unackedBytes: 12,
+      acks: 4,
+    })
+  })
+
+  it('drops a junk value instead of fabricating a zero', () => {
+    // A zero would read as "nothing delivered", which is a CLAIM; absence reads
+    // as "not reported". Strings, NaN/Infinity and negatives are all no-report.
+    const report = buildDiagnostics(
+      diagnosticsSources({
+        sessions: () => [
+          {
+            sessionId: 's-1',
+            deviceId: 'dev-1',
+            subscriptions: 1,
+            deliveredBytes: '300000',
+            unackedBytes: Number.NaN,
+            acks: -2,
+          } as never,
+        ],
+      }),
+    )
+    const [session] = report.sessions
+    expect(session).toBeDefined()
+    expect(session?.deliveredBytes).toBeUndefined()
+    expect(session?.unackedBytes).toBeUndefined()
+    expect(session?.acks).toBeUndefined()
+  })
+})
