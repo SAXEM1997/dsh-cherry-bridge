@@ -407,4 +407,124 @@ describe('#212: the peer’s un-acked delivery window cannot stall a wait', () =
     // The refusal does not break delivery — the window holds it, honestly.
     expect(rig.fake.heldEventCount).toBeGreaterThan(0)
   })
+
+  it('①f the layer reports its own delivery ledger, so the window is MEASURABLE', async () => {
+    // The 2026-11-03 device record had to EXTRAPOLATE "the stream exceeded
+    // 256 KiB" from the pre-fix 666-event freeze. This ledger turns that into a
+    // measurement: the bytes actually delivered for the session, the bytes the
+    // peer may still count as un-acked, and how many acks it took to free them.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: TERMINAL_MESSAGE,
+        runDelayMs: 2000,
+      },
+    })
+
+    const pending = rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'hello',
+      timeoutMs: 4000,
+    }) as Promise<{ status: string }>
+
+    await vi.waitFor(() => expect(rig.subscriptions().waiterCount('s-1')).toBe(1), 3_000)
+    for (let index = 0; index < CHUNKS; index += 1) {
+      rig.fake.pushEvent('s-1', {
+        kind: 'part.append',
+        payload: {
+          messageId: 'm-assistant',
+          partId: 'p-1',
+          revision: String(index + 1),
+          offsetUtf8: String(index * 900),
+          text: CHUNK,
+        },
+      })
+    }
+
+    // The pushes go out over the loopback, so the ledger is read AFTER the
+    // terminal settled: by then the acks have freed the window, which is the
+    // state ①g pins from the other side (a refused ack never frees it).
+    expect((await pending).status).toBe('completed')
+
+    const ledger = rig.subscriptions().deliveryOf('s-1')
+    expect(ledger).toBeDefined()
+    // The measurement the device record could not make.
+    expect(ledger?.deliveredBytes).toBeGreaterThan(262_144)
+    expect(ledger?.acks).toBeGreaterThanOrEqual(1)
+    // The acks FREED budget: what is still un-acked sits under the watermark,
+    // never at the peer's window — the whole point of the fix, now visible
+    // from outside.
+    expect(ledger?.unackedBytes).toBeLessThan(262_144)
+    expect(ledger?.unackedBytes).toBeLessThanOrEqual(ledger?.deliveredBytes ?? 0)
+    // A session this layer never subscribed to has no ledger to report.
+    expect(rig.subscriptions().deliveryOf('s-never-subscribed')).toBeUndefined()
+  })
+
+  it('①g a refused ack is NOT progress: the ledger keeps zero acks and the full window', async () => {
+    // The `acks += 1` sits AFTER the peer's answer on purpose; moved before it,
+    // a peer that refuses every ack would still look like it freed the window.
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    await rig.subscriptions().ensure('s-1')
+    rig.fake.refuseAcks({ reason: 'INTERNAL', message: 'ack refused on purpose' })
+    for (let index = 0; index < CHUNKS; index += 1) {
+      rig.fake.pushEvent('s-1', {
+        kind: 'part.append',
+        payload: {
+          messageId: 'm-assistant',
+          partId: 'p-1',
+          revision: String(index + 1),
+          offsetUtf8: String(index * 900),
+          text: CHUNK,
+        },
+      })
+    }
+    await vi.waitFor(() => expect(rig.fake.ackCalls.length).toBe(1), 3_000)
+
+    const ledger = rig.subscriptions().deliveryOf('s-1')
+    expect(ledger?.acks).toBe(0)
+    // Still essentially the whole stream un-acked: a refusal must not move the
+    // byte side either (the number is the layer's own, slightly under the
+    // peer's window because the peer counts what it SENT).
+    expect(ledger?.unackedBytes).toBeGreaterThan(200_000)
+    expect(ledger?.deliveredBytes).toBeGreaterThanOrEqual(ledger?.unackedBytes ?? 0)
+  })
+
+  it('①h the ledger belongs to the CURRENT subscription: a re-subscribe resets it', async () => {
+    const rig = await makeRig({ agent: { agents: [AGENT], sessions: [SESSION] } })
+    await rig.subscriptions().ensure('s-1')
+    for (let index = 0; index < 5; index += 1) {
+      rig.fake.pushEvent('s-1', {
+        kind: 'part.append',
+        payload: {
+          messageId: 'm-assistant',
+          partId: 'p-1',
+          revision: String(index + 1),
+          offsetUtf8: String(index * 900),
+          text: CHUNK,
+        },
+      })
+    }
+    // The events cross the loopback asynchronously; wait until the layer really
+    // has them, or the ledger would be read before any delivery.
+    await vi.waitFor(
+      () => expect(rig.subscriptions().deliveryOf('s-1')?.deliveredBytes).toBeGreaterThan(0),
+      3_000,
+    )
+    await rig.subscriptions().ack('s-1')
+    const before = rig.subscriptions().deliveryOf('s-1')
+    expect(before?.deliveredBytes).toBeGreaterThan(0)
+    expect(before?.acks).toBe(1)
+    expect(before?.unackedBytes).toBe(0)
+
+    // A re-ensure replaces the subscription (its own ledger), so the counters
+    // describe the NEW install — they never accumulate across re-subscribes.
+    await rig.subscriptions().ensure('s-1')
+    expect(rig.subscriptions().deliveryOf('s-1')).toEqual({
+      deliveredBytes: 0,
+      unackedBytes: 0,
+      acks: 0,
+    })
+  })
 })

@@ -830,10 +830,11 @@ the error message).
 - **May be emitted** (`sanitizeDevice`): `deviceId`, `displayName`, `state`,
   `enabled`, `hosts`, `port`, a **12-char digest** of `desktopIdentity`, the
   hello-negotiated `limits` (`heartbeatMs`/`subscriptions`/`pageItems`/
-  `inFlightRequests` — **only with a live connection**; the endpoint never
-  dials and never wakes a device to fetch fallbacks), `messageSummaries` (the
-  hello capability bit, absent when not advertised), `sessionId` and session
-  cursors (unsubscribed sessions have none), the `stats` counters
+  `inFlightRequests` — **only with a live connection**; it never dials or wakes
+  a device for fallbacks), `messageSummaries` (the
+  hello capability bit, absent when not advertised), `sessionId`, session
+  cursors (none when unsubscribed) and their ledger (`deliveredBytes`/
+  `unackedBytes`/`acks`, #217), the `stats` counters
   (`connections`/`sockets`/`connectionsBuilt`/`subscriptions`), the two resolved
   `config` keys, and error `reason`/`message`.
 - **Never emitted**: `accessToken`, `tokenExpiresAt`, `invitationSecret`, the

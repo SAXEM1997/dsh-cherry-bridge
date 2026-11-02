@@ -878,7 +878,16 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
       [...state.subscriptions.entries()].flatMap(([deviceId, layer]) =>
         layer.activeSessions().map((sessionId) => {
           const cursor = layer.cursorOf(sessionId)
-          return { deviceId, sessionId, subscriptions: 1, ...(cursor === undefined ? {} : { cursor }) }
+          // The layer's own delivery ledger (issue #217), beside the cursor it
+          // is measured against: both come from ONE session state read.
+          const delivery = layer.deliveryOf(sessionId)
+          return {
+            deviceId,
+            sessionId,
+            subscriptions: 1,
+            ...(cursor === undefined ? {} : { cursor }),
+            ...(delivery === undefined ? {} : delivery),
+          }
         }),
       ),
     diagnosticsErrors: () => [...state.recentErrors],

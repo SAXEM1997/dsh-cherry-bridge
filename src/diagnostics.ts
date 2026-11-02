@@ -216,6 +216,16 @@ export interface DiagnosticsSession {
   deviceId: string
   subscriptions: number
   cursor?: { sessionId: string; streamEpoch: string; seq: string }
+  /**
+   * Issue #217: the layer's own delivery ledger for THIS subscription — payload
+   * bytes received since it was installed, how many of them the peer may still
+   * count as un-acknowledged, and successful acks. Absent when the layer does
+   * not report it (an unsubscribed session has no ledger); counts describe the
+   * current subscription, so a re-subscribe restarts them.
+   */
+  deliveredBytes?: number
+  unackedBytes?: number
+  acks?: number
 }
 
 /** One recent error summary (spec §5: 「最近错误摘要」). */
@@ -324,6 +334,10 @@ export interface SubscriptionStat {
   sessionId: string
   subscriptions: number
   cursor?: { sessionId: string; streamEpoch: string; seq: string }
+  /** See {@link DiagnosticsSession.deliveredBytes} (issue #217). */
+  deliveredBytes?: number
+  unackedBytes?: number
+  acks?: number
 }
 
 /**
@@ -577,6 +591,17 @@ function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+/**
+ * A delivery-ledger counter (issue #217): a NON-NEGATIVE finite number, or
+ * nothing at all. Absence means "not reported"; a fabricated zero would read as
+ * "nothing was delivered", which is a claim this projection has no evidence for.
+ */
+function countEntry(key: 'deliveredBytes' | 'unackedBytes' | 'acks', raw: unknown): Partial<DiagnosticsSession> {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0
+    ? ({ [key]: raw } as Partial<DiagnosticsSession>)
+    : {}
+}
+
 /** The loose-bag view every projection in this module takes of its input. */
 function bag(raw: unknown): Record<string, unknown> {
   return (raw ?? {}) as Record<string, unknown>
@@ -728,6 +753,9 @@ export function sanitizeDiagnostics(source: {
                 seq: typeof cursor['seq'] === 'string' ? cursor['seq'] : '',
               },
             }),
+        ...countEntry('deliveredBytes', value['deliveredBytes']),
+        ...countEntry('unackedBytes', value['unackedBytes']),
+        ...countEntry('acks', value['acks']),
       }
     }),
     recentErrors: (source.recentErrors ?? []).map((raw): DiagnosticsError => {
@@ -808,6 +836,9 @@ export function buildDiagnostics(
         deviceId: entry.deviceId,
         subscriptions: entry.subscriptions,
         ...(entry.cursor === undefined ? {} : { cursor: { ...entry.cursor } }),
+        ...(entry.deliveredBytes === undefined ? {} : { deliveredBytes: entry.deliveredBytes }),
+        ...(entry.unackedBytes === undefined ? {} : { unackedBytes: entry.unackedBytes }),
+        ...(entry.acks === undefined ? {} : { acks: entry.acks }),
       })
     }
   } catch {
