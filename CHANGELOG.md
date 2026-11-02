@@ -17,7 +17,11 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
-## Unreleased
+## v0.2.2 (2026-11-02)
+
+Verified against desktop **2.1.4 – 2.1.10** — the range and the protocol pins
+(`0.7.0` / `0.2.5`) are unchanged by this release, and no tool, parameter or
+RPC surface moved: the fourteen `cherry_*` tools are the same shapes.
 
 ### Fixed
 
@@ -26,12 +30,14 @@ who never open this file.
   (`remoteLimits.unackedBytes`, 256 KiB). The desktop stops delivering — the
   run's terminal included — once that much has been sent since the last
   `agent.subscriptions.ack`, and the layer used to ack only from
-  `cherry_events`, so a 240 s wait could sit on a stream whose run had committed
-  its answer 22 s after the send. `SessionSubscriptions` now acks what it has
-  already buffered, at a quarter of the peer's hello-advertised window (the
-  pinned constant when it advertises none), one ack in flight per session. A
-  refused ack is surfaced as one bounded warning and retried by its own timer
-  with a doubling delay — a held stream sends nothing to retry on (#212).
+  `cherry_events`, so on 2026-11-02 a 240 s wait sat on a stream whose run had
+  committed its answer 22 s after the send while the cursor stayed frozen at
+  `seq 666` — 262144 / 666 ≈ 394 bytes per event, the window to the byte.
+  `SessionSubscriptions` now acks what it has already buffered, at a quarter of
+  the peer's hello-advertised window (the pinned constant when it advertises
+  none), one auto-ack in flight per session. A refused ack is surfaced as one
+  bounded warning and retried by its own timer with a doubling delay — a held
+  stream sends nothing to retry on (#212, PR #213).
 
 ## v0.2.1 (2026-11-01)
 
