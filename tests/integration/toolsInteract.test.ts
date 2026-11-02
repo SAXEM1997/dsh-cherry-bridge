@@ -712,7 +712,8 @@ describe('interactive cherry tools over a real loopback channel', () => {
     // `idle` — an ANSWER, not an error and not a 30s park.
     expect(result.status).toBe('idle')
     expect(elapsed).toBeLessThan(2_000)
-    // And no waiter silently mutated the peer's view.
+    // No events reached the subscription, so neither the layer's flow-control
+    // ack (issue #212) nor an explicit one had anything to report.
     expect(rig.fake.ackCalls).toHaveLength(0)
   })
 

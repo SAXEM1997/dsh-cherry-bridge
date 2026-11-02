@@ -1338,6 +1338,16 @@ export class FakeCherry {
     return this.#ackCalls
   }
 
+  /**
+   * How many `agent.events` batches the un-acked window is currently HOLDING.
+   * Observability for the flow-control model (issue #212): a test can prove the
+   * peer really held a terminal — and that an ack released it — instead of
+   * trusting the outcome alone.
+   */
+  get heldEventCount(): number {
+    return this.#held.length
+  }
+
   /** Every `agent.subscriptions.close`, in arrival order (ordering evidence). */
   get closeCalls(): readonly { subscriptionId: string; sessionId: string | undefined }[] {
     return this.#closeCalls
@@ -2016,8 +2026,10 @@ export class FakeCherry {
    * The peer's flow control: deliver an `agent.events` batch only while the
    * bytes delivered-but-un-acked stay inside the window, and HOLD it otherwise.
    * A held batch is retried, in arrival order, when an ack frees budget
-   * ({@link #flushHeld}). A notification with no live subscription is dropped,
-   * exactly like a peer that has nobody to send to.
+   * ({@link #flushHeld}). A frame that cannot be attributed to a subscription
+   * this fake holds is passed through untouched: the window is a property of a
+   * live subscription, and `pushNotification` is the escape hatch the
+   * notification-layer tests drive.
    */
   #deliverEvents(params: unknown): void {
     if (params === null || typeof params !== 'object') return
@@ -2444,7 +2456,11 @@ export class FakeCherry {
         : Object.fromEntries(
             Object.entries(hello.capabilities).filter(([key]) => key !== 'agentMessageSummariesVersion'),
           )),
-      ...(hello.omitLimits ? {} : { limits: hello.limits ?? {} }),
+      // The real desktop advertises its WHOLE `remoteLimits` map in hello, so
+      // the fake advertises the same window it enforces (issue #212): a
+      // fixture that narrows `agent.unackedBytes` cannot drift from the limit
+      // the client reads.
+      ...(hello.omitLimits ? {} : { limits: { unackedBytes: this.#unackedWindow(), ...hello.limits } }),
       ...(hello.omitHeartbeatMs ? {} : { heartbeatMs: hello.heartbeatMs ?? 20_000 }),
     }
     this.#lastHelloReply = reply

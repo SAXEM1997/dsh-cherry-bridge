@@ -36,7 +36,7 @@ in [`docs/e2e-checklist.md`](../docs/e2e-checklist.md).
 | `recordBytes` | 65,536 (64 KiB) | one JSON-RPC record above it **aborts the connection** — the transport answers by killing it, so every in-flight request fails |
 | `contentBytes` | 24,576 (24 KiB) | the slice size for one `agent.content.read` |
 | `pageItems` | 100 | the protocol's single-page hard cap; `hello` may negotiate smaller |
-| `unackedBytes` | 262,144 (256 KiB) | the peer HOLDS `agent.events` beyond this much un-acked delivery — terminal included; the layer acks its buffer at ¼ of it (issue #212) |
+| `unackedBytes` | 262,144 (256 KiB) | the peer HOLDS `agent.events` beyond this much un-acked delivery — terminal included; the layer acks at ¼ of it (hello value, else this) (issue #212) |
 
 Through 2.1.7 the desktop's `pageOf` pages by **count alone** (2.1.8's byte
 budget aside, still count-paged): `pageItems: 100` fat parts produced a record
@@ -188,8 +188,7 @@ projection. An unchanged message costs no repeat `agent.parts.list`
 RPC on send → wait → read rounds, while every read still re-fetches and
 sha256-verifies every `{ref}`'s bytes (a corrupted ref behind an unchanged
 revision fails with `ContentIntegrityError`; `toolsReadCache.test.ts` T1b pins
-this beside the cache). A hit is still not a zero-RPC read: 2.1.6+ externalizes
-every part over 4,096 characters.
+this beside the cache).
 
 - **Entry & key**: the `agent.parts.list` result — `{revision, page}` — keyed
   `<deviceId>\0<messageId>` (device-scoped: a message id is the peer's; two

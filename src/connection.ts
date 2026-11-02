@@ -39,6 +39,17 @@ export interface EffectiveLimits {
   pageItems: number
   inFlightRequests: number
   /**
+   * The peer's hello-advertised UN-ACKED DELIVERY WINDOW (protocol
+   * `remoteLimits.unackedBytes`). Past this much delivered-but-unacknowledged
+   * traffic the desktop holds its event stream (issue #212), so the
+   * subscription layer sizes its own ack watermark from it.
+   *
+   * ABSENT, never defaulted — same rule as `messageSummaries` below: a hello
+   * that does not carry the key leaves the layer on the pinned protocol
+   * constant rather than on a guess about this peer.
+   */
+  unackedBytes?: number
+  /**
    * The peer's hello-advertised `agentMessageSummariesVersion` (issue #105),
    * stored BESIDE the limits because it is re-read by that same handshake.
    *
@@ -1402,11 +1413,13 @@ export class DeviceConnection {
     // reconnect to a peer that no longer advertises the capability (or a
     // downgrade) cannot inherit a stale `messageSummaries` from the previous
     // link — the exact failure mode that would send `partsMode` to a 2.1.7 peer.
+    const unackedBytes = positive(hello.limits?.['unackedBytes'])
     this.#limits = {
       heartbeatMs: positive(hello.heartbeatMs) ?? FALLBACK_LIMITS.heartbeatMs,
       subscriptions: positive(hello.limits?.['subscriptions']) ?? FALLBACK_LIMITS.subscriptions,
       pageItems: positive(hello.limits?.['pageItems']) ?? FALLBACK_LIMITS.pageItems,
       inFlightRequests: positive(hello.limits?.['inFlightRequests']) ?? FALLBACK_LIMITS.inFlightRequests,
+      ...(unackedBytes === undefined ? {} : { unackedBytes }),
       ...(typeof hello.agentMessageSummariesVersion === 'number'
         ? { messageSummaries: hello.agentMessageSummariesVersion }
         : {}),
