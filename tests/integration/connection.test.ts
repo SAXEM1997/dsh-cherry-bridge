@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { WebSocket } from 'ws'
 import { createHash } from 'node:crypto'
+import { createServer } from 'node:net'
 import type { ComponentLogger, Logger } from '@libp2p/interface'
 import {
   connectSecureChannel,
@@ -1374,9 +1375,87 @@ describe('DeviceConnection over a real loopback channel', () => {
   })
 
   // -------------------------------------------------------------------------
-  // R3-F2: the structured OFFLINE face for a request in flight at link loss
+  // #220: a candidate that FAILED is demoted behind the untried ones
   // -------------------------------------------------------------------------
 
+  it('#220 a candidate that just failed is demoted behind the untried ones on the next pass', async () => {
+    const identity = await createDeviceIdentity()
+    const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
+    // A candidate that ACCEPTS and then DESTROYS: a per-ADDRESS channel
+    // failure, which is the class the pass already falls through, and one this
+    // test can COUNT. An unroutable address would fail just as well and prove
+    // nothing about the ORDER, which is the whole point.
+    let deadAttempts = 0
+    const dead = createServer((socket) => {
+      deadAttempts += 1
+      socket.destroy()
+    })
+    await new Promise<void>((resolve) => dead.listen(0, '127.0.0.1', resolve))
+    dead.unref()
+    const address = dead.address()
+    if (address === null || typeof address === 'string') throw new Error('the dead candidate has no port')
+    try {
+      // `127.0.0.1` is FIRST in record order and dead; `localhost` reaches the
+      // fake. Falling through the first one is already pinned (#135); what is
+      // new is the SECOND pass, which must not pay the dead address again.
+      const record = recordFor(fakeInfo, {
+        hosts: ['127.0.0.1', 'localhost'],
+        ports: { '127.0.0.1': address.port, localhost: fakeInfo.port },
+      })
+      const connection = makeConnection({ identity, record, backoffInitialMs: 40 })
+
+      await connection.connect()
+      expect(connection.state).toBe('connected')
+      expect(deadAttempts).toBe(1)
+
+      // The link drops: the reconnect is a SECOND establishment pass. With the
+      // demotion it reaches the candidate that worked FIRST, so the address
+      // that just failed is not dialed again.
+      expect(fakeInfo.fake.dropConnections()).toBe(1)
+      await waitFor(() => fakeInfo.fake.connectionCount >= 2, 5_000)
+      await waitForState(connection, 'connected')
+      expect(deadAttempts).toBe(1)
+    } finally {
+      await new Promise<void>((resolve) => dead.close(() => resolve()))
+    }
+  }, 15_000)
+
+  it('#220b a candidate whose peer refuses hello is demoted too', async () => {
+    // The OTHER classification site: this candidate completes the WebSocket
+    // upgrade AND the Noise handshake (so the dial succeeds) and then refuses
+    // `connection.hello` — a per-ADDRESS failure the pass falls through. It
+    // needs a SECOND peer that shares the desktop identity, otherwise the pin
+    // check would answer `IdentityMismatchError`, which is a pairing verdict
+    // and correctly ends the pass instead.
+    const identity = await createDeviceIdentity()
+    const desktopKey = await createDeviceIdentity()
+    const badInfo = await makeFake({
+      identity: desktopKey,
+      helloFailure: { reason: 'INTERNAL_ERROR', message: 'hello refused on this address' },
+    })
+    const goodInfo = await makeFake({ identity: desktopKey, hello: { heartbeatMs: 60_000 } })
+    expect(badInfo.desktopIdentity).toBe(goodInfo.desktopIdentity)
+
+    const record = recordFor(goodInfo, {
+      hosts: ['127.0.0.1', 'localhost'],
+      ports: { '127.0.0.1': badInfo.port, localhost: goodInfo.port },
+    })
+    const connection = makeConnection({ identity, record, backoffInitialMs: 40 })
+
+    await connection.connect()
+    expect(connection.state).toBe('connected')
+    expect(badInfo.fake.socketCount).toBe(1)
+
+    expect(goodInfo.fake.dropConnections()).toBe(1)
+    await waitFor(() => goodInfo.fake.connectionCount >= 2, 5_000)
+    await waitForState(connection, 'connected')
+    // The refusing address is not dialed again on the second pass.
+    expect(badInfo.fake.socketCount).toBe(1)
+  }, 15_000)
+
+  // -------------------------------------------------------------------------
+  // R3-F2: the structured OFFLINE face for a request in flight at link loss
+  // -------------------------------------------------------------------------
   it('F2-3 a business request in flight when the link drops gets the structured offline face, not a raw disposal message', async () => {
     const identity = await createDeviceIdentity()
     // The peer accepts the request but stalls it, so the caller is genuinely

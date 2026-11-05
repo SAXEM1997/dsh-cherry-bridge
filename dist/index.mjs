@@ -3394,6 +3394,29 @@ var DeviceConnection = class {
 	#pendingPings = /* @__PURE__ */ new Set();
 	#token;
 	#tokenExpiresAt;
+	/**
+	* Hosts whose LAST attempt failed for that ADDRESS's own reason (issue #220).
+	* A pass dials the hosts it has not failed yet FIRST, so a stale candidate
+	* sitting first in `record.hosts` cannot cost its dial timeout on every
+	* reconnect — the rule the official client states as "failed candidates
+	* rotate behind untried addresses across retries, so the round budget cannot
+	* permanently starve a later route"
+	* (`.scratch-csa/docs/references/remote-access/connectivity.md` §Connection
+	* lifetime; the tree is gitignored, and its remote-agent directory is the
+	* same `16e505fe` at app tags v0.5.2 and v0.5.3, so this is not a rule that
+	* arrived with a newer app).
+	*
+	* Demotion is ORDER, never exclusion: with every host marked the list falls
+	* back to record order, so a record whose only address is marked still dials
+	* it. A mark is cleared when that host itself connects, so a repaired address
+	* returns to the front on its own — no expiry timer, no persistence, no
+	* config key. A pairing-level verdict and a cancellation never mark (they are
+	* not this address's fault: the line `isPerHostFailure` draws for the
+	* handshake face, mirrored explicitly in the dial face, where only
+	* `IdentityMismatchError` can arise today), and `close()` keeps the marks
+	* because they describe addresses, not this lifecycle.
+	*/
+	#demotedHosts = /* @__PURE__ */ new Set();
 	#wsOptions;
 	constructor(opts) {
 		this.record = opts.record;
@@ -3628,7 +3651,7 @@ var DeviceConnection = class {
 		this.#setState("connecting");
 		if (this.record.hosts.length === 0) throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, /* @__PURE__ */ new Error("the device record has no candidate hosts"));
 		let lastError = /* @__PURE__ */ new Error(`device ${this.record.deviceId}: all candidate hosts unreachable`);
-		for (const host of this.record.hosts) {
+		for (const host of this.#dialOrder()) {
 			if (!this.#running || epoch !== this.#epoch) throw new CancelledError();
 			let link;
 			try {
@@ -3636,22 +3659,44 @@ var DeviceConnection = class {
 				link = await this.#dial(host, port, epoch);
 			} catch (error) {
 				if (error instanceof IdentityMismatchError) throw error;
+				if (error instanceof CancelledError) throw error;
 				lastError = error instanceof Error ? error : new Error(String(error));
+				this.#demotedHosts.add(host);
 				continue;
 			}
 			this.#link = link;
 			try {
 				await this.#handshake(link, epoch);
+				this.#demotedHosts.delete(host);
 				return;
 			} catch (error) {
 				if (error instanceof CancelledError || !this.#running || epoch !== this.#epoch) throw new CancelledError();
 				if (!isPerHostFailure(error)) throw error;
+				this.#demotedHosts.add(host);
 				this.#teardownLink();
 				lastError = error instanceof Error ? error : new Error(String(error));
 				continue;
 			}
 		}
 		throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, lastError);
+	}
+	/**
+	* The pass's dial order (issue #220): hosts this connection has NOT failed
+	* yet, in record order, then the demoted ones, in record order.
+	*
+	* Record order is preserved INSIDE each half, so an ordinary single-address
+	* record, a fresh record and an all-demoted record all dial exactly the list
+	* the record carries — the demotion can only move an address that failed
+	* behind addresses that did not, and can never drop one.
+	*/
+	#dialOrder() {
+		const hosts = this.record.hosts;
+		if (this.#demotedHosts.size === 0) return hosts;
+		const untried = [];
+		const demoted = [];
+		for (const host of hosts) if (this.#demotedHosts.has(host)) demoted.push(host);
+		else untried.push(host);
+		return [...untried, ...demoted];
 	}
 	async #dial(host, port, epoch) {
 		const ws = new WebSocket(directEndpointUrl({
