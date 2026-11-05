@@ -288,15 +288,20 @@ describe('④ the page is bilingual, including the codes', () => {
       stubClient(
         withStatus('failed', {
           code: 'invalid',
-          problems: [{ code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'null' }],
+          // `string` → "a string", NOT `null` → "null": a token that reads the
+          // same in both languages and as the raw token cannot distinguish a
+          // translated shape from an untranslated one. (The standards review
+          // caught the original `null` here, where deleting SHAPE_KEYS left this
+          // case green.)
+          problems: [{ code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'string' }],
         }),
       ),
     )
     await screen.findByText('The switch is on, but the configuration is not usable yet:')
-    // The SHAPE is translated (null stays null, `string` would read "a string"),
-    // so no `typeof` result ever lands inside an English sentence.
+    // The SHAPE is translated — `string` reads "a string", so no `typeof`
+    // result ever lands inside an English sentence.
     expect(
-      screen.getByText('timeoutMs must be an integer between 0 and 2147483647 (got null)'),
+      screen.getByText('timeoutMs must be an integer between 0 and 2147483647 (got a string)'),
     ).toBeDefined()
     // And the hard requirement travels with the language.
     expect(screen.getByText('Experimental')).toBeDefined()
