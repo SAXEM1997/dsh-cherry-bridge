@@ -161,13 +161,39 @@ export const NO_START_CAPABILITIES: SubagentCapabilities = Object.freeze({
 export interface RunResultSettlement {
   /** The turn attempt. Its rejection is flattened, never propagated. */
   attempt(): Promise<SubagentResult>
-  /** The partial output a cancelled or failed run still reports. */
+  /** The partial output a cancelled or failed run still reports. A throw from it is contained. */
   collectOutput(): readonly SubagentContentBlock[]
-  /** Provider-authored failure detail, clipped to the seam ceiling. */
+  /** Provider-authored failure detail, clipped to the seam ceiling. A throw from it is contained. */
   collectDiagnostic?(): string | undefined
   /** Whether LOCAL cancellation settled before the attempt's outcome. */
   cancelled(): boolean
-  /** Diagnostic sink; a throw from it is contained. */
+  /**
+   * Where a settlement reports what went wrong — a LOGGING AND OPERATIONS
+   * channel, not a data channel.
+   *
+   * It is deliberately NOT the source of `SubagentResult.diagnostic`: that comes
+   * from {@link collectDiagnostic}, and {@link settleRunResult} folds it into the
+   * result itself. Treating this sink as a diagnostic back-up produces a second,
+   * competing copy of the same fact.
+   *
+   * What a caller must be ready for, because every point below is pinned by a
+   * test rather than left to be discovered by reading the implementation:
+   *
+   *  - **0 to 3 calls per settlement.** A clean run reports nothing. A failed
+   *    one reports the attempt's own error. A collector that then throws adds a
+   *    report of its own — one per broken collector, so three at most.
+   *  - **The order is meaningful.** The attempt's failure always arrives FIRST.
+   *    Collector failures arrive after it, prefixed with the collector's name
+   *    (`collectOutput() failed: …`). A keep-first sink therefore keeps the real
+   *    cause, and a last-wins one still keeps something that names the collector
+   *    instead of a silently substituted message.
+   *  - **`stopReason` is always the settlement's own**, i.e. the value the parent
+   *    will receive. On the cancelled paths that is `aborted` even when the child
+   *    had in fact succeeded: a run we stopped listening to did not fail, and
+   *    reporting `completed` there would contradict the answer the parent holds.
+   *  - **A throw from this sink is contained**, so a broken sink cannot become
+   *    the rejection {@link settleRunResult} exists to avoid.
+   */
   onError?(error: Error, stopReason: SubagentStopReason): void
   /** The request's cancellation signal; the listener is removed on every path. */
   signal: AbortSignal
@@ -212,10 +238,52 @@ export function clipDiagnostic(text: string): string {
  * @returns the terminal result, always.
  */
 export async function settleRunResult(parts: RunResultSettlement): Promise<SubagentResult> {
+  /**
+   * The two collectors are the LAST things that can break this function's
+   * promise, and they are exactly the ones a provider supplies from LIVE
+   * backend state (a session snapshot, a session's last error) — so a throw is a
+   * real possibility, not a theoretical one. `externalRunHandle` hands the
+   * result promise straight through with no `.catch` of its own, so an escaping
+   * throw becomes `run.result` REJECTING, which the seam contract forbids. The
+   * `onError` sink was already contained; these two were not.
+   *
+   * Degrading to the empty value is the honest answer, but on its own it is
+   * indistinguishable from a genuinely empty one, so the throw is also REPORTED
+   * through that same sink, labelled with the collector that broke. The report
+   * is itself contained: a sink that throws must not become the rejection this
+   * whole function exists to avoid.
+   */
+  const report = (label: string, error: unknown, stopReason: SubagentStopReason): void => {
+    try {
+      const cause = toError(error)
+      // `cause` keeps the original error's identity: this path reads live backend
+      // state, so it is exactly the path an operator will need to investigate,
+      // and a rebuilt message alone would throw away the stack that says where.
+      parts.onError?.(new Error(`${label}: ${cause.message}`, { cause }), stopReason)
+    } catch {
+      // Contained by construction: this runs inside a collector's own catch.
+    }
+  }
+  const collectOutput = (stopReason: SubagentStopReason): readonly SubagentContentBlock[] => {
+    try {
+      return parts.collectOutput()
+    } catch (error) {
+      report('collectOutput() failed', error, stopReason)
+      return []
+    }
+  }
+  const collectDiagnostic = (stopReason: SubagentStopReason): string | undefined => {
+    try {
+      return parts.collectDiagnostic?.()
+    } catch (error) {
+      report('collectDiagnostic() failed', error, stopReason)
+      return undefined
+    }
+  }
   try {
     const result = await parts.attempt()
     if (parts.cancelled()) {
-      return { output: parts.collectOutput(), stopReason: 'aborted' }
+      return { output: collectOutput('aborted'), stopReason: 'aborted' }
     }
     // A provider-supplied diagnostic rides the same ceiling as one collected
     // here; the host normalizes both, so the transcription does too.
@@ -224,17 +292,17 @@ export async function settleRunResult(parts: RunResultSettlement): Promise<Subag
       : { ...result, diagnostic: clipDiagnostic(result.diagnostic) }
   } catch (error) {
     if (parts.cancelled()) {
-      return { output: parts.collectOutput(), stopReason: 'aborted' }
+      return { output: collectOutput('aborted'), stopReason: 'aborted' }
     }
     try {
       parts.onError?.(toError(error), 'error')
     } catch {
       // A broken diagnostic sink must not turn a settled failure into a rejection.
     }
-    const collected = parts.collectDiagnostic?.()
+    const collected = collectDiagnostic('error')
     const diagnostic = collected === undefined ? undefined : clipDiagnostic(collected)
     return {
-      output: parts.collectOutput(),
+      output: collectOutput('error'),
       ...(diagnostic === undefined ? {} : { diagnostic }),
       stopReason: 'error',
     }
