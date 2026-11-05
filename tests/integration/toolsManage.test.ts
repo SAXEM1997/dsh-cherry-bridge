@@ -619,6 +619,17 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     }
     /** webServer present (browser deploy) unless `headless`. */
     headless: boolean
+    /**
+     * The host's subagent registry, as `ctx.subagents` arrives.
+     *
+     * `registered` is the ONLY evidence that the experimental subsystem reached
+     * the host at all: without it, deleting `apply`'s `subagents.mount(...)` left
+     * every assembly case green (a review found exactly that).
+     */
+    subagents: {
+      registered: Array<{ name: string; dispose: () => void }>
+      registerProvider(provider: { name: string }): () => void
+    }
     inject(deps: string[], cb: (ctx: unknown) => unknown): void
     effect(cb: () => () => void): void
   }
@@ -636,7 +647,19 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         return () => {}
       },
     }
+    const subagents: AssemblyCtx['subagents'] = {
+      registered: [],
+      registerProvider(provider) {
+        const entry = { name: provider.name, dispose: () => {} }
+        subagents.registered.push(entry)
+        return () => {
+          const index = subagents.registered.indexOf(entry)
+          if (index >= 0) subagents.registered.splice(index, 1)
+        }
+      },
+    }
     const ctx: AssemblyCtx = {
+      subagents,
       server: {
         routes,
         register(route) {
@@ -690,6 +713,19 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       headless,
       inject(deps, cb) {
         if (headless) throw new Error('service "webServer" is not available')
+        // BEFORE the scope gate: `asksForScopeKeys` THROWS on a key set it does
+        // not recognise (that is how it catches a typo'd scope key), so the
+        // subagent subsystem's one key has to be answered first or the throw
+        // would read as "the injection never arrived".
+        if (deps.length === 1 && deps[0] === 'subagents') {
+          // The callback's RETURN is the injected fibre's disposer on a real
+          // host. Captured here rather than discarded, because that is the
+          // unload path SUB-06 names — and a fixture that threw it away made
+          // deleting the provider's release invisible.
+          const effect = cb({ subagents: ctx.subagents })
+          if (typeof effect === 'function') ctx.injectedEffects.push(effect as () => void)
+          return
+        }
         // Split BY DEPENDENCY KEY: the scope subsystem's two keys answer with
         // the services plus the injected ctx's own effect/on — as an EXACT set,
         // so a misspelled key throws here instead of still matching (B6).
@@ -707,6 +743,60 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     }
     return ctx
   }
+
+  describe('the experimental subagent subsystem reaches the host, and leaves it', () => {
+    const SUBAGENT = {
+      enabled: true,
+      device: 'desk-1',
+      agentId: 'agent-7',
+      workspaceId: 'ws-1',
+    } as const
+
+    it('⑳a `apply` registers the provider when the switch is on (SUB-01/04)', async () => {
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      expect(ctx.subagents.registered.map((entry) => entry.name)).toEqual(['cherry'])
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳b the plugin’s teardown releases it (SUB-06)', async () => {
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      expect(ctx.subagents.registered).toHaveLength(1)
+      // The ROOT effect is the plugin's own teardown (`ctx.effect`), and it
+      // drains every subsystem disposer — this is the path a host unload takes.
+      for (const teardown of ctx.effects) await teardown()
+      expect(ctx.subagents.registered).toEqual([])
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳b2 the injected fibre’s own teardown releases it too (SUB-06)', async () => {
+      // The host tears the registration down when the injected service goes
+      // away, independently of the plugin's root effect.
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      expect(ctx.subagents.registered).toHaveLength(1)
+      expect(ctx.injectedEffects.length).toBeGreaterThan(0)
+      for (const teardown of ctx.injectedEffects.splice(0)) teardown()
+      expect(ctx.subagents.registered).toEqual([])
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳c with no `subagent` key nothing is registered (SUB-01)', async () => {
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir })
+      expect(ctx.subagents.registered).toEqual([])
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+  })
 
   /** Open one SSE stream on the assembly's own route table. */
   async function openStream(ctx: AssemblyCtx): Promise<{ response: FakeResponse; close: () => void }> {

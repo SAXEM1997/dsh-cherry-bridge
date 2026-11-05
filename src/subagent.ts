@@ -393,7 +393,12 @@ export function externalRunHandle(parts: ExternalRunHandleParts): SubagentRun {
       if (disposal !== undefined) return disposal
       parts.signal.removeEventListener('abort', parts.onAbort)
       parts.requestCancel()
-      disposal = parts.teardown()
+      // WRAPPED, not assigned bare. A teardown that throws SYNCHRONOUSLY would
+      // leave `disposal` undefined, so the next `dispose()` would run a second
+      // teardown against a child the first one may have half-released — the
+      // exact thing the memo exists to prevent. `Promise.resolve().then` turns
+      // that throw into a rejection the memo can hold.
+      disposal = Promise.resolve().then(() => parts.teardown())
       return disposal
     },
   }

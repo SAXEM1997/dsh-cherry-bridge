@@ -261,3 +261,14 @@ export const DEFAULT_MAX_INTERACTION_ABANDONS = 8
  * the wire.
  */
 export const MESSAGE_TEXT_MAX_CHARS = 32_768
+
+/**
+ * How much of the task becomes the Cherry session's title when the seam sent no
+ * label (SUB-23).
+ *
+ * A session list is read by a human scanning titles, so this is a caption
+ * budget rather than a data one: 60 characters is about one line in the
+ * settings page and in Cherry's own sidebar, and it is enough to tell two
+ * delegations apart.
+ */
+export const SUBAGENT_TITLE_FALLBACK_CHARS = 60

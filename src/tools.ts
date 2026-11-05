@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { MESSAGE_TEXT_MAX_CHARS } from './defaults.js'
+import { MESSAGE_TEXT_MAX_CHARS, SUBAGENT_TITLE_FALLBACK_CHARS } from './defaults.js'
 import { matchRoute } from './subagent.js'
 import type { CherrySubagentRoute, CherrySubagentRunOutcome, SubagentTarget } from './subagent.js'
 import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
@@ -4601,13 +4601,17 @@ export class CherryToolEngine {
     // requires one, and a delegation's creation step is its own (see its
     // docblock). Both workspace branches are explicit — an implicit choice would
     // write into a workspace the operator never named.
+    const title = input.label ?? input.text.trim().slice(0, SUBAGENT_TITLE_FALLBACK_CHARS).trim()
     const created = await this.#command(connection, 'agent.sessions.create', {
       commandId: randomUUID(),
       agentId: input.target.agentId,
       ...('workspaceId' in workspace
         ? { workspaceId: workspace.workspaceId }
         : { workspace: { kind: 'system' as const } }),
-      ...(input.label === undefined ? {} : { title: input.label }),
+      // SUB-23: the seam's label when it sent one, else the head of the task —
+      // a session list is read by a human scanning titles, and an untitled
+      // session is indistinguishable from every other one.
+      ...(title === undefined ? {} : { title }),
     })
     const sessionId = optionalString(created['sessionId'])
     if (sessionId === undefined) {
@@ -4677,7 +4681,11 @@ export class CherryToolEngine {
         optionalString(answer['executionId']) ?? observedExecutionId,
       ).catch(() => {})
     }
-    return this.#foldDelegation(answer, { ceilingHit, maxInteractionAbandons: input.maxInteractionAbandons })
+    return this.#foldDelegation(answer, {
+      ceilingHit,
+      maxInteractionAbandons: input.maxInteractionAbandons,
+      timeoutMs: input.timeoutMs,
+    })
   }
 
   /**
@@ -4701,7 +4709,7 @@ export class CherryToolEngine {
    */
   #foldDelegation(
     answer: Record<string, unknown>,
-    extra: { ceilingHit: boolean; maxInteractionAbandons: number },
+    extra: { ceilingHit: boolean; maxInteractionAbandons: number; timeoutMs: number },
   ): CherrySubagentRunOutcome {
     const status = String(answer['status'] ?? '')
     const text = typeof answer['text'] === 'string' ? answer['text'] : ''
@@ -4720,8 +4728,9 @@ export class CherryToolEngine {
         status: 'error',
         text,
         diagnostic:
-          'the delegation reached its timeout and was cancelled; the run may still be finishing on the ' +
-          'desktop. Raise `subagent.timeoutMs` (0 disables the bound) if the child needs longer.',
+          `the delegation reached its ${String(extra.timeoutMs)} ms timeout and was cancelled; the run may ` +
+          'still be finishing on the desktop. Raise `subagent.timeoutMs` (0 disables the bound) if the child ' +
+          'needs longer.',
       }
     }
     if (typeof answer['aggregateError'] === 'string') {

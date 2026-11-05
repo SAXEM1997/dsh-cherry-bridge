@@ -5744,7 +5744,7 @@ function externalRunHandle(parts) {
 			if (disposal !== void 0) return disposal;
 			parts.signal.removeEventListener("abort", parts.onAbort);
 			parts.requestCancel();
-			disposal = parts.teardown();
+			disposal = Promise.resolve().then(() => parts.teardown());
 			return disposal;
 		}
 	};
@@ -8838,11 +8838,12 @@ var CherryToolEngine = class {
 		const resolved = await this.#linkOr(deviceId);
 		if (resolved.link === void 0) throw new Error(`cherry subagent: the target device is unavailable (${String(resolved.verdict.error)})`);
 		const { connection, record } = resolved.link;
+		const title = input.label ?? input.text.trim().slice(0, 60).trim();
 		const created = await this.#command(connection, "agent.sessions.create", {
 			commandId: randomUUID(),
 			agentId: input.target.agentId,
 			..."workspaceId" in workspace ? { workspaceId: workspace.workspaceId } : { workspace: { kind: "system" } },
-			...input.label === void 0 ? {} : { title: input.label }
+			...title === void 0 ? {} : { title }
 		});
 		const sessionId = optionalString(created["sessionId"]);
 		if (sessionId === void 0) throw new Error(`cherry subagent: the peer created no session (${String(created["error"] ?? "no sessionId in the receipt")})`);
@@ -8886,7 +8887,8 @@ var CherryToolEngine = class {
 		if (answer["status"] === "timeout") await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer["executionId"]) ?? observedExecutionId).catch(() => {});
 		return this.#foldDelegation(answer, {
 			ceilingHit,
-			maxInteractionAbandons: input.maxInteractionAbandons
+			maxInteractionAbandons: input.maxInteractionAbandons,
+			timeoutMs: input.timeoutMs
 		});
 	}
 	/**
@@ -8919,7 +8921,7 @@ var CherryToolEngine = class {
 		if (status === "timeout") return {
 			status: "error",
 			text,
-			diagnostic: "the delegation reached its timeout and was cancelled; the run may still be finishing on the desktop. Raise `subagent.timeoutMs` (0 disables the bound) if the child needs longer."
+			diagnostic: `the delegation reached its ${String(extra.timeoutMs)} ms timeout and was cancelled; the run may still be finishing on the desktop. Raise \`subagent.timeoutMs\` (0 disables the bound) if the child needs longer.`
 		};
 		if (typeof answer["aggregateError"] === "string") return {
 			status: "error",

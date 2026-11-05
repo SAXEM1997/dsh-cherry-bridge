@@ -33,9 +33,10 @@ import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
  *    implementation of the same fold — the drift #230's extraction exists to
  *    prevent. So the reason rides the ONE fold and both faces see it.
  *
- * WHAT THIS FILE DOES NOT COVER: the delegation itself (the runner, the
- * interaction policy, the timeout and the abort channel) lives in
- * `tests/integration/subagentDelegation.test.ts`.
+ * WHAT THIS FILE DOES NOT COVER: the provider's own mapping onto the seam (that
+ * is `tests/unit/subagentSeam.test.ts`) and the subsystem's switch
+ * (`tests/unit/subagentHost.test.ts`). The delegation's policy cases — the
+ * interaction loop, the timeout, the abort channel — are below.
  */
 
 function makeCtx(): CherryToolsContext & { readonly definitions: CherryToolDefinition[] } {
@@ -349,6 +350,16 @@ describe('the route table decides where a delegation lands (SUB-10..14)', () => 
     expect(created.at(-1)?.params['workspaceId']).toBe('ws-2')
   })
 
+  it('②f2 a route’s DEVICE override is used, and an unknown one fails loudly', async () => {
+    // The other half of SUB-11: a route may name a device. Pointing it at one
+    // this plugin does not have must surface the verdict naming it, which is
+    // only possible if the route's device was consulted at all.
+    const rig = await makeRig(completing('routed'))
+    await expect(
+      delegate(rig, { cwd: '/w/dsh', routes: [{ cwdPrefix: '/w/dsh', device: 'desk-missing' }] }),
+    ).rejects.toThrow('desk-missing')
+  })
+
   it('②g no route matches, so the configured target stands (SUB-12)', async () => {
     const rig = await makeRig(completing('default target'))
     await delegate(rig, {
@@ -357,6 +368,44 @@ describe('the route table decides where a delegation lands (SUB-10..14)', () => 
     })
     const created = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.sessions.create')
     expect(created.at(-1)?.params['workspaceId']).toBe('ws-1')
+  })
+})
+
+describe('the session’s title and the window’s start are the seam’s facts (SUB-23/40)', () => {
+  it('②h with no label, the title is the head of the task', async () => {
+    const rig = await makeRig(completing('ok'))
+    const text = 'x'.repeat(200)
+    await delegate(rig, { text })
+    const created = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.sessions.create')
+    expect(created.at(-1)?.params['title']).toBe('x'.repeat(60))
+  })
+
+  it('②i creating the session does NOT spend the run’s window (SUB-40)', async () => {
+    // The window starts at the SEND's own success. A peer that takes 400 ms to
+    // create a session, with a 300 ms window, must still let the run finish —
+    // otherwise a slow creation would be reported as a slow CHILD.
+    const rig = await makeRig(completing('made it'))
+    rig.fake.setMethodDelay('agent.sessions.create', 400)
+    const outcome = await delegate(rig, { timeoutMs: 300 })
+    expect(outcome.status).toBe('completed')
+    expect(outcome.text).toBe('made it')
+  })
+})
+
+describe('a settled run whose history could not be read is not a silent child (SUB-50)', () => {
+  it('②j an assembly failure is reported as itself, never as empty text (SUB-51)', async () => {
+    // The run really did settle; only the read behind its text failed. Folding
+    // that into "the child produced no text" would report a content failure as a
+    // silent child — the distinction the ticket's review demanded.
+    const rig = await makeRig(completing('unreadable'))
+    // A peer that answers the message walk with a page whose `items` is not an
+    // array is a protocol violation the walk refuses, which is the assembly
+    // failure this case needs.
+    rig.fake.setReadFailure('agent.messages.list', { reason: 'INTERNAL', message: 'history unavailable' })
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('history could not be read')
+    expect(outcome.diagnostic).not.toContain('produced no text')
   })
 })
 
@@ -369,9 +418,13 @@ describe('a delegation has no human to ask (SUB-30..32)', () => {
     // The DENIAL, not an approval: the peer records which one it received.
     const answered = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.interactions.respond')
     expect(answered.map((entry) => entry.params['decision'])).toEqual(['deny'])
-    // Nothing was surfaced to the DSH user: a delegation never produces an
-    // `ask_user_question`, and this seam has no channel for one.
-    expect(outcome.diagnostic).toBeUndefined()
+    // SUB-32: nothing was surfaced to the DSH user. This plugin has no channel
+    // that could produce an `ask_user_question` — the observable claim is that
+    // the outcome never hands a question back and the card was never approved.
+    expect(outcome).not.toHaveProperty('questions')
+    expect(outcome).not.toHaveProperty('interactionId')
+    expect(outcome.status).not.toBe('awaiting-interaction')
+    expect(rig.fake.commandCalls.filter((entry) => entry.method === 'agent.interactions.respond')).toHaveLength(1)
   })
 
   it('③b a child that keeps asking is cancelled at the ceiling and reported (SUB-31)', async () => {
@@ -386,6 +439,11 @@ describe('a delegation has no human to ask (SUB-30..32)', () => {
     expect(outcome.status).toBe('error')
     expect(outcome.diagnostic).toContain('3')
     expect(outcome.diagnostic).toContain('human input')
+    // The BOUNDARY, not just the fact: with a ceiling of 3 it denies exactly
+    // two cards and cancels on the third. A case that only checked the word
+    // stayed green with `>=` relaxed to `>`.
+    const answered = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.interactions.respond')
+    expect(answered).toHaveLength(2)
     // It gave up by CANCELLING the run, not by walking away from it.
     expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
   })
@@ -400,7 +458,10 @@ describe('the deadline is the delegation’s own (SUB-40..42)', () => {
     const rig = await makeRig(completing('too late', { runDelayMs: 30_000 }))
     const outcome = await delegate(rig, { timeoutMs: 150 })
     expect(outcome.status).toBe('error')
-    expect(outcome.diagnostic).toContain('timeout')
+    // The CONFIGURED value, not just the word: the generic "the run ended
+    // timeout" fallback also contains it, so a case that only looked for the
+    // word would stay green with the whole dedicated branch deleted.
+    expect(outcome.diagnostic).toContain('150 ms')
     expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
   })
 

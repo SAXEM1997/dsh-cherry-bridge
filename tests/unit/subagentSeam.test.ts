@@ -514,6 +514,28 @@ describe('#229 externalRunHandle disposes exactly once', () => {
     expect(disposed).toBe(true)
   })
 
+  it('a teardown that throws SYNCHRONOUSLY is memoized too, not re-run', async () => {
+    // Assigning `parts.teardown()` bare leaves the memo undefined when the call
+    // throws before returning a promise, so a second `dispose()` runs a second
+    // teardown against a child the first may have half-released.
+    const wiring = abortWiring()
+    let teardowns = 0
+    const run = externalRunHandle({
+      id: 'run-5',
+      result: Promise.resolve(completedResult()),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+      requestCancel: () => {},
+      teardown: (() => {
+        teardowns += 1
+        throw new Error('teardown threw before returning')
+      }) as () => Promise<void>,
+    })
+    await expect(run.dispose()).rejects.toThrow('teardown threw before returning')
+    await expect(run.dispose()).rejects.toThrow('teardown threw before returning')
+    expect(teardowns).toBe(1)
+  })
+
   it('a teardown that rejects rejects dispose, and a second call does not retry', async () => {
     // Memoizing the promise means the failure is delivered to every caller
     // rather than re-attempted: a retry would run a second teardown against a
