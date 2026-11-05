@@ -2366,3 +2366,109 @@ describe('issue #109: a rate-limited COMMAND explains itself', () => {
     await rig.stop()
   }, 20_000)
 })
+
+// ---------------------------------------------------------------------------
+// ⑱⑲ issue #239 — the ids the RECEIPT names must reach the WAITING answer
+// ---------------------------------------------------------------------------
+
+describe('issue #239: the receipt names the run and the command it started', () => {
+  it('⑱ the receipt\'s executionId PINS the wait, so a foreign run\'s terminal cannot be adopted', async () => {
+    // `#runOnce` hands the waiter the id the receipt named. Without it the
+    // waiter falls back to ADOPTING the first post-baseline execution it sees
+    // (⑯) — correct only when the receipt was SILENT. Here the receipt names
+    // the run AND an unrelated execution settles first, so the two worlds
+    // answer differently: the pinned wait reports this run's `completed`, an
+    // adopting one reports the intruder's `failed` for a run still in flight.
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [{ ...SESSION }],
+        terminalMessage: terminalMessage('the real run'),
+        // The margin that makes the ORDER of the two settlements a fact rather
+        // than a race: the intruder is pushed as soon as the send reaches the
+        // peer, so this run's own terminal is 1.5 s behind it. A shorter delay
+        // would let a loaded machine settle the real run FIRST, and then an
+        // adopting waiter would pick it up too — a green test proving nothing.
+        runDelayMs: 1_500,
+      },
+    })
+
+    const pending = rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'pin my run',
+      // A long window: a waiter that adopted the intruder answers at once with
+      // the wrong verdict, and one that never settles would park until this
+      // case's own timeout kills it.
+      timeoutMs: 30_000,
+    }) as Promise<{ status: string; executionId?: string; text?: string }>
+
+    // WAIT ON THE LEDGER, never a sleep: the cut is taken BEFORE the command, so
+    // the intruder has to arrive after the send reached the peer — and this is
+    // the earliest moment that is true.
+    await vi.waitFor(() => expect(rig.fake.commandCallsFor('agent.messages.send')).toHaveLength(1), {
+      timeout: 5_000,
+      interval: 10,
+    })
+    // The receipt really did name the run: the fake stamps a fresh id per run,
+    // so the assertion below cannot pass by matching a hardcoded fixture.
+    const sent = rig.fake.commandCallsFor('agent.messages.send').at(-1)!
+    const realExecutionId = String(rig.fake.receiptFor(String(sent['commandId']))?.['executionId'])
+    expect(realExecutionId).toMatch(/^exec-/)
+    expect(realExecutionId).not.toBe('exec-intruder')
+
+    // THE ORDER IS ASSERTED, NOT ASSUMED. Everything below is only meaningful
+    // while this run has NOT settled: if it had, an adopting waiter would pick
+    // the REAL run up and report `completed` too, so the case would pass while
+    // proving nothing — the exact false green this whole test exists to remove.
+    // The 1.5 s margin makes this true; this assertion is what makes a machine
+    // slow enough to break the margin say so instead of hiding it. (It also
+    // catches the day the fake starts emitting a `running` update at admission:
+    // that would make the real run the first post-baseline execution, and this
+    // line would fail rather than silently retire the case.)
+    expect(rig.fake.executionUpdates).toHaveLength(0)
+
+    rig.fake.pushEvent('s-1', {
+      kind: 'execution.updated',
+      payload: {
+        executionId: 'exec-intruder',
+        status: 'failed',
+        messageId: 'm-intruder',
+        durable: true,
+        history: { messageRevision: '1', historyRevision: '1' },
+        error: { reason: 'INTERNAL', message: 'Intruder' },
+      },
+    })
+
+    const result = await pending
+    // The answer is the REAL run's — its status, its id, its own text — not the
+    // verdict of whichever execution happened to settle first.
+    expect(result.status).toBe('completed')
+    expect(result.executionId).toBe(realExecutionId)
+    expect(result.text).toBe('the real run')
+  }, 20_000)
+
+  it('⑲ a WAITING send echoes the caller\'s commandId in its terminal answer', async () => {
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [{ ...SESSION }], terminalMessage: terminalMessage('done') },
+    })
+
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'hello',
+      timeoutMs: 5_000,
+      // The idempotency id a caller REUSES to retry an answer it never received.
+      commandId: 'caller-named-id',
+    })) as { status: string; commandId?: string }
+
+    expect(result.status).toBe('completed')
+    // ⑫ covers the `wait: false` receipt branch, ⑪* the wire body, and
+    // `toolsAggregateBudget.test.ts` T3 the TIMEOUT face; none of them sees the
+    // id on a WAITING answer that reached a terminal. It has to be there: a
+    // caller that loses this answer retries under the SAME id, and the peer's
+    // ledger is keyed on the id, not on the run.
+    expect(rig.fake.commandCallsFor('agent.messages.send')[0]!['commandId']).toBe('caller-named-id')
+    expect(result.commandId).toBe('caller-named-id')
+  }, 20_000)
+})

@@ -622,6 +622,30 @@ describe('#229 matchRoute picks the first declared prefix at a path boundary', (
     expect(matchRoute([], '/workspace/dsh')).toBeUndefined()
   })
 
+  it('#239a a BLANK prefix claims nothing, which is what keeps an empty string from matching every path', () => {
+    // This case stands in for the `prefix.length === 0` guard that used to sit
+    // in the loop (issue #239). That guard was UNREACHABLE — `node:path`'s
+    // `normalize` answers at least `.` for ANY input, a blank string included
+    // (`normalize('') === '.'`; whitespace is preserved verbatim) — so no test
+    // could ever bite it, and an unreachable guard reads as "there is an input
+    // that gets here". Deleting it is safe because those normalized forms
+    // claim nothing on their own, and that is the fact this case pins: the
+    // alternative failure is silent and total. With a genuinely EMPTY prefix,
+    // `startsWith(prefix + sep)` degenerates to `startsWith('/')` (on POSIX;
+    // `sep` is the platform's own, `src/subagent.ts`), so the route would claim
+    // EVERY POSIX-absolute path.
+    //
+    // The config parser refuses a blank `cwdPrefix` upstream
+    // (`route-cwd-prefix`), so this input cannot arrive through configuration.
+    // It is asserted here because `matchRoute` is exported and is exercised
+    // directly, which is exactly how this suite reaches it.
+    expect(matchRoute([{ cwdPrefix: '' }], '/workspace/dsh')).toBeUndefined()
+    expect(matchRoute([{ cwdPrefix: '   ' }], '/workspace/dsh')).toBeUndefined()
+    // `.` is not a blanket either: it names the current directory, so it only
+    // claims a cwd that normalizes to the same thing.
+    expect(matchRoute([{ cwdPrefix: '.' }], '/workspace/dsh')).toBeUndefined()
+  })
+
   it('normalizes both sides before comparing, and stays case-sensitive (SUB-14)', () => {
     const routes: CherrySubagentRoute[] = [{ cwdPrefix: '/workspace/dsh/', workspaceId: 'dsh' }]
     // Trailing slash on the prefix, `..` in the cwd, redundant separators.
