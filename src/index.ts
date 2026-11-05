@@ -7,9 +7,14 @@ import type { DeviceState, WsDialOptions } from './connection.js'
 import { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
-import { CHERRY_TOOL_NAMES, registerCherryTools } from './tools.js'
+import { CHERRY_TOOL_NAMES, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
 import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
 import { ToolScopeState } from './toolScope.js'
+import { CherryToolEngine } from './tools.js'
+import { resolveSubagentConfig } from './subagent.js'
+import type { SubagentConfig } from './subagent.js'
+import { createSubagentHost } from './subagentHost.js'
+import type { SubagentHost, SubagentHostContext } from './subagentHost.js'
 import { createToolScopeHost, registerAtomically } from './toolScopeHost.js'
 import type { RefreshSummary } from './toolScopeHost.js'
 import { registerHttpApi } from './httpApi.js'
@@ -71,6 +76,16 @@ export const inject = ['tools']
 // ---------------------------------------------------------------------------
 
 export interface CherryBridgeConfig {
+  /**
+   * The EXPERIMENTAL subagent subsystem — off unless this object says otherwise.
+   *
+   * Nothing is registered while it is absent or `enabled: false`: a model should
+   * not see a feature the operator has not turned on, and a delegation is a whole
+   * agent run on someone's desktop rather than a cheap tool call. See
+   * {@link SubagentConfig} for the fields; `resolveSubagentConfig` validates them
+   * and every unusable one is named in the subsystem's own reason.
+   */
+  subagent?: SubagentConfig
   /**
    * Plugin data directory holding `identity.key` and `devices.json`, both
    * 0600. Omitted follows `$DSH_HOME`, then `~/.dsh`.
@@ -298,6 +313,14 @@ export function resolveDataDir(config: CherryBridgeConfig = {}, env = process.en
 
 interface AssemblyState {
   store: DeviceStore
+  /**
+   * The EXPERIMENTAL subagent subsystem for this apply, when one was mounted.
+   *
+   * Held on the state rather than returned because the settings page reaches it
+   * through the HTTP face (#233) and the diagnostics report reads its state; a
+   * re-apply replaces it, so a panel never reads a previous assembly's verdict.
+   */
+  subagents?: SubagentHost
   /**
    * The scope document's in-memory authority — the ONE owner of the document,
    * the degradation set, the judgement generation and the installed-layer
@@ -998,15 +1021,53 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // `registerAtomically` because the aggregate contract only hands its disposer
   // back on SUCCESS: without the ledger, a registration that throws half-way
   // would leave the definitions it already registered with no owner at all.
+  // THE ENGINE IS BUILT HERE, not inside the tool host's injection callback.
+  // Two subsystems need it: the fourteen tools (through the host below) and the
+  // subagent provider (through `runSubagentDelegation`). Building it in the
+  // callback would tie the delegation to the SCOPE subsystem's decision — and the
+  // scope default is "no workspace has the tools", so a delegation would fail
+  // exactly when an operator enabled only the experiment.
+  const engine = new CherryToolEngine(deps)
   const host = createToolScopeHost({
     scope,
     names: CHERRY_TOOL_NAMES,
-    registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryTools(toolsCtx, deps)),
+    registerTools: () =>
+      registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine).dispose),
   })
   // Mounted AFTER the root effect above and released ONLY through this disposer
   // (the root effect drains `state.disposers`): there is deliberately no second
   // root `ctx.effect`, and `mount()`'s disposer is the subsystem's only path out.
   state.disposers.push(host.mount(ctx))
+
+  // THE EXPERIMENT (spec §6.4). Its own `inject(['subagents'])`, deliberately
+  // NOT a key on the root `inject = ['tools']`: a plugin whose root injection
+  // names a service the composition lacks stays pending forever, taking the
+  // fourteen tools down with it.
+  const subagentResolution = resolveSubagentConfig(config.subagent)
+  const subagents = createSubagentHost({
+    resolution: subagentResolution,
+    // The delegation runs on THIS apply's engine, so the provider and the tools
+    // share one pool, one subscription set and one set of caches.
+    run: (input) => {
+      if (subagentResolution.kind !== 'ready') {
+        // Unreachable: the host registers nothing unless the config resolved.
+        throw new Error('cherry subagent: the subsystem is not configured')
+      }
+      const resolved = subagentResolution.config
+      return engine.runSubagentDelegation({
+        target: resolved.target,
+        routes: resolved.routes,
+        cwd: input.cwd,
+        label: input.label,
+        text: input.text,
+        timeoutMs: resolved.timeoutMs,
+        maxInteractionAbandons: resolved.maxInteractionAbandons,
+        signal: input.signal,
+      })
+    },
+  })
+  state.subagents = subagents
+  state.disposers.push(subagents.mount(ctx as unknown as SubagentHostContext))
 
   void loadOrCreateIdentity(dataDir).then(
     (identity) => {

@@ -604,11 +604,15 @@ function toSubagentResult(outcome: CherrySubagentRunOutcome): SubagentResult {
  * report a `completed` nobody is listening for.
  *
  * @param deps - the run seam: the one place a delegation touches Cherry Studio.
+ * @param options - the registration name; the configured one, defaulting to `cherry`.
  * @returns a provider the runtime can register under the configured name.
  */
-export function createCherryProvider(deps: CherryProviderDeps): CherrySubagentProvider {
+export function createCherryProvider(
+  deps: CherryProviderDeps,
+  options: { readonly name?: string } = {},
+): CherrySubagentProvider {
   return {
-    name: CHERRY_SUBAGENT_PROVIDER_DEFAULT,
+    name: options.name ?? CHERRY_SUBAGENT_PROVIDER_DEFAULT,
     capabilities: NO_START_CAPABILITIES,
     inheritsParentContext: false,
     async start(request: SubagentStartRequest): Promise<SubagentRun> {

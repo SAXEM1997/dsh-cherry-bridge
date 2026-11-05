@@ -1960,16 +1960,27 @@ export function registerCherryToolsWithEngine(
   ctx: CherryToolsContext,
   deps: CherryToolsDeps,
   options: CherryToolEngineOptions = {},
+  /**
+   * An engine the ASSEMBLY already owns, reused instead of building one here.
+   *
+   * The subagent subsystem needs the same engine, and it must not depend on the
+   * tools being registered: the scope subsystem hides the fourteen tools per
+   * workspace (by default in every workspace), while a delegation is a separate
+   * feature an operator can enable on its own. Sharing the instance is what
+   * keeps those two lifecycles independent — and it is the reason the engine is
+   * built in `apply` rather than inside the tool host's injection callback.
+   */
+  shared: CherryToolEngine | undefined = undefined,
 ): { dispose: () => void; engine: CherryToolEngine | undefined } {
   const tools = ctx.tools
   if (tools === undefined) {
     // Headless deployments have no tool registry. Degrade to a warning rather
     // than throwing: the assembly's HTTP/UI half must still come up.
     console.warn('[cherry-remote] ctx.tools is unavailable; the cherry_* tools were not registered')
-    return { dispose: () => {}, engine: undefined }
+    return { dispose: () => {}, engine: shared }
   }
 
-  const engine = new CherryToolEngine(deps, options)
+  const engine = shared ?? new CherryToolEngine(deps, options)
   const disposers = engine.definitions().map((definition) => tools.register(definition))
   return {
     engine,
