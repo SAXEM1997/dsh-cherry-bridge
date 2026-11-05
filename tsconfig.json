@@ -41,6 +41,9 @@
   //
   // `i18nUsage.test.ts` is routed by the same rule as `i18n.test.ts`: it imports
   // `ui/src/**` (the KEYS tables), so it must be checked by the UI project only.
+  // `i18nParity.test.ts` follows it for the same reason (it reads the two
+  // dictionaries), and `uiSubagentPanel.test.ts` is a jsdom render test like its
+  // two siblings.
   // `i18nAssets.test.ts` is deliberately NOT listed on either side — it imports
   // no `ui` module (it reads them as text and parses them with the compiler API),
   // so the server project covers it by default, which is what keeps
@@ -54,6 +57,8 @@
     "tests/unit/localeMeta.test.ts",
     "tests/unit/ui.test.ts",
     "tests/unit/uiScopePanel.test.ts",
+    "tests/unit/i18nParity.test.ts",
+    "tests/unit/uiSubagentPanel.test.ts",
     "tests/integration/clientBundle.test.ts",
     "_research"
   ]

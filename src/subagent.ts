@@ -792,37 +792,102 @@ export interface ResolvedSubagentConfig {
 }
 
 /**
+ * The SHAPE a config value arrived as.
+ *
+ * A closed set, because it is a translatable parameter: the settings page owns
+ * the words, and a raw `typeof` result on a Chinese page is exactly the mixing
+ * these codes exist to remove. `undefined` is a member because {@link shapeName}
+ * is total over its input, not because any site currently records it.
+ */
+export type ReceivedShape =
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'object'
+  | 'array'
+  | 'null'
+  | 'undefined'
+  | 'function'
+  | 'symbol'
+  | 'bigint'
+  | 'NaN'
+  | 'Infinity'
+  | '-Infinity'
+
+/**
+ * One reason a `subagent` config could not be used.
+ *
+ * A code plus its parameters — NEVER a sentence — because the settings page is
+ * bilingual (#233) and this array is the data it renders. `field` is the config
+ * PATH (`device`, `routes[0].cwdPrefix`), and `received` is the shape that
+ * arrived, never the value: a problem crosses the HTTP face, so it must not
+ * carry what the operator typed into the box.
+ *
+ * The arms are exact rather than one bag of optional parameters, so a code that
+ * needs `min`/`max` cannot be built without them, and the page's switch over
+ * `code` can be exhaustive.
+ */
+export type SubagentProblem =
+  | {
+      readonly code: 'not-string' | 'not-boolean' | 'not-array' | 'not-object'
+      readonly field: string
+      readonly received: ReceivedShape
+    }
+  | { readonly code: 'empty' | 'missing' | 'route-cwd-prefix'; readonly field: string }
+  | {
+      readonly code: 'out-of-range'
+      readonly field: string
+      readonly min: number
+      readonly max: number
+      readonly received: ReceivedShape
+    }
+  | {
+      readonly code: 'enum'
+      readonly field: string
+      readonly allowed: readonly string[]
+      readonly received: ReceivedShape
+    }
+  | { readonly code: 'exclusive'; readonly field: string; readonly other: string }
+
+/**
  * What the switch decided.
  *
  * Three outcomes, not two, because "off" and "wrong" are different answers: off
  * registers nothing and says nothing (SUB-01), while wrong stops the subsystem at
- * `failed` with a reason a human can act on (SUB-03). Folding the second into the
+ * `failed` with problems a human can act on (SUB-03). Folding the second into the
  * first would hide a broken configuration behind a switch the operator believes
  * is on.
  */
 export type SubagentConfigResolution =
   | { readonly kind: 'disabled' }
-  | { readonly kind: 'invalid'; readonly problems: readonly string[] }
+  | { readonly kind: 'invalid'; readonly problems: readonly SubagentProblem[] }
   | { readonly kind: 'ready'; readonly config: ResolvedSubagentConfig }
 
 /** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
 const TIMER_CEILING_MS = 2_147_483_647
 
-/** Read one optional non-blank string field, recording a problem when it is unusable. */
+/**
+ * Read one optional non-blank string field, recording a problem when it is unusable.
+ *
+ * @param path - the config path to name in a problem. Defaults to `key`; a route
+ *   field passes its full path (`routes[0].device`) so the page highlights the
+ *   entry that is wrong rather than a name that occurs in several places.
+ */
 function optionalText(
   raw: Record<string, unknown>,
   key: string,
-  problems: string[],
+  problems: SubagentProblem[],
+  path: string = key,
 ): string | undefined {
   const value = raw[key]
   if (value === undefined) return undefined
   if (typeof value !== 'string') {
-    problems.push(`\`${key}\` 必须是字符串（收到 ${shapeName(value)}）`)
+    problems.push({ code: 'not-string', field: path, received: shapeName(value) })
     return undefined
   }
   const trimmed = value.trim()
   if (trimmed.length === 0) {
-    problems.push(`\`${key}\` 不能为空`)
+    problems.push({ code: 'empty', field: path })
     return undefined
   }
   return trimmed
@@ -832,48 +897,83 @@ function optionalText(
 function optionalInteger(
   raw: Record<string, unknown>,
   key: string,
-  problems: string[],
+  problems: SubagentProblem[],
   range: { min: number; max: number },
 ): number | undefined {
   const value = raw[key]
   if (value === undefined) return undefined
+  // ONE code for a wrong type and for an out-of-range number: both are answered
+  // by the same sentence ("must be an integer between min and max"), and a
+  // second code no site can emit is a translation the page carries for nobody.
   if (typeof value !== 'number' || !Number.isInteger(value) || value < range.min || value > range.max) {
-    problems.push(`\`${key}\` 必须是 ${range.min} 到 ${range.max} 之间的整数（收到 ${shapeName(value)}）`)
+    problems.push({
+      code: 'out-of-range',
+      field: key,
+      min: range.min,
+      max: range.max,
+      received: shapeName(value),
+    })
     return undefined
   }
   return value
 }
 
-/** The shape a config value arrived as, for a value-free problem message. */
-function shapeName(value: unknown): string {
+/** `typeof` → the member of {@link ReceivedShape} it names. Total over the eight. */
+const TYPEOF_SHAPES = {
+  string: 'string',
+  number: 'number',
+  boolean: 'boolean',
+  object: 'object',
+  undefined: 'undefined',
+  function: 'function',
+  symbol: 'symbol',
+  bigint: 'bigint',
+} as const satisfies Readonly<Record<string, ReceivedShape>>
+
+/**
+ * The shape a config value arrived as, for a value-free problem.
+ *
+ * Never the VALUE: these problems ride the HTTP face and end up in a log line,
+ * and a config field can hold anything an operator pasted. `array` and `null`
+ * are special-cased because `typeof` answers `object` for both, and the
+ * distinction is the whole message ("an array where an object belongs").
+ */
+function shapeName(value: unknown): ReceivedShape {
   if (value === null) return 'null'
   if (Array.isArray(value)) return 'array'
-  if (typeof value === 'number' && !Number.isFinite(value)) return String(value)
-  return typeof value
+  // A non-finite number is NOT "a number that is out of range": `Number.isInteger`
+  // already refuses it, and an operator who wrote `NaN` or `Infinity` wants to
+  // see that word rather than a range they believe they satisfied.
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value) as ReceivedShape
+  return TYPEOF_SHAPES[typeof value]
 }
 
 /** Validate the route table, recording a problem per unusable entry. */
-function routesOf(raw: Record<string, unknown>, problems: string[]): CherrySubagentRoute[] {
+function routesOf(raw: Record<string, unknown>, problems: SubagentProblem[]): CherrySubagentRoute[] {
   const value = raw['routes']
   if (value === undefined) return []
   if (!Array.isArray(value)) {
-    problems.push(`\`routes\` 必须是数组（收到 ${shapeName(value)}）`)
+    problems.push({ code: 'not-array', field: 'routes', received: shapeName(value) })
     return []
   }
   const routes: CherrySubagentRoute[] = []
   value.forEach((entry: unknown, index: number) => {
+    const at = `routes[${index}]`
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-      problems.push(`\`routes[${index}]\` 必须是对象（收到 ${shapeName(entry)}）`)
+      problems.push({ code: 'not-object', field: at, received: shapeName(entry) })
       return
     }
     const record = entry as Record<string, unknown>
-    const prefix = optionalText(record, 'cwdPrefix', [])
-    if (prefix === undefined) {
-      problems.push(`\`routes[${index}]\` 缺少非空的 \`cwdPrefix\``)
+    // Judged HERE rather than through {@link optionalText}: a wrong type and a
+    // blank value are the same problem for a routing key, and one that is
+    // swallowed into a throwaway array cannot be reported twice.
+    const prefix = typeof record['cwdPrefix'] === 'string' ? record['cwdPrefix'].trim() : ''
+    if (prefix.length === 0) {
+      problems.push({ code: 'route-cwd-prefix', field: `${at}.cwdPrefix` })
       return
     }
-    const device = optionalText(record, 'device', problems)
-    const workspaceId = optionalText(record, 'workspaceId', problems)
+    const device = optionalText(record, 'device', problems, `${at}.device`)
+    const workspaceId = optionalText(record, 'workspaceId', problems, `${at}.workspaceId`)
     routes.push({
       cwdPrefix: prefix,
       ...(device === undefined ? {} : { device }),
@@ -901,14 +1001,17 @@ export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
   if (typeof raw !== 'object' || Array.isArray(raw)) {
     // Present but unreadable. Answering `disabled` here would hide a typo behind
     // a switch the operator believes is on, so it is a problem by name.
-    return { kind: 'invalid', problems: [`\`subagent\` 必须是对象（收到 ${shapeName(raw)}）`] }
+    return {
+      kind: 'invalid',
+      problems: [{ code: 'not-object', field: 'subagent', received: shapeName(raw) }],
+    }
   }
   const record = raw as Record<string, unknown>
-  const problems: string[] = []
+  const problems: SubagentProblem[] = []
 
   const enabled = record['enabled']
   if (enabled !== undefined && typeof enabled !== 'boolean') {
-    problems.push(`\`enabled\` 必须是布尔值（收到 ${shapeName(enabled)}）`)
+    problems.push({ code: 'not-boolean', field: 'enabled', received: shapeName(enabled) })
   }
   if (enabled !== true) {
     // Off is off: a target left half-written behind a closed switch is a draft.
@@ -923,11 +1026,21 @@ export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
   const workspaceId = optionalText(record, 'workspaceId', problems)
   const workspaceKind = record['workspaceKind']
   if (workspaceKind !== undefined && workspaceKind !== 'system') {
-    problems.push(`\`workspaceKind\` 只接受 "system"（收到 ${shapeName(workspaceKind)}）`)
+    problems.push({
+      code: 'enum',
+      field: 'workspaceKind',
+      allowed: ['system'],
+      received: shapeName(workspaceKind),
+    })
   }
   const cwdModeValue = record['cwdMode']
   if (cwdModeValue !== undefined && cwdModeValue !== 'isolated' && cwdModeValue !== 'shared') {
-    problems.push(`\`cwdMode\` 只接受 "isolated" 或 "shared"（收到 ${shapeName(cwdModeValue)}）`)
+    problems.push({
+      code: 'enum',
+      field: 'cwdMode',
+      allowed: ['isolated', 'shared'],
+      received: shapeName(cwdModeValue),
+    })
   }
   const timeoutMs = optionalInteger(record, 'timeoutMs', problems, { min: 0, max: TIMER_CEILING_MS })
   const maxInteractionAbandons = optionalInteger(record, 'maxInteractionAbandons', problems, {
@@ -938,12 +1051,16 @@ export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
   const routes = routesOf(record, problems)
 
   // The target: device and agent, plus exactly one arm of the workspace choice.
-  if (device === undefined && record['device'] === undefined) problems.push('缺少 `device`')
-  if (agentId === undefined && record['agentId'] === undefined) problems.push('缺少 `agentId`')
+  if (device === undefined && record['device'] === undefined) {
+    problems.push({ code: 'missing', field: 'device' })
+  }
+  if (agentId === undefined && record['agentId'] === undefined) {
+    problems.push({ code: 'missing', field: 'agentId' })
+  }
   if (workspaceId !== undefined && workspaceKind === 'system') {
-    problems.push('`workspaceId` 与 `workspaceKind: "system"` 只能二选一')
+    problems.push({ code: 'exclusive', field: 'workspaceId', other: 'workspaceKind' })
   } else if (workspaceId === undefined && workspaceKind !== 'system') {
-    problems.push('缺少 `workspaceId`（或 `workspaceKind: "system"`）')
+    problems.push({ code: 'missing', field: 'workspaceId' })
   }
 
   if (problems.length > 0) return { kind: 'invalid', problems }
@@ -964,4 +1081,27 @@ export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
       revision: revision ?? 0,
     },
   }
+}
+
+/**
+ * Whether two resolutions are the SAME decision.
+ *
+ * Compared as JSON, which is sound here and only here: {@link resolveSubagentConfig}
+ * is the sole producer of these objects and builds `config` in ONE object
+ * literal, so equal values always serialize identically. A second producer, or a
+ * field whose insertion order varies, would break the comparison silently —
+ * which is why this note is part of the contract rather than a remark about a
+ * helper.
+ *
+ * Its one caller is the settings page's "restart required" flag (#233): a saved
+ * document whose decision differs from the one this apply resolved is a change
+ * that has not taken effect, while one that matches needs no restart. Saying
+ * "restart to apply" unconditionally would be a lie in the case that matters
+ * most — the operator who saved, restarted, and is now looking at the page.
+ */
+export function sameSubagentResolution(
+  a: SubagentConfigResolution,
+  b: SubagentConfigResolution,
+): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
 }

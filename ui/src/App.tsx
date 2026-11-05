@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { DeviceCard } from './DeviceCard'
 import { PairingWizard } from './PairingWizard'
+import { SubagentPanel } from './SubagentPanel'
 import { ToolScopePanel } from './ToolScopePanel'
 import { REQUEST_TIMEOUT, listDevices } from './api'
 import { useT } from './i18n'
@@ -31,6 +32,7 @@ import type {
   EventSourceFactory,
   PairingProgressEvent,
   ScopeClient,
+  SubagentClient,
 } from './types'
 
 export interface AppProps {
@@ -49,6 +51,14 @@ export interface AppProps {
    * to stand up a fake registry server to render the page.
    */
   scopeClient?: ScopeClient
+  /**
+   * The experimental subagent panel's HTTP seam, injected the same way. Kept
+   * optional rather than defaulted here so a test that renders `App` for the
+   * device list does not have to answer `/subagent` too — the panel falls back
+   * to the real client and renders its own load-error line, which is a loud
+   * failure rather than a silent one.
+   */
+  subagentClient?: SubagentClient
 }
 
 /** The production stream opener; the host page always has `EventSource`. */
@@ -99,6 +109,7 @@ export function App({
   codeLifetimeMs,
   runLifetimeMs,
   scopeClient,
+  subagentClient,
 }: AppProps): ReturnType<typeof Object> {
   const t = useT()
   const [devices, setDevices] = useState<DeviceSummary[]>([])
@@ -230,6 +241,10 @@ export function App({
       {/* Above the device list: the scope decides which workspaces the tools
           appear in, which is the setting an operator comes here to change. */}
       <ToolScopePanel {...(scopeClient === undefined ? {} : { client: scopeClient })} />
+
+      {/* The experiment: OFF by default, labelled as experimental where the
+          operator turns it on, never only after it works (#233). */}
+      <SubagentPanel {...(subagentClient === undefined ? {} : { client: subagentClient })} />
 
       <section className="cherry-panel" aria-labelledby="cherry-devices-title">
         <h3 id="cherry-devices-title">{t('app.devices.heading')}</h3>

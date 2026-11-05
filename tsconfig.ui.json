@@ -47,6 +47,8 @@
     "tests/unit/localeMeta.test.ts",
     "tests/unit/ui.test.ts",
     "tests/unit/uiScopePanel.test.ts",
+    "tests/unit/i18nParity.test.ts",
+    "tests/unit/uiSubagentPanel.test.ts",
     "tests/integration/clientBundle.test.ts"
   ]
 }

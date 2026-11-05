@@ -325,3 +325,21 @@
 .cherry-state[data-state='unknown'] {
   --cherry-state-color: #484f58;
 }
+
+/* The experimental badge: visible in every state, including the failure states
+   that exist because the operator has not configured the feature yet. */
+.cherry-experimental {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--cherry-accent, #c77);
+  border-radius: 999px;
+  color: var(--cherry-accent, #c77);
+  font-size: 0.75em;
+  font-weight: 600;
+  vertical-align: middle;
+}
+.cherry-subagent-form { display: flex; flex-direction: column; gap: 8px; }
+.cherry-subagent-field { display: flex; flex-direction: column; gap: 2px; }
+.cherry-subagent-check { display: flex; align-items: center; gap: 6px; }
+.cherry-subagent-problems { margin: 4px 0 0; padding-left: 20px; }

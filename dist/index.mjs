@@ -1560,7 +1560,7 @@ function normalizeWorkspaceId(value) {
 * `sessionIds` that is not an array degrades to `[]` rather than throwing.
 */
 function toScopeWorkspace(raw) {
-	if (!isRecord$2(raw)) return void 0;
+	if (!isRecord$3(raw)) return void 0;
 	const id = usableText(raw.id);
 	if (id === void 0) return void 0;
 	const path = usableText(raw.path);
@@ -1648,7 +1648,7 @@ function normalizeScope(input) {
 		problem: "parse"
 	};
 	const value = parsed.value;
-	if (!isRecord$2(value)) return {
+	if (!isRecord$3(value)) return {
 		doc: strictScope(),
 		problem: "parse"
 	};
@@ -1712,7 +1712,7 @@ function parseScopeInput(input) {
 		return { ok: false };
 	}
 }
-function isRecord$2(value) {
+function isRecord$3(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function isFiniteNumber(value) {
@@ -1731,7 +1731,7 @@ function usableText(value) {
 * (B14). The returned ids are de-duplicated and sorted.
 */
 function readScopeFields(value) {
-	if (!isRecord$2(value)) return void 0;
+	if (!isRecord$3(value)) return void 0;
 	const mode = value.mode;
 	if (mode !== "global" && mode !== "selected") return void 0;
 	const raw = value.workspaceIds;
@@ -4870,12 +4870,12 @@ function eventBytes(event) {
 		return 64;
 	}
 }
-function isRecord$1(value) {
+function isRecord$2(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 /** Validates the three cursor fields the protocol declares (all strings). */
 function readCursor$1(value) {
-	if (!isRecord$1(value)) return void 0;
+	if (!isRecord$2(value)) return void 0;
 	const { sessionId, streamEpoch, seq } = value;
 	if (typeof sessionId !== "string" || typeof streamEpoch !== "string" || typeof seq !== "string") return void 0;
 	return {
@@ -5225,8 +5225,8 @@ var SessionSubscriptions = class {
 		if (typeof subscriptionId !== "string") throw new Error(`agent.sessions.subscribe returned no subscriptionId for ${sessionId}`);
 		if (result["mode"] === "checkpoint") {
 			const checkpoint = result["checkpoint"];
-			const cursor = isRecord$1(checkpoint) ? readCursor$1(checkpoint["cursor"]) : void 0;
-			if (!isRecord$1(checkpoint) || typeof checkpoint["checkpointId"] !== "string" || cursor === void 0) throw new Error(`agent.sessions.subscribe returned a malformed checkpoint descriptor for ${sessionId}`);
+			const cursor = isRecord$2(checkpoint) ? readCursor$1(checkpoint["cursor"]) : void 0;
+			if (!isRecord$2(checkpoint) || typeof checkpoint["checkpointId"] !== "string" || cursor === void 0) throw new Error(`agent.sessions.subscribe returned a malformed checkpoint descriptor for ${sessionId}`);
 			return {
 				mode: "checkpoint",
 				subscriptionId,
@@ -5335,7 +5335,7 @@ var SessionSubscriptions = class {
 			const result = await this.#rpc.request("agent.checkpoints.read", params);
 			const pageItems = result["items"];
 			if (Array.isArray(pageItems)) {
-				for (const item of pageItems) if (isRecord$1(item) && typeof item["kind"] === "string") items.push({
+				for (const item of pageItems) if (isRecord$2(item) && typeof item["kind"] === "string") items.push({
 					kind: item["kind"],
 					value: item["value"]
 				});
@@ -5456,7 +5456,7 @@ var SessionSubscriptions = class {
 	* touched either: the position an event occupied is not being un-retained.
 	*/
 	#onEvents(params) {
-		if (!isRecord$1(params)) {
+		if (!isRecord$2(params)) {
 			console.warn("[cherry-remote] ignoring malformed agent.events notification");
 			return;
 		}
@@ -5480,7 +5480,7 @@ var SessionSubscriptions = class {
 		}
 		let appended = 0;
 		for (const raw of events) {
-			if (!isRecord$1(raw)) continue;
+			if (!isRecord$2(raw)) continue;
 			const seq = String(raw["seq"] ?? "");
 			if (seq === "") continue;
 			const arrived = Number(seq);
@@ -5590,7 +5590,7 @@ var SessionSubscriptions = class {
 	* mode). ⑤ pins this behaviour as intended.
 	*/
 	#onResetRequired(params) {
-		if (!isRecord$1(params)) {
+		if (!isRecord$2(params)) {
 			console.warn("[cherry-remote] ignoring malformed agent.subscriptions.resetRequired notification");
 			return;
 		}
@@ -5992,17 +5992,30 @@ function resolveTargetDevice(target, routes, cwd) {
 }
 /** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
 const TIMER_CEILING_MS = 2147483647;
-/** Read one optional non-blank string field, recording a problem when it is unusable. */
-function optionalText(raw, key, problems) {
+/**
+* Read one optional non-blank string field, recording a problem when it is unusable.
+*
+* @param path - the config path to name in a problem. Defaults to `key`; a route
+*   field passes its full path (`routes[0].device`) so the page highlights the
+*   entry that is wrong rather than a name that occurs in several places.
+*/
+function optionalText(raw, key, problems, path = key) {
 	const value = raw[key];
 	if (value === void 0) return void 0;
 	if (typeof value !== "string") {
-		problems.push(`\`${key}\` 必须是字符串（收到 ${shapeName(value)}）`);
+		problems.push({
+			code: "not-string",
+			field: path,
+			received: shapeName(value)
+		});
 		return;
 	}
 	const trimmed = value.trim();
 	if (trimmed.length === 0) {
-		problems.push(`\`${key}\` 不能为空`);
+		problems.push({
+			code: "empty",
+			field: path
+		});
 		return;
 	}
 	return trimmed;
@@ -6012,40 +6025,76 @@ function optionalInteger(raw, key, problems, range) {
 	const value = raw[key];
 	if (value === void 0) return void 0;
 	if (typeof value !== "number" || !Number.isInteger(value) || value < range.min || value > range.max) {
-		problems.push(`\`${key}\` 必须是 ${range.min} 到 ${range.max} 之间的整数（收到 ${shapeName(value)}）`);
+		problems.push({
+			code: "out-of-range",
+			field: key,
+			min: range.min,
+			max: range.max,
+			received: shapeName(value)
+		});
 		return;
 	}
 	return value;
 }
-/** The shape a config value arrived as, for a value-free problem message. */
+/** `typeof` → the member of {@link ReceivedShape} it names. Total over the eight. */
+const TYPEOF_SHAPES = {
+	string: "string",
+	number: "number",
+	boolean: "boolean",
+	object: "object",
+	undefined: "undefined",
+	function: "function",
+	symbol: "symbol",
+	bigint: "bigint"
+};
+/**
+* The shape a config value arrived as, for a value-free problem.
+*
+* Never the VALUE: these problems ride the HTTP face and end up in a log line,
+* and a config field can hold anything an operator pasted. `array` and `null`
+* are special-cased because `typeof` answers `object` for both, and the
+* distinction is the whole message ("an array where an object belongs").
+*/
 function shapeName(value) {
 	if (value === null) return "null";
 	if (Array.isArray(value)) return "array";
 	if (typeof value === "number" && !Number.isFinite(value)) return String(value);
-	return typeof value;
+	return TYPEOF_SHAPES[typeof value];
 }
 /** Validate the route table, recording a problem per unusable entry. */
 function routesOf(raw, problems) {
 	const value = raw["routes"];
 	if (value === void 0) return [];
 	if (!Array.isArray(value)) {
-		problems.push(`\`routes\` 必须是数组（收到 ${shapeName(value)}）`);
+		problems.push({
+			code: "not-array",
+			field: "routes",
+			received: shapeName(value)
+		});
 		return [];
 	}
 	const routes = [];
 	value.forEach((entry, index) => {
+		const at = `routes[${index}]`;
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-			problems.push(`\`routes[${index}]\` 必须是对象（收到 ${shapeName(entry)}）`);
+			problems.push({
+				code: "not-object",
+				field: at,
+				received: shapeName(entry)
+			});
 			return;
 		}
 		const record = entry;
-		const prefix = optionalText(record, "cwdPrefix", []);
-		if (prefix === void 0) {
-			problems.push(`\`routes[${index}]\` 缺少非空的 \`cwdPrefix\``);
+		const prefix = typeof record["cwdPrefix"] === "string" ? record["cwdPrefix"].trim() : "";
+		if (prefix.length === 0) {
+			problems.push({
+				code: "route-cwd-prefix",
+				field: `${at}.cwdPrefix`
+			});
 			return;
 		}
-		const device = optionalText(record, "device", problems);
-		const workspaceId = optionalText(record, "workspaceId", problems);
+		const device = optionalText(record, "device", problems, `${at}.device`);
+		const workspaceId = optionalText(record, "workspaceId", problems, `${at}.workspaceId`);
 		routes.push({
 			cwdPrefix: prefix,
 			...device === void 0 ? {} : { device },
@@ -6069,12 +6118,20 @@ function resolveSubagentConfig(raw) {
 	if (raw === void 0 || raw === null) return { kind: "disabled" };
 	if (typeof raw !== "object" || Array.isArray(raw)) return {
 		kind: "invalid",
-		problems: [`\`subagent\` 必须是对象（收到 ${shapeName(raw)}）`]
+		problems: [{
+			code: "not-object",
+			field: "subagent",
+			received: shapeName(raw)
+		}]
 	};
 	const record = raw;
 	const problems = [];
 	const enabled = record["enabled"];
-	if (enabled !== void 0 && typeof enabled !== "boolean") problems.push(`\`enabled\` 必须是布尔值（收到 ${shapeName(enabled)}）`);
+	if (enabled !== void 0 && typeof enabled !== "boolean") problems.push({
+		code: "not-boolean",
+		field: "enabled",
+		received: shapeName(enabled)
+	});
 	if (enabled !== true) return problems.length > 0 ? {
 		kind: "invalid",
 		problems
@@ -6085,9 +6142,19 @@ function resolveSubagentConfig(raw) {
 	const agentId = optionalText(record, "agentId", problems);
 	const workspaceId = optionalText(record, "workspaceId", problems);
 	const workspaceKind = record["workspaceKind"];
-	if (workspaceKind !== void 0 && workspaceKind !== "system") problems.push(`\`workspaceKind\` 只接受 "system"（收到 ${shapeName(workspaceKind)}）`);
+	if (workspaceKind !== void 0 && workspaceKind !== "system") problems.push({
+		code: "enum",
+		field: "workspaceKind",
+		allowed: ["system"],
+		received: shapeName(workspaceKind)
+	});
 	const cwdModeValue = record["cwdMode"];
-	if (cwdModeValue !== void 0 && cwdModeValue !== "isolated" && cwdModeValue !== "shared") problems.push(`\`cwdMode\` 只接受 "isolated" 或 "shared"（收到 ${shapeName(cwdModeValue)}）`);
+	if (cwdModeValue !== void 0 && cwdModeValue !== "isolated" && cwdModeValue !== "shared") problems.push({
+		code: "enum",
+		field: "cwdMode",
+		allowed: ["isolated", "shared"],
+		received: shapeName(cwdModeValue)
+	});
 	const timeoutMs = optionalInteger(record, "timeoutMs", problems, {
 		min: 0,
 		max: TIMER_CEILING_MS
@@ -6101,10 +6168,23 @@ function resolveSubagentConfig(raw) {
 		max: Number.MAX_SAFE_INTEGER
 	});
 	const routes = routesOf(record, problems);
-	if (device === void 0 && record["device"] === void 0) problems.push("缺少 `device`");
-	if (agentId === void 0 && record["agentId"] === void 0) problems.push("缺少 `agentId`");
-	if (workspaceId !== void 0 && workspaceKind === "system") problems.push("`workspaceId` 与 `workspaceKind: \"system\"` 只能二选一");
-	else if (workspaceId === void 0 && workspaceKind !== "system") problems.push("缺少 `workspaceId`（或 `workspaceKind: \"system\"`）");
+	if (device === void 0 && record["device"] === void 0) problems.push({
+		code: "missing",
+		field: "device"
+	});
+	if (agentId === void 0 && record["agentId"] === void 0) problems.push({
+		code: "missing",
+		field: "agentId"
+	});
+	if (workspaceId !== void 0 && workspaceKind === "system") problems.push({
+		code: "exclusive",
+		field: "workspaceId",
+		other: "workspaceKind"
+	});
+	else if (workspaceId === void 0 && workspaceKind !== "system") problems.push({
+		code: "missing",
+		field: "workspaceId"
+	});
 	if (problems.length > 0) return {
 		kind: "invalid",
 		problems
@@ -6126,6 +6206,25 @@ function resolveSubagentConfig(raw) {
 			revision: revision ?? 0
 		}
 	};
+}
+/**
+* Whether two resolutions are the SAME decision.
+*
+* Compared as JSON, which is sound here and only here: {@link resolveSubagentConfig}
+* is the sole producer of these objects and builds `config` in ONE object
+* literal, so equal values always serialize identically. A second producer, or a
+* field whose insertion order varies, would break the comparison silently —
+* which is why this note is part of the contract rather than a remark about a
+* helper.
+*
+* Its one caller is the settings page's "restart required" flag (#233): a saved
+* document whose decision differs from the one this apply resolved is a change
+* that has not taken effect, while one that matches needs no restart. Saying
+* "restart to apply" unconditionally would be a lie in the case that matters
+* most — the operator who saved, restarted, and is now looking at the page.
+*/
+function sameSubagentResolution(a, b) {
+	return JSON.stringify(a) === JSON.stringify(b);
 }
 //#endregion
 //#region src/contentGate.ts
@@ -6815,7 +6914,7 @@ const DEFAULT_WAIT_POLL_MS = 25;
 * without a next step is a dead end for the caller.
 */
 const SUBSCRIPTION_LOST_GUIDANCE = "the session's event subscription was lost mid-wait and could not be re-established; the run's outcome is unknowable from this wait. Read the session with cherry_read (it does not need a subscription), or call cherry_wait again to rebuild the subscription from a fresh baseline";
-function isRecord(value) {
+function isRecord$1(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 /**
@@ -6833,7 +6932,7 @@ function isRecord(value) {
 */
 function executionErrorOf(payload) {
 	const error = payload["error"];
-	if (!isRecord(error)) return void 0;
+	if (!isRecord$1(error)) return void 0;
 	const reason = optionalString(error["reason"]);
 	if (reason === void 0) return void 0;
 	const message = optionalString(error["message"]);
@@ -6846,7 +6945,7 @@ function executionErrorOf(payload) {
 function failureReason(error) {
 	if (!(error instanceof JsonRpcRequestError)) return void 0;
 	const data = error.data;
-	if (isRecord(data) && typeof data["reason"] === "string") return data["reason"];
+	if (isRecord$1(data) && typeof data["reason"] === "string") return data["reason"];
 }
 /**
 * The phrase this hint leaves behind, so applying it twice reads once.
@@ -6878,7 +6977,7 @@ function withPeerRefusalHint(error) {
 	if (!(error instanceof JsonRpcRequestError)) return error;
 	if (failureReason(error) !== "RESOURCE_EXHAUSTED") return error;
 	const data = error.data;
-	if (!isRecord(data) || !isRecord(data["details"]) || data["details"]["retryable"] !== false) return error;
+	if (!isRecord$1(data) || !isRecord$1(data["details"]) || data["details"]["retryable"] !== false) return error;
 	if (error.message.includes(PEER_REFUSAL_FINAL_MARK)) return error;
 	const kind = optionalString(data["details"]["kind"]);
 	const cause = kind === "ITEM_TOO_LARGE" ? "an ITEM_TOO_LARGE page item over its byte budget" : "the same item";
@@ -6992,7 +7091,7 @@ function sameCommandValue(left, right) {
 		if (left.length !== right.length) return false;
 		return left.every((value, index) => sameCommandValue(value, right[index]));
 	}
-	if (isRecord(left) && isRecord(right)) {
+	if (isRecord$1(left) && isRecord$1(right)) {
 		const leftKeys = Object.keys(left);
 		if (leftKeys.length !== Object.keys(right).length) return false;
 		return leftKeys.every((key) => Object.hasOwn(right, key) && sameCommandValue(left[key], right[key]));
@@ -7036,7 +7135,7 @@ const RATE_LIMIT_HINT_MARK = "refuses BEFORE dispatch";
 function rateLimitedWaitMs(error) {
 	if (!(error instanceof JsonRpcRequestError)) return void 0;
 	const data = error.data;
-	if (!isRecord(data)) return void 0;
+	if (!isRecord$1(data)) return void 0;
 	const raw = data["retryAfterMs"];
 	if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) return void 0;
 	return Math.ceil(raw);
@@ -7161,7 +7260,7 @@ function hostListArgument(value) {
 */
 function isStaleRevisionRefusal(receipt) {
 	if (receipt["status"] !== "rejected") return false;
-	const error = isRecord(receipt["error"]) ? receipt["error"] : void 0;
+	const error = isRecord$1(receipt["error"]) ? receipt["error"] : void 0;
 	if (error === void 0 || error["reason"] !== "CONFLICT") return false;
 	const message = error["message"];
 	return typeof message === "string" && message.includes(SEND_STALE_REVISION_MESSAGE);
@@ -8252,7 +8351,7 @@ var CherryToolEngine = class {
 	*/
 	async #readOnce(connection, sessionId, limit, resume) {
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const historyRevision = session["historyRevision"];
 		if (typeof historyRevision !== "string") throw new Error(`agent.sessions.get returned no historyRevision for session ${sessionId}`);
 		const messageList = messageListRequest(connection);
@@ -8384,7 +8483,7 @@ var CherryToolEngine = class {
 		const partId = String(raw["partId"] ?? "");
 		const revision = String(raw["revision"] ?? "");
 		const kind = String(raw["kind"] ?? "");
-		const content = isRecord(raw["content"]) ? raw["content"] : {};
+		const content = isRecord$1(raw["content"]) ? raw["content"] : {};
 		if (kind === "file") return {
 			partId,
 			kind,
@@ -8397,7 +8496,7 @@ var CherryToolEngine = class {
 		};
 		let text;
 		if (typeof content["text"] === "string") text = content["text"];
-		else if (isRecord(content["ref"])) {
+		else if (isRecord$1(content["ref"])) {
 			let releaseSlot;
 			try {
 				const refusal = this.#externalizedRefusal(content["ref"]);
@@ -8481,7 +8580,7 @@ var CherryToolEngine = class {
 		} catch {
 			return;
 		}
-		if (!isRecord(parsed)) return void 0;
+		if (!isRecord$1(parsed)) return void 0;
 		if (optionalString(parsed["filename"]) === void 0 && optionalString(parsed["mediaType"]) === void 0) return;
 		const everythingLifted = Object.keys(parsed).every((key) => key === "mediaType" || key === "filename");
 		return {
@@ -8525,7 +8624,7 @@ var CherryToolEngine = class {
 	*/
 	#attachmentFace(kind, raw, content, metadata) {
 		if (kind !== "file" && kind !== "data") return {};
-		const ref = isRecord(raw["ref"]) ? raw["ref"] : isRecord(content["ref"]) ? content["ref"] : {};
+		const ref = isRecord$1(raw["ref"]) ? raw["ref"] : isRecord$1(content["ref"]) ? content["ref"] : {};
 		const name = kind === "file" ? optionalString(raw["name"]) : optionalString(metadata?.["filename"]) ?? optionalString(content["filename"]);
 		const mediaType = kind === "data" && metadata !== void 0 ? optionalString(metadata["mediaType"]) ?? optionalString(content["mediaType"]) : optionalString(ref["mediaType"]) ?? optionalString(metadata?.["mediaType"]) ?? optionalString(content["mediaType"]);
 		const byteLength = kind === "file" ? optionalString(ref["byteLength"]) : void 0;
@@ -8788,7 +8887,7 @@ var CherryToolEngine = class {
 				const sessionId = typeof receipt["sessionId"] === "string" ? receipt["sessionId"] : void 0;
 				if (sessionId === void 0) return receipt;
 				const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+				const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 				const created = {
 					sessionId,
 					device: record.deviceId,
@@ -9050,7 +9149,7 @@ var CherryToolEngine = class {
 			status: "completed",
 			text
 		};
-		const error = isRecord(answer["executionError"]) ? answer["executionError"] : void 0;
+		const error = isRecord$1(answer["executionError"]) ? answer["executionError"] : void 0;
 		const reason = error === void 0 ? void 0 : optionalString(error["reason"]);
 		const message = error === void 0 ? void 0 : optionalString(error["message"]);
 		const detail = reason === void 0 ? `the run ended ${status}` : `the run ended ${status}: ${reason}`;
@@ -9191,7 +9290,7 @@ var CherryToolEngine = class {
 		const first = await attempt(callerId ?? randomUUID());
 		if (!isStaleRevisionRefusal(first.receipt)) return first;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle === void 0 || optionalString(session["activeExecutionId"]) !== void 0) return first;
 		this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), idle);
@@ -9238,7 +9337,7 @@ var CherryToolEngine = class {
 					if (!deadlineExhaustion(error)) throw error;
 					throw new Error(`cherry_wait: could not read the session snapshot for ${sessionId} on ${record.deviceId} within the wait answer's ${preconditionBudgetMs} ms budget (the ${window} ms window plus its bounded tail); whether anything is running is UNKNOWN — retry \`cherry_wait\` (a later call rebuilds the subscription), and check \`cherry_devices\` if the device stays silent`, { cause: error });
 				}
-				const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+				const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 				const activeExecutionId = optionalString(session["activeExecutionId"]);
 				if (activeExecutionId === void 0) {
 					const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
@@ -9407,7 +9506,7 @@ var CherryToolEngine = class {
 				const sessionId = requiredString(args, "sessionId");
 				const interactionId = requiredString(args, "interactionId");
 				const decision = optionalString(args["decision"]);
-				const response = isRecord(args["response"]) ? args["response"] : void 0;
+				const response = isRecord$1(args["response"]) ? args["response"] : void 0;
 				if (decision === void 0 && response === void 0) return {
 					error: "response-required",
 					message: "provide either `decision` (approve|deny) or `response` ({kind:\"answer\", answers})"
@@ -9422,7 +9521,7 @@ var CherryToolEngine = class {
 				};
 				if (response !== void 0) {
 					const answers = response["answers"];
-					if (response["kind"] !== "answer" || !isRecord(answers)) return {
+					if (response["kind"] !== "answer" || !isRecord$1(answers)) return {
 						error: "invalid-response",
 						message: "`response` must be {kind:\"answer\", answers:{<question text>: <answer>}}"
 					};
@@ -10059,7 +10158,7 @@ var CherryToolEngine = class {
 		const cached = this.#revisionCache.get(this.#cacheKey(deviceId, sessionId));
 		if (cached !== void 0) return cached;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle === void 0) throw new Error(`agent.sessions.get returned no idle revision for session ${sessionId}`);
 		this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), idle);
@@ -10070,7 +10169,7 @@ var CherryToolEngine = class {
 		let revision;
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			if (String(entry["kind"] ?? "") !== "session.updated") continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			revision = optionalString(payload["idleRevision"]) ?? optionalString(payload["historyRevision"]) ?? revision;
 		}
 		return revision;
@@ -10100,7 +10199,7 @@ var CherryToolEngine = class {
 			return streamed;
 		}
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
-		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};
+		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
 		const idle = optionalString(session["idleRevision"]) ?? optionalString(session["historyRevision"]);
 		if (idle !== void 0) this.#remember(this.#revisionCache, deviceId, this.#cacheKey(deviceId, sessionId), idle);
 		const active = optionalString(session["activeExecutionId"]);
@@ -10119,7 +10218,7 @@ var CherryToolEngine = class {
 		let active;
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			if (String(entry["kind"] ?? "") !== "execution.updated") continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			const executionId = optionalString(payload["executionId"]);
 			const status = optionalString(payload["status"]);
 			if (executionId === void 0 || status === void 0) continue;
@@ -10144,7 +10243,7 @@ var CherryToolEngine = class {
 	async #interactionSnapshot(connection, subscriptions, deviceId, sessionId, interactionId) {
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			if (String(entry["kind"] ?? "") !== "interaction.updated") continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			if (optionalString(payload["interactionId"]) !== interactionId) continue;
 			this.#rememberInteraction(deviceId, sessionId, payload);
 		}
@@ -10390,7 +10489,7 @@ var CherryToolEngine = class {
 			if (Number.isFinite(seq) && seq > scannedSeqNext) scannedSeqNext = seq;
 			const beforeBaseline = !Number.isFinite(seq) || seq <= options.baselineSeq;
 			const kind = String(entry["kind"] ?? "");
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			if (kind === "interaction.updated") {
 				const interactionId = optionalString(payload["interactionId"]);
 				const status = optionalString(payload["status"]);
@@ -10480,7 +10579,7 @@ var CherryToolEngine = class {
 			if (String(entry["kind"] ?? "") !== "execution.updated") continue;
 			const seq = Number(entry["seq"]);
 			if (Number.isFinite(seq) && seq <= baselineSeq) continue;
-			const executionId = optionalString((isRecord(entry["payload"]) ? entry["payload"] : {})["executionId"]);
+			const executionId = optionalString((isRecord$1(entry["payload"]) ? entry["payload"] : {})["executionId"]);
 			if (executionId !== void 0) return executionId;
 		}
 	}
@@ -10496,7 +10595,7 @@ var CherryToolEngine = class {
 			if (String(entry["kind"] ?? "") !== "execution.updated") continue;
 			const seq = Number(entry["seq"]);
 			if (Number.isFinite(seq) && seq > baselineSeq) continue;
-			const payload = isRecord(entry["payload"]) ? entry["payload"] : {};
+			const payload = isRecord$1(entry["payload"]) ? entry["payload"] : {};
 			if (optionalString(payload["executionId"]) !== executionId) continue;
 			const status = optionalString(payload["status"]);
 			if (status !== void 0 && TERMINAL_EXECUTION_STATUSES.includes(status)) settled = {
@@ -10793,7 +10892,7 @@ var CherryToolEngine = class {
 	*/
 	async #sessionSnapshot(connection, sessionId, deadline) {
 		const result = await connection.rpc.request("agent.sessions.get", { sessionId }, deadline === void 0 ? void 0 : { deadline: deadline.instant });
-		return isRecord(result["session"]) ? result["session"] : {};
+		return isRecord$1(result["session"]) ? result["session"] : {};
 	}
 	/**
 	* The session's recent messages, projected with `{ref}` parts aggregated
@@ -10972,7 +11071,7 @@ function arrayOf(value) {
 		dropped: 0,
 		notAnArray: value === void 0 ? "missing" : value === null ? "null" : typeof value
 	};
-	const items = value.filter(isRecord);
+	const items = value.filter(isRecord$1);
 	return {
 		items,
 		dropped: value.length - items.length
@@ -10985,7 +11084,7 @@ function aggregateLimit(value) {
 }
 /** Parses the tool-facing cursor argument into the protocol's cursor shape. */
 function readCursor(value) {
-	if (!isRecord(value)) return void 0;
+	if (!isRecord$1(value)) return void 0;
 	const { sessionId, streamEpoch, seq } = value;
 	if (typeof sessionId !== "string" || typeof streamEpoch !== "string" || typeof seq !== "string") return void 0;
 	return {
@@ -11043,17 +11142,17 @@ function questionKeysOf(input) {
 * be presented as an answer key.
 */
 function parseQuestionInput(input) {
-	if (!isRecord(input)) return void 0;
+	if (!isRecord$1(input)) return void 0;
 	let body;
 	if (typeof input["text"] === "string") try {
 		body = JSON.parse(input["text"]);
 	} catch {
 		return;
 	}
-	else if (isRecord(input["ref"])) return;
+	else if (isRecord$1(input["ref"])) return;
 	else body = input;
-	if (!isRecord(body) || !Array.isArray(body["questions"])) return void 0;
-	return body["questions"].map((question) => isRecord(question) ? optionalString(question["question"]) : void 0).filter((question) => question !== void 0);
+	if (!isRecord$1(body) || !Array.isArray(body["questions"])) return void 0;
+	return body["questions"].map((question) => isRecord$1(question) ? optionalString(question["question"]) : void 0).filter((question) => question !== void 0);
 }
 /**
 * The full stop-point TOKEN a message walk hands out (issue #26), or
@@ -11529,6 +11628,126 @@ function newestAssistantMessage(messages) {
 	return [];
 }
 //#endregion
+//#region src/subagentConfigStore.ts
+/**
+* Where the experiment's configuration lives: `<dataDir>/subagent.json` (#233).
+*
+* The settings page cannot write the profile's YAML, so a switch there would be
+* a control nothing reads. This is the document it writes instead, deliberately
+* the same shape as `scope.json`: 0600, atomic, one monotonic `revision`, and a
+* read-modify-write save so two open pages cannot silently overwrite each other.
+*
+* ## Two sources, one winner
+*
+* The profile's `subagent` key still works — it is the SEED, used until the page
+* writes a document. After that the FILE wins, because a save the operator just
+* made must not be undone by a YAML value they edited last week. A seed has no
+* `revision` (the profile cannot carry an `expectedRevision`), so {@link read}
+* drops it rather than let it pose as a baseline.
+*
+* ## The resolver stays the only validator
+*
+* `save` checks the LOCK and the body's shape, and nothing else. Every field
+* verdict belongs to `resolveSubagentConfig`, which already answers with the
+* codes the page renders — so a save that stores an unusable value is not a
+* refused request, it is a document whose next read reports `failed` with its
+* problems. One validator, one set of codes, no second dialect to keep in step.
+*
+* The consequence is stated rather than hidden: this store will happily write
+* `{ enabled: 'true' }`, and the page then shows the `not-boolean` problem. That
+* is the same answer the profile YAML gets, which is the point.
+*/
+/** A plain JSON object, which is the only thing a config document can be. */
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/** The document's own `revision`, or `0` when it does not carry a usable one. */
+function revisionOf(document) {
+	if (!isRecord(document)) return 0;
+	const revision = document["revision"];
+	return typeof revision === "number" && Number.isInteger(revision) && revision >= 0 ? revision : 0;
+}
+/**
+* Build the store for ONE apply.
+*
+* @param parts - the file, the profile's seed value, and a warning sink. Nothing
+*   is read here: {@link SubagentConfigDocument.read} does the I/O, so building
+*   a store cannot throw on a missing or unreadable data directory.
+*/
+function createSubagentConfigDocument(parts) {
+	const log = parts.log ?? (() => {});
+	const readFile = () => {
+		let text;
+		try {
+			text = readFileSync(parts.file, "utf8");
+		} catch (error) {
+			const code = error instanceof Error && "code" in error ? String(error.code) : "";
+			if (code !== "ENOENT") log(`[cherry-remote] 读取子智能体配置失败（${code || "unknown"}）`);
+			return;
+		}
+		let parsed;
+		try {
+			parsed = JSON.parse(text);
+		} catch {
+			log("[cherry-remote] 子智能体配置不是合法 JSON；按未配置处理，保存会覆盖它");
+			return;
+		}
+		if (!isRecord(parsed)) {
+			log("[cherry-remote] 子智能体配置不是对象；按未配置处理，保存会覆盖它");
+			return;
+		}
+		return {
+			document: parsed,
+			revision: revisionOf(parsed),
+			source: "file"
+		};
+	};
+	const read = () => readFile() ?? {
+		document: parts.seed,
+		revision: 0,
+		source: "config"
+	};
+	return {
+		read,
+		save(body, expectedRevision) {
+			if (!isRecord(body)) return {
+				ok: false,
+				status: 400,
+				error: "invalid-request",
+				message: "请求体必须是 JSON 对象"
+			};
+			if (typeof expectedRevision !== "number" || !Number.isFinite(expectedRevision)) return {
+				ok: false,
+				status: 400,
+				error: "missing-expected-revision",
+				message: "请求必须携带基准 expectedRevision（读-改-写）"
+			};
+			const current = read();
+			if (expectedRevision !== current.revision) return {
+				ok: false,
+				status: 409,
+				error: "subagent-revision-conflict",
+				message: `配置已被他处修改（当前 revision=${current.revision}），请重新读取后再保存`
+			};
+			const { revision: _serverOwned, expectedRevision: _baseline, ...fields } = body;
+			const revision = current.revision + 1;
+			const document = {
+				...fields,
+				revision
+			};
+			writeFileAtomicSync(parts.file, `${JSON.stringify(document, null, 2)}\n`);
+			return {
+				ok: true,
+				stored: {
+					document,
+					revision,
+					source: "file"
+				}
+			};
+		}
+	};
+}
+//#endregion
 //#region src/subagentTool.ts
 /**
 * The model-facing description.
@@ -11635,8 +11854,6 @@ function createCherrySubagentTool(parts) {
 //#region src/subagentHost.ts
 /** The injection key. ONE key, so the subsystem cannot be held pending by another. */
 const INJECT_KEYS$1 = ["subagents"];
-/** The reason text for a host that has no registry at all (SUB-02). */
-const UNSUPPORTED_REASON = "宿主没有 subagents 服务（DSH 版本过低）；子智能体子系统不可用，其余功能不受影响";
 /**
 * Build the subsystem for ONE apply.
 *
@@ -11649,13 +11866,16 @@ function createSubagentHost(parts) {
 	const allowedFor = parts.allowedFor;
 	let status = resolution.kind === "disabled" ? {
 		state: "pending",
-		reason: "实验性子智能体未启用（默认关闭）"
+		reason: { code: "disabled" }
 	} : resolution.kind === "invalid" ? {
 		state: "failed",
-		reason: resolution.problems.join("；")
+		reason: {
+			code: "invalid",
+			problems: resolution.problems
+		}
 	} : {
 		state: "pending",
-		reason: "等待宿主注入 subagents"
+		reason: { code: "awaiting-injection" }
 	};
 	let release;
 	return {
@@ -11665,9 +11885,9 @@ function createSubagentHost(parts) {
 			if (ctx.subagents === void 0) {
 				status = {
 					state: "unsupported",
-					reason: UNSUPPORTED_REASON
+					reason: { code: "unsupported" }
 				};
-				log(`[cherry-remote] 子智能体子系统未启用：${UNSUPPORTED_REASON}`);
+				log("[cherry-remote] 子智能体子系统不可用", status.reason);
 				return () => {};
 			}
 			const tools = ctx.tools;
@@ -11683,10 +11903,10 @@ function createSubagentHost(parts) {
 			* @returns the tool's disposer, or the reason there is none.
 			*/
 			const registerTool = (service) => {
-				if (tools === void 0) return { problem: "宿主没有 tools 服务" };
+				if (tools === void 0) return { problem: { code: "no-tools-service" } };
 				const startActivation = service.startActivation;
-				if (typeof startActivation !== "function") return { problem: "宿主没有 startActivation 接口" };
-				if (allowedFor !== void 0 && typeof tools.resolve !== "function") return { problem: "宿主没有 tools.resolve（步骤级激活条件不受支持），无法逐步骤约束可见性；工具不注册（fail-closed）" };
+				if (typeof startActivation !== "function") return { problem: { code: "no-start-activation" } };
+				if (allowedFor !== void 0 && typeof tools.resolve !== "function") return { problem: { code: "no-step-condition" } };
 				const definition = createCherrySubagentTool({
 					toolName: resolution.config.toolName,
 					providerName: resolution.config.providerName,
@@ -11707,7 +11927,7 @@ function createSubagentHost(parts) {
 				if (service === void 0) {
 					status = {
 						state: "unsupported",
-						reason: UNSUPPORTED_REASON
+						reason: { code: "unsupported" }
 					};
 					return;
 				}
@@ -11717,7 +11937,10 @@ function createSubagentHost(parts) {
 				} catch (error) {
 					status = {
 						state: "failed",
-						reason: `注册 provider 失败：${error instanceof Error ? error.message : String(error)}`
+						reason: {
+							code: "provider-refused",
+							message: error instanceof Error ? error.message : String(error)
+						}
 					};
 					log("[cherry-remote] 子智能体 provider 注册失败", error);
 					return;
@@ -11729,7 +11952,10 @@ function createSubagentHost(parts) {
 					if ("problem" in added) toolProblem = added.problem;
 					else releaseTool = added.release;
 				} catch (error) {
-					toolProblem = `工具注册被宿主拒绝：${error instanceof Error ? error.message : String(error)}`;
+					toolProblem = {
+						code: "host-refused",
+						message: error instanceof Error ? error.message : String(error)
+					};
 					log("[cherry-remote] cherry_subagent 工具注册失败", error);
 				}
 				release = () => {
@@ -11738,9 +11964,21 @@ function createSubagentHost(parts) {
 				};
 				const providerName = resolution.config.providerName;
 				const toolName = resolution.config.toolName;
-				status = {
+				status = toolProblem === void 0 ? {
 					state: "ready",
-					reason: toolProblem === void 0 ? `已注册 provider "${providerName}" 与工具 "${toolName}"` : `已注册 provider "${providerName}"；${toolProblem}，工具 "${toolName}" 未注册`
+					reason: {
+						code: "ready",
+						providerName,
+						toolName
+					}
+				} : {
+					state: "ready",
+					reason: {
+						code: "ready-without-tool",
+						providerName,
+						toolName,
+						problem: toolProblem
+					}
 				};
 			};
 			try {
@@ -11751,14 +11989,14 @@ function createSubagentHost(parts) {
 						release = void 0;
 						status = {
 							state: "pending",
-							reason: "等待宿主注入 subagents"
+							reason: { code: "awaiting-injection" }
 						};
 					};
 				});
 			} catch (error) {
 				status = {
 					state: "pending",
-					reason: "等待宿主注入 subagents"
+					reason: { code: "awaiting-injection" }
 				};
 				log("[cherry-remote] subagents 注入不可用；子智能体子系统保持 pending", error);
 			}
@@ -13137,6 +13375,12 @@ async function handleRequest(req, res, route) {
 			writeError(res, 405, "method-not-allowed", "GET/PUT only");
 			return;
 		}
+		if (first === "subagent" && match.segments.length === 1) {
+			if (method === "GET") return subagentSnapshot(res, route);
+			if (method === "PUT") return await saveSubagentDocument(req, res, route);
+			writeError(res, 405, "method-not-allowed", "GET/PUT only");
+			return;
+		}
 		writeError(res, 404, "not-found", "unknown route");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -13288,6 +13532,73 @@ async function saveScopeDocument(req, res, route) {
 		scope: scopeProjection(result.doc),
 		pruned: [...result.pruned]
 	});
+}
+/**
+* `GET /cherry-remote/api/subagent`: the stored document, the RUNNING verdict,
+* and whether the two disagree (#233).
+*
+* THREE channels, deliberately not merged. `subagent` is what the page edits,
+* `status` is what the assembly decided — so a saved-but-not-applied document is
+* visible instead of looking applied — and `pendingRestart` is the one-bit answer
+* to "must the operator restart". That last one is computed HERE because both
+* sides are at hand; a page cannot compare them without a second copy of the
+* resolver.
+*/
+function subagentSnapshot(res, route) {
+	const deps = route.deps.subagent;
+	if (deps === void 0) {
+		writeError(res, 404, "not-found", "this assembly wires no subagent document");
+		return;
+	}
+	writeJson(res, 200, subagentBody(deps, deps.document.read()));
+}
+/** The ONE body the GET and the PUT answer, so a save cannot leave the page's form and its status describing different documents. */
+function subagentBody(deps, stored) {
+	const running = deps.running();
+	const document = stored.document;
+	return {
+		subagent: {
+			...typeof document === "object" && document !== null && !Array.isArray(document) ? document : {},
+			revision: stored.revision
+		},
+		source: stored.source,
+		status: deps.status(),
+		pendingRestart: running !== void 0 && !sameSubagentResolution(resolveSubagentConfig(document), running)
+	};
+}
+/**
+* `PUT /cherry-remote/api/subagent`: read-modify-write, locked on the document's
+* own revision.
+*
+* The answer is the GET's body, deliberately: the page replaces its state with
+* it, so a save cannot leave the form describing one document and the status
+* another.
+*
+* Note what this does NOT do — re-register the provider. The subsystem mounts
+* once per apply (#231), so a save takes effect at the next one and
+* `pendingRestart` says whether that is still owed. Hot-reloading an
+* assembly-time registration would mean tearing a live provider down under
+* running delegations, which is its own decision, not a side effect of a save.
+*/
+async function saveSubagentDocument(req, res, route) {
+	const deps = route.deps.subagent;
+	if (deps === void 0) {
+		writeError(res, 404, "not-found", "this assembly wires no subagent document");
+		return;
+	}
+	let body;
+	try {
+		body = await readJsonBody(req);
+	} catch (error) {
+		writeError(res, 400, "invalid-request", error instanceof Error ? error.message : String(error));
+		return;
+	}
+	const result = deps.document.save(body, body["expectedRevision"]);
+	if (!result.ok) {
+		writeError(res, result.status, result.error, result.message);
+		return;
+	}
+	writeJson(res, 200, subagentBody(deps, result.stored));
 }
 /**
 * One device's diagnostics projection: the live state plus, when a connection
@@ -13837,6 +14148,10 @@ const state = {
 	store: new DeviceStore(join(tmpdirFallback(), "devices.json")),
 	scope: new ToolScopeState({ file: join(tmpdirFallback(), "scope.json") }),
 	refreshScope: () => void 0,
+	subagentConfig: createSubagentConfigDocument({
+		file: join(tmpdirFallback(), "subagent.json"),
+		seed: void 0
+	}),
 	identity: void 0,
 	identityError: void 0,
 	rateBudgetPerSecond: 32,
@@ -14081,6 +14396,28 @@ function assemblyDeps() {
 		scope: state.scope,
 		refreshScope: () => state.refreshScope(),
 		/**
+		* The experiment's two faces (#233) — the document the settings page edits
+		* and the verdict the assembly reached from it.
+		*
+		* Every member is LAZY: this deps object is built before the subsystem is
+		* mounted, so a captured `state.subagents` would be the one from before the
+		* mount. `status()`'s fallback is what the host itself answers before its
+		* mount (`pending` + `awaiting-injection`), not an invented state — and a
+		* served request cannot observe that window, since `apply` finishes before
+		* the web server can dispatch.
+		*/
+		subagent: {
+			document: {
+				read: () => state.subagentConfig.read(),
+				save: (body, expectedRevision) => state.subagentConfig.save(body, expectedRevision)
+			},
+			status: () => state.subagents?.status() ?? {
+				state: "pending",
+				reason: { code: "awaiting-injection" }
+			},
+			running: () => state.subagentResolution
+		},
+		/**
 		* The pairing seam, shared by `cherry_pair` and `POST /pair`.
 		*
 		* The HTTP face's `pair` signature is `PairWithPayloadOptions` — it names
@@ -14184,6 +14521,11 @@ function apply(ctx, config = {}) {
 	scope.load();
 	state.scope = scope;
 	state.refreshScope = () => host.refresh();
+	state.subagentConfig = createSubagentConfigDocument({
+		file: join(dataDir, "subagent.json"),
+		seed: config.subagent,
+		log: (message) => console.warn(message)
+	});
 	const deps = assemblyDeps();
 	state.disposers.push(registerHttpApi(ctx, deps));
 	ctx.effect?.(() => () => {
@@ -14197,7 +14539,8 @@ function apply(ctx, config = {}) {
 		return evictAllConnections();
 	});
 	const engine = new CherryToolEngine(deps);
-	const subagentResolution = resolveSubagentConfig(config.subagent);
+	const subagentResolution = resolveSubagentConfig(state.subagentConfig.read().document);
+	state.subagentResolution = subagentResolution;
 	const host = createToolScopeHost({
 		scope,
 		names: cherryScopeToolNames(subagentResolution.kind === "ready" ? subagentResolution.config.toolName : CHERRY_SUBAGENT_TOOL_DEFAULT),

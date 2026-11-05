@@ -1,5 +1,10 @@
 import { createCherryProvider, resolveTargetDevice } from './subagent.js'
-import type { CherryProviderDeps, CherrySubagentProvider, SubagentConfigResolution } from './subagent.js'
+import type {
+  CherryProviderDeps,
+  CherrySubagentProvider,
+  SubagentConfigResolution,
+  SubagentProblem,
+} from './subagent.js'
 import { createCherrySubagentTool } from './subagentTool.js'
 import type { CherryActivation, CherryActivationSpec } from './subagentTool.js'
 import type { CherryToolDefinition } from './tools.js'
@@ -35,11 +40,57 @@ import type { CherryToolDefinition } from './tools.js'
  * this plugin does not need is a pending fibre for a feature nobody asked for.
  */
 
+/**
+ * Why the model-facing tool is missing while the provider is registered.
+ *
+ * One code per CAUSE, because they send an operator to four different places:
+ * two say the host is too old (a tool registry, a `startActivation`), one says
+ * it is too old in a way that would make the tool UNGATED, and one is a name
+ * collision only the host can describe.
+ */
+export type SubagentToolProblem =
+  | { readonly code: 'no-tools-service' }
+  | { readonly code: 'no-start-activation' }
+  | { readonly code: 'no-step-condition' }
+  | { readonly code: 'host-refused'; readonly message: string }
+
+/**
+ * Why the subsystem is in the state it is: a code, plus exactly the parameters
+ * that code needs.
+ *
+ * NOT a sentence, and not a `Record<string, string>` bag either. The settings
+ * page is bilingual (#233), so the words have to live in the page; and a bag
+ * would let a code gain a parameter no page reads (or lose one a page needs)
+ * with nothing failing. As exact arms, the page's switch over `code` can be
+ * exhaustive and every parameter is typed at the site that builds it.
+ *
+ * Two arms carry the HOST's own text (`provider-refused`, `host-refused`'s
+ * message): a proper noun from the host is not translatable, and inventing words
+ * for it would be guessing at the host's vocabulary. Everything this plugin
+ * says itself is a code.
+ */
+export type SubagentStatusReason =
+  | { readonly code: 'disabled' }
+  | { readonly code: 'awaiting-injection' }
+  | { readonly code: 'unsupported' }
+  | { readonly code: 'invalid'; readonly problems: readonly SubagentProblem[] }
+  | { readonly code: 'provider-refused'; readonly message: string }
+  | { readonly code: 'ready'; readonly providerName: string; readonly toolName: string }
+  | {
+      readonly code: 'ready-without-tool'
+      readonly providerName: string
+      readonly toolName: string
+      readonly problem: SubagentToolProblem
+    }
+
 /** What the settings page and the diagnostics report show for this subsystem. */
 export interface SubagentSubsystemStatus {
   readonly state: 'pending' | 'unsupported' | 'failed' | 'ready'
-  /** Human-readable, and the ONLY thing a panel has to render. */
-  readonly reason: string
+  /**
+   * The machine-readable reason. The PANEL renders it (its dictionary owns the
+   * wording); nothing here is meant to be shown as-is.
+   */
+  readonly reason: SubagentStatusReason
 }
 
 /** The `ctx.subagents` face this subsystem consumes, structurally. */
@@ -142,9 +193,6 @@ export interface SubagentHost {
   status(): SubagentSubsystemStatus
 }
 
-/** The reason text for a host that has no registry at all (SUB-02). */
-const UNSUPPORTED_REASON = '宿主没有 subagents 服务（DSH 版本过低）；子智能体子系统不可用，其余功能不受影响'
-
 /**
  * Build the subsystem for ONE apply.
  *
@@ -180,10 +228,10 @@ export function createSubagentHost(parts: {
   const allowedFor = parts.allowedFor
   let status: SubagentSubsystemStatus =
     resolution.kind === 'disabled'
-      ? { state: 'pending', reason: '实验性子智能体未启用（默认关闭）' }
+      ? { state: 'pending', reason: { code: 'disabled' } }
       : resolution.kind === 'invalid'
-        ? { state: 'failed', reason: resolution.problems.join('；') }
-        : { state: 'pending', reason: '等待宿主注入 subagents' }
+        ? { state: 'failed', reason: { code: 'invalid', problems: resolution.problems } }
+        : { state: 'pending', reason: { code: 'awaiting-injection' } }
   // The registration's disposer, once it exists. Held so `mount`'s own disposer
   // and the injected effect cannot each release it twice.
   let release: (() => void) | undefined
@@ -202,8 +250,11 @@ export function createSubagentHost(parts: {
       // that will never have the service must say so, while "the injection has
       // not arrived yet" is a different state that resolves itself.
       if (ctx.subagents === undefined) {
-        status = { state: 'unsupported', reason: UNSUPPORTED_REASON }
-        log(`[cherry-remote] 子智能体子系统未启用：${UNSUPPORTED_REASON}`)
+        status = { state: 'unsupported', reason: { code: 'unsupported' } }
+        // The CODE, not a second copy of the sentence the page shows: a log line
+        // that paraphrases the panel's wording is one more place for the two to
+        // disagree, and an operator reading this log has the page open anyway.
+        log('[cherry-remote] 子智能体子系统不可用', status.reason)
         return () => {}
       }
 
@@ -225,21 +276,18 @@ export function createSubagentHost(parts: {
        */
       const registerTool = (
         service: SubagentsService,
-      ): { release: () => void } | { problem: string } => {
-        if (tools === undefined) return { problem: '宿主没有 tools 服务' }
+      ): { release: () => void } | { problem: SubagentToolProblem } => {
+        if (tools === undefined) return { problem: { code: 'no-tools-service' } }
         const startActivation = service.startActivation
         // A service with no `startActivation` cannot honour the tool: registering
         // it would promise the model a delegation that throws on every call.
-        if (typeof startActivation !== 'function') return { problem: '宿主没有 startActivation 接口' }
+        if (typeof startActivation !== 'function') return { problem: { code: 'no-start-activation' } }
         // A host that predates the option ignores it rather than refusing it —
         // see {@link PredicateCapableTools}. Registering there would leave the
         // tool ON in every workspace with nothing saying so, which is the exact
         // failure the condition exists to close, one host generation earlier.
         if (allowedFor !== undefined && typeof tools.resolve !== 'function') {
-          return {
-            problem:
-              '宿主没有 tools.resolve（步骤级激活条件不受支持），无法逐步骤约束可见性；工具不注册（fail-closed）',
-          }
+          return { problem: { code: 'no-step-condition' } }
         }
         const definition = createCherrySubagentTool({
           // SUB-04: the CONFIGURED names. A hardcoded literal here would make
@@ -278,7 +326,7 @@ export function createSubagentHost(parts: {
 
       const register = (service: SubagentsService | undefined): void => {
         if (service === undefined) {
-          status = { state: 'unsupported', reason: UNSUPPORTED_REASON }
+          status = { state: 'unsupported', reason: { code: 'unsupported' } }
           return
         }
         let releaseProvider: () => void
@@ -292,14 +340,14 @@ export function createSubagentHost(parts: {
           // fourteen tools, the settings page, the HTTP face — has nothing to do
           // with it.
           const message = error instanceof Error ? error.message : String(error)
-          status = { state: 'failed', reason: `注册 provider 失败：${message}` }
+          status = { state: 'failed', reason: { code: 'provider-refused', message } }
           log('[cherry-remote] 子智能体 provider 注册失败', error)
           return
         }
         // The provider exists from here on, so every path below must keep a
         // disposer for it — including the one where the tool cannot be added.
         let releaseTool: (() => void) | undefined
-        let toolProblem: string | undefined
+        let toolProblem: SubagentToolProblem | undefined
         try {
           const added = registerTool(service)
           if ('problem' in added) toolProblem = added.problem
@@ -309,7 +357,10 @@ export function createSubagentHost(parts: {
           // taken), not a broken configuration: the PROVIDER still works — the
           // host's own `subagent` tool can drive it — so the subsystem stays
           // `ready` and only the model-facing tool is missing.
-          toolProblem = `工具注册被宿主拒绝：${error instanceof Error ? error.message : String(error)}`
+          toolProblem = {
+            code: 'host-refused',
+            message: error instanceof Error ? error.message : String(error),
+          }
           log('[cherry-remote] cherry_subagent 工具注册失败', error)
         }
         release = () => {
@@ -321,13 +372,13 @@ export function createSubagentHost(parts: {
         // the registry.
         const providerName = resolution.config.providerName
         const toolName = resolution.config.toolName
-        status = {
-          state: 'ready',
-          reason:
-            toolProblem === undefined
-              ? `已注册 provider "${providerName}" 与工具 "${toolName}"`
-              : `已注册 provider "${providerName}"；${toolProblem}，工具 "${toolName}" 未注册`,
-        }
+        status =
+          toolProblem === undefined
+            ? { state: 'ready', reason: { code: 'ready', providerName, toolName } }
+            : {
+                state: 'ready',
+                reason: { code: 'ready-without-tool', providerName, toolName, problem: toolProblem },
+              }
       }
 
       try {
@@ -339,13 +390,13 @@ export function createSubagentHost(parts: {
           return () => {
             release?.()
             release = undefined
-            status = { state: 'pending', reason: '等待宿主注入 subagents' }
+            status = { state: 'pending', reason: { code: 'awaiting-injection' } }
           }
         })
       } catch (error) {
         // The host refused the injection. Stay `pending` rather than `failed`:
         // nothing about the operator's configuration is wrong.
-        status = { state: 'pending', reason: '等待宿主注入 subagents' }
+        status = { state: 'pending', reason: { code: 'awaiting-injection' } }
         log('[cherry-remote] subagents 注入不可用；子智能体子系统保持 pending', error)
       }
 

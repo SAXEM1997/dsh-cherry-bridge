@@ -1,8 +1,8 @@
 # AGENTS.md — `ui/`
 
-The settings page: pairing wizard, device cards and the tool-scope panel. It
-builds to `lib/client.js` (`npm run build:client`) and that bundle is COMMITTED
-with its source. Loaded automatically when a file tool touches `ui/**`.
+The settings page: pairing wizard, device cards, the tool-scope panel and the
+experimental subagent panel. It builds to `lib/client.js`
+(`npm run build:client`) and that bundle is COMMITTED with its source. Loaded automatically when a file tool touches `ui/**`.
 
 - **One view, no router.** `App.tsx` owns the two things that outlive both
   children: the SSE stream and the device map.
@@ -39,6 +39,21 @@ with its source. Loaded automatically when a file tool touches `ui/**`.
   open), so a 忘记/恢复 chosen under it would be re-sent by the next 保存地址 — and
   that PATCH clears the mark for any host it names. Hence
   `disabled={busy || editor === 'address'}` on both controls, pinned by `#204m`.
-- **jsdom only.** `tests/unit/ui.test.ts` and `uiScopePanel.test.ts` render the
-  page; a browser-only API needs a fake in the test, not a guard in the page.
+- **The experimental badge is NOT conditional (#233).** `SubagentPanel` renders
+  the badge, the "why experimental" sentence and the feedback link ABOVE the
+  switch, in every state including every failure state. The user's hard
+  requirement is that nobody turns this on without knowing it is experimental,
+  so a label that appears only once it works satisfies nobody. Those three
+  sentences are quoted verbatim by the README pair (#234): a reword is a docs
+  change too, and `tests/unit/uiSubagentPanel.test.ts` ①a pins the wording.
+- **A save carries what the form does not show.** `cwdMode`, `routes` and
+  `maxInteractionAbandons` have no control on that panel, so `bodyOf` spreads the
+  STORED document through and overrides only the rendered fields. Sending just
+  the rendered half would delete configuration the operator never saw. `cwdMode`
+  and `routes` are rendered as read-only mono lines (routes as JSON, because a
+  problem can name `routes[0].cwdPrefix` and no control here fixes it);
+  `maxInteractionAbandons` is not rendered at all.
+- **jsdom only.** `tests/unit/ui.test.ts`, `uiScopePanel.test.ts` and
+  `uiSubagentPanel.test.ts` render the page; a browser-only API needs a fake in
+  the test, not a guard in the page.
 

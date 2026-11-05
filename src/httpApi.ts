@@ -9,6 +9,10 @@ import { CONTRACT_DIFFERENCES, buildDiagnostics, readScopeSegment } from './diag
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
 import type { ScopeDoc, ToolScopeState } from './toolScope.js'
 import type { RefreshSummary } from './toolScopeHost.js'
+import { resolveSubagentConfig, sameSubagentResolution } from './subagent.js'
+import type { SubagentConfigResolution } from './subagent.js'
+import type { SubagentConfigDocument, StoredSubagentConfig } from './subagentConfigStore.js'
+import type { SubagentSubsystemStatus } from './subagentHost.js'
 import { failureText } from './text.js'
 
 /**
@@ -193,6 +197,28 @@ export interface CherryHttpDeps {
    * a torn-down mount has no round to run and answers `undefined`.
    */
   refreshScope: () => RefreshSummary | undefined
+  /**
+   * The experiment's document, the decision THIS apply made from it, and the
+   * subsystem's live verdict (#233).
+   *
+   * Optional only so a caller that never wired the experiment — the HTTP face's
+   * own fixtures — still gets every other route; `GET`/`PUT /subagent` answer
+   * 404 rather than inventing a switch nothing reads.
+   *
+   * Every member is a LAZY accessor for the reason `refreshScope` is one: the
+   * deps object is built BEFORE the subsystem mounts, so a value captured here
+   * would be the one from before the mount.
+   */
+  subagent?: {
+    document: SubagentConfigDocument
+    status(): SubagentSubsystemStatus
+    /**
+     * The resolution this apply used, or `undefined` before the assembly has
+     * decided. Needed because the saved document and the RUNNING decision are
+     * two different facts, and only their difference says "restart".
+     */
+    running(): SubagentConfigResolution | undefined
+  }
   /**
    * `pairWithPayload`, as the assembly exposes it. The HTTP face calls it for
    * `POST /pair`; the `cherry_pair` TOOL reaches the same implementation
@@ -1092,6 +1118,17 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
       return
     }
 
+    // #233: the experiment's configuration document. The same prefix seat, the
+    // same fence and the same read-modify-write discipline as `/scope`, and for
+    // the same reason the method verdict comes FIRST: a refused method neither
+    // reads the body nor touches the document.
+    if (first === 'subagent' && match.segments.length === 1) {
+      if (method === 'GET') return subagentSnapshot(res, route)
+      if (method === 'PUT') return await saveSubagentDocument(req, res, route)
+      writeError(res, 405, 'method-not-allowed', 'GET/PUT only')
+      return
+    }
+
     writeError(res, 404, 'not-found', 'unknown route')
   } catch (error) {
     // Defense in depth: the routes below handle their own failures, so reaching
@@ -1280,6 +1317,92 @@ async function saveScopeDocument(
   // NO `await` between the save above and this call (§6.3's hard constraint).
   route.deps.refreshScope()
   writeJson(res, 200, { scope: scopeProjection(result.doc), pruned: [...result.pruned] })
+}
+
+/**
+ * `GET /cherry-remote/api/subagent`: the stored document, the RUNNING verdict,
+ * and whether the two disagree (#233).
+ *
+ * THREE channels, deliberately not merged. `subagent` is what the page edits,
+ * `status` is what the assembly decided — so a saved-but-not-applied document is
+ * visible instead of looking applied — and `pendingRestart` is the one-bit answer
+ * to "must the operator restart". That last one is computed HERE because both
+ * sides are at hand; a page cannot compare them without a second copy of the
+ * resolver.
+ */
+function subagentSnapshot(res: HttpResponseLike, route: RouteContext): void {
+  const deps = route.deps.subagent
+  if (deps === undefined) {
+    writeError(res, 404, 'not-found', 'this assembly wires no subagent document')
+    return
+  }
+  writeJson(res, 200, subagentBody(deps, deps.document.read()))
+}
+
+/** The ONE body the GET and the PUT answer, so a save cannot leave the page's form and its status describing different documents. */
+function subagentBody(
+  deps: NonNullable<CherryHttpDeps['subagent']>,
+  stored: StoredSubagentConfig,
+): Record<string, unknown> {
+  const running = deps.running()
+  const document = stored.document
+  return {
+    // An OBJECT is what the page renders, even when the stored value is not one:
+    // a hand-edited file or a junk profile seed is reported by the `not-object`
+    // problem in `status.reason`, and the form must not try to be that report.
+    subagent: {
+      ...(typeof document === 'object' && document !== null && !Array.isArray(document) ? document : {}),
+      revision: stored.revision,
+    },
+    source: stored.source,
+    status: deps.status(),
+    // `running === undefined` means this apply has not decided yet, which a
+    // served request cannot observe. Answering "restart needed" then would be a
+    // guess; comparing only when there is something to compare against keeps the
+    // flag a fact rather than a default.
+    pendingRestart: running !== undefined && !sameSubagentResolution(resolveSubagentConfig(document), running),
+  }
+}
+
+/**
+ * `PUT /cherry-remote/api/subagent`: read-modify-write, locked on the document's
+ * own revision.
+ *
+ * The answer is the GET's body, deliberately: the page replaces its state with
+ * it, so a save cannot leave the form describing one document and the status
+ * another.
+ *
+ * Note what this does NOT do — re-register the provider. The subsystem mounts
+ * once per apply (#231), so a save takes effect at the next one and
+ * `pendingRestart` says whether that is still owed. Hot-reloading an
+ * assembly-time registration would mean tearing a live provider down under
+ * running delegations, which is its own decision, not a side effect of a save.
+ */
+async function saveSubagentDocument(
+  req: HttpRequestLike,
+  res: HttpResponseLike,
+  route: RouteContext,
+): Promise<void> {
+  const deps = route.deps.subagent
+  if (deps === undefined) {
+    writeError(res, 404, 'not-found', 'this assembly wires no subagent document')
+    return
+  }
+  let body: Record<string, unknown>
+  try {
+    body = await readJsonBody(req)
+  } catch (error) {
+    // The body-level refusal every writing route shares: a body that is not JSON
+    // at all is not a config-field verdict, so it must not wear a field's code.
+    writeError(res, 400, 'invalid-request', error instanceof Error ? error.message : String(error))
+    return
+  }
+  const result = deps.document.save(body, body['expectedRevision'])
+  if (!result.ok) {
+    writeError(res, result.status, result.error, result.message)
+    return
+  }
+  writeJson(res, 200, subagentBody(deps, result.stored))
 }
 
 /**
