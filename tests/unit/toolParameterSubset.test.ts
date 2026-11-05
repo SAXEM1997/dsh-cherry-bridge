@@ -31,6 +31,15 @@ import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.j
  * keeps that transcription honest — a checker that returned `[]` for
  * everything would let `#219a` pass vacuously.
  *
+ * The transcription was CROSS-CHECKED against the real function once
+ * (2026-11-05), because a transcription can only be as right as its reading:
+ * driving `assertSupportedJsonSchema` from the installed
+ * `@deepseek-ai/dsh-tools@0.2.2-rc.1` over this branch's fourteen schemas
+ * accepts 14/14, and over `main`'s it rejects the same EIGHT tools with the
+ * same NINETEEN keyword paths this file reports. That check needs the host
+ * package on disk, so it is deliberately not part of the suite; the
+ * transcription is the arm that runs everywhere.
+ *
  * One rule of `checkSchemaNode` is deliberately NOT transcribed: the
  * lossless-JSON check on annotation values. Every annotation this plugin
  * declares is a string literal, so that rule cannot fire here.
