@@ -657,12 +657,34 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
    *   is how the scope host's own unsupported verdict (and the tool count it
    *   names) becomes observable through `apply`.
    */
-  function assemblyCtx(headless = false, missing?: 'restrict'): AssemblyCtx {
+  /** One live agent, as `projectAgent` reads it (`agent.ctx.tools.restrict`). */
+  interface LiveAgent {
+    id: string
+    session: { header: { cwd: string } }
+    ctx: { tools: { restrict(filter: { deny: readonly string[] }): () => void } }
+  }
+
+  function assemblyCtx(
+    headless = false,
+    missing?: 'restrict',
+    /**
+     * Live agents the scope subsystem will see. `[]` by default: every other case
+     * here cares that the tool REGISTERS, and a layer is only installed for a
+     * live agent, so an agent-less rig keeps those cases from depending on the
+     * install path.
+     */
+    live: readonly LiveAgent[] = [],
+  ): AssemblyCtx {
     const routes = new Map<string, (req: never, res: never) => unknown>()
     /** The ctx the scope subsystem's injection callback receives. */
     const injected = {
-      agents: { list: () => [] },
-      workspaceRegistry: { list: () => [], resolveByPath: async () => undefined },
+      agents: { list: () => live },
+      // Never empty: `setWorkspaces([])` is a read FAILURE, which would make the
+      // judgement fail-closed for a different reason than the one under test.
+      workspaceRegistry: {
+        list: () => [{ id: 'OTHER', title: 'Other', path: '/w/other' }],
+        resolveByPath: async () => undefined,
+      },
       effect(cb: () => () => void) {
         ctx.injectedEffects.push(cb())
       },
@@ -919,6 +941,53 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
       const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
       expect(when!({ agent: { id: 'any-agent' } })).toBe(true)
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳i the governed list honours a RENAMED tool, not the default (SUB-04)', async () => {
+      // The belt (`restrict` + `guard`) is built from a NAME, so a list built
+      // from a constant instead of the resolved config governs a tool that does
+      // not exist and leaves the real one ungoverned. The braces (`when`) hide it
+      // either way, which is exactly why this needs its own case: without one the
+      // mutation `cherryScopeToolNames()` — the argument dropped — leaves every
+      // relevant test green.
+      const index = await import('../../src/index.js')
+      const denials: string[][] = []
+      const ctx = assemblyCtx(false, undefined, [
+        {
+          id: 'agent-a',
+          session: { header: { cwd: '/w/excluded' } },
+          ctx: {
+            tools: {
+              restrict(filter) {
+                denials.push([...filter.deny])
+                return () => {}
+              },
+            },
+          },
+        },
+      ])
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: { ...SUBAGENT, toolName: 'custom_delegate' } })
+      // The first synchronous round runs before the subagent host has registered
+      // the fifteenth name, so a `PUT /scope` — which calls `refresh()` inline —
+      // is what makes the deny set observably complete.
+      const response = new FakeResponse()
+      await ctx.server.dispatch(
+        new FakeRequest(`${PREFIX}/scope`, {
+          host: HOST,
+          method: 'PUT',
+          body: JSON.stringify({ mode: 'selected', workspaceIds: [], expectedRevision: 0 }),
+        }) as never,
+        response as never,
+      )
+      expect(response.status).toBe(200)
+      const denied = denials.at(-1)
+      expect(denied).toBeDefined()
+      expect(denied).toContain('custom_delegate')
+      // The default name is registered by nobody under this config, so governing
+      // it would submit an unknown name to `restrict()` — which the host refuses.
+      expect(denied).not.toContain('cherry_subagent')
       rmSync(dataDir, { recursive: true, force: true })
     })
 

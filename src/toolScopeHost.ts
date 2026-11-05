@@ -314,8 +314,10 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       // Both clauses are about SCOPE and both stay true whatever else the
       // assembly registers: this subsystem registers nothing, and none of the
       // names it was given can be hidden. (The experimental delegation tool is
-      // registered by the subagent subsystem and is therefore visible on such a
-      // host — its own switch is its only gate. Claiming "none of them is
+      // registered by the subagent subsystem and is not hidden either — but it
+      // is not left to its switch here: it carries a step-time
+      // `register({ when })` condition built from the SAME visibility
+      // judgement, so it is still dropped per step. Claiming "none of them is
       // registered" was true only while this list WAS the whole registry.)
       reason: `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个名字也无法被隐藏`,
     }
