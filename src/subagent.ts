@@ -38,6 +38,12 @@
  */
 
 import { normalize, sep } from 'node:path'
+import {
+  CHERRY_SUBAGENT_PROVIDER_DEFAULT,
+  CHERRY_SUBAGENT_TOOL_DEFAULT,
+  DEFAULT_MAX_INTERACTION_ABANDONS,
+  DEFAULT_SUBAGENT_TIMEOUT_MS,
+} from './defaults.js'
 
 // ---------------------------------------------------------------------------
 // The seam's vocabulary
@@ -528,6 +534,243 @@ export function createCherryProvider(deps?: CherryProviderDeps): CherrySubagentP
       // policy and the deadline, and fold this run's assistant text into a
       // published SubagentRun. Everything above this line is already final.
       throw new Error(`cherry subagent: the run seam is not wired yet (#231) for ${text.length} characters`)
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SubagentConfig — the one table both faces read
+// ---------------------------------------------------------------------------
+
+/**
+ * The operator's configuration for the subagent subsystem.
+ *
+ * Deliberately ONE flat table, readable and writable by a single GET/PUT pair
+ * (#233) with `revision` as the optimistic lock: a shape that could only be read
+ * from profile YAML would have to be re-derived by the settings page, and the two
+ * readings would drift. Every field is optional — the switch is what decides,
+ * and a draft target behind a closed switch is not an error (SUB-01).
+ */
+export interface SubagentConfig {
+  /** The switch. Absent or `false` registers nothing (SUB-01). */
+  enabled?: boolean
+  /** The name the provider is registered under. Default `cherry`. */
+  providerName?: string
+  /** The name the tool is exposed under. Default `cherry_subagent`. */
+  toolName?: string
+  /** Device selector — an exact id or a unique prefix, as the tools take it. */
+  device?: string
+  /** The Cherry agent that runs the delegation. */
+  agentId?: string
+  /** A registered workspace id, as `cherry_workspaces` reports it. */
+  workspaceId?: string
+  /** The other arm of the workspace choice; mutually exclusive with {@link workspaceId}. */
+  workspaceKind?: 'system'
+  /** Declaration only (D1): which directory a delegation is told it is in. */
+  cwdMode?: 'isolated' | 'shared'
+  /** Per-directory target overrides, in precedence order (SUB-10..14). */
+  routes?: readonly CherrySubagentRoute[]
+  /** The wait window; `0` means no wall-clock bound (SUB-40..43). */
+  timeoutMs?: number
+  /** How many interactions one delegation may abandon (SUB-31). */
+  maxInteractionAbandons?: number
+  /** The revision this config was read at; the next `PUT` quotes it (#233). */
+  revision?: number
+}
+
+/** Where a delegation actually lands. */
+export interface SubagentTarget {
+  /** Device selector, as configured. */
+  readonly device: string
+  /** The Cherry agent id. */
+  readonly agentId: string
+  /** The workspace arm: a registered id, or the system workspace. */
+  readonly workspace: { readonly workspaceId: string } | { readonly kind: 'system' }
+}
+
+/** A config that passed validation, with every default applied. */
+export interface ResolvedSubagentConfig {
+  readonly providerName: string
+  readonly toolName: string
+  readonly target: SubagentTarget
+  readonly cwdMode: 'isolated' | 'shared'
+  readonly routes: readonly CherrySubagentRoute[]
+  readonly timeoutMs: number
+  readonly maxInteractionAbandons: number
+  readonly revision: number
+}
+
+/**
+ * What the switch decided.
+ *
+ * Three outcomes, not two, because "off" and "wrong" are different answers: off
+ * registers nothing and says nothing (SUB-01), while wrong stops the subsystem at
+ * `failed` with a reason a human can act on (SUB-03). Folding the second into the
+ * first would hide a broken configuration behind a switch the operator believes
+ * is on.
+ */
+export type SubagentConfigResolution =
+  | { readonly kind: 'disabled' }
+  | { readonly kind: 'invalid'; readonly problems: readonly string[] }
+  | { readonly kind: 'ready'; readonly config: ResolvedSubagentConfig }
+
+/** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
+const TIMER_CEILING_MS = 2_147_483_647
+
+/** Read one optional non-blank string field, recording a problem when it is unusable. */
+function optionalText(
+  raw: Record<string, unknown>,
+  key: string,
+  problems: string[],
+): string | undefined {
+  const value = raw[key]
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') {
+    problems.push(`\`${key}\` 必须是字符串（收到 ${shapeName(value)}）`)
+    return undefined
+  }
+  const trimmed = value.trim()
+  if (trimmed.length === 0) {
+    problems.push(`\`${key}\` 不能为空`)
+    return undefined
+  }
+  return trimmed
+}
+
+/** Read one optional integer in a closed range, recording a problem when it is unusable. */
+function optionalInteger(
+  raw: Record<string, unknown>,
+  key: string,
+  problems: string[],
+  range: { min: number; max: number },
+): number | undefined {
+  const value = raw[key]
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < range.min || value > range.max) {
+    problems.push(`\`${key}\` 必须是 ${range.min} 到 ${range.max} 之间的整数（收到 ${shapeName(value)}）`)
+    return undefined
+  }
+  return value
+}
+
+/** The shape a config value arrived as, for a value-free problem message. */
+function shapeName(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value)
+  return typeof value
+}
+
+/** Validate the route table, recording a problem per unusable entry. */
+function routesOf(raw: Record<string, unknown>, problems: string[]): CherrySubagentRoute[] {
+  const value = raw['routes']
+  if (value === undefined) return []
+  if (!Array.isArray(value)) {
+    problems.push(`\`routes\` 必须是数组（收到 ${shapeName(value)}）`)
+    return []
+  }
+  const routes: CherrySubagentRoute[] = []
+  value.forEach((entry: unknown, index: number) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      problems.push(`\`routes[${index}]\` 必须是对象（收到 ${shapeName(entry)}）`)
+      return
+    }
+    const record = entry as Record<string, unknown>
+    const prefix = optionalText(record, 'cwdPrefix', [])
+    if (prefix === undefined) {
+      problems.push(`\`routes[${index}]\` 缺少非空的 \`cwdPrefix\``)
+      return
+    }
+    const device = optionalText(record, 'device', problems)
+    const workspaceId = optionalText(record, 'workspaceId', problems)
+    routes.push({
+      cwdPrefix: prefix,
+      ...(device === undefined ? {} : { device }),
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+    })
+  })
+  return routes
+}
+
+/**
+ * Resolve the operator's `subagent` config into the decision the assembly acts on.
+ *
+ * Validation is exhaustive rather than fail-fast: the answer is one `failed`
+ * state whose reason lists EVERY unusable field, because an operator fixing a
+ * config one reload per mistake is the outcome a first-error-wins validator
+ * produces.
+ *
+ * @param raw - the `subagent` config value, exactly as the host handed it over.
+ * @returns `disabled`, `invalid` with the problems, or `ready` with the defaults applied.
+ */
+export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
+  // Absent — and an explicitly empty key, which is the same statement — is the
+  // switch being off, not a mistake to report.
+  if (raw === undefined || raw === null) return { kind: 'disabled' }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    // Present but unreadable. Answering `disabled` here would hide a typo behind
+    // a switch the operator believes is on, so it is a problem by name.
+    return { kind: 'invalid', problems: [`\`subagent\` 必须是对象（收到 ${shapeName(raw)}）`] }
+  }
+  const record = raw as Record<string, unknown>
+  const problems: string[] = []
+
+  const enabled = record['enabled']
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    problems.push(`\`enabled\` 必须是布尔值（收到 ${shapeName(enabled)}）`)
+  }
+  if (enabled !== true) {
+    // Off is off: a target left half-written behind a closed switch is a draft.
+    // The only exception is an unreadable `enabled`, which cannot be called off.
+    return problems.length > 0 ? { kind: 'invalid', problems } : { kind: 'disabled' }
+  }
+
+  const providerName = optionalText(record, 'providerName', problems) ?? CHERRY_SUBAGENT_PROVIDER_DEFAULT
+  const toolName = optionalText(record, 'toolName', problems) ?? CHERRY_SUBAGENT_TOOL_DEFAULT
+  const device = optionalText(record, 'device', problems)
+  const agentId = optionalText(record, 'agentId', problems)
+  const workspaceId = optionalText(record, 'workspaceId', problems)
+  const workspaceKind = record['workspaceKind']
+  if (workspaceKind !== undefined && workspaceKind !== 'system') {
+    problems.push(`\`workspaceKind\` 只接受 "system"（收到 ${shapeName(workspaceKind)}）`)
+  }
+  const cwdModeValue = record['cwdMode']
+  if (cwdModeValue !== undefined && cwdModeValue !== 'isolated' && cwdModeValue !== 'shared') {
+    problems.push(`\`cwdMode\` 只接受 "isolated" 或 "shared"（收到 ${shapeName(cwdModeValue)}）`)
+  }
+  const timeoutMs = optionalInteger(record, 'timeoutMs', problems, { min: 0, max: TIMER_CEILING_MS })
+  const maxInteractionAbandons = optionalInteger(record, 'maxInteractionAbandons', problems, {
+    min: 1,
+    max: Number.MAX_SAFE_INTEGER,
+  })
+  const revision = optionalInteger(record, 'revision', problems, { min: 0, max: Number.MAX_SAFE_INTEGER })
+  const routes = routesOf(record, problems)
+
+  // The target: device and agent, plus exactly one arm of the workspace choice.
+  if (device === undefined && record['device'] === undefined) problems.push('缺少 `device`')
+  if (agentId === undefined && record['agentId'] === undefined) problems.push('缺少 `agentId`')
+  if (workspaceId !== undefined && workspaceKind === 'system') {
+    problems.push('`workspaceId` 与 `workspaceKind: "system"` 只能二选一')
+  } else if (workspaceId === undefined && workspaceKind !== 'system') {
+    problems.push('缺少 `workspaceId`（或 `workspaceKind: "system"`）')
+  }
+
+  if (problems.length > 0) return { kind: 'invalid', problems }
+  // Narrowing: the three target fields are present because every missing one
+  // pushed a problem, and a run reaching here has none.
+  const workspace: SubagentTarget['workspace'] =
+    workspaceId === undefined ? { kind: 'system' } : { workspaceId }
+  return {
+    kind: 'ready',
+    config: {
+      providerName,
+      toolName,
+      target: { device: device as string, agentId: agentId as string, workspace },
+      cwdMode: cwdModeValue === 'shared' ? 'shared' : 'isolated',
+      routes,
+      timeoutMs: timeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS,
+      maxInteractionAbandons: maxInteractionAbandons ?? DEFAULT_MAX_INTERACTION_ABANDONS,
+      revision: revision ?? 0,
     },
   }
 }

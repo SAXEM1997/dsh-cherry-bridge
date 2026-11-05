@@ -202,3 +202,50 @@ export const LIST_PAGE_CLAMP = 16
  * judged in both directions.
  */
 export const MAX_RESUME_TOKEN_CHARS = 4_096
+
+// ---------------------------------------------------------------------------
+// The subagent subsystem (experimental, off by default — issue #231)
+// ---------------------------------------------------------------------------
+
+/**
+ * The provider name a Cherry delegation is registered under.
+ *
+ * These four values are **numbers and words that also appear in the copy**: the
+ * README pair, the tool description and the settings page all quote them, and a
+ * reader has no way to tell a stale sentence from a changed default. They live
+ * here, once, and `tests/unit/subagentConfig.test.ts` pins them — the same
+ * discipline issue #219 applied to the parameter descriptions.
+ */
+export const CHERRY_SUBAGENT_PROVIDER_DEFAULT = 'cherry'
+
+/**
+ * The tool name a delegation is exposed to the model under.
+ *
+ * `cherry_subagent`, not `subagent_cherry`: it has to read as the fifteenth
+ * `cherry_*` tool so it falls inside the scope subsystem's `restrict`/`guard`
+ * name list without a second convention.
+ */
+export const CHERRY_SUBAGENT_TOOL_DEFAULT = 'cherry_subagent'
+
+/**
+ * How long a delegation waits for the child's terminal, measured from the
+ * send's own success — 30 minutes.
+ *
+ * A delegation is a whole agent run on a desktop, not one tool call: the official
+ * Codex provider carries no timeout at all and the OAR provider's is optional,
+ * so a bound here is a deliberate choice rather than an inherited one. It exists
+ * because the parent cannot see the child's progress, and a delegation that
+ * outlives the operator's patience is better reported as an error naming this
+ * number than left to hang. `0` disables it (SUB-42).
+ */
+export const DEFAULT_SUBAGENT_TIMEOUT_MS = 1_800_000
+
+/**
+ * How many interactions one delegation may abandon before the run is cancelled.
+ *
+ * Cherry children ask their human questions; a delegation has no human to ask,
+ * so every interaction is denied and the run continues (SUB-30). A child that
+ * keeps asking is not making progress, and the ceiling turns that loop into a
+ * reported failure instead of an unbounded run.
+ */
+export const DEFAULT_MAX_INTERACTION_ABANDONS = 8
