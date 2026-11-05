@@ -1,6 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { MESSAGE_TEXT_MAX_CHARS, SUBAGENT_TITLE_FALLBACK_CHARS } from './defaults.js'
-import { matchRoute } from './subagent.js'
+import {
+  CHERRY_SUBAGENT_TOOL_DEFAULT,
+  MESSAGE_TEXT_MAX_CHARS,
+  SUBAGENT_TITLE_FALLBACK_CHARS,
+} from './defaults.js'
+import { matchRoute, resolveTargetDevice } from './subagent.js'
 import type { CherrySubagentRoute, CherrySubagentRunOutcome, SubagentTarget } from './subagent.js'
 import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
@@ -67,6 +71,26 @@ export interface ToolContentBlock {
   text: string
 }
 
+/**
+ * The execution context the host hands a tool body.
+ *
+ * A transcription of the two fields this plugin reads out of the host's
+ * `ToolRunContext` (`@deepseek-ai/dsh-tools@0.2.2-rc.1`, `contracts.d.ts:231` →
+ * `ToolExecutionInput`): `agent` is OPTIONAL there because a call can arrive
+ * without a delegating agent (a nested/PTC dispatch, a headless run), and
+ * `signal` is the caller's required cancellation.
+ *
+ * `agent` stays `unknown` on purpose: the fourteen `cherry_*` tools address the
+ * PEER and never the calling agent, so nothing in this file should be tempted to
+ * reach into the host's `Agent` shape. The one tool that does need it
+ * (`cherry_subagent`) only forwards it to the seam.
+ */
+export interface CherryToolExec {
+  readonly agent?: unknown
+  /** Required on the host's own contract (`ToolExecutionInput.signal`). */
+  readonly signal: AbortSignal
+}
+
 /** The registry-ready definition this plugin hands the host. */
 export interface CherryToolDefinition {
   name: string
@@ -77,7 +101,18 @@ export interface CherryToolDefinition {
     schema: Record<string, unknown>
     render(args: unknown, value: unknown): ToolContentBlock[]
   }
-  execute(args: Record<string, unknown>): Promise<unknown>
+  /**
+   * Pure synchronous classifier for overlap with sibling tool calls
+   * (`contracts.d.ts:80`). Only `true` opts in; omission is exclusive.
+   */
+  isConcurrencySafe?(args: unknown): boolean
+  /**
+   * `exec` is optional because the fourteen peer tools ignore it entirely: they
+   * take their cancellation from the host's own rpc timeouts, not from the
+   * caller's signal. A tool that DOES need the calling agent (`cherry_subagent`)
+   * declares it required-by-contract in its own body and throws when absent.
+   */
+  execute(args: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>
 }
 
 /** The host's tool registry, as this plugin consumes it. */
@@ -1923,11 +1958,17 @@ export interface CherryToolEngineOptions {
 /**
  * The 14 `cherry_*` tool names, in the family's documented order.
  *
- * THE one list: the plugin assembly (`src/index.ts` hands it to the scope host
- * as `names`, which is where the visibility `deny` sets and the dispatch
- * guard's scope come from) and the contract suite read this constant instead of
- * keeping a copy of their own. The diagnostics face does NOT read it — its
- * scope segment reports the live scope state, not this list.
+ * This is what {@link registerCherryTools} REGISTERS, and nothing else: the
+ * contract suite asserts the two sets against each other in both directions. The
+ * list the SCOPE subsystem governs is the wider {@link cherryScopeToolNames}
+ * — the fourteen here plus the experimental delegation tool, which is registered
+ * by the subagent subsystem instead. Keeping the two apart is what lets each
+ * statement stay true.
+ *
+ * `src/index.ts` hands the SCOPE list to the scope host as `names`, which is
+ * where the visibility `deny` sets and the dispatch guard's scope come from. The
+ * diagnostics face does NOT read either list — its scope segment reports the
+ * live scope state, not a constant.
  *
  * {@link CherryToolEngine.definitions()} still spells each name inside its own
  * declaration — that literal is what the host registry receives — so the two
@@ -1951,6 +1992,39 @@ export const CHERRY_TOOL_NAMES: readonly string[] = [
   'cherry_pair',
   'cherry_unpair',
 ] as const
+
+/**
+ * Every tool name the SCOPE subsystem governs — the fourteen above plus the
+ * experimental delegation tool, whose name the operator can rename.
+ *
+ * Two lists rather than one, because they answer different questions:
+ * {@link CHERRY_TOOL_NAMES} is "what `registerCherryTools` registers", which the
+ * contract suite asserts in both directions, while this one is "what an operator
+ * can be excluded from". The subagent tool is registered by the SUBAGENT
+ * subsystem, not by `registerCherryTools` — it exists only while an experimental
+ * switch is on — so folding it into the first list would make that bidirectional
+ * assertion describe a registration that never happens.
+ *
+ * Scope hides and guards **by name**, not by ownership (`toolScopeHost`'s
+ * `targetDeny` intersects this list with the registry's live `schemas()`, and
+ * its dispatch guard rejects a listed name outright), so a tool registered
+ * elsewhere in the assembly is still governed here. That is the whole reason
+ * the delegation tool defaults to `cherry_subagent`: an operator who excludes a
+ * workspace from the bridge is not offered a way around it by the experiment.
+ *
+ * A FUNCTION rather than a constant because `subagent.toolName` is configurable
+ * (SUB-04): the assembly builds this list from the name the config resolved, so
+ * the governed set and the registered tool cannot drift apart when an operator
+ * renames the tool.
+ *
+ * @param toolName - the delegation tool's registered name.
+ * @returns the names the scope subsystem hides and guards.
+ */
+export function cherryScopeToolNames(
+  toolName: string = CHERRY_SUBAGENT_TOOL_DEFAULT,
+): readonly string[] {
+  return [...CHERRY_TOOL_NAMES, toolName]
+}
 
 /**
  * Registers the whole `cherry_*` family on `ctx.tools` — exactly the names in
@@ -1990,7 +2064,7 @@ export function registerCherryToolsWithEngine(
    * An engine the ASSEMBLY already owns, reused instead of building one here.
    *
    * The subagent subsystem needs the same engine, and it must not depend on the
-   * tools being registered: the scope subsystem hides the fourteen tools per
+   * tools being registered: the scope subsystem hides these fourteen per
    * workspace (by default in every workspace), while a delegation is a separate
    * feature an operator can enable on its own. Sharing the instance is what
    * keeps those two lifecycles independent — and it is the reason the engine is
@@ -4604,7 +4678,10 @@ export class CherryToolEngine {
     onSessionCreated?: (sessionId: string) => void
   }): Promise<CherrySubagentRunOutcome> {
     const route = matchRoute(input.routes, input.cwd)
-    const deviceId = route?.device ?? input.target.device
+    // The SAME resolution the model-facing tool reports (`resolveTargetDevice`):
+    // two spellings of "which device" would let the tool name one desktop while
+    // the run lands on another.
+    const deviceId = resolveTargetDevice(input.target, input.routes, input.cwd)
     // A route may override the workspace without touching the device, which is
     // the whole point of a per-directory table (SUB-11).
     const workspace =

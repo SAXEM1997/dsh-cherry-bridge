@@ -11,7 +11,8 @@ import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection, DeviceUnavailableError, TransportLostError } from '../../src/connection.js'
 import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
+import { CHERRY_TOOL_NAMES, cherryScopeToolNames, registerCherryTools } from '../../src/tools.js'
+import { CHERRY_SUBAGENT_TOOL_DEFAULT } from '../../src/defaults.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { ToolScopeState } from '../../src/toolScope.js'
 import { pairWithPayload } from '../../src/pairing.js'
@@ -1802,6 +1803,30 @@ describe('③ release configuration', () => {
     expect(CHERRY_TOOL_NAMES).toHaveLength(14)
     expect(new Set(CHERRY_TOOL_NAMES).size).toBe(14)
     expect(CHERRY_TOOL_NAMES.every((name) => name.startsWith('cherry_'))).toBe(true)
+  })
+
+  it('declares the 15 names the SCOPE governs as the 14 tools plus the delegation tool', () => {
+    // ②b Two lists, two claims. `CHERRY_TOOL_NAMES` says what
+    // `registerCherryTools` registers (asserted in both directions just below);
+    // this one says what an operator can be EXCLUDED from, and the difference is
+    // exactly the experimental tool, which the subagent subsystem registers
+    // instead — only while its switch is on.
+    //
+    // The extra entry is the CONFIGURED default rather than a second literal, so
+    // renaming the tool cannot leave the scope list hiding a name that is never
+    // registered (which would look like protection and be none).
+    const governed = cherryScopeToolNames()
+    expect(governed).toHaveLength(15)
+    expect(new Set(governed).size).toBe(15)
+    expect(governed.every((name) => name.startsWith('cherry_'))).toBe(true)
+    expect([...governed].sort()).toEqual([...CHERRY_TOOL_NAMES, CHERRY_SUBAGENT_TOOL_DEFAULT].sort())
+    // It is a FUNCTION because `subagent.toolName` is configurable: the assembly
+    // builds the governed list from the resolved config, so a rename moves both
+    // the registration and the scope list. A constant would have left the scope
+    // list hiding a name nobody registers.
+    expect(cherryScopeToolNames('custom_delegate')).toHaveLength(15)
+    expect(cherryScopeToolNames('custom_delegate')).toContain('custom_delegate')
+    expect(cherryScopeToolNames('custom_delegate')).not.toContain(CHERRY_SUBAGENT_TOOL_DEFAULT)
   })
 
   it('registers exactly the names in CHERRY_TOOL_NAMES, in both directions', () => {

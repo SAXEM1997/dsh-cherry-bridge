@@ -706,6 +706,29 @@ export function createCherryProvider(
   }
 }
 
+/**
+ * Which desktop one delegation lands on: the matching route's override, else the
+ * configured default.
+ *
+ * ONE function for both faces — the runner (`runSubagentDelegation`) and the
+ * model-facing tool, which reports the device it is about to use. Two spellings
+ * of "which device" would let the tool tell the model `A` while the run lands on
+ * `B`, and the model's follow-up (`cherry_sessions` needs a device) would then
+ * read the wrong desktop.
+ *
+ * @param target - the configured default target.
+ * @param routes - the declared routes, in precedence order.
+ * @param cwd - the child's resolved directory (the routing key).
+ * @returns the device id this delegation will address.
+ */
+export function resolveTargetDevice(
+  target: SubagentTarget,
+  routes: readonly CherrySubagentRoute[] | undefined,
+  cwd: string,
+): string {
+  return matchRoute(routes, cwd)?.device ?? target.device
+}
+
 // ---------------------------------------------------------------------------
 // SubagentConfig — the one table both faces read
 // ---------------------------------------------------------------------------

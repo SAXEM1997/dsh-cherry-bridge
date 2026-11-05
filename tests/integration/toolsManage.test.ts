@@ -629,12 +629,24 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     subagents: {
       registered: Array<{ name: string; dispose: () => void }>
       registerProvider(provider: { name: string }): () => void
+      /**
+       * The activation seam the model-facing tool calls. Present because the
+       * subsystem registers that tool only when the service can honour it, so a
+       * fixture without it would silently test the "no tool" path.
+       */
+      startActivation(spec: { provider: string }): Promise<{ childId: string }>
     }
     inject(deps: string[], cb: (ctx: unknown) => unknown): void
     effect(cb: () => () => void): void
   }
 
-  function assemblyCtx(headless = false): AssemblyCtx {
+  /**
+   * @param headless - omit `webServer`, the browser-less deploy.
+   * @param missing - a capability to DELETE from the fake tool registry, which
+   *   is how the scope host's own unsupported verdict (and the tool count it
+   *   names) becomes observable through `apply`.
+   */
+  function assemblyCtx(headless = false, missing?: 'restrict'): AssemblyCtx {
     const routes = new Map<string, (req: never, res: never) => unknown>()
     /** The ctx the scope subsystem's injection callback receives. */
     const injected = {
@@ -656,6 +668,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
           const index = subagents.registered.indexOf(entry)
           if (index >= 0) subagents.registered.splice(index, 1)
         }
+      },
+      async startActivation(spec) {
+        return { childId: `child-of-${spec.provider}` }
       },
     }
     const ctx: AssemblyCtx = {
@@ -741,6 +756,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         ctx.effects.push(cb())
       },
     }
+    if (missing === 'restrict') {
+      delete (ctx.tools as { restrict?: unknown }).restrict
+    }
     return ctx
   }
 
@@ -785,6 +803,72 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       expect(ctx.injectedEffects.length).toBeGreaterThan(0)
       for (const teardown of ctx.injectedEffects.splice(0)) teardown()
       expect(ctx.subagents.registered).toEqual([])
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳d the switch also puts `cherry_subagent` on the tool registry (SUB-04)', async () => {
+      // The whole point of the ticket: the model can DELEGATE. A provider with no
+      // tool in front of it is reachable only through the host's own `subagent`
+      // tool, which is not what an operator turning this on expects.
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      const names = ctx.tools.definitions.map((definition) => definition.name)
+      expect(names).toContain('cherry_subagent')
+      // Registered BESIDE the fourteen, not instead of one: the assembly's own
+      // registration is untouched by the experiment.
+      expect(names).toHaveLength(15)
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳e the plugin teardown takes the tool away with the provider (SUB-06)', async () => {
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      expect(ctx.tools.definitions.some((definition) => definition.name === 'cherry_subagent')).toBe(true)
+      for (const teardown of ctx.effects) await teardown()
+      expect(ctx.tools.definitions).toEqual([])
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳f an EXPLICIT `enabled: false` with a complete target registers nothing (SUB-01)', async () => {
+      // Deliberately NOT the same input as ⑳c (no `subagent` key at all): this
+      // case is the one that distinguishes "the switch decided" from "the
+      // resolution crashed and took the registration with it". The target is
+      // fully specified, so only the switch can produce this outcome.
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx()
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: { ...SUBAGENT, enabled: false } })
+      const names = ctx.tools.definitions.map((definition) => definition.name)
+      expect(names).not.toContain('cherry_subagent')
+      expect(names).toHaveLength(14)
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳g the scope list `apply` hands the host carries the delegation tool too', async () => {
+      // The ONE place the assembly's `names` choice is observable. A host
+      // missing `tools.restrict` makes the scope subsystem refuse to register
+      // anything, and its verdict names how many tools it WOULD have governed.
+      //
+      // Fifteen, not fourteen: the delegation tool is scope-governed even though
+      // the subagent subsystem registers it, so an excluded workspace cannot
+      // reach the experiment as a way around the bridge. Reverting `apply` to
+      // `CHERRY_TOOL_NAMES` turns this red.
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx(false, 'restrict')
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir })
+      const response = new FakeResponse()
+      await ctx.server.dispatch(
+        new FakeRequest(`${PREFIX}/scope`, { host: HOST }) as never,
+        response as never,
+      )
+      const body = JSON.parse(response.body) as { host: { reason: string; capable: boolean } }
+      expect(body.host.capable).toBe(false)
+      expect(body.host.reason).toContain('15 个名字')
       rmSync(dataDir, { recursive: true, force: true })
     })
 

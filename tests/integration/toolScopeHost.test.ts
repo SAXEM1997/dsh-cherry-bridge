@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
+import { CHERRY_TOOL_NAMES, cherryScopeToolNames, registerCherryTools } from '../../src/tools.js'
 import type { CherryToolsDeps } from '../../src/tools.js'
 import { ToolScopeState } from '../../src/toolScope.js'
 import { createToolScopeHost, registerAtomically } from '../../src/toolScopeHost.js'
@@ -77,6 +77,12 @@ interface RigOptions {
    * face / the injection callback (a throwing `guard` or `on`, R16).
    */
   patchRoot?: (host: FakeToolHost) => void
+  /**
+   * The names this host is asked to GOVERN. Omitted ⇒ the fourteen tools, the
+   * default every other case in this file wants. The production assembly passes
+   * the wider `cherryScopeToolNames()` (issue #232).
+   */
+  names?: readonly string[]
 }
 
 /** One host-level rig: a fake host plus a real scope state and a real mount. */
@@ -93,7 +99,7 @@ function rig(options: RigOptions = {}) {
 
   const tools = createToolScopeHost({
     scope,
-    names: CHERRY_TOOL_NAMES,
+    names: options.names ?? CHERRY_TOOL_NAMES,
     // Task 6's bounded recheck: injected as a SCHEDULE, never as a count — the
     // default is the production `[250, 2000]`.
     ...(options.recheckDelaysMs === undefined ? {} : { recheckDelaysMs: options.recheckDelaysMs }),
@@ -695,6 +701,35 @@ function layerOps(host: FakeToolHost, agentId: string): Array<{ op: string; deny
 }
 
 describe('T5a install/release criteria: the target set, the empty set and the guard', () => {
+  it('①a a governed name registered OUTSIDE this host is hidden too (issue #232)', async () => {
+    // Scope hides and guards BY NAME, not by ownership. The delegation tool is
+    // the one name where that matters: `subagentHost` registers it, not
+    // `registerCherryTools`, so a list that only described this host's own
+    // factory would leave an excluded workspace a way around the bridge.
+    const { host, scope } = rig({
+      names: cherryScopeToolNames(),
+      registerTools: (fake) => {
+        const releases = registerOn(fake, CHERRY_TOOL_NAMES)
+        // The fifteenth, registered the way the subagent subsystem does it.
+        releases.push(...registerOn(fake, ['cherry_subagent']))
+        return () => {
+          for (const release of releases.splice(0)) release()
+        }
+      },
+    })
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    await settle()
+    expect(host.restrictCalls.length).toBeGreaterThan(0)
+    for (const call of host.restrictCalls) {
+      expect(denyOf(call)).toContain('cherry_subagent')
+    }
+    // The visible effect: nothing of ours survives in the agent's table.
+    expect(host.agentView('agent-a').filter((name) => name.startsWith('cherry_'))).toEqual([])
+  })
+
   it('① the deny argument is the no-argument global view ∩ our names — never empty, never allow (B12①/B18③)', async () => {
     // A global view that holds MORE than our family: the intersection (not the
     // raw schemas() list, and not the static name list either) is what may be

@@ -1,5 +1,8 @@
-import { createCherryProvider } from './subagent.js'
+import { createCherryProvider, resolveTargetDevice } from './subagent.js'
 import type { CherryProviderDeps, CherrySubagentProvider, SubagentConfigResolution } from './subagent.js'
+import { createCherrySubagentTool } from './subagentTool.js'
+import type { CherryActivation, CherryActivationSpec } from './subagentTool.js'
+import type { CherryToolDefinition } from './tools.js'
 
 /**
  * The subagent subsystem's mount: the switch, the injection gate and the
@@ -42,7 +45,18 @@ export interface SubagentSubsystemStatus {
 /** The `ctx.subagents` face this subsystem consumes, structurally. */
 export interface SubagentsService {
   registerProvider(provider: CherrySubagentProvider): () => void
+  /**
+   * The one activation call the model-facing tool makes. Present on every host
+   * that has this seam (`dsh-subagent`'s manager host), and structural here so
+   * this file stays free of `@deepseek-ai/*` types.
+   */
+  startActivation?(spec: CherryActivationSpec): Promise<CherryActivation>
   list?(): readonly { readonly name: string }[]
+}
+
+/** The `ctx.tools` face the tool registration needs, structurally. */
+export interface ToolsRegistry {
+  register(definition: CherryToolDefinition): () => void
 }
 
 /** The ctx this subsystem mounts on. Structural, like every host face here. */
@@ -55,6 +69,17 @@ export interface SubagentHostContext {
   inject?<T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown
   /** Present on the plugin root ctx once a subagent registry is loaded. */
   subagents?: SubagentsService | undefined
+  /**
+   * The tool registry, probed at MOUNT time off the plugin root ctx — the same
+   * static probe `toolScopeHost` makes, and for the same reason: a host without
+   * it will never have it.
+   *
+   * It is deliberately NOT part of {@link INJECT_KEYS}: the provider does not
+   * need `ctx.tools` (the host's own `subagent` tool can drive it), so gating the
+   * whole subsystem on the tool registry would lose a working provider over a
+   * missing unrelated service.
+   */
+  tools?: ToolsRegistry | undefined
 }
 
 /** The injected ctx's face. */
@@ -119,20 +144,61 @@ export function createSubagentHost(parts: {
         return () => {}
       }
 
+      // The SECOND static probe, and the same reasoning: `ctx.tools` either
+      // exists on this host or never will. Captured here, at mount time, so the
+      // injected callback reads a value that cannot change under it.
+      const tools = ctx.tools
+
+      /**
+       * Register the model-facing tool against the service we just registered a
+       * provider on.
+       *
+       * Each refusal names its OWN cause: "the host has no tool registry" and
+       * "the seam cannot start an activation" send an operator to different
+       * places, and collapsing them into one `undefined` is how a reason string
+       * starts lying.
+       *
+       * @returns the tool's disposer, or the reason there is none.
+       */
+      const registerTool = (
+        service: SubagentsService,
+      ): { release: () => void } | { problem: string } => {
+        if (tools === undefined) return { problem: '宿主没有 tools 服务' }
+        const startActivation = service.startActivation
+        // A service with no `startActivation` cannot honour the tool: registering
+        // it would promise the model a delegation that throws on every call.
+        if (typeof startActivation !== 'function') return { problem: '宿主没有 startActivation 接口' }
+        return {
+          release: tools.register(
+            createCherrySubagentTool({
+              // SUB-04: the CONFIGURED names. A hardcoded literal here would make
+              // `toolName` a config field that validates, defaults and does
+              // nothing — the settings page would accept a rename the registry
+              // never sees.
+              toolName: resolution.config.toolName,
+              providerName: resolution.config.providerName,
+              // The SAME resolution the runner uses, so the tool cannot report a
+              // desktop the run does not address.
+              resolveDevice: (cwd: string) =>
+                resolveTargetDevice(resolution.config.target, resolution.config.routes, cwd),
+              // Bound to the service: `startActivation` is a host method and must
+              // not lose its receiver on the way through this closure.
+              startActivation: (spec: CherryActivationSpec) => startActivation.call(service, spec),
+            }),
+          ),
+        }
+      }
+
       const register = (service: SubagentsService | undefined): void => {
         if (service === undefined) {
           status = { state: 'unsupported', reason: UNSUPPORTED_REASON }
           return
         }
+        let releaseProvider: () => void
         try {
-          const dispose = service.registerProvider(
+          releaseProvider = service.registerProvider(
             createCherryProvider({ run: parts.run }, { name: resolution.config.providerName }),
           )
-          release = dispose
-          status = {
-            state: 'ready',
-            reason: `已注册 provider "${resolution.config.providerName}"`,
-          }
         } catch (error) {
           // A duplicate name is the ordinary way this throws (`DUPLICATE_PROVIDER`),
           // and it must NOT take the assembly down: the rest of the plugin — the
@@ -141,6 +207,39 @@ export function createSubagentHost(parts: {
           const message = error instanceof Error ? error.message : String(error)
           status = { state: 'failed', reason: `注册 provider 失败：${message}` }
           log('[cherry-remote] 子智能体 provider 注册失败', error)
+          return
+        }
+        // The provider exists from here on, so every path below must keep a
+        // disposer for it — including the one where the tool cannot be added.
+        let releaseTool: (() => void) | undefined
+        let toolProblem: string | undefined
+        try {
+          const added = registerTool(service)
+          if ('problem' in added) toolProblem = added.problem
+          else releaseTool = added.release
+        } catch (error) {
+          // A refused tool registration is the host's answer (a name already
+          // taken), not a broken configuration: the PROVIDER still works — the
+          // host's own `subagent` tool can drive it — so the subsystem stays
+          // `ready` and only the model-facing tool is missing.
+          toolProblem = `工具注册被宿主拒绝：${error instanceof Error ? error.message : String(error)}`
+          log('[cherry-remote] cherry_subagent 工具注册失败', error)
+        }
+        release = () => {
+          releaseTool?.()
+          releaseProvider()
+        }
+        // Both CONFIGURED names: a status line that quotes the default while the
+        // operator renamed the tool sends them looking for a tool that is not in
+        // the registry.
+        const providerName = resolution.config.providerName
+        const toolName = resolution.config.toolName
+        status = {
+          state: 'ready',
+          reason:
+            toolProblem === undefined
+              ? `已注册 provider "${providerName}" 与工具 "${toolName}"`
+              : `已注册 provider "${providerName}"；${toolProblem}，工具 "${toolName}" 未注册`,
         }
       }
 

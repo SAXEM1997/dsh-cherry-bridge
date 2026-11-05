@@ -744,6 +744,9 @@ selector, `cherry_pair` does not.
 - The 14 tools are decided **per workspace**; the default is `selected` + an
   empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
   document lands on the stricter side; no "unreadable → global" escape).
+- `cherry_subagent` is the ONE exception: it is on the same governed list
+  (`cherryScopeToolNames()`), but the SUBAGENT subsystem registers it, so where
+  scope cannot restrict at all it stays visible and its switch is the only gate.
 - A save re-installs or releases the restriction layer for **every live agent**
   and takes effect on the **next turn** — no restart, no new session.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
@@ -758,8 +761,7 @@ selector, `cherry_pair` does not.
 - The scope document lives at `<dataDir>/scope.json` (0600, atomic, monotonic
   `revision`), **not** in profile YAML. The one exception: a document that fails
   to parse or has invalid fields is rebuilt on the stricter side with `revision`
-  reset to 0, and stays writable. `PUT` is read-modify-write with a required
-  `expectedRevision`; a `PUT` prune is the only path that clears stale ids.
+  reset to 0, and stays writable.
 
 ### HTTP face: endpoints, scope errors and the diagnostics body
 
@@ -941,6 +943,5 @@ faces:
   honour `details.retryable: false`; it has no adaptive page size, so a
   byte-budget `RESOURCE_EXHAUSTED` still does not converge at a fixed limit. Our
   answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
-- Its read path refuses an unusable `byteLength`; we fall back to a slice bound
-  plus the cumulative arm.
+- Its read path refuses an unusable `byteLength` (see above).
 

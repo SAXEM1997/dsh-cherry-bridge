@@ -1,5 +1,5 @@
 import { homedir, hostname } from "node:os";
-import { dirname, join, normalize, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 import { chmodSync, closeSync, copyFileSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
@@ -2824,6 +2824,14 @@ const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 * judged in both directions.
 */
 const MAX_RESUME_TOKEN_CHARS = 4096;
+/**
+* The tool name a delegation is exposed to the model under.
+*
+* `cherry_subagent`, not `subagent_cherry`: it has to read as the fifteenth
+* `cherry_*` tool so it falls inside the scope subsystem's `restrict`/`guard`
+* name list without a second convention.
+*/
+const CHERRY_SUBAGENT_TOOL_DEFAULT = "cherry_subagent";
 /**
 * The protocol's `agent.messages.send.text` ceiling, in characters.
 *
@@ -5930,6 +5938,24 @@ function createCherryProvider(deps, options = {}) {
 		}
 	};
 }
+/**
+* Which desktop one delegation lands on: the matching route's override, else the
+* configured default.
+*
+* ONE function for both faces — the runner (`runSubagentDelegation`) and the
+* model-facing tool, which reports the device it is about to use. Two spellings
+* of "which device" would let the tool tell the model `A` while the run lands on
+* `B`, and the model's follow-up (`cherry_sessions` needs a device) would then
+* read the wrong desktop.
+*
+* @param target - the configured default target.
+* @param routes - the declared routes, in precedence order.
+* @param cwd - the child's resolved directory (the routing key).
+* @returns the device id this delegation will address.
+*/
+function resolveTargetDevice(target, routes, cwd) {
+	return matchRoute(routes, cwd)?.device ?? target.device;
+}
 /** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
 const TIMER_CEILING_MS = 2147483647;
 /** Read one optional non-blank string field, recording a problem when it is unusable. */
@@ -7132,11 +7158,17 @@ function jsonRender(_args, value) {
 /**
 * The 14 `cherry_*` tool names, in the family's documented order.
 *
-* THE one list: the plugin assembly (`src/index.ts` hands it to the scope host
-* as `names`, which is where the visibility `deny` sets and the dispatch
-* guard's scope come from) and the contract suite read this constant instead of
-* keeping a copy of their own. The diagnostics face does NOT read it — its
-* scope segment reports the live scope state, not this list.
+* This is what {@link registerCherryTools} REGISTERS, and nothing else: the
+* contract suite asserts the two sets against each other in both directions. The
+* list the SCOPE subsystem governs is the wider {@link cherryScopeToolNames}
+* — the fourteen here plus the experimental delegation tool, which is registered
+* by the subagent subsystem instead. Keeping the two apart is what lets each
+* statement stay true.
+*
+* `src/index.ts` hands the SCOPE list to the scope host as `names`, which is
+* where the visibility `deny` sets and the dispatch guard's scope come from. The
+* diagnostics face does NOT read either list — its scope segment reports the
+* live scope state, not a constant.
 *
 * {@link CherryToolEngine.definitions()} still spells each name inside its own
 * declaration — that literal is what the host registry receives — so the two
@@ -7160,6 +7192,36 @@ const CHERRY_TOOL_NAMES = [
 	"cherry_pair",
 	"cherry_unpair"
 ];
+/**
+* Every tool name the SCOPE subsystem governs — the fourteen above plus the
+* experimental delegation tool, whose name the operator can rename.
+*
+* Two lists rather than one, because they answer different questions:
+* {@link CHERRY_TOOL_NAMES} is "what `registerCherryTools` registers", which the
+* contract suite asserts in both directions, while this one is "what an operator
+* can be excluded from". The subagent tool is registered by the SUBAGENT
+* subsystem, not by `registerCherryTools` — it exists only while an experimental
+* switch is on — so folding it into the first list would make that bidirectional
+* assertion describe a registration that never happens.
+*
+* Scope hides and guards **by name**, not by ownership (`toolScopeHost`'s
+* `targetDeny` intersects this list with the registry's live `schemas()`, and
+* its dispatch guard rejects a listed name outright), so a tool registered
+* elsewhere in the assembly is still governed here. That is the whole reason
+* the delegation tool defaults to `cherry_subagent`: an operator who excludes a
+* workspace from the bridge is not offered a way around it by the experiment.
+*
+* A FUNCTION rather than a constant because `subagent.toolName` is configurable
+* (SUB-04): the assembly builds this list from the name the config resolved, so
+* the governed set and the registered tool cannot drift apart when an operator
+* renames the tool.
+*
+* @param toolName - the delegation tool's registered name.
+* @returns the names the scope subsystem hides and guards.
+*/
+function cherryScopeToolNames(toolName = CHERRY_SUBAGENT_TOOL_DEFAULT) {
+	return [...CHERRY_TOOL_NAMES, toolName];
+}
 /**
 * The same registration, with the ENGINE it built handed back.
 *
@@ -8851,7 +8913,7 @@ var CherryToolEngine = class {
 	*/
 	async runSubagentDelegation(input) {
 		const route = matchRoute(input.routes, input.cwd);
-		const deviceId = route?.device ?? input.target.device;
+		const deviceId = resolveTargetDevice(input.target, input.routes, input.cwd);
 		const workspace = route?.workspaceId === void 0 ? input.target.workspace : { workspaceId: route.workspaceId };
 		const resolved = await this.#linkOr(deviceId);
 		if (resolved.link === void 0) throw new Error(`cherry subagent: the target device is unavailable (${String(resolved.verdict.error)})`);
@@ -11433,6 +11495,109 @@ function newestAssistantMessage(messages) {
 	return [];
 }
 //#endregion
+//#region src/subagentTool.ts
+/**
+* The model-facing description.
+*
+* Four facts, each one a mistake the model would otherwise make (SUB-64), plus
+* the refusal note SUB-54 requires. Kept as one constant so a test can assert
+* the phrases and a reader can see all of them at once.
+*/
+const DESCRIPTION = "Delegate a self-contained task to a Cherry Studio agent: a separate agent that works in its own context on the operator's desktop, so the work does not consume this conversation's context.\n\nThe child does NOT see this conversation — include everything it needs in `prompt`. It does NOT accept follow-up messages: nothing you say after this call reaches it. This tool starts the run and returns at once; the runtime notifies you when the child finishes, and the notification carries the child's final answer.\n\nThe child may decline the task — Cherry agents have their own role boundaries — and a refusal is a normal completed run whose text IS the refusal. Read the answer before assuming the work was done.";
+/**
+* Read one required non-empty string argument.
+*
+* A local copy of `tools.ts`'s `requiredString` on purpose: sharing it would
+* publish a three-line predicate from a module whose exports are a compatibility
+* commitment (`src` ships in the tarball), which is a worse trade than the
+* duplication.
+*/
+function requiredArgument(args, key) {
+	const value = args[key];
+	if (typeof value !== "string" || value === "") throw new Error(`cherry_subagent: "${key}" is required and must be a non-empty string`);
+	return value;
+}
+/**
+* Build the tool for one apply.
+*
+* @param parts - the configured provider name and the activation call.
+* @returns a registry-ready definition; nothing is registered here.
+*/
+function createCherrySubagentTool(parts) {
+	return {
+		name: parts.toolName ?? "cherry_subagent",
+		description: DESCRIPTION,
+		parameters: {
+			type: "object",
+			properties: {
+				description: {
+					type: "string",
+					description: "A short (3-5 word) description of the delegated task, for display."
+				},
+				prompt: {
+					type: "string",
+					description: "The complete, self-contained task for the child. It does not share this conversation's context, so include everything it needs."
+				},
+				cwd: {
+					type: "string",
+					description: "Initial child working directory. Relative paths use your current directory; omitted inherits it. It also selects the operator's route for this directory, so a delegation may land on a different desktop or workspace than the default. Later directory changes in either agent are independent."
+				}
+			},
+			required: ["description", "prompt"],
+			additionalProperties: false
+		},
+		output: {
+			schema: {
+				type: "object",
+				additionalProperties: false,
+				required: ["kind", "subagentId"],
+				properties: {
+					kind: {
+						type: "string",
+						const: "activation"
+					},
+					subagentId: { type: "string" },
+					device: { type: "string" }
+				}
+			},
+			render: (_args, value) => {
+				const { subagentId, device } = value;
+				return [{
+					type: "text",
+					text: device === void 0 ? `started subagent ${String(subagentId)}` : `started subagent ${String(subagentId)} on device ${String(device)}`
+				}];
+			}
+		},
+		isConcurrencySafe: () => true,
+		execute: async (args, exec) => {
+			if (exec?.agent === void 0) throw new Error("cherry_subagent: this tool requires a calling agent (exec.agent was undefined)");
+			const parent = exec.agent;
+			const label = requiredArgument(args, "description");
+			const text = requiredArgument(args, "prompt");
+			const cwd = typeof args["cwd"] === "string" && args["cwd"] !== "" ? args["cwd"] : void 0;
+			const device = cwd !== void 0 && isAbsolute(cwd) ? parts.resolveDevice(cwd) : void 0;
+			return {
+				kind: "activation",
+				subagentId: (await parts.startActivation({
+					provider: parts.providerName,
+					label,
+					request: {
+						...cwd === void 0 ? {} : { cwd },
+						prompt: [{
+							type: "text",
+							text
+						}],
+						parent
+					},
+					signal: exec.signal,
+					delivery: "parent"
+				})).childId,
+				...device === void 0 ? {} : { device }
+			};
+		}
+	};
+}
+//#endregion
 //#region src/subagentHost.ts
 /** The injection key. ONE key, so the subsystem cannot be held pending by another. */
 const INJECT_KEYS$1 = ["subagents"];
@@ -11470,6 +11635,29 @@ function createSubagentHost(parts) {
 				log(`[cherry-remote] 子智能体子系统未启用：${UNSUPPORTED_REASON}`);
 				return () => {};
 			}
+			const tools = ctx.tools;
+			/**
+			* Register the model-facing tool against the service we just registered a
+			* provider on.
+			*
+			* Each refusal names its OWN cause: "the host has no tool registry" and
+			* "the seam cannot start an activation" send an operator to different
+			* places, and collapsing them into one `undefined` is how a reason string
+			* starts lying.
+			*
+			* @returns the tool's disposer, or the reason there is none.
+			*/
+			const registerTool = (service) => {
+				if (tools === void 0) return { problem: "宿主没有 tools 服务" };
+				const startActivation = service.startActivation;
+				if (typeof startActivation !== "function") return { problem: "宿主没有 startActivation 接口" };
+				return { release: tools.register(createCherrySubagentTool({
+					toolName: resolution.config.toolName,
+					providerName: resolution.config.providerName,
+					resolveDevice: (cwd) => resolveTargetDevice(resolution.config.target, resolution.config.routes, cwd),
+					startActivation: (spec) => startActivation.call(service, spec)
+				})) };
+			};
 			const register = (service) => {
 				if (service === void 0) {
 					status = {
@@ -11478,19 +11666,37 @@ function createSubagentHost(parts) {
 					};
 					return;
 				}
+				let releaseProvider;
 				try {
-					release = service.registerProvider(createCherryProvider({ run: parts.run }, { name: resolution.config.providerName }));
-					status = {
-						state: "ready",
-						reason: `已注册 provider "${resolution.config.providerName}"`
-					};
+					releaseProvider = service.registerProvider(createCherryProvider({ run: parts.run }, { name: resolution.config.providerName }));
 				} catch (error) {
 					status = {
 						state: "failed",
 						reason: `注册 provider 失败：${error instanceof Error ? error.message : String(error)}`
 					};
 					log("[cherry-remote] 子智能体 provider 注册失败", error);
+					return;
 				}
+				let releaseTool;
+				let toolProblem;
+				try {
+					const added = registerTool(service);
+					if ("problem" in added) toolProblem = added.problem;
+					else releaseTool = added.release;
+				} catch (error) {
+					toolProblem = `工具注册被宿主拒绝：${error instanceof Error ? error.message : String(error)}`;
+					log("[cherry-remote] cherry_subagent 工具注册失败", error);
+				}
+				release = () => {
+					releaseTool?.();
+					releaseProvider();
+				};
+				const providerName = resolution.config.providerName;
+				const toolName = resolution.config.toolName;
+				status = {
+					state: "ready",
+					reason: toolProblem === void 0 ? `已注册 provider "${providerName}" 与工具 "${toolName}"` : `已注册 provider "${providerName}"；${toolProblem}，工具 "${toolName}" 未注册`
+				};
 			};
 			try {
 				ctx.inject?.(INJECT_KEYS$1, (injected) => {
@@ -11660,7 +11866,7 @@ function createToolScopeHost(deps) {
 		};
 		return {
 			capable: false,
-			reason: `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ 这 ${names.length} 个工具一个都不注册（fail-closed）`
+			reason: `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个名字也无法被隐藏`
 		};
 	}
 	function projectAgent(raw) {
@@ -12091,7 +12297,7 @@ function createToolScopeHost(deps) {
 		} catch (error) {
 			degradeToVisibilityOnly(`宿主 tools.guard 安装被拒绝：${describeError(error)}`, error);
 		}
-		else degradeToVisibilityOnly("宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 14 个工具，不是渲染层假过滤）");
+		else degradeToVisibilityOnly(`宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 ${names.length} 个工具，不是渲染层假过滤）`);
 		const on = agentCtx.on;
 		if (typeof on === "function") {
 			subscribe(state, on, "agent/created", (payload) => {
@@ -13946,13 +14152,13 @@ function apply(ctx, config = {}) {
 		return evictAllConnections();
 	});
 	const engine = new CherryToolEngine(deps);
+	const subagentResolution = resolveSubagentConfig(config.subagent);
 	const host = createToolScopeHost({
 		scope,
-		names: CHERRY_TOOL_NAMES,
+		names: cherryScopeToolNames(subagentResolution.kind === "ready" ? subagentResolution.config.toolName : CHERRY_SUBAGENT_TOOL_DEFAULT),
 		registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine).dispose)
 	});
 	state.disposers.push(host.mount(ctx));
-	const subagentResolution = resolveSubagentConfig(config.subagent);
 	const subagents = createSubagentHost({
 		resolution: subagentResolution,
 		run: (input) => {

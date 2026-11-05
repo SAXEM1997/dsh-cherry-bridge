@@ -4,10 +4,14 @@ import { DeviceStore } from './deviceStore.js'
 import { loadOrCreateIdentity } from './identity.js'
 import { DeviceConnection } from './connection.js'
 import type { DeviceState, WsDialOptions } from './connection.js'
-import { DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND } from './defaults.js'
+import {
+  CHERRY_SUBAGENT_TOOL_DEFAULT,
+  DEFAULT_PER_SESSION_CACHE_BYTES,
+  DEFAULT_RATE_BUDGET_PER_SECOND,
+} from './defaults.js'
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
-import { CHERRY_TOOL_NAMES, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
+import { cherryScopeToolNames, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
 import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
 import { ToolScopeState } from './toolScope.js'
 import { CherryToolEngine } from './tools.js'
@@ -1028,9 +1032,20 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // scope default is "no workspace has the tools", so a delegation would fail
   // exactly when an operator enabled only the experiment.
   const engine = new CherryToolEngine(deps)
+  // Resolved BEFORE the scope host because the scope host needs the delegation
+  // tool's NAME: the experiment is configured, and `toolName` is one of its
+  // fields, so the governed list cannot be a module constant.
+  const subagentResolution = resolveSubagentConfig(config.subagent)
   const host = createToolScopeHost({
     scope,
-    names: CHERRY_TOOL_NAMES,
+    // The SCOPE list, not the registration list: it carries the experimental
+    // delegation tool too, so an excluded workspace is not offered a way around
+    // the bridge through the experiment (see `cherryScopeToolNames`).
+    names: cherryScopeToolNames(
+      subagentResolution.kind === 'ready'
+        ? subagentResolution.config.toolName
+        : CHERRY_SUBAGENT_TOOL_DEFAULT,
+    ),
     registerTools: () =>
       registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine).dispose),
   })
@@ -1043,7 +1058,6 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // NOT a key on the root `inject = ['tools']`: a plugin whose root injection
   // names a service the composition lacks stays pending forever, taking the
   // fourteen tools down with it.
-  const subagentResolution = resolveSubagentConfig(config.subagent)
   const subagents = createSubagentHost({
     resolution: subagentResolution,
     // The delegation runs on THIS apply's engine, so the provider and the tools
