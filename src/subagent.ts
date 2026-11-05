@@ -41,6 +41,7 @@ import { randomUUID } from 'node:crypto'
 import { normalize, sep } from 'node:path'
 import {
   CHERRY_SUBAGENT_PROVIDER_DEFAULT,
+  MESSAGE_TEXT_MAX_CHARS,
   CHERRY_SUBAGENT_TOOL_DEFAULT,
   DEFAULT_MAX_INTERACTION_ABANDONS,
   DEFAULT_SUBAGENT_TIMEOUT_MS,
@@ -483,7 +484,8 @@ export function matchRoute(
  *
  * @param prompt - the task's content blocks.
  * @returns the concatenated text, in order.
- * @throws when a block is not text, or the task is empty after trimming.
+ * @throws when a block is not text, when the task is empty after trimming, or
+ *   when it is longer than the peer's own body ceiling.
  */
 export function textPrompt(prompt: readonly SubagentContentBlock[]): string {
   if (prompt.length === 0) {
@@ -499,6 +501,16 @@ export function textPrompt(prompt: readonly SubagentContentBlock[]): string {
   const joined = texts.join('')
   if (joined.trim().length === 0) {
     throw new Error('cherry subagent: the one-shot task must not be empty')
+  }
+  // The peer's schema refuses a body over this, so a task assembled by a model
+  // would come back as a schema error from the wire. Refusing here — still
+  // before anything exists on the Cherry side — is the same judgement the
+  // empty-task rule makes, one dimension over.
+  if (joined.length > MESSAGE_TEXT_MAX_CHARS) {
+    throw new Error(
+      `cherry subagent: the one-shot task is ${joined.length} characters, over the ${MESSAGE_TEXT_MAX_CHARS} ` +
+        'the peer accepts; shorten it or delegate it in several runs',
+    )
   }
   return joined
 }

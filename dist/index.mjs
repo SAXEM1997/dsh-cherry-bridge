@@ -2824,6 +2824,17 @@ const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 * judged in both directions.
 */
 const MAX_RESUME_TOKEN_CHARS = 4096;
+/**
+* The protocol's `agent.messages.send.text` ceiling, in characters.
+*
+* A PROTOCOL fact, not a policy: the peer's schema refuses a longer body. It
+* lives here because TWO faces pre-validate against it — `cherry_send`'s tool
+* arguments and a subagent delegation's assembled prompt — and a second copy
+* would drift the moment the peer's ceiling moved. Pre-validating is the whole
+* point: a refusal we can explain beats a schema error round-tripped back from
+* the wire.
+*/
+const MESSAGE_TEXT_MAX_CHARS = 32768;
 //#endregion
 //#region src/connection.ts
 /**
@@ -5784,7 +5795,8 @@ function matchRoute(routes, cwd) {
 *
 * @param prompt - the task's content blocks.
 * @returns the concatenated text, in order.
-* @throws when a block is not text, or the task is empty after trimming.
+* @throws when a block is not text, when the task is empty after trimming, or
+*   when it is longer than the peer's own body ceiling.
 */
 function textPrompt(prompt) {
 	if (prompt.length === 0) throw new Error("cherry subagent: the one-shot task must contain only text blocks");
@@ -5795,6 +5807,7 @@ function textPrompt(prompt) {
 	}
 	const joined = texts.join("");
 	if (joined.trim().length === 0) throw new Error("cherry subagent: the one-shot task must not be empty");
+	if (joined.length > 32768) throw new Error(`cherry subagent: the one-shot task is ${joined.length} characters, over the ${MESSAGE_TEXT_MAX_CHARS} the peer accepts; shorten it or delegate it in several runs`);
 	return joined;
 }
 /** The output blocks for one run's text; empty when there is nothing to report. */
@@ -6616,7 +6629,7 @@ const MAX_EXTERNALIZED_BYTES = 33554432;
 */
 const DEFAULT_CONTENT_READ_CONCURRENCY = 4;
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
-const TEXT_MAX_LENGTH = 32768;
+const TEXT_MAX_LENGTH = MESSAGE_TEXT_MAX_CHARS;
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
 const DEFAULT_WAIT_TIMEOUT_MS = 12e4;
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */

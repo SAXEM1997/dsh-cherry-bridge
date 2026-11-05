@@ -338,6 +338,28 @@ describe('a delegation reports what the run amounted to (SUB-22/50..54)', () => 
   })
 })
 
+describe('the route table decides where a delegation lands (SUB-10..14)', () => {
+  it('②f a matching route overrides the workspace, and the override reaches the wire', async () => {
+    const rig = await makeRig(completing('routed'))
+    await delegate(rig, {
+      cwd: '/w/dsh/src',
+      routes: [{ cwdPrefix: '/w/dsh', workspaceId: 'ws-2' }],
+    })
+    const created = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.sessions.create')
+    expect(created.at(-1)?.params['workspaceId']).toBe('ws-2')
+  })
+
+  it('②g no route matches, so the configured target stands (SUB-12)', async () => {
+    const rig = await makeRig(completing('default target'))
+    await delegate(rig, {
+      cwd: '/somewhere/else',
+      routes: [{ cwdPrefix: '/w/dsh', workspaceId: 'ws-2' }],
+    })
+    const created = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.sessions.create')
+    expect(created.at(-1)?.params['workspaceId']).toBe('ws-1')
+  })
+})
+
 describe('a delegation has no human to ask (SUB-30..32)', () => {
   it('③a every card is DENIED and the run carries on to its terminal', async () => {
     const rig = await makeRig(completing('finished anyway', { pushInteractionOnRun: INTERACTION, denyKeepsRunAlive: true }))

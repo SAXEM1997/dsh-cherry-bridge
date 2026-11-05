@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { MESSAGE_TEXT_MAX_CHARS } from '../../src/defaults.js'
 import {
   NO_START_CAPABILITIES,
   SUBAGENT_DIAGNOSTIC_MAX_BYTES,
@@ -558,6 +559,14 @@ describe('#229 externalRunHandle disposes exactly once', () => {
 const DEFAULT_ROUTE: CherrySubagentRoute = { cwdPrefix: '/nowhere', workspaceId: 'default-ws' }
 
 describe('#229 matchRoute picks the first declared prefix at a path boundary', () => {
+  it('returns the whole route, so a device override reaches the caller (SUB-11)', () => {
+    // `matchRoute` hands back the DECLARED object; the delegation reads
+    // `route.device` and `route.workspaceId` off it. A route carrying only a
+    // device must not lose it on the way out.
+    const routes: CherrySubagentRoute[] = [{ cwdPrefix: '/w/dsh', device: 'desk-2' }]
+    expect(matchRoute(routes, '/w/dsh/src')?.device).toBe('desk-2')
+  })
+
   it('takes the FIRST declared match, not the longest (SUB-10)', () => {
     const routes: CherrySubagentRoute[] = [
       { cwdPrefix: '/workspace', workspaceId: 'outer' },
@@ -706,6 +715,27 @@ function providerRequest(overrides: Partial<SubagentStartRequest> = {}): Subagen
     ...overrides,
   }
 }
+
+describe('#231 a task the peer could never accept is refused before anything exists', () => {
+  it('⑤0 an over-long task throws, and the runner is never called', async () => {
+    // The peer's schema refuses a body over 32,768 characters, so a task
+    // assembled by a model would come back as a schema error from the wire —
+    // AFTER a Cherry session had been created for it. Refusing here is the same
+    // judgement the empty-task rule makes, one dimension over.
+    const { deps, calls } = runnerStub(async () => ({ status: 'completed', text: 'never' }))
+    const prompt = [{ type: 'text', text: 'x'.repeat(MESSAGE_TEXT_MAX_CHARS + 1) }]
+    await expect(createCherryProvider(deps).start(providerRequest({ prompt }))).rejects.toThrow('32768')
+    expect(calls).toHaveLength(0)
+  })
+
+  it('⑤1 exactly the ceiling is accepted', async () => {
+    const { deps, calls } = runnerStub(async () => ({ status: 'completed', text: 'ok' }))
+    const prompt = [{ type: 'text', text: 'x'.repeat(MESSAGE_TEXT_MAX_CHARS) }]
+    const run = await createCherryProvider(deps).start(providerRequest({ prompt }))
+    await run.result
+    expect(calls).toHaveLength(1)
+  })
+})
 
 describe('#231 the provider maps the runner’s answer onto the seam', () => {
   it('⑥a a completed run becomes `completed` with the run’s text as one block (SUB-22)', async () => {

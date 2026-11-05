@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { MESSAGE_TEXT_MAX_CHARS } from './defaults.js'
 import { matchRoute } from './subagent.js'
 import type { CherrySubagentRoute, CherrySubagentRunOutcome, SubagentTarget } from './subagent.js'
 import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
@@ -1085,7 +1086,7 @@ const MAX_EXTERNALIZED_BYTES = 32 * 1024 * 1024
 const DEFAULT_CONTENT_READ_CONCURRENCY = 4
 
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
-const TEXT_MAX_LENGTH = 32_768
+const TEXT_MAX_LENGTH = MESSAGE_TEXT_MAX_CHARS
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */

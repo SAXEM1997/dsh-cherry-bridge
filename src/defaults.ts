@@ -249,3 +249,15 @@ export const DEFAULT_SUBAGENT_TIMEOUT_MS = 1_800_000
  * reported failure instead of an unbounded run.
  */
 export const DEFAULT_MAX_INTERACTION_ABANDONS = 8
+
+/**
+ * The protocol's `agent.messages.send.text` ceiling, in characters.
+ *
+ * A PROTOCOL fact, not a policy: the peer's schema refuses a longer body. It
+ * lives here because TWO faces pre-validate against it — `cherry_send`'s tool
+ * arguments and a subagent delegation's assembled prompt — and a second copy
+ * would drift the moment the peer's ceiling moved. Pre-validating is the whole
+ * point: a refusal we can explain beats a schema error round-tripped back from
+ * the wire.
+ */
+export const MESSAGE_TEXT_MAX_CHARS = 32_768
