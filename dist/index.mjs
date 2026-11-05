@@ -6709,13 +6709,31 @@ var AssemblyDeadline = class {
 	instant;
 	constructor(startedAt, windowMs) {
 		const tail = Math.min(Math.max(windowMs, WAIT_ANSWER_TAIL_FLOOR_MS), WAIT_ANSWER_TAIL_MS);
-		this.instant = startedAt + windowMs + tail;
+		this.instant = Number.isFinite(startedAt + windowMs) ? startedAt + windowMs + tail : startedAt + tail;
 	}
 	/** Whether the budget is spent (a deadline exactly now counts as spent). */
 	expired() {
 		return performance.now() >= this.instant;
 	}
 };
+/**
+* The window the ANSWER gets, which is deliberately not always the window the
+* WAIT gets.
+*
+* For every finite `timeoutMs` the two are the same — the answer may spend one
+* bounded tail past the caller's patience, and that is the whole `AssemblyDeadline`
+* design. `timeoutMs: 0` is the one case where they must differ: SUB-42 makes it
+* "no wall-clock bound on the WAIT", a decision about how long a parent is
+* willing to wait for a child, and it says nothing about how long a CONTENT
+* read may take. An unbounded assembly would be a different promise — one no
+* caller asked for and no link can honour.
+*
+* @param timeoutMs - the wait window; `Infinity` means unbounded.
+* @returns the finite window the answer's assembly is budgeted with.
+*/
+function answerWindowFor(timeoutMs) {
+	return Number.isFinite(timeoutMs) ? timeoutMs : WAIT_ANSWER_TAIL_MS;
+}
 /**
 * POLL CADENCE for the waiter loop.
 *
@@ -10156,7 +10174,7 @@ var CherryToolEngine = class {
 	*/
 	async #awaitRun(connection, subscriptions, sessionId, options) {
 		const deadline = options.startedAt + options.timeoutMs;
-		const answerDeadline = new AssemblyDeadline(options.startedAt, options.timeoutMs);
+		const answerDeadline = new AssemblyDeadline(options.startedAt, answerWindowFor(options.timeoutMs));
 		let latestExecutionId = options.executionId;
 		const baselineSeq = options.baselineSeq ?? this.#newestSeq(subscriptions, sessionId);
 		const observation = {};

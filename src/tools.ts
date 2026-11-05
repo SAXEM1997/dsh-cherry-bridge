@@ -1172,13 +1172,38 @@ class AssemblyDeadline {
 
   constructor(startedAt: number, windowMs: number) {
     const tail = Math.min(Math.max(windowMs, WAIT_ANSWER_TAIL_FLOOR_MS), WAIT_ANSWER_TAIL_MS)
-    this.instant = startedAt + windowMs + tail
+    // An INFINITE window (a delegation with `timeoutMs: 0`) would make the
+    // instant infinite, and the answer would lose the absolute bound this whole
+    // class exists to impose — under a degrading link every request could then
+    // absorb `transportRetryWaitMs` for as long as the peer felt like it.
+    // `answerWindowFor` is what keeps that from reaching here; the guard is the
+    // second line of defence, so a future caller cannot reintroduce it.
+    this.instant = Number.isFinite(startedAt + windowMs) ? startedAt + windowMs + tail : startedAt + tail
   }
 
   /** Whether the budget is spent (a deadline exactly now counts as spent). */
   expired(): boolean {
     return performance.now() >= this.instant
   }
+}
+
+/**
+ * The window the ANSWER gets, which is deliberately not always the window the
+ * WAIT gets.
+ *
+ * For every finite `timeoutMs` the two are the same — the answer may spend one
+ * bounded tail past the caller's patience, and that is the whole `AssemblyDeadline`
+ * design. `timeoutMs: 0` is the one case where they must differ: SUB-42 makes it
+ * "no wall-clock bound on the WAIT", a decision about how long a parent is
+ * willing to wait for a child, and it says nothing about how long a CONTENT
+ * read may take. An unbounded assembly would be a different promise — one no
+ * caller asked for and no link can honour.
+ *
+ * @param timeoutMs - the wait window; `Infinity` means unbounded.
+ * @returns the finite window the answer's assembly is budgeted with.
+ */
+export function answerWindowFor(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs) ? timeoutMs : WAIT_ANSWER_TAIL_MS
 }
 
 /**
@@ -6570,7 +6595,7 @@ export class CherryToolEngine {
     // aggregate may spend only the bounded TAIL past the window (see
     // `AssemblyDeadline`), and every request it issues is clamped to that
     // instant.
-    const answerDeadline = new AssemblyDeadline(options.startedAt, options.timeoutMs)
+    const answerDeadline = new AssemblyDeadline(options.startedAt, answerWindowFor(options.timeoutMs))
     let latestExecutionId = options.executionId
     // THE BASELINE: the newest seq already in the buffer when this wait began.
     // The fold below sees only events strictly after it, so a prior run's
