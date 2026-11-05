@@ -366,14 +366,21 @@ describe('⑤ the README pair carries the same three sentences', () => {
     ] as const) {
       const t = createTranslator(locale)
       const text = readme(name)
+      const heading = locale === 'zh' ? /^## 实验性子智能体$/m : /^## Experimental subagent$/m
       // `subagent.experimental` carries two of the three phrases (实验性 and
       // 默认关闭) and `subagent.feedback` the third, so these two sentences are
-      // the whole hard requirement. `subagent.defaultOff` is NOT pinned here:
-      // its content ("needs a device/agent/workspace, restart to apply") is the
-      // README's own prose below, and duplicating it verbatim read like a
-      // copy-paste slip in a document.
+      // the whole hard requirement. `subagent.defaultOff` is NOT pinned: its
+      // restart line is the README's own prose, and quoting it as well put
+      // 默认关闭 on two adjacent lines — which reads like a copy-paste slip.
+      //
+      // The HEADING is pinned too, and the sentences must follow it: without
+      // that, deleting the section left this case green (a sentence anywhere in
+      // the file, a fenced code block included, satisfied a presence check).
+      expect(text, `${name} must carry the section heading`).toMatch(heading)
+      const at = text.search(heading)
       for (const key of ['subagent.experimental', 'subagent.feedback']) {
-        expect(text, `${name} must quote ${key} verbatim`).toContain(t(key))
+        expect(text, `${name} must quote ${key} verbatim, inside that section`).toContain(t(key))
+        expect(text.indexOf(t(key)), `${name} quotes ${key} before its heading`).toBeGreaterThan(at)
       }
       // The feedback entry point is the same string as the page's (#234).
       expect(text).toContain('https://github.com/SAXEM1997/dsh-cherry-bridge/issues')

@@ -272,7 +272,7 @@ exporting `./client`). Through the `settings.section` slot it registers a
 (paste → 6-digit code → verdict), a scope panel, and live state pushed over the
 same-origin SSE feed (`/cherry-remote/api/events`).
 
-The 15 tools appear **per workspace**, by **hiding, not refusing** (in an
+The 15 tools appear **per workspace** (the fifteenth, `cherry_subagent`, exists only while the experiment is on and its configuration is usable), by **hiding, not refusing** (in an
 out-of-scope session they never enter the tool table, saving context):
 
 - **Default is nobody**: a missing, corrupt or unreadable scope document is

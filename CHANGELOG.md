@@ -63,11 +63,12 @@ task, and the concurrency ceiling is unverified above three.
 
 - Every tool's parameter schema now stays inside the subset the host's value
   validator actually enforces (#219). Eight of the fourteen carried keywords the
-  host reads nothing of — `minimum`/`maximum` on the seven numeric faces,
-  `maxLength` on the six token/text faces, an object-valued
-  `additionalProperties` on `cherry_respond`'s `answers` — so they were
+  host reads nothing of: `minimum`/`maximum` on seven numeric faces, `maxLength`
+  on six token/text faces (four of them through one shared cursor parameter), and
+  an object-valued `additionalProperties` on `cherry_respond`'s `answers` — eight
+  tools in all, several carrying more than one kind. Those keywords were
   annotations rather than enforcement, and the day a host site started asserting
-  `parameters` all eight would have failed together. The bounds moved into the
+  `parameters` all eight would have failed on that day. The bounds moved into the
   descriptions (what a model reads); the parsers still enforce the ceilings.
 
 ### Fixed
