@@ -221,6 +221,23 @@ describe('② the status is rendered from CODES, and the two failures differ', (
       ),
     ).toBeDefined()
   })
+
+  it('②e shows the stored routes read-only, because a problem can name one this form cannot edit', async () => {
+    renderPanel(
+      stubClient({
+        ...READY,
+        subagent: { ...READY.subagent, routes: [{ cwdPrefix: '/repo/a', device: 'desk-9' }] },
+      }),
+    )
+    // `routesOf` validates every entry and pushes `routes[0].cwdPrefix`-style
+    // problems, so a bad route has to be visible HERE or nowhere: the page has
+    // no editor for it, and `bodyOf` carries the stored value through untouched.
+    // It is not a declaration: `matchRoute` picks the device and workspace for
+    // a subdirectory from exactly this table.
+    await screen.findByText(
+      'routes：[{"cwdPrefix":"/repo/a","device":"desk-9"}]（按子目录前缀覆盖设备与工作区；本页只展示，不编辑）',
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -229,7 +246,10 @@ describe('② the status is rendered from CODES, and the two failures differ', (
 
 describe('③ a save is a read-modify-write, locked on what was read', () => {
   it('③a sends the read revision, the edited fields, and the fields the form never showed', async () => {
-    const client = stubClient(READY)
+    const client = stubClient({
+      ...READY,
+      subagent: { ...READY.subagent, routes: [{ cwdPrefix: '/repo/a', workspaceId: 'ws-2' }] },
+    })
     renderPanel(client)
     const device = (await screen.findByLabelText('目标设备')) as HTMLInputElement
     fireEvent.change(device, { target: { value: '  desk-2  ' } })
@@ -245,6 +265,10 @@ describe('③ a save is a read-modify-write, locked on what was read', () => {
     // `cwdMode` has no control on this page — dropping it would make a save
     // delete configuration the operator never saw.
     expect(body.cwdMode).toBe('shared')
+    // `routes` picks the device and workspace for a directory, and it has no
+    // control here either: a save that sent only the rendered half would
+    // re-route every delegated directory, silently.
+    expect(body.routes).toEqual([{ cwdPrefix: '/repo/a', workspaceId: 'ws-2' }])
     expect(body.agentId).toBe('agent-7')
     expect(body.timeoutMs).toBe(1_800_000)
     await screen.findByText('已保存。')

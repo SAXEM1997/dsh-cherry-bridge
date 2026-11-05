@@ -387,6 +387,19 @@ export interface SubagentStatus {
 }
 
 /**
+ * One per-directory override — `CherrySubagentRoute` in `src/subagent.ts`.
+ *
+ * Mirrored because the panel SHOWS the table: a route can make the document
+ * invalid with a problem path (`routes[0].cwdPrefix`) the operator has to be
+ * able to read against something, and the page has no editor for it.
+ */
+export interface CherrySubagentRoute {
+  cwdPrefix: string
+  device?: string
+  workspaceId?: string
+}
+
+/**
  * The stored configuration document — `SubagentConfig` in `src/subagent.ts`.
  *
  * Every field is optional because the document is a draft: the switch is what
@@ -402,6 +415,8 @@ export interface SubagentConfig {
   workspaceId?: string
   workspaceKind?: 'system'
   cwdMode?: 'isolated' | 'shared'
+  /** Per-directory device/workspace overrides, in precedence order. */
+  routes?: readonly CherrySubagentRoute[]
   timeoutMs?: number
   maxInteractionAbandons?: number
   revision?: number

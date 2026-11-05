@@ -24,10 +24,12 @@
  *  - **A refusal never moves the draft.** The local fields are the operator's
  *    edit; a conflict offers a re-read instead of re-seeding over their typing.
  *
- * Fields this form does NOT render — `cwdMode`, `routes`, `maxInteractionAbandons`
- * — are carried through from the stored document untouched. Dropping them would
- * make a save delete configuration the operator never saw, and `cwdMode` is
- * shown read-only precisely because it has no consumer yet (D1).
+ * Fields this form does NOT render as CONTROLS — `cwdMode`, `routes`,
+ * `maxInteractionAbandons` — are carried through from the stored document
+ * untouched. Dropping them would make a save delete configuration the operator
+ * never saw. Two of them still get a read-only line: `cwdMode` because it has
+ * no consumer yet (D1), `routes` because it has one (a per-directory device and
+ * workspace) and a problem can name an entry this page cannot edit.
  */
 import { useCallback, useEffect, useState } from 'react'
 import { ApiError, REQUEST_TIMEOUT, defaultSubagentClient } from './api'
@@ -474,6 +476,16 @@ export function SubagentPanel({ client = defaultSubagentClient }: SubagentPanelP
                   changed behaviour would be the fake switch again. */}
               <p className="cherry-hint cherry-mono">
                 {t('subagent.cwdMode', { value: data.subagent.cwdMode ?? 'isolated' })}
+              </p>
+
+              {/* Read-only for a DIFFERENT reason than `cwdMode`: `routes` is
+                  live (`matchRoute` picks the device and workspace from it),
+                  but the page has no editor for a per-directory table, and a
+                  bad entry is named in a problem (`routes[0].cwdPrefix`) the
+                  operator would otherwise never see. JSON, not a pretty table:
+                  it shows exactly the stored value. */}
+              <p className="cherry-hint cherry-mono">
+                {t('subagent.routes', { value: JSON.stringify(data.subagent.routes ?? []) })}
               </p>
 
               <div className="cherry-scope-save">

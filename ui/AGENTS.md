@@ -49,7 +49,10 @@ experimental subagent panel. It builds to `lib/client.js`
 - **A save carries what the form does not show.** `cwdMode`, `routes` and
   `maxInteractionAbandons` have no control on that panel, so `bodyOf` spreads the
   STORED document through and overrides only the rendered fields. Sending just
-  the rendered half would delete configuration the operator never saw.
+  the rendered half would delete configuration the operator never saw. `cwdMode`
+  and `routes` are rendered as read-only mono lines (routes as JSON, because a
+  problem can name `routes[0].cwdPrefix` and no control here fixes it);
+  `maxInteractionAbandons` is not rendered at all.
 - **jsdom only.** `tests/unit/ui.test.ts`, `uiScopePanel.test.ts` and
   `uiSubagentPanel.test.ts` render the page; a browser-only API needs a fake in
   the test, not a guard in the page.

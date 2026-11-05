@@ -246,6 +246,7 @@ const zh: Dict = {
   'subagent.workspace.system': '系统工作区',
   'subagent.workspaceId': '工作区 id',
   'subagent.cwdMode': 'cwdMode：{value}（声明字段，本期不改变行为）',
+  'subagent.routes': 'routes：{value}（按子目录前缀覆盖设备与工作区；本页只展示，不编辑）',
   'subagent.timeoutMs': '单次委托超时（毫秒；0 表示不限）',
   'subagent.timeoutHint': '默认 1800000（30 分钟）。',
   'subagent.save': '保存子智能体配置',
@@ -488,6 +489,8 @@ const en: Dict = {
   'subagent.workspace.system': 'The system workspace',
   'subagent.workspaceId': 'Workspace id',
   'subagent.cwdMode': 'cwdMode: {value} (a declared field; it changes no behaviour yet)',
+  'subagent.routes':
+    'routes: {value} (per-directory overrides for the device and the workspace; shown here, not edited here)',
   'subagent.timeoutMs': 'Timeout per delegation (milliseconds; 0 means no bound)',
   'subagent.timeoutHint': 'Default 1800000 (30 minutes).',
   'subagent.save': 'Save the subagent configuration',
