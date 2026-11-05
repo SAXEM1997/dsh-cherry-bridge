@@ -896,6 +896,29 @@ export class DeviceConnection {
   #pendingPings = new Set<{ nonce: string; sentAt: number }>()
   #token: string | undefined
   #tokenExpiresAt: number | undefined
+  /**
+   * Hosts whose LAST attempt failed for that ADDRESS's own reason (issue #220).
+   * A pass dials the hosts it has not failed yet FIRST, so a stale candidate
+   * sitting first in `record.hosts` cannot cost its dial timeout on every
+   * reconnect — the rule the official client states as "failed candidates
+   * rotate behind untried addresses across retries, so the round budget cannot
+   * permanently starve a later route"
+   * (`.scratch-csa/docs/references/remote-access/connectivity.md` §Connection
+   * lifetime; the tree is gitignored, and its remote-agent directory is the
+   * same `16e505fe` at app tags v0.5.2 and v0.5.3, so this is not a rule that
+   * arrived with a newer app).
+   *
+   * Demotion is ORDER, never exclusion: with every host marked the list falls
+   * back to record order, so a record whose only address is marked still dials
+   * it. A mark is cleared when that host itself connects, so a repaired address
+   * returns to the front on its own — no expiry timer, no persistence, no
+   * config key. A pairing-level verdict and a cancellation never mark (they are
+   * not this address's fault: the line `isPerHostFailure` draws for the
+   * handshake face, mirrored explicitly in the dial face, where only
+   * `IdentityMismatchError` can arise today), and `close()` keeps the marks
+   * because they describe addresses, not this lifecycle.
+   */
+  readonly #demotedHosts = new Set<string>()
 
   readonly #wsOptions: WsDialOptions | undefined
 
@@ -1255,7 +1278,7 @@ export class DeviceConnection {
     }
 
     let lastError: Error = new Error(`device ${this.record.deviceId}: all candidate hosts unreachable`)
-    for (const host of this.record.hosts) {
+    for (const host of this.#dialOrder()) {
       // CANCELLATION GATE, at the top of every candidate. `close()` bumps the
       // epoch and clears `#running`, so either check is enough — both are here
       // because they answer different halves of the same question ("is this
@@ -1279,7 +1302,15 @@ export class DeviceConnection {
         link = await this.#dial(host, port, epoch)
       } catch (error) {
         if (error instanceof IdentityMismatchError) throw error
+        // A cancellation is not this ADDRESS's fault, so it neither marks it
+        // nor continues the pass. UNREACHABLE today — `#dial`'s AbortController
+        // is aborted only through `#teardownLink`, which needs `#link`, and
+        // `#link` is not committed until the dial returns — so this is a
+        // DEFENSIVE arm, not a pinned one: it keeps the rule true if the dial
+        // ever grows a close path, at the cost of two lines and no behaviour.
+        if (error instanceof CancelledError) throw error
         lastError = error instanceof Error ? error : new Error(String(error))
+        this.#demotedHosts.add(host)
         continue
       }
       // Commit the link before the RPC handshake so every failure path below
@@ -1288,6 +1319,8 @@ export class DeviceConnection {
       this.#link = link
       try {
         await this.#handshake(link, epoch)
+        // This address works: any mark an earlier pass left on it is stale.
+        this.#demotedHosts.delete(host)
         return
       } catch (error) {
         // A close() that landed mid-handshake surfaces here as the failure of
@@ -1299,16 +1332,38 @@ export class DeviceConnection {
         // The terminal faces end the pass: they describe the PAIRING, not this
         // address, so trying the next candidate would only repeat them.
         if (!isPerHostFailure(error)) throw error
-        // A channel-level failure (socket dropped mid-handshake) is this
-        // ADDRESS's problem: tear the link down here, since the loop's next
-        // iteration would otherwise overwrite `#link` and leak this socket, and
-        // fall through to the next candidate.
+        // A peer that answers hello/authenticate with a per-address failure is
+        // this ADDRESS's problem too: demote it for the NEXT pass, tear the
+        // link down here (the loop's next iteration would otherwise overwrite
+        // `#link` and leak this socket), and fall through to the next candidate.
+        this.#demotedHosts.add(host)
         this.#teardownLink()
         lastError = error instanceof Error ? error : new Error(String(error))
         continue
       }
     }
     throw new AllHostsUnreachableError(this.record.deviceId, this.record.hosts, lastError)
+  }
+
+  /**
+   * The pass's dial order (issue #220): hosts this connection has NOT failed
+   * yet, in record order, then the demoted ones, in record order.
+   *
+   * Record order is preserved INSIDE each half, so an ordinary single-address
+   * record, a fresh record and an all-demoted record all dial exactly the list
+   * the record carries — the demotion can only move an address that failed
+   * behind addresses that did not, and can never drop one.
+   */
+  #dialOrder(): readonly string[] {
+    const hosts = this.record.hosts
+    if (this.#demotedHosts.size === 0) return hosts
+    const untried: string[] = []
+    const demoted: string[] = []
+    for (const host of hosts) {
+      if (this.#demotedHosts.has(host)) demoted.push(host)
+      else untried.push(host)
+    }
+    return [...untried, ...demoted]
   }
 
   async #dial(host: string, port: number, epoch: number): Promise<LiveLink> {
