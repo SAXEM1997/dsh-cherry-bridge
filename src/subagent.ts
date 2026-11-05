@@ -37,6 +37,7 @@
  * @module cherry-remote/subagent
  */
 
+import { randomUUID } from 'node:crypto'
 import { normalize, sep } from 'node:path'
 import {
   CHERRY_SUBAGENT_PROVIDER_DEFAULT,
@@ -90,10 +91,30 @@ export interface SubagentCapabilities {
   readonly depthLimit: boolean
 }
 
-/** The task and the caller-owned cancellation a provider receives. */
+/**
+ * The task and the caller-owned cancellation a provider receives.
+ *
+ * The host hands `start` a `ResolvedSubagentStartRequest`, which is this shape
+ * with `cwd` already resolved — so `cwd` is REQUIRED here even though the
+ * unresolved request the runtime builds has it optional. Modelling the optional
+ * form would have forced every reader to answer "what if the runtime did not
+ * resolve it", a state the host cannot produce.
+ *
+ * The four trailing fields exist so this transcription matches the host's, and
+ * they are ALWAYS ABSENT in practice: `NO_START_CAPABILITIES` turns every one of
+ * them off, and the host refuses a request that asks for one BEFORE calling
+ * `start`. They are declared rather than omitted because a type that is narrower
+ * than the host's is a type that lies about what the host may pass.
+ */
 export interface SubagentStartRequest {
-  /** Initial child directory, resolved to an absolute path by the runtime. */
-  readonly cwd?: string
+  /**
+   * Initial child directory, already resolved to an absolute path.
+   *
+   * A ROUTING KEY and nothing more: the host does not check that it exists on
+   * this machine's filesystem before passing an absolute path through, and the
+   * Cherry side is a different machine anyway. Never stat it.
+   */
+  readonly cwd: string
   /** Short display label; the runtime passes it through to `start`. */
   readonly label?: string
   /** The task, as content blocks. */
@@ -102,6 +123,14 @@ export interface SubagentStartRequest {
   readonly parent: unknown
   /** Canonical cancellation channel, before and after startup. */
   readonly signal: AbortSignal
+  /** Refused by capability: this provider declares `agentPreset: false`. */
+  readonly agentPreset?: unknown
+  /** Refused by capability: this provider declares `agentOptions: false`. */
+  readonly agentOptions?: unknown
+  /** Refused by capability: this provider declares `outputSchema: false`. */
+  readonly outputSchema?: unknown
+  /** Refused by capability: this provider declares `depthLimit: false`. */
+  readonly maxDepth?: unknown
 }
 
 /** One registered transport. */
@@ -377,11 +406,15 @@ export function externalRunHandle(parts: ExternalRunHandleParts): SubagentRun {
  * One declared target route.
  *
  * A route names a Cherry workspace, and optionally the device that hosts it. The
- * seam has NO per-call channel for a delegation target — the object a provider
+ * seam has NO per-call channel for a delegation TARGET — the object a provider
  * receives is built by the runtime and its fields are fixed
- * (`@deepseek-ai/dsh-subagent/lib/index.js:1504-1509`) — so `cwd` is the only
- * caller-influenced string that reaches a provider. Routing on it is how a
- * delegation lands in the workspace the user declared for that directory.
+ * (`@deepseek-ai/dsh-subagent/lib/index.js:1504-1509`).
+ *
+ * `cwd` is the only caller-influenced field that can carry a DIRECTORY, which is
+ * why routing keys on it. It is NOT the only caller-influenced field: `label` and
+ * `prompt` are model-authored too. They are unusable as routing keys for the
+ * opposite reason — a label is a caption, not a path, and matching on prompt text
+ * would make a delegation's destination depend on prose.
  */
 export interface CherrySubagentRoute {
   /** Directory prefix this route claims, compared after normalization. */
@@ -502,21 +535,80 @@ export interface CherryProviderDeps {
    */
   run(input: {
     readonly text: string
-    readonly cwd: string | undefined
+    /** The seam's resolved child directory — a routing key, never stat'ed. */
+    readonly cwd: string
     readonly label: string | undefined
     readonly signal: AbortSignal
   }): Promise<CherrySubagentRunOutcome>
 }
 
+/** The output blocks for one run's text; empty when there is nothing to report. */
+function textBlocks(text: string): SubagentContentBlock[] {
+  return text.trim().length === 0 ? [] : [{ type: 'text', text }]
+}
+
+/**
+ * What the runner's outcome means to the seam.
+ *
+ * `aborted` is the one status the peer never reported: the runner synthesises it
+ * when OUR signal ended the wait, which is why it maps to the seam's own
+ * `aborted` rather than to an error. Everything that is not `completed` carries
+ * a diagnostic when the runner supplied one — and a `completed` result never
+ * does, because the host appends a result's diagnostic to the settlement
+ * notification and an unexplained warning on a success is worse than silence.
+ *
+ * @param outcome - what the run amounted to.
+ * @returns the seam's result.
+ */
+function toSubagentResult(outcome: CherrySubagentRunOutcome): SubagentResult {
+  const output = textBlocks(outcome.text)
+  if (outcome.status === 'completed') return { output, stopReason: 'completed' }
+  if (outcome.status === 'aborted') return { output, stopReason: 'aborted' }
+  return {
+    output,
+    stopReason: 'error',
+    ...(outcome.diagnostic === undefined ? {} : { diagnostic: outcome.diagnostic }),
+  }
+}
+
 /**
  * Build the one-shot Cherry provider.
  *
- * @param deps - the run seam, or undefined while the wiring is still landing.
- * @returns a provider the runtime can register under `cherry`.
+ * The shape the runtime sees is three declarations and one method:
+ * `capabilities` is all-false (this provider cannot honour an agent preset, an
+ * output schema or a depth limit, and the host refuses such a request BEFORE
+ * `start`), `inheritsParentContext` is false (a Cherry child starts fresh), and
+ * `start` returns a run handle immediately.
+ *
+ * ## What `start` refuses, and what it defers
+ *
+ * A task this provider cannot represent is refused BEFORE anything exists on the
+ * Cherry side, so a rejected delegation leaves no orphan session behind (SUB-20,
+ * SUB-21) — and so is a request whose signal has already aborted (SUB-24).
+ *
+ * Everything else DEFERS: an unreachable device, a session the peer refused, a
+ * run that failed. `start` returns a run handle at once and those settle through
+ * `run.result`, because the alternative is a parent blocked on a device handshake
+ * it cannot cancel. The seam's contract draws exactly this line — fail before
+ * returning means clean up and reject, fail after means settle through the
+ * result — and a run whose handle already exists is on the far side of it.
+ *
+ * ## The two signals
+ *
+ * `request.signal` is the parent's. `dispose()` has to stop the child WITHOUT
+ * that signal having fired (the host disposes a run for reasons of its own), so
+ * the provider owns a LOCAL controller: `deps.run` watches the local one, the
+ * parent's abort is forwarded into it, and `requestCancel` aborts it. That is
+ * also what makes `settleRunResult`'s `cancelled()` answer `true` on the dispose
+ * path — the seam requires a disposed run to settle as `aborted` rather than
+ * report a `completed` nobody is listening for.
+ *
+ * @param deps - the run seam: the one place a delegation touches Cherry Studio.
+ * @returns a provider the runtime can register under the configured name.
  */
-export function createCherryProvider(deps?: CherryProviderDeps): CherrySubagentProvider {
+export function createCherryProvider(deps: CherryProviderDeps): CherrySubagentProvider {
   return {
-    name: 'cherry',
+    name: CHERRY_SUBAGENT_PROVIDER_DEFAULT,
     capabilities: NO_START_CAPABILITIES,
     inheritsParentContext: false,
     async start(request: SubagentStartRequest): Promise<SubagentRun> {
@@ -526,14 +618,69 @@ export function createCherryProvider(deps?: CherryProviderDeps): CherrySubagentP
       if (request.signal.aborted) {
         throw new Error('cherry subagent: the request was aborted before startup')
       }
-      if (deps === undefined) {
-        throw new Error('cherry subagent: the run seam is not wired yet (#231)')
+
+      const local = new AbortController()
+      const onHostAbort = (): void => {
+        local.abort()
       }
-      // #231 fills this body: resolve the target route from `request.cwd`,
-      // create the Cherry session, run the wait loop under the interaction
-      // policy and the deadline, and fold this run's assistant text into a
-      // published SubagentRun. Everything above this line is already final.
-      throw new Error(`cherry subagent: the run seam is not wired yet (#231) for ${text.length} characters`)
+      request.signal.addEventListener('abort', onHostAbort, { once: true })
+
+      // The run's own state, read by the collectors. `outcome` is set the moment
+      // the runner reports; `failure` when it could not even be started. Both are
+      // captured because `settleRunResult` asks for them AFTER the attempt
+      // settles, and by then the promise's value is no longer reachable.
+      let outcome: CherrySubagentRunOutcome | undefined
+      let failure: Error | undefined
+      const attempt = deps.run({ text, cwd: request.cwd, label: request.label, signal: local.signal }).then(
+        (settled) => {
+          outcome = settled
+          return settled
+        },
+        (error: unknown) => {
+          failure = error instanceof Error ? error : new Error(String(error))
+          throw failure
+        },
+      )
+      // Never rejects, so it can be awaited by `teardown` without a catch of its
+      // own: a disposed run is one whose child has stopped, and a run that failed
+      // to start has already stopped.
+      const stopped = attempt.then(
+        () => undefined,
+        () => undefined,
+      )
+
+      return externalRunHandle({
+        // D5: the seam's id is the HOST's `childId`, and the host refuses a
+        // duplicate — so it is minted here, not borrowed from the Cherry session
+        // id (which does not exist yet at this point anyway).
+        id: randomUUID(),
+        result: settleRunResult({
+          attempt: async () => toSubagentResult(await attempt),
+          // A partial only exists once the runner has reported. `cancelled()`
+          // decides whether it is reported at all, and it reads the LOCAL signal
+          // so a dispose settles as aborted.
+          collectOutput: () => (outcome === undefined ? [] : textBlocks(outcome.text)),
+          collectDiagnostic: () =>
+            outcome === undefined
+              ? // The runner could not start: its message is the only account of
+                // why, and it is ours (an unreachable device, a refused session),
+                // not peer content.
+                failure?.message
+              : outcome.diagnostic,
+          cancelled: () => local.signal.aborted,
+          signal: request.signal,
+          onAbort: onHostAbort,
+        }),
+        signal: request.signal,
+        onAbort: onHostAbort,
+        requestCancel: () => {
+          local.abort()
+        },
+        // Awaiting the settlement is what "runs until the child has actually
+        // stopped" means for a remote child: the runner's cancellation path
+        // issues the peer's own `agent.executions.cancel` and then answers.
+        teardown: () => stopped,
+      })
     },
   }
 }

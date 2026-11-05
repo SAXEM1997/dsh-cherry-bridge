@@ -9,7 +9,9 @@ import {
   textPrompt,
 } from '../../src/subagent.js'
 import type {
+  CherryProviderDeps,
   CherrySubagentRoute,
+  CherrySubagentRunOutcome,
   SubagentResult,
   SubagentRun,
   SubagentStartRequest,
@@ -665,5 +667,183 @@ describe('#229 start rejects an unusable prompt before it builds anything', () =
     // `.toThrow()` passes with the aborted guard deleted (found by mutation).
     await expect(provider.start({ ...startRequest(), signal: aborted.signal })).rejects.toThrow(/aborted/)
     expect(ran).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The wired provider (#231)
+// ---------------------------------------------------------------------------
+
+/**
+ * A `deps.run` stand-in: it records what it was asked and answers what the case
+ * says. The REAL runner is `tests/integration/subagentRun.test.ts` — this file
+ * pins only what the provider does with its answer, which is the mapping and the
+ * two signals.
+ */
+function runnerStub(answer: (input: { signal: AbortSignal }) => Promise<CherrySubagentRunOutcome>): {
+  deps: CherryProviderDeps
+  calls: Array<{ text: string; cwd: string; label: string | undefined; signal: AbortSignal }>
+} {
+  const calls: Array<{ text: string; cwd: string; label: string | undefined; signal: AbortSignal }> = []
+  return {
+    calls,
+    deps: {
+      run: (input) => {
+        calls.push(input)
+        return answer(input)
+      },
+    },
+  }
+}
+
+/** A request the provider will accept, with the caller's own controller. */
+function providerRequest(overrides: Partial<SubagentStartRequest> = {}): SubagentStartRequest {
+  return {
+    cwd: '/w/dsh',
+    prompt: [{ type: 'text', text: 'summarise the repo' }],
+    parent: {},
+    signal: new AbortController().signal,
+    ...overrides,
+  }
+}
+
+describe('#231 the provider maps the runner’s answer onto the seam', () => {
+  it('⑥a a completed run becomes `completed` with the run’s text as one block (SUB-22)', async () => {
+    const { deps } = runnerStub(async () => ({ status: 'completed', text: 'the answer' }))
+    const run = await createCherryProvider(deps).start(providerRequest())
+    await expect(run.result).resolves.toEqual({
+      output: [{ type: 'text', text: 'the answer' }],
+      stopReason: 'completed',
+    })
+  })
+
+  it('⑥b the task, the cwd and the label all reach the runner', async () => {
+    const { deps, calls } = runnerStub(async () => ({ status: 'completed', text: 'ok' }))
+    const run = await createCherryProvider(deps).start(providerRequest({ label: 'a caption' }))
+    await run.result
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.text).toBe('summarise the repo')
+    expect(calls[0]?.cwd).toBe('/w/dsh')
+    expect(calls[0]?.label).toBe('a caption')
+  })
+
+  it('⑥c an error outcome carries its diagnostic and never rejects (SUB-27/52)', async () => {
+    const { deps } = runnerStub(async () => ({
+      status: 'error',
+      text: '',
+      diagnostic: 'the run ended failed: RESOURCE_EXHAUSTED',
+    }))
+    const run = await createCherryProvider(deps).start(providerRequest())
+    const result = await run.result
+    expect(result.stopReason).toBe('error')
+    expect(result.output).toEqual([])
+    expect(result.diagnostic).toContain('RESOURCE_EXHAUSTED')
+  })
+
+  it('⑥d a runner that cannot even start settles as an error, not a rejection', async () => {
+    // An unreachable device or a refused session: the handle already exists, so
+    // the seam's "fail after returning means settle through result" applies. The
+    // runner's message is the only account of why, so it becomes the diagnostic.
+    const { deps } = runnerStub(async () => {
+      throw new Error('cherry subagent: the target device is unavailable (device-not-found)')
+    })
+    const run = await createCherryProvider(deps).start(providerRequest())
+    const result = await run.result
+    expect(result.stopReason).toBe('error')
+    expect(result.diagnostic).toContain('device-not-found')
+  })
+
+  it('⑥e a `completed` result carries NO diagnostic, whatever the runner said', async () => {
+    // The host appends a result's diagnostic to the settlement notification, so
+    // one on a success reaches the parent as an unexplained warning.
+    const { deps } = runnerStub(async () => ({ status: 'completed', text: 'fine', diagnostic: 'noise' }))
+    const run = await createCherryProvider(deps).start(providerRequest())
+    const result = await run.result
+    expect(result.stopReason).toBe('completed')
+    expect(result.diagnostic).toBeUndefined()
+  })
+})
+
+describe('#231 cancellation is the provider’s own signal (SUB-25/26)', () => {
+  it('⑦a a parent abort reaches the runner and the run settles `aborted`', async () => {
+    const controller = new AbortController()
+    const { deps, calls } = runnerStub(
+      (input) =>
+        new Promise((resolve) => {
+          input.signal.addEventListener('abort', () => resolve({ status: 'aborted', text: 'partial' }), {
+            once: true,
+          })
+        }),
+    )
+    const run = await createCherryProvider(deps).start(providerRequest({ signal: controller.signal }))
+    controller.abort()
+    const result = await run.result
+    expect(calls[0]?.signal.aborted).toBe(true)
+    expect(result.stopReason).toBe('aborted')
+    // The partial the runner reported rides along (SUB-25's "取已收到的部分").
+    expect(result.output).toEqual([{ type: 'text', text: 'partial' }])
+  })
+
+  it('⑦b dispose stops the child WITHOUT the parent’s signal firing, and settles `aborted`', async () => {
+    // The host disposes a run for reasons of its own, so a provider that only
+    // forwarded `request.signal` would leave the child running and then report a
+    // `completed` nobody is listening for.
+    let observed: AbortSignal | undefined
+    const { deps } = runnerStub(
+      (input) =>
+        new Promise((resolve) => {
+          observed = input.signal
+          input.signal.addEventListener('abort', () => resolve({ status: 'aborted', text: '' }), { once: true })
+        }),
+    )
+    const run = await createCherryProvider(deps).start(providerRequest())
+    expect(observed?.aborted).toBe(false)
+    await run.dispose()
+    expect(observed?.aborted).toBe(true)
+    await expect(run.result).resolves.toEqual({ output: [], stopReason: 'aborted' })
+  })
+
+  it('⑦b2 a child that answers AFTER a dispose is still `aborted`, never `completed`', async () => {
+    // The seam's rule: a run we stopped listening to did not succeed, even when
+    // the child had in fact finished. `⑦b` cannot see this — the runner there
+    // reports `aborted` itself, so the mapping and the cancellation agree — which
+    // is why this case lets the runner answer `completed` on purpose.
+    let release: () => void = () => {}
+    const { deps } = runnerStub(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve({ status: 'completed', text: 'the late answer' })
+        }),
+    )
+    const run = await createCherryProvider(deps).start(providerRequest())
+    const disposal = run.dispose()
+    release()
+    await disposal
+    const result = await run.result
+    expect(result.stopReason).toBe('aborted')
+    // The partial is still reported — the text arrived, we simply stopped
+    // treating it as a success.
+    expect(result.output).toEqual([{ type: 'text', text: 'the late answer' }])
+  })
+
+  it('⑦c dispose waits for the runner to actually stop', async () => {
+    let release: () => void = () => {}
+    const { deps } = runnerStub(
+      (input) =>
+        new Promise((resolve) => {
+          release = () => resolve({ status: 'aborted', text: '' })
+          input.signal.addEventListener('abort', () => release(), { once: true })
+        }),
+    )
+    const run = await createCherryProvider(deps).start(providerRequest())
+    let disposed = false
+    const disposal = run.dispose().then(() => {
+      disposed = true
+    })
+    await Promise.resolve()
+    expect(disposed).toBe(false)
+    release()
+    await disposal
+    expect(disposed).toBe(true)
   })
 })
