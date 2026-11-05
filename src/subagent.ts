@@ -167,7 +167,33 @@ export interface RunResultSettlement {
   collectDiagnostic?(): string | undefined
   /** Whether LOCAL cancellation settled before the attempt's outcome. */
   cancelled(): boolean
-  /** Diagnostic sink; a throw from it is contained. */
+  /**
+   * Where a settlement reports what went wrong — a LOGGING AND OPERATIONS
+   * channel, not a data channel.
+   *
+   * It is deliberately NOT the source of `SubagentResult.diagnostic`: that comes
+   * from {@link collectDiagnostic}, and {@link settleRunResult} folds it into the
+   * result itself. Treating this sink as a diagnostic back-up produces a second,
+   * competing copy of the same fact.
+   *
+   * What a caller must be ready for, because every point below is pinned by a
+   * test rather than left to be discovered by reading the implementation:
+   *
+   *  - **0 to 3 calls per settlement.** A clean run reports nothing. A failed
+   *    one reports the attempt's own error. A collector that then throws adds a
+   *    report of its own — one per broken collector, so three at most.
+   *  - **The order is meaningful.** The attempt's failure always arrives FIRST.
+   *    Collector failures arrive after it, prefixed with the collector's name
+   *    (`collectOutput() failed: …`). A keep-first sink therefore keeps the real
+   *    cause, and a last-wins one still keeps something that names the collector
+   *    instead of a silently substituted message.
+   *  - **`stopReason` is always the settlement's own**, i.e. the value the parent
+   *    will receive. On the cancelled paths that is `aborted` even when the child
+   *    had in fact succeeded: a run we stopped listening to did not fail, and
+   *    reporting `completed` there would contradict the answer the parent holds.
+   *  - **A throw from this sink is contained**, so a broken sink cannot become
+   *    the rejection {@link settleRunResult} exists to avoid.
+   */
   onError?(error: Error, stopReason: SubagentStopReason): void
   /** The request's cancellation signal; the listener is removed on every path. */
   signal: AbortSignal
@@ -229,7 +255,11 @@ export async function settleRunResult(parts: RunResultSettlement): Promise<Subag
    */
   const report = (label: string, error: unknown, stopReason: SubagentStopReason): void => {
     try {
-      parts.onError?.(new Error(`${label}: ${toError(error).message}`), stopReason)
+      const cause = toError(error)
+      // `cause` keeps the original error's identity: this path reads live backend
+      // state, so it is exactly the path an operator will need to investigate,
+      // and a rebuilt message alone would throw away the stack that says where.
+      parts.onError?.(new Error(`${label}: ${cause.message}`, { cause }), stopReason)
     } catch {
       // Contained by construction: this runs inside a collector's own catch.
     }

@@ -234,7 +234,7 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
         throw new Error('snapshot unavailable')
       },
       cancelled: () => reads++ === 0,
-      onError: (error) => reported.push(error.message),
+      onError: (error, stopReason) => reported.push(`${stopReason}: ${error.message}`),
       signal: wiring.signal,
       onAbort: wiring.onAbort,
     })
@@ -244,7 +244,7 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
     // The throw is REPORTED, not swallowed: an empty output from a broken
     // collector and an empty output from a child that produced nothing are
     // different facts, and this sink is the only place left to distinguish them.
-    expect(reported).toEqual(['collectOutput() failed: snapshot unavailable'])
+    expect(reported).toEqual(['aborted: collectOutput() failed: snapshot unavailable'])
   })
 
   it('does not reject when collectOutput throws on the CANCELLED failure path', async () => {
@@ -258,7 +258,7 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
         throw new Error('snapshot unavailable')
       },
       cancelled: () => true,
-      onError: (error) => reported.push(error.message),
+      onError: (error, stopReason) => reported.push(`${stopReason}: ${error.message}`),
       signal: wiring.signal,
       onAbort: wiring.onAbort,
     })
@@ -266,7 +266,7 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
     expect(settled.output).toEqual([])
     // The attempt's own failure stays SILENT here (we cancelled it), so the
     // collector failure is the only thing the sink hears about.
-    expect(reported).toEqual(['collectOutput() failed: snapshot unavailable'])
+    expect(reported).toEqual(['aborted: collectOutput() failed: snapshot unavailable'])
   })
 
   it('does not reject when collectOutput throws on the error path', async () => {
@@ -280,13 +280,13 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
         throw new Error('snapshot unavailable')
       },
       cancelled: () => false,
-      onError: (error) => reported.push(error.message),
+      onError: (error, stopReason) => reported.push(`${stopReason}: ${error.message}`),
       signal: wiring.signal,
       onAbort: wiring.onAbort,
     })
     expect(settled.stopReason).toBe('error')
     expect(settled.output).toEqual([])
-    expect(reported).toEqual(['peer exploded', 'collectOutput() failed: snapshot unavailable'])
+    expect(reported).toEqual(['error: peer exploded', 'error: collectOutput() failed: snapshot unavailable'])
   })
 
   it('does not reject when collectDiagnostic throws on the error path', async () => {
@@ -301,7 +301,7 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
         throw new Error('no session to read')
       },
       cancelled: () => false,
-      onError: (error) => reported.push(error.message),
+      onError: (error, stopReason) => reported.push(`${stopReason}: ${error.message}`),
       signal: wiring.signal,
       onAbort: wiring.onAbort,
     })
@@ -309,7 +309,41 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
     // Absent, not an empty string: "there is no diagnostic" and "the diagnostic
     // is blank" are different, and the seam's ceiling applies to the former.
     expect(settled.diagnostic).toBeUndefined()
-    expect(reported).toEqual(['peer exploded', 'collectDiagnostic() failed: no session to read'])
+    expect(reported).toEqual(['error: peer exploded', 'error: collectDiagnostic() failed: no session to read'])
+  })
+
+  it('does not reject when the sink throws while reporting a collector failure', async () => {
+    // Two containments in a row: the collector throws, and the sink told about it
+    // throws too. The second is the one this pins — the report runs inside the
+    // collector's own catch, so a bare sink call there would escape from it and
+    // turn a settled failure into a rejection.
+    const wiring = abortWiring()
+    const seen: Array<{ message: string; cause: unknown }> = []
+    const settled = await settleRunResult({
+      attempt: async () => {
+        throw new Error('peer exploded')
+      },
+      collectOutput: () => {
+        throw new Error('snapshot unavailable')
+      },
+      cancelled: () => false,
+      onError: (error) => {
+        seen.push({ message: error.message, cause: error.cause })
+        throw new Error('sink is broken too')
+      },
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(settled.stopReason).toBe('error')
+    expect(settled.output).toEqual([])
+    expect(seen.map((entry) => entry.message)).toEqual([
+      'peer exploded',
+      'collectOutput() failed: snapshot unavailable',
+    ])
+    // The re-wrap keeps the original as `cause`: this path reads live backend
+    // state, so it is the path an operator will need to investigate, and a
+    // message alone would throw away the stack that says where.
+    expect((seen[1]?.cause as Error).message).toBe('snapshot unavailable')
   })
 
   it('never reads collectDiagnostic when the run was cancelled', async () => {
