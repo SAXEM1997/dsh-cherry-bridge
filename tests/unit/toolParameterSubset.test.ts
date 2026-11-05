@@ -40,9 +40,10 @@ import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.j
  * package on disk, so it is deliberately not part of the suite; the
  * transcription is the arm that runs everywhere.
  *
- * One rule of `checkSchemaNode` is deliberately NOT transcribed: the
- * lossless-JSON check on annotation values. Every annotation this plugin
- * declares is a string literal, so that rule cannot fire here.
+ * Two rules of `checkSchemaNode` are deliberately NOT transcribed, both
+ * because they cannot fire on a declaration a human writes as a literal:
+ * the circular-reference guard, and the lossless-JSON check on annotation
+ * values (every annotation here is a string literal).
  */
 
 // ---------------------------------------------------------------------------
@@ -107,9 +108,12 @@ function scalarMatches(type: string, value: unknown): boolean {
 }
 
 /**
- * Every way `schema` falls outside the host's enforced subset, path-qualified —
- * the same verdicts, in the same shape, as `assertSupportedJsonSchema`'s
- * `JsonSchemaError.violations`.
+ * Every way `schema` falls outside the host's enforced subset, path-qualified.
+ *
+ * The PATHS are the contract — which node is outside the subset, and which
+ * keyword put it there. The diagnostic wording is transcribed verbatim where
+ * this file carries the rule, but it is not itself mirrored: the host's
+ * `JsonSchemaError` message format is not something a plugin should pin.
  */
 function subsetViolations(schema: unknown, path = 'parameters'): string[] {
   if (!isPlainRecord(schema)) return [`${path} must be a schema object`]
@@ -155,7 +159,12 @@ function subsetViolations(schema: unknown, path = 'parameters'): string[] {
 
   const type = schema['type']
   if (typeof type !== 'string' || !(SCHEMA_TYPES as readonly string[]).includes(type)) {
-    return [...violations, `${path}.type must be one of ${SCHEMA_TYPES.join('/')}`]
+    return [
+      ...violations,
+      Array.isArray(type)
+        ? `${path}.type must be a single type string (type arrays are not supported)`
+        : `${path}.type must be one of ${SCHEMA_TYPES.join('/')}`,
+    ]
   }
   for (const [key, types] of Object.entries(KEYWORD_TYPES)) {
     if (Object.hasOwn(schema, key) && !types.includes(type)) {
@@ -335,13 +344,32 @@ describe('issue #219: the host-enforced JSON Schema subset', () => {
         /required names "device" which is not in properties/,
       ],
       ['a misplaced keyword', { type: 'string', properties: {} }, /properties is not supported on type "string"/],
-      ['a type array', { type: ['string', 'null'] }, /type must be one of/],
+      ['a type array', { type: ['string', 'null'] }, /type arrays are not supported/],
+      [
+        'oneOf beside type',
+        { type: 'string', oneOf: [{ type: 'string' }, { type: 'integer' }] },
+        /cannot declare both type and oneOf/,
+      ],
+      [
+        'a oneOf sibling keyword',
+        { oneOf: [{ type: 'string' }, { type: 'integer' }], properties: {} },
+        /properties is not supported beside oneOf/,
+      ],
+      ['a one-element oneOf', { oneOf: [{ type: 'string' }] }, /at least two schemas/],
+      ['a const of the wrong type', { type: 'string', const: 5 }, /const must be a string value/],
+      [
+        'a const outside its own enum',
+        { type: 'string', enum: ['a'], const: 'b' },
+        /const must be one of parameters\.enum when both are declared/,
+      ],
+      ['an empty enum', { type: 'string', enum: [] }, /enum must be a non-empty array of string values/],
     ]
     for (const [why, schema, needle] of rejected) {
       const violations = subsetViolations(schema)
       expect(violations.join('; '), `${why} was accepted`).toMatch(needle)
     }
-    // Positive control: the subset's own keywords, nested, are clean.
+    // Positive controls: the subset's own keywords, nested, are clean — and so
+    // are the four annotations, which the subset accepts on any node.
     expect(
       subsetViolations({
         type: 'object',
@@ -349,6 +377,7 @@ describe('issue #219: the host-enforced JSON Schema subset', () => {
           decision: { type: 'string', enum: ['approve', 'deny'], description: 'card answer' },
           answers: { type: 'object', additionalProperties: true },
           tags: { type: 'array', items: { type: 'string' } },
+          title: { type: 'string', title: 'a title', default: 'x', examples: ['a', 'b'] },
         },
         required: ['decision'],
         additionalProperties: false,
