@@ -108,7 +108,7 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     expect(properties(definition)['device']).toMatchObject({ type: 'string' })
   })
 
-  it('cherry_agents requires device and bounds limit as an AGGREGATE, not a page', () => {
+  it('cherry_agents requires device and declares limit as an AGGREGATE integer, not a page', () => {
     const definition = toolOf('cherry_agents')
     expect(definition.parameters.required).toEqual(['device'])
     expect(properties(definition)['device']).toMatchObject({ type: 'string' })
@@ -116,16 +116,17 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     expect(limit['type']).toBe('integer')
     // The caller's ceiling is the AGGREGATE total: it must admit the brief's
     // 150 (which the tool satisfies with multiple clamped pages), so it is
-    // deliberately NOT the 100-item protocol page cap.
-    expect(limit['maximum']).toBe(1000)
-    expect(limit['minimum']).toBe(1)
+    // deliberately NOT the 100-item protocol page cap. The two NUMBERS are no
+    // longer schema keywords (issue #219: the host's enforced parameter subset
+    // has no `minimum`/`maximum`) — they live in the description, pinned by
+    // `toolParameterSubset.test.ts` #219b.
   })
 
   it('cherry_workspaces requires device and agentId and paginates like the other list tools', () => {
     const definition = toolOf('cherry_workspaces')
     expect(definition.parameters.required).toEqual(['device', 'agentId'])
     expect(Object.keys(properties(definition)).sort()).toEqual(['agentId', 'cursor', 'device', 'limit'])
-    expect(properties(definition)['limit']!['maximum']).toBe(1000)
+    expect(properties(definition)['limit']!['type']).toBe('integer')
   })
 
   it('cherry_sessions requires device and exposes the two filter passthroughs plus the aggregate cap', () => {
@@ -133,14 +134,14 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     expect(definition.parameters.required).toEqual(['device'])
     expect(properties(definition)['agentId']).toMatchObject({ type: 'string' })
     expect(properties(definition)['workspaceId']).toMatchObject({ type: 'string' })
-    expect(properties(definition)['limit']!['maximum']).toBe(1000)
+    expect(properties(definition)['limit']!['type']).toBe('integer')
   })
 
   it('cherry_read requires device and sessionId', () => {
     const definition = toolOf('cherry_read')
     expect(definition.parameters.required).toEqual(['device', 'sessionId'])
     expect(properties(definition)['sessionId']).toMatchObject({ type: 'string' })
-    expect(properties(definition)['limit']!['maximum']).toBe(1000)
+    expect(properties(definition)['limit']!['type']).toBe('integer')
   })
 
   it('cherry_events requires device and sessionId and declares a closed cursor shape', () => {
@@ -161,11 +162,11 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
       expect(keys).not.toContain('nextCursor')
       if (listTools.includes(definition.name)) {
         expect(keys).toContain('cursor')
-        // Issue #70: the token is caller input with a peer-supplied tail, so
-        // the declaration carries the ceiling the parser enforces. The number
-        // is pinned LITERALLY: moving it is a declaration change, not a
-        // refactor.
-        expect(properties(definition)['cursor']).toMatchObject({ type: 'string', maxLength: 4096 })
+        // Issue #70: the token is caller input with a peer-supplied tail. Its
+        // ceiling is TEXT now (issue #219: `maxLength` is outside the host's
+        // enforced parameter subset), enforced by the parser and pinned as a
+        // number by `toolParameterSubset.test.ts` #219b.
+        expect(properties(definition)['cursor']).toMatchObject({ type: 'string' })
       } else if (definition.name !== 'cherry_events') {
         // `cherry_events` has its own cursor OBJECT, declared since Task 8.
         expect(keys).not.toContain('cursor')
@@ -174,11 +175,10 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
   })
 
   it('issue #74: cherry_read bounds its resume token the way the list tools do', () => {
-    // The declaration carries the ceiling the parser enforces. The number is
-    // pinned LITERALLY: moving it is a declaration change, not a refactor.
+    // Same bound, same face: the ceiling is TEXT (issue #219) and the number is
+    // pinned by `toolParameterSubset.test.ts` #219b.
     expect(properties(toolOf('cherry_read'))['messagesResumeCursor']).toMatchObject({
       type: 'string',
-      maxLength: 4096,
     })
   })
 
@@ -244,13 +244,13 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     ])
   })
 
-  it('every read-only tool declares the aggregate limit as an integer within [1, 1000]', () => {
+  it('every read-only tool declares the aggregate limit as an integer', () => {
+    // The BOUNDS moved into the description (issue #219) and are pinned there;
+    // what stays here is the shape the host's parameter subset can carry.
     for (const definition of registerReadOnly()) {
       const limit = properties(definition)['limit']
       if (limit === undefined) continue
       expect(limit['type']).toBe('integer')
-      expect(limit['minimum']).toBe(1)
-      expect(limit['maximum']).toBe(1000)
     }
   })
 
@@ -294,10 +294,12 @@ describe('tool parameter schemas: the complete 14-tool registry (Task 10④)', (
   it('cherry_send requires device/sessionId/text and caps text at the protocol ceiling of 32768', () => {
     const definition = toolOf('cherry_send')
     expect(definition.parameters.required).toEqual(['device', 'sessionId', 'text'])
-    // 32768 is the protocol's `agent.messages.send.text` ceiling: the schema
-    // must state it so an over-long body is refused before the wire rather than
-    // round-tripped into a peer error.
-    expect(properties(definition)['text']).toMatchObject({ type: 'string', maxLength: 32_768 })
+    // 32768 is the protocol's `agent.messages.send.text` ceiling. The tool still
+    // refuses an over-long body BEFORE the wire (`text-too-long`), and the
+    // number is stated in the description because the host's parameter subset
+    // has no `maxLength` (issue #219; pinned by toolParameterSubset.test.ts
+    // #219b).
+    expect(properties(definition)['text']).toMatchObject({ type: 'string' })
   })
 
   it('cherry_cancel REQUIRES expectedExecutionId: a cancel without a target is unrunnable', () => {

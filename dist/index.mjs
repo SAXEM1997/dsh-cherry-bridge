@@ -2812,9 +2812,11 @@ const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 * `<ms>:<uuid>`, the numeric `pageOf` faces a handful of digits, and a future
 * desktop may use something longer — but nothing legitimate comes near this.
 * The bound exists so a hand-built or model-mangled string is refused by a
-* BOUND instead of being split, hashed and carried to the peer, and so both
-* parameters can declare `maxLength` honestly. ONE number for both faces: it
-* bounds caller INPUT, not what a token means.
+* BOUND instead of being split, hashed and carried to the peer. Both parsers
+* enforce it, and both parameter DESCRIPTIONS state it — not a JSON-Schema
+* `maxLength`, which the host's enforced parameter subset does not have (issue
+* #219). ONE number for both faces: it bounds caller INPUT, not what a token
+* means.
 *
 * The emit side enforces it too (#76): a stop point whose token would exceed
 * this is not named at all, because a token this tool refuses to replay is
@@ -5804,6 +5806,16 @@ const MESSAGE_SUMMARIES_PAGE_ITEMS = PAGE_ITEMS_FALLBACK;
 /** The largest MESSAGE aggregate a caller may ask for; the per-page clamp still applies. */
 const MAX_AGGREGATE_LIMIT = 1e3;
 /**
+* The aggregate `limit` bound as TEXT, for the five parameter descriptions.
+*
+* The host's enforced parameter-schema subset has no `minimum`/`maximum` (issue
+* #219), so the numbers a caller needs live in the description — the part a
+* model actually reads — while {@link aggregateLimit} is what enforces them: it
+* CLAMPS, which is why the sentence says clamped rather than refused. ONE
+* sentence for all five faces so the bounds cannot drift apart.
+*/
+const AGGREGATE_LIMIT_BOUNDS = `(default ${PAGE_ITEMS_FALLBACK}, min 1, max ${MAX_AGGREGATE_LIMIT}; values outside that range are clamped)`;
+/**
 * MESSAGE CEILING for the terminal/timeout/idle aggregate (issue #3).
 *
 * These three results are answers to a WAIT, not listings: the caller asked
@@ -6147,6 +6159,12 @@ const TEXT_MAX_LENGTH = 32768;
 const DEFAULT_WAIT_TIMEOUT_MS = 12e4;
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */
 const MIN_WAIT_TIMEOUT_MS = 1;
+/**
+* The wait window as TEXT, shared by `cherry_send` and `cherry_wait` (issue
+* #219: the host's parameter subset has no `minimum`, and the floor is a CLAMP
+* in {@link waitTimeout}, not a refusal).
+*/
+const WAIT_TIMEOUT_DESCRIPTION = `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}; a value below ${MIN_WAIT_TIMEOUT_MS} is raised to ${MIN_WAIT_TIMEOUT_MS}). A default, not a cap.`;
 /**
 * How much EXTRA time a wait ANSWER may spend assembling its content, at most
 * (issue #21). The effective tail is the caller's own window, CLAMPED to
@@ -7377,9 +7395,7 @@ var CherryToolEngine = class {
 					},
 					limit: {
 						type: "integer",
-						minimum: 1,
-						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of agents to return in total across pages (default 100)."
+						description: `Maximum number of agents to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`
 					},
 					cursor: LIST_CURSOR_PARAMETER
 				},
@@ -7424,9 +7440,7 @@ var CherryToolEngine = class {
 					},
 					limit: {
 						type: "integer",
-						minimum: 1,
-						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of workspaces to return in total across pages (default 100)."
+						description: `Maximum number of workspaces to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`
 					},
 					cursor: LIST_CURSOR_PARAMETER
 				},
@@ -7483,9 +7497,7 @@ var CherryToolEngine = class {
 					},
 					limit: {
 						type: "integer",
-						minimum: 1,
-						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of sessions to return in total across pages (default 100)."
+						description: `Maximum number of sessions to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`
 					},
 					cursor: LIST_CURSOR_PARAMETER
 				},
@@ -7536,13 +7548,10 @@ var CherryToolEngine = class {
 					},
 					limit: {
 						type: "integer",
-						minimum: 1,
-						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of messages to return in total across pages (default 100). Distinct from the output budget: the answer may stop earlier with `truncationReason: \"aggregate-bytes\"`, which a larger `limit` does not extend — the resume token, when one is returned, is how older messages are reached."
+						description: `Maximum number of messages to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}. Distinct from the output budget: the answer may stop earlier with \`truncationReason: "aggregate-bytes"\`, which a larger \`limit\` does not extend — the resume token, when one is returned, is how older messages are reached.`
 					},
 					messagesResumeCursor: {
 						type: "string",
-						maxLength: MAX_RESUME_TOKEN_CHARS,
 						description: `A \`messagesResumeCursor\` a previous truncated read (this tool, or cherry_send/cherry_wait) returned: \`"cursor:<peer position>"\` or \`"after:<messageId>"\`. Continues the walk at that stop point instead of at the newest message; \`limit\` bounds what comes back from there. Omit it to read from the newest message. A token this tool did not emit is refused locally, and ${MAX_RESUME_TOKEN_CHARS} characters is the ceiling.`
 					}
 				},
@@ -8185,7 +8194,6 @@ var CherryToolEngine = class {
 					},
 					text: {
 						type: "string",
-						maxLength: TEXT_MAX_LENGTH,
 						description: `The message text, which must not be blank. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling).`
 					},
 					wait: {
@@ -8194,8 +8202,7 @@ var CherryToolEngine = class {
 					},
 					timeoutMs: {
 						type: "integer",
-						minimum: MIN_WAIT_TIMEOUT_MS,
-						description: `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}). A default, not a cap.`
+						description: WAIT_TIMEOUT_DESCRIPTION
 					},
 					commandId: {
 						type: "string",
@@ -8344,8 +8351,7 @@ var CherryToolEngine = class {
 					},
 					timeoutMs: {
 						type: "integer",
-						minimum: MIN_WAIT_TIMEOUT_MS,
-						description: `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}). A default, not a cap.`
+						description: WAIT_TIMEOUT_DESCRIPTION
 					}
 				},
 				required: ["device", "sessionId"],
@@ -8424,9 +8430,7 @@ var CherryToolEngine = class {
 					},
 					limit: {
 						type: "integer",
-						minimum: 1,
-						maximum: MAX_AGGREGATE_LIMIT,
-						description: "Maximum number of interactions to return in total across pages (default 100)."
+						description: `Maximum number of interactions to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`
 					},
 					cursor: LIST_CURSOR_PARAMETER
 				},
@@ -8513,8 +8517,8 @@ var CherryToolEngine = class {
 							},
 							answers: {
 								type: "object",
-								additionalProperties: { type: "string" },
-								description: "Every question text mapped to its answer. Blank answers are refused."
+								additionalProperties: true,
+								description: "Every question text mapped to its answer, each value a string. Blank answers are refused."
 							}
 						},
 						required: ["kind", "answers"],
@@ -10486,7 +10490,6 @@ const LIST_TOKEN_FIELDS = 4;
 /** The `cursor` parameter every list tool shares (issues #65 and #70). */
 const LIST_CURSOR_PARAMETER = {
 	type: "string",
-	maxLength: MAX_RESUME_TOKEN_CHARS,
 	description: `A \`resumeCursor\` a previous TRUNCATED answer of this tool returned: replay it with the SAME device and filters to continue from that stop point (\`limit\` then bounds this answer). A token from another tool, device or filter set is refused locally, and so is a token this account cannot have received intact (the token carries a checksum; ${MAX_RESUME_TOKEN_CHARS} characters is the ceiling).`
 };
 /** Canonical, key-sorted rendering of the caller's filters (undefined keys dropped). */

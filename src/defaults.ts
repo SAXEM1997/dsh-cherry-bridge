@@ -190,9 +190,11 @@ export const LIST_PAGE_CLAMP = 16
  * `<ms>:<uuid>`, the numeric `pageOf` faces a handful of digits, and a future
  * desktop may use something longer — but nothing legitimate comes near this.
  * The bound exists so a hand-built or model-mangled string is refused by a
- * BOUND instead of being split, hashed and carried to the peer, and so both
- * parameters can declare `maxLength` honestly. ONE number for both faces: it
- * bounds caller INPUT, not what a token means.
+ * BOUND instead of being split, hashed and carried to the peer. Both parsers
+ * enforce it, and both parameter DESCRIPTIONS state it — not a JSON-Schema
+ * `maxLength`, which the host's enforced parameter subset does not have (issue
+ * #219). ONE number for both faces: it bounds caller INPUT, not what a token
+ * means.
  *
  * The emit side enforces it too (#76): a stop point whose token would exceed
  * this is not named at all, because a token this tool refuses to replay is
