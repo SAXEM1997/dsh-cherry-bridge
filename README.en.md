@@ -21,7 +21,7 @@ settings page for device and tool-scope management.
 
 ```mermaid
 flowchart TB
-    T["DSH sessions<br/>14 cherry_* tools"] --> P
+    T["DSH sessions<br/>15 cherry_* tools"] --> P
     W["Settings page<br/>devices · pairing · scope"] --> P
     P["dsh-cherry-bridge<br/>pool · subscriptions · scope"]
     P <-->|"ws:// · Noise XX"| C["Cherry Studio desktop<br/>QR pairing · approvals"]
@@ -29,7 +29,7 @@ flowchart TB
 
 - Package: `dsh-cherry-bridge`, plugin id: `cherry-remote`
 - Transport: `ws://` + Noise XX by default (encryption lives in the Noise record layer); a desktop behind a TLS front is reached over `wss://`, with `wsTls` supplying the private-CA trust
-- Tool face: 14 `cherry_*` tools, enabled **per workspace**, and by default **nobody has them** (see “Scope”)
+- Tool face: 15 `cherry_*` tools — the fifteenth, `cherry_subagent`, is the **experimental, off-by-default** cross-desktop delegation (see [Experimental subagent](#experimental-subagent)) — enabled **per workspace**, and by default **nobody has them** (see “Scope”)
 - Settings page and HTTP face: the same-origin prefix `/cherry-remote/api` on the host web server
 
 ## Install
@@ -96,6 +96,7 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | `perSessionCacheBytes` | number | `2097152` (2 MiB) | Per-session cap on the **local** subscription event cache; beyond it events are dropped from the oldest end (FIFO) with a `warn`, but the **newest single event is always kept** — even when it alone exceeds the cap (no drop line is logged then, and the window stays over budget). |
 | `rateBudgetPerSecond` | number | `32` | Per-device smoothed request budget (req/s). The desktop's shared allowance is 64 req/s through 2.1.6 and 256 req/s from 2.1.7, and only the newer generation downgrades an overrun to a single `RATE_LIMITED` refusal (the older one terminates the session with close `1011`) — hence a value sized for the harsher generation. Content reads (`agent.content.read`) derive their own tier at 8:1, **capped at 512/s** (that allowance is the same in both generations). |
 | `wsTls` | object | — | **Flat** `tls.connect` options for every `wss` dial (`rejectUnauthorized` / `ca` only): operator-supplied trust for a desktop behind a private CA or a self-signed TLS front. Applied to BOTH dial sites — pairing and reconnect. **Never written to the device archive, never logged, never in diagnostics.** The whole object applies as written or is ignored entirely: an unknown key or unusable value warns by name and falls back to Node's default trust store (no partial application). |
+| `subagent` | object | — | Profile seed for the experimental subagent (**off by default**). Fields and behaviour: [Experimental subagent](#experimental-subagent). Once the settings page saves a document, `<dataDir>/subagent.json` wins over this key. |
 
 > `wsTls.ca` is **PEM CONTENT** (the certificate text itself), not a file path.
 
@@ -119,6 +120,7 @@ cherry_interactions → see pending question/approval cards; cherry_respond answ
 | `cherry_interactions` | List the session's **pending** interaction cards (questions / approvals). A truncated answer always carries `truncated` + `truncationReason`; when the stop point can be named it also carries a `resumeCursor` — replay it as `cursor` from the same `sessionId` to continue (`limit` counts the peer's pre-filter rows). |
 | `cherry_respond` | Answer an interaction card: questions must be answered in full; approvals take `decision`. |
 | `cherry_cancel` | Cancel the session's in-flight execution (`expectedExecutionId` required). |
+| `cherry_subagent` | Hand a **self-contained** task to a Cherry agent on one paired desktop (**experimental, off by default** — see [Experimental subagent](#experimental-subagent)). The child does not see this conversation and accepts no follow-up messages; the tool returns at once and the runtime notifies you when the run ends. With an absolute `cwd` the answer carries `device` (hand it to `cherry_sessions`), but **no** `cherrySessionId`. |
 | `cherry_pair` | Pair with a desktop using the pairing information shown by the scanned page. |
 | `cherry_unpair` | Unpair: tear the connection down and delete the device archive entry. |
 
@@ -135,6 +137,55 @@ cursor when one can be named), `idle` (`cherry_wait` met a session with nothing
 in flight and returned the snapshot immediately), and `subscription-lost` (the
 subscription was lost and could not be rebuilt, so the outcome is
 **unknowable**; repair guidance ships with it).
+
+## Experimental subagent
+
+> Experimental: this spans two systems the plugin does not control — DSH and Cherry Studio — so its interface and behaviour may change. Off by default.
+>
+> Ideas and bug reports are welcome: [dsh-cherry-bridge issues](https://github.com/SAXEM1997/dsh-cherry-bridge/issues)
+
+Turning it on: the settings page’s “Experimental subagent” block, or the
+`subagent` key in `cordis.patch.yml`:
+
+```yaml
+subagent:
+  enabled: true
+  device: desk-1        # a deviceId, or a prefix that names exactly one device
+  agentId: agent-7      # a Cherry agent id on that device
+  workspaceId: ws-1     # a registered workspace id; use workspaceKind: system instead
+```
+
+**A save or a config edit takes effect when DSH restarts**: the tool is
+registered during assembly, and this plugin does not hot-reload. A save on the
+page writes `<dataDir>/subagent.json` (`0600`, atomic, monotonic `revision`),
+which takes precedence over the profile’s `subagent` key as soon as it exists.
+
+With it on, the model gains one `cherry_subagent` tool: it hands a self-contained
+task to a Cherry agent on that desktop and **returns at once**; the runtime
+notifies the parent when the child’s run ends. The child **does not see this
+conversation** and **accepts no follow-up messages** — everything it needs has to
+be in `prompt`.
+
+The settings page edits `enabled` / `device` / `agentId` / workspace /
+`timeoutMs` (30 minutes by default, `0` means no bound). `providerName`,
+`toolName`, `cwdMode`, `routes` and `maxInteractionAbandons` are only carried
+through — `routes` is shown read-only (it overrides the device and workspace per
+directory prefix), the rest need the config file.
+
+Known limits:
+
+- **One-shot**: no follow-up messages, no cold recovery, no structured output, no
+  progress stream; progress is `cherry_read` after the fact.
+- **No sandbox inheritance**: the child runs under Cherry Studio’s own permission
+  model; DSH’s sandbox and approval UI do not apply.
+- **The child may decline the task**: Cherry agents have their own role
+  boundaries. A refusal is a **normally completed run** whose text is the refusal
+  — not a failure; read the answer before retrying or rewording.
+- **Capacity is unverified**: only 3 concurrent delegations were exercised; a
+  lower ceiling on the Cherry side at higher concurrency is not ruled out.
+
+Like the other `cherry_*` tools it obeys the enabled scope: an excluded workspace
+does not see it.
 
 ## Errors and limits
 
@@ -221,7 +272,7 @@ exporting `./client`). Through the `settings.section` slot it registers a
 (paste → 6-digit code → verdict), a scope panel, and live state pushed over the
 same-origin SSE feed (`/cherry-remote/api/events`).
 
-The 14 tools appear **per workspace**, by **hiding, not refusing** (in an
+The 15 tools appear **per workspace** (the fifteenth, `cherry_subagent`, exists only while the experiment is on and its configuration is usable), by **hiding, not refusing** (in an
 out-of-scope session they never enter the tool table, saving context):
 
 - **Default is nobody**: a missing, corrupt or unreadable scope document is
