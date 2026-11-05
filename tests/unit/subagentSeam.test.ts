@@ -194,6 +194,109 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
     expect(settled.stopReason).toBe('error')
   })
 
+  // The two COLLECTORS are the last thing that can break the never-rejecting
+  // contract: `onError` is contained, but `collectOutput()` and
+  // `collectDiagnostic?.()` were not, and `externalRunHandle` passes the result
+  // promise straight through with no `.catch` of its own. A provider reads live
+  // backend state in both, so a throw is a real possibility. Each call site gets
+  // its own case, because a single test cannot pin four separate guards.
+  it('does not reject when collectOutput throws on the CANCELLED success path', async () => {
+    const wiring = abortWiring()
+    const reported: string[] = []
+    // A `cancelled()` that is true exactly ONCE, which is what SEPARATES this
+    // path's guard from the catch's. Without the guard the throw escapes into
+    // the catch, which re-reads `cancelled()`, finds false, and settles the run
+    // as `error` — flipping a verdict the parent already caused. With the guard
+    // the catch is never reached at all, so `cancelled()` is read exactly once.
+    //
+    // A plain `() => true` here would make the two guards INDISTINGUISHABLE
+    // (both settle `aborted` with `[]`), and the guard would be untested — the
+    // mutation that deletes it survived against exactly that shape.
+    let reads = 0
+    const settled = await settleRunResult({
+      attempt: async () => completedResult('late answer nobody is listening for'),
+      collectOutput: () => {
+        throw new Error('snapshot unavailable')
+      },
+      cancelled: () => reads++ === 0,
+      onError: (error) => reported.push(error.message),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(reads).toBe(1)
+    expect(settled.stopReason).toBe('aborted')
+    expect(settled.output).toEqual([])
+    // The throw is REPORTED, not swallowed: an empty output from a broken
+    // collector and an empty output from a child that produced nothing are
+    // different facts, and this sink is the only place left to distinguish them.
+    expect(reported).toEqual(['collectOutput() failed: snapshot unavailable'])
+  })
+
+  it('does not reject when collectOutput throws on the CANCELLED failure path', async () => {
+    const wiring = abortWiring()
+    const reported: string[] = []
+    const settled = await settleRunResult({
+      attempt: async () => {
+        throw new Error('aborted by transport')
+      },
+      collectOutput: () => {
+        throw new Error('snapshot unavailable')
+      },
+      cancelled: () => true,
+      onError: (error) => reported.push(error.message),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(settled.stopReason).toBe('aborted')
+    expect(settled.output).toEqual([])
+    // The attempt's own failure stays SILENT here (we cancelled it), so the
+    // collector failure is the only thing the sink hears about.
+    expect(reported).toEqual(['collectOutput() failed: snapshot unavailable'])
+  })
+
+  it('does not reject when collectOutput throws on the error path', async () => {
+    const wiring = abortWiring()
+    const reported: string[] = []
+    const settled = await settleRunResult({
+      attempt: async () => {
+        throw new Error('peer exploded')
+      },
+      collectOutput: () => {
+        throw new Error('snapshot unavailable')
+      },
+      cancelled: () => false,
+      onError: (error) => reported.push(error.message),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(settled.stopReason).toBe('error')
+    expect(settled.output).toEqual([])
+    expect(reported).toEqual(['peer exploded', 'collectOutput() failed: snapshot unavailable'])
+  })
+
+  it('does not reject when collectDiagnostic throws on the error path', async () => {
+    const wiring = abortWiring()
+    const reported: string[] = []
+    const settled = await settleRunResult({
+      attempt: async () => {
+        throw new Error('peer exploded')
+      },
+      collectOutput: () => [],
+      collectDiagnostic: () => {
+        throw new Error('no session to read')
+      },
+      cancelled: () => false,
+      onError: (error) => reported.push(error.message),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(settled.stopReason).toBe('error')
+    // Absent, not an empty string: "there is no diagnostic" and "the diagnostic
+    // is blank" are different, and the seam's ceiling applies to the former.
+    expect(settled.diagnostic).toBeUndefined()
+    expect(reported).toEqual(['peer exploded', 'collectDiagnostic() failed: no session to read'])
+  })
+
   it('clips a provider diagnostic to the seam byte ceiling without splitting a character', async () => {
     // The host caps `diagnostic` at 4096 UTF-8 BYTES. A Chinese character is
     // three bytes, so a character-count clip would overshoot by 3x — and a
