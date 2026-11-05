@@ -140,11 +140,33 @@ function scopeSnapshot(): Response {
   })
 }
 
+/**
+ * The `GET /cherry-remote/api/subagent` answer every render path needs (#233).
+ *
+ * `App` also mounts the experimental subagent panel, which reads on mount. With
+ * no answer here the mock throws, the panel renders its `role="alert"` load
+ * error, and every case that asks for `screen.getByRole('alert')` suddenly finds
+ * TWO alerts — the exact failure this entry removes. Same discipline as
+ * `scopeSnapshot`: default last, built fresh per harness (a body reads once).
+ */
+function subagentSnapshot(): Response {
+  return jsonResponse(200, {
+    subagent: { revision: 0 },
+    source: 'config',
+    status: { state: 'pending', reason: { code: 'disabled' } },
+    pendingRestart: false,
+  })
+}
+
 function installFetch(responses: Array<[string, string, Response]>): Harness {
   const calls: FetchCall[] = []
   const order: string[] = []
   let counter = 0
-  const table: Array<[string, string, Response]> = [...responses, ['GET', '/cherry-remote/api/scope', scopeSnapshot()]]
+  const table: Array<[string, string, Response]> = [
+    ...responses,
+    ['GET', '/cherry-remote/api/scope', scopeSnapshot()],
+    ['GET', '/cherry-remote/api/subagent', subagentSnapshot()],
+  ]
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     const method = (init?.method ?? 'GET').toUpperCase()

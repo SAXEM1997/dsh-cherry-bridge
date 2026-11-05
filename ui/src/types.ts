@@ -312,3 +312,120 @@ export const STATE_KEYS: Record<DeviceState, string> = {
   disabled: 'device.state.disabled',
   'identity-mismatch': 'device.state.identity-mismatch',
 }
+
+// ---------------------------------------------------------------------------
+// The experimental subagent face (#233)
+// ---------------------------------------------------------------------------
+
+/**
+ * The shape the server reports for a config value that arrived unusable.
+ *
+ * Mirrors `ReceivedShape` in `src/subagent.ts`. It is a CLOSED set because the
+ * page translates it: rendering a raw `typeof` result inside a Chinese sentence
+ * is the mixed-language page these codes exist to remove. A value outside this
+ * set (a newer server) falls back to the token itself rather than throwing.
+ */
+export type ReceivedShape =
+  | 'string'
+  | 'number'
+  | 'boolean'
+  | 'object'
+  | 'array'
+  | 'null'
+  | 'undefined'
+  | 'function'
+  | 'symbol'
+  | 'bigint'
+  | 'NaN'
+  | 'Infinity'
+  | '-Infinity'
+
+/**
+ * One reason the configuration is unusable, as the server sends it: a code plus
+ * its parameters, never a sentence.
+ *
+ * The page owns the wording (`subagent.problem.*`). Keeping the split here is
+ * what lets the same document be shown in two languages, and it is why these
+ * arms are exact rather than one bag of optional fields.
+ */
+export type SubagentProblem =
+  | {
+      code: 'not-string' | 'not-boolean' | 'not-array' | 'not-object'
+      field: string
+      received: ReceivedShape
+    }
+  | { code: 'empty' | 'missing' | 'route-cwd-prefix'; field: string }
+  | { code: 'out-of-range'; field: string; min: number; max: number; received: ReceivedShape }
+  | { code: 'enum'; field: string; allowed: string[]; received: ReceivedShape }
+  | { code: 'exclusive'; field: string; other: string }
+
+/** Why the provider is registered but the model-facing tool is not. */
+export type SubagentToolProblem =
+  | { code: 'no-tools-service' }
+  | { code: 'no-start-activation' }
+  | { code: 'no-step-condition' }
+  | { code: 'host-refused'; message: string }
+
+/**
+ * Why the subsystem is in the state it is.
+ *
+ * `unsupported` and `failed` are the pair the page must NOT collapse: one is a
+ * host this operator cannot change, the other is a typo they can fix on the
+ * same screen.
+ */
+export type SubagentStatusReason =
+  | { code: 'disabled' | 'awaiting-injection' | 'unsupported' }
+  | { code: 'invalid'; problems: SubagentProblem[] }
+  | { code: 'provider-refused'; message: string }
+  | { code: 'ready'; providerName: string; toolName: string }
+  | { code: 'ready-without-tool'; providerName: string; toolName: string; problem: SubagentToolProblem }
+
+/** `SubagentHost.status()`, as `GET /subagent` echoes it. */
+export interface SubagentStatus {
+  state: 'pending' | 'unsupported' | 'failed' | 'ready'
+  reason: SubagentStatusReason
+}
+
+/**
+ * The stored configuration document — `SubagentConfig` in `src/subagent.ts`.
+ *
+ * Every field is optional because the document is a draft: the switch is what
+ * decides, and a half-written target behind a closed switch is not an error.
+ * `revision` is the server's lock, not a field the page edits.
+ */
+export interface SubagentConfig {
+  enabled?: boolean
+  providerName?: string
+  toolName?: string
+  device?: string
+  agentId?: string
+  workspaceId?: string
+  workspaceKind?: 'system'
+  cwdMode?: 'isolated' | 'shared'
+  timeoutMs?: number
+  maxInteractionAbandons?: number
+  revision?: number
+}
+
+/** The whole `GET /cherry-remote/api/subagent` body. */
+export interface SubagentResponse {
+  /** The document as an object, always, even when the stored value was not one. */
+  subagent: SubagentConfig & { revision: number }
+  /** `config` = the profile seed; `file` = the document this page saves. */
+  source: 'file' | 'config'
+  /** What the RUNNING assembly decided — not what the stored document implies. */
+  status: SubagentStatus
+  /** True while the stored document's decision differs from the running one. */
+  pendingRestart: boolean
+}
+
+/** The read-modify-write body `PUT /subagent` accepts. */
+export interface SubagentSaveRequest extends SubagentConfig {
+  expectedRevision: number
+}
+
+/** The panel's HTTP seam: the default is the same-origin client, tests inject a stub. */
+export interface SubagentClient {
+  get(): Promise<SubagentResponse>
+  put(body: SubagentSaveRequest): Promise<SubagentResponse>
+}

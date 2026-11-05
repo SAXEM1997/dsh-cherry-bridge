@@ -16,6 +16,9 @@ import type {
   ScopeResponse,
   ScopeSaveRequest,
   ScopeSaveResult,
+  SubagentClient,
+  SubagentResponse,
+  SubagentSaveRequest,
 } from './types'
 
 /** A refused call, carrying the server's structured error verbatim. */
@@ -224,4 +227,36 @@ export async function putScope(body: ScopeSaveRequest): Promise<ScopeSaveResult>
 export const defaultScopeClient: ScopeClient = {
   get: () => getScope(),
   put: (body) => putScope(body),
+}
+
+/**
+ * `GET /subagent` — the experiment's stored configuration and the RUNNING verdict.
+ *
+ * Two facts, one body, deliberately: the page must be able to show "saved, not
+ * applied" without a second call, and a second call could be answered between
+ * two different applies.
+ */
+export async function getSubagent(): Promise<SubagentResponse> {
+  const body = await request(`${API_BASE}/subagent`)
+  return body as SubagentResponse
+}
+
+/**
+ * `PUT /subagent` — read-modify-write, locked on `expectedRevision`.
+ *
+ * The refusal codes are the route's, and the caller branches on them:
+ * `invalid-request` / `missing-expected-revision` (400),
+ * `subagent-revision-conflict` (409). `invalid-request` covers a body that is
+ * not JSON at all; a config FIELD that is unusable is not a refusal — it is
+ * stored, and the next read reports it as a `failed` verdict with its problems.
+ */
+export async function putSubagent(body: SubagentSaveRequest): Promise<SubagentResponse> {
+  const result = await request(`${API_BASE}/subagent`, { method: 'PUT', body: JSON.stringify(body) })
+  return result as SubagentResponse
+}
+
+/** The production {@link SubagentClient}: the two same-origin calls above. */
+export const defaultSubagentClient: SubagentClient = {
+  get: () => getSubagent(),
+  put: (body) => putSubagent(body),
 }
