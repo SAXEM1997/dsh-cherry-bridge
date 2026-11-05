@@ -689,6 +689,34 @@ describe('SessionSubscriptions over a real loopback channel', () => {
     expect(rig.subs.read('s1', rig.subs.windowStart('s1')!)).toEqual({ error: 'cursor-out-of-window' })
   })
 
+  it('#221 keeps the NEWEST event when it ALONE exceeds perSessionCacheBytes', async () => {
+    // A budget below one event's size (an operator setting, not a peer one).
+    // Dropping from the oldest end until the window fits therefore reaches the
+    // NEWEST event and evicts it too, leaving an EMPTY window: the event that
+    // just happened is exactly what a reader wants, and `windowStart` has
+    // advanced past it, so every read from the baseline answers
+    // cursor-out-of-window about content that was held a moment ago.
+    const rig = await makeRig({}, { perSessionCacheBytes: 2_048 })
+    await rig.subs.ensure('s1')
+    const filler = 'x'.repeat(4_000)
+    rig.fake.pushEvent('s1', { kind: 'execution.updated', payload: { tag: 'only', filler } })
+    await waitFor(() => rig.subs.cursorOf('s1')?.seq === '1', 3_000, 'the event cached')
+
+    const read = rig.subs.read('s1')
+    if (!('events' in read)) throw new Error('expected events')
+    expect(read.events).toHaveLength(1)
+    expect((read.events[0]!.payload as unknown as { tag: string }).tag).toBe('only')
+
+    // NOTHING was dropped, so the baseline is still a servable resume point —
+    // the boundary moved only when events really were discarded.
+    const fromBaseline = rig.subs.read('s1', cursor('s1', 0))
+    if (!('events' in fromBaseline)) throw new Error('the baseline must still be servable')
+    expect(fromBaseline.events).toHaveLength(1)
+
+    // And the eviction line must not claim a drop that did not happen.
+    expect(consoleWarn.mock.calls.flat().map(String).some((message) => /dropped .* oldest/i.test(message))).toBe(false)
+  })
+
   it('⑬ acknowledges the delivered cursor to the peer', async () => {
     const rig = await makeRig()
     await rig.subs.ensure('s1')
