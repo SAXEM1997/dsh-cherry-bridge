@@ -679,10 +679,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     /** The ctx the scope subsystem's injection callback receives. */
     const injected = {
       agents: { list: () => live },
-      // Never empty: `setWorkspaces([])` is a read FAILURE, which would make the
-      // judgement fail-closed for a different reason than the one under test.
+      // EMPTY unless a live agent was asked for, so no existing case changes what
+      // it observes. A read `[]` is a read FAILURE (`setWorkspaces`), and ⑳i
+      // needs a READABLE list — otherwise the judgement would be fail-closed for
+      // a different reason than the one under test.
       workspaceRegistry: {
-        list: () => [{ id: 'OTHER', title: 'Other', path: '/w/other' }],
+        list: () => (live.length === 0 ? [] : [{ id: 'OTHER', title: 'Other', path: '/w/other' }]),
         resolveByPath: async () => undefined,
       },
       effect(cb: () => () => void) {
