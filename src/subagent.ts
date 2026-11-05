@@ -1082,3 +1082,26 @@ export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
     },
   }
 }
+
+/**
+ * Whether two resolutions are the SAME decision.
+ *
+ * Compared as JSON, which is sound here and only here: {@link resolveSubagentConfig}
+ * is the sole producer of these objects and builds `config` in ONE object
+ * literal, so equal values always serialize identically. A second producer, or a
+ * field whose insertion order varies, would break the comparison silently —
+ * which is why this note is part of the contract rather than a remark about a
+ * helper.
+ *
+ * Its one caller is the settings page's "restart required" flag (#233): a saved
+ * document whose decision differs from the one this apply resolved is a change
+ * that has not taken effect, while one that matches needs no restart. Saying
+ * "restart to apply" unconditionally would be a lie in the case that matters
+ * most — the operator who saved, restarted, and is now looking at the page.
+ */
+export function sameSubagentResolution(
+  a: SubagentConfigResolution,
+  b: SubagentConfigResolution,
+): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}

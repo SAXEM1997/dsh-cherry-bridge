@@ -16,7 +16,9 @@ import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
 import { ToolScopeState } from './toolScope.js'
 import { CherryToolEngine } from './tools.js'
 import { resolveSubagentConfig } from './subagent.js'
-import type { SubagentConfig } from './subagent.js'
+import type { SubagentConfig, SubagentConfigResolution } from './subagent.js'
+import { createSubagentConfigDocument } from './subagentConfigStore.js'
+import type { SubagentConfigDocument } from './subagentConfigStore.js'
 import { createSubagentHost } from './subagentHost.js'
 import type { SubagentHost, SubagentHostContext } from './subagentHost.js'
 import { createToolScopeHost, registerAtomically } from './toolScopeHost.js'
@@ -326,6 +328,22 @@ interface AssemblyState {
    */
   subagents?: SubagentHost
   /**
+   * The experiment's configuration document for THIS apply (#233).
+   *
+   * Read ONCE, at assembly: the switch decides which registrations happen, so a
+   * per-request read could not change them — and the settings page's PUT writes
+   * this document for the NEXT apply, which is why the route reports whether a
+   * restart is still owed rather than pretending to hot-reload.
+   */
+  subagentConfig: SubagentConfigDocument
+  /**
+   * The decision this apply made from that document, or `undefined` before it
+   * resolved. The settings page compares it with the SAVED document to answer
+   * "does this need a restart" — the one comparison a page cannot make itself
+   * without a second copy of the resolver.
+   */
+  subagentResolution?: SubagentConfigResolution
+  /**
    * The scope document's in-memory authority — the ONE owner of the document,
    * the degradation set, the judgement generation and the installed-layer
    * records (spec §6.1). `apply` replaces this placeholder with the instance
@@ -420,6 +438,10 @@ const state: AssemblyState = {
   // can read them, and `refreshScope` has no round to run until it does.
   scope: new ToolScopeState({ file: join(tmpdirFallback(), 'scope.json') }),
   refreshScope: () => undefined,
+  subagentConfig: createSubagentConfigDocument({
+    file: join(tmpdirFallback(), 'subagent.json'),
+    seed: undefined,
+  }),
   identity: undefined,
   identityError: undefined,
   rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
@@ -806,6 +828,25 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
     scope: state.scope,
     refreshScope: () => state.refreshScope(),
     /**
+     * The experiment's two faces (#233) — the document the settings page edits
+     * and the verdict the assembly reached from it.
+     *
+     * Every member is LAZY: this deps object is built before the subsystem is
+     * mounted, so a captured `state.subagents` would be the one from before the
+     * mount. `status()`'s fallback is what the host itself answers before its
+     * mount (`pending` + `awaiting-injection`), not an invented state — and a
+     * served request cannot observe that window, since `apply` finishes before
+     * the web server can dispatch.
+     */
+    subagent: {
+      document: {
+        read: () => state.subagentConfig.read(),
+        save: (body, expectedRevision) => state.subagentConfig.save(body, expectedRevision),
+      },
+      status: () => state.subagents?.status() ?? { state: 'pending', reason: { code: 'awaiting-injection' } },
+      running: () => state.subagentResolution,
+    },
+    /**
      * The pairing seam, shared by `cherry_pair` and `POST /pair`.
      *
      * The HTTP face's `pair` signature is `PairWithPayloadOptions` — it names
@@ -992,6 +1033,16 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   state.scope = scope
   state.refreshScope = () => host.refresh()
 
+  // The experiment's document (#233), bound to THIS apply's data directory
+  // before any face reads it. The profile's `subagent` key rides in as the SEED:
+  // an operator who configured YAML keeps working, and the first save from the
+  // settings page takes over from it.
+  state.subagentConfig = createSubagentConfigDocument({
+    file: join(dataDir, 'subagent.json'),
+    seed: config.subagent,
+    log: (message) => console.warn(message),
+  })
+
   const deps = assemblyDeps()
   // `registerHttpApi` owns the headless degradation (warn + skip) and the route
   // disposer. The TOOL registrations deliberately have no seat here: they are
@@ -1035,7 +1086,8 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // Resolved BEFORE the scope host because the scope host needs the delegation
   // tool's NAME: the experiment is configured, and `toolName` is one of its
   // fields, so the governed list cannot be a module constant.
-  const subagentResolution = resolveSubagentConfig(config.subagent)
+  const subagentResolution = resolveSubagentConfig(state.subagentConfig.read().document)
+  state.subagentResolution = subagentResolution
   const host = createToolScopeHost({
     scope,
     // The SCOPE list, not the registration list: it carries the experimental

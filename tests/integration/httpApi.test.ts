@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DeviceStore, QuarantinedArchiveError } from '../../src/deviceStore.js'
@@ -11,6 +11,10 @@ import type { DeviceState } from '../../src/connection.js'
 import { isTrustedWebRequest, registerHttpApi, resolveTrustedHosts } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
 import { ToolScopeState } from '../../src/toolScope.js'
+import { resolveSubagentConfig } from '../../src/subagent.js'
+import type { SubagentConfigResolution } from '../../src/subagent.js'
+import { createSubagentConfigDocument } from '../../src/subagentConfigStore.js'
+import type { SubagentSubsystemStatus } from '../../src/subagentHost.js'
 import { LOG_TEXT_MAX } from '../../src/text.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
@@ -2224,6 +2228,123 @@ describe('⑧ quarantined archive', () => {
 // The real plugin assembly (index.ts apply): minimal M2 wiring
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ⑩ the experiment's document (#233)
+// ---------------------------------------------------------------------------
+
+/**
+ * The switch is only a switch if it PERSISTS and its effect is stated honestly.
+ * The subsystem mounts once per apply (`#231`), so a save cannot re-register the
+ * provider; the route says whether a restart is still owed instead of pretending
+ * `status` changed. These cases pin the transport, the lock and that one word.
+ */
+describe('⑩ the experiment’s document (#233)', () => {
+  const ENABLED = { enabled: true, device: 'desk-1', agentId: 'agent-7', workspaceId: 'ws-1' }
+
+  /** The deps slice the two routes need, over a REAL document in the test's dataDir. */
+  function experiment(options: { seed?: unknown; running?: SubagentConfigResolution } = {}): NonNullable<
+    CherryHttpDeps['subagent']
+  > {
+    return {
+      document: createSubagentConfigDocument({ file: join(dataDir, 'subagent.json'), seed: options.seed }),
+      running: () => options.running,
+      status: (): SubagentSubsystemStatus => ({ state: 'pending', reason: { code: 'disabled' } }),
+    }
+  }
+
+  it('⑩a GET answers the document, its source and the running verdict', async () => {
+    mount({ subagent: experiment() })
+    const { status, json } = await call('/subagent')
+    expect(status).toBe(200)
+    // One whole-object comparison: the page has ONE shape to render, and an
+    // extra field here is an extra field the page would silently ignore.
+    expect(json).toEqual({
+      subagent: { revision: 0 },
+      source: 'config',
+      status: { state: 'pending', reason: { code: 'disabled' } },
+      pendingRestart: false,
+    })
+  })
+
+  it('⑩b PUT stores the document, bumps the revision, and the GET reads it back', async () => {
+    mount({ subagent: experiment() })
+    const saved = await call('/subagent', {
+      method: 'PUT',
+      body: JSON.stringify({ ...ENABLED, expectedRevision: 0 }),
+    })
+    expect(saved.status).toBe(200)
+    // `expectedRevision` is the LOCK and must not land in the document: it is
+    // not a config field, and a page that read it back would echo it forever.
+    expect(saved.json.subagent).toEqual({ ...ENABLED, revision: 1 })
+    expect(saved.json.source).toBe('file')
+
+    const reread = await call('/subagent')
+    expect(reread.json.subagent).toEqual({ ...ENABLED, revision: 1 })
+    expect(JSON.parse(readFileSync(join(dataDir, 'subagent.json'), 'utf8'))).toEqual({
+      ...ENABLED,
+      revision: 1,
+    })
+
+    // A SECOND save quoting the revision the first one returned must succeed. A
+    // route that dropped the caller's baseline (or pinned it to 0) would refuse
+    // every save after the first — the switch would be stuck at whatever the
+    // first save wrote, and no assertion above would notice.
+    const second = await call('/subagent', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled: false, expectedRevision: reread.json.subagent.revision }),
+    })
+    expect(second.status).toBe(200)
+    expect(second.json.subagent).toEqual({ enabled: false, revision: 2 })
+  })
+
+  it('⑩c a stale baseline is a 409 and the document does not move', async () => {
+    mount({ subagent: experiment() })
+    await call('/subagent', { method: 'PUT', body: JSON.stringify({ ...ENABLED, expectedRevision: 0 }) })
+    const stale = await call('/subagent', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled: false, expectedRevision: 0 }),
+    })
+    expect(stale.status).toBe(409)
+    expect(stale.json.error).toBe('subagent-revision-conflict')
+    expect(stale.json.message).toContain('revision=1')
+    const reread = await call('/subagent')
+    expect(reread.json.subagent).toEqual({ ...ENABLED, revision: 1 })
+  })
+
+  it('⑩d `pendingRestart` follows the DIFFERENCE between saved and running', async () => {
+    // Saved `enabled: true`, running `disabled`: the save has not taken effect.
+    mount({ subagent: experiment({ running: { kind: 'disabled' } }) })
+    const saved = await call('/subagent', {
+      method: 'PUT',
+      body: JSON.stringify({ ...ENABLED, expectedRevision: 0 }),
+    })
+    expect(saved.json.pendingRestart).toBe(true)
+    // The running VERDICT is unchanged by a save — that is the honesty the flag
+    // exists for: it must not look applied.
+    expect(saved.json.status).toEqual({ state: 'pending', reason: { code: 'disabled' } })
+
+    // The same document, already resolved by the assembly: nothing is owed. A
+    // page that always said "restart to apply" would be wrong exactly here.
+    mount({ subagent: experiment({ running: resolveSubagentConfig({ ...ENABLED, revision: 1 }) }) })
+    const applied = await call('/subagent')
+    expect(applied.json.pendingRestart).toBe(false)
+  })
+
+  it('⑩e an assembly with no experiment 404s, and a refused method never touches the document', async () => {
+    mount()
+    expect((await call('/subagent')).status).toBe(404)
+
+    mount({ subagent: experiment() })
+    expect((await call('/subagent', { method: 'DELETE' })).status).toBe(405)
+    // A body that is not a JSON object is the body-level refusal, not a config
+    // verdict: it must not wear a field's code.
+    const bad = await call('/subagent', { method: 'PUT', body: JSON.stringify([ENABLED]) })
+    expect(bad.status).toBe(400)
+    expect(bad.json.error).toBe('invalid-request')
+    expect(existsSync(join(dataDir, 'subagent.json'))).toBe(false)
+  })
+})
+
 describe('plugin assembly (index.ts apply)', () => {
   interface AssemblyCtx {
     /** The same FakeWebServer the unit-level tests drive, so `call` works. */
@@ -2344,6 +2465,48 @@ describe('plugin assembly (index.ts apply)', () => {
     expect(ctx.effects).toHaveLength(1)
     ctx.effects[0]!()
     expect(ctx.server.routes.size).toBe(0)
+  })
+
+  it('serves the experiment’s document from the REAL assembly, and notices a save that has not applied (#233)', async () => {
+    // The route's unit cases above supply their own deps, so they cannot tell
+    // `running: () => state.subagentResolution` from `running: () => undefined`.
+    // This case drives the real `apply`, and the ONLY observation that
+    // distinguishes the two is the flip to `pendingRestart: true` after a save
+    // that differs from what the assembly resolved.
+    const index = await import('../../src/index.js')
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, {
+      dataDir,
+      subagent: { enabled: true, device: 'desk-1', agentId: 'agent-7', workspaceId: 'ws-1' },
+    })
+
+    const first = await call('/subagent', {}, ctx.server)
+    expect(first.status).toBe(200)
+    // The profile's key is the SEED until the page saves, and this host has no
+    // `subagents` service, so the verdict is the honest "host too old".
+    expect(first.json.source).toBe('config')
+    expect(first.json.subagent).toEqual({
+      enabled: true,
+      device: 'desk-1',
+      agentId: 'agent-7',
+      workspaceId: 'ws-1',
+      revision: 0,
+    })
+    expect(first.json.status).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+    expect(first.json.pendingRestart).toBe(false)
+
+    const saved = await call(
+      '/subagent',
+      { method: 'PUT', body: JSON.stringify({ enabled: false, expectedRevision: 0 }) },
+      ctx.server,
+    )
+    expect(saved.status).toBe(200)
+    expect(saved.json.pendingRestart).toBe(true)
+    expect(saved.json.source).toBe('file')
+    // And the RUNNING verdict is untouched by the save: a route that reported
+    // the saved document's decision here would be claiming a hot reload.
+    expect(saved.json.status).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+    ctx.effects[0]?.()
   })
 
   it('does not adopt connections from a previous apply against another archive', async () => {
