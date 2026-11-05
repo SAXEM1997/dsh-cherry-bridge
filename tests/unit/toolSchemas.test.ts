@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { DeviceStore } from '../../src/deviceStore.js'
-import { registerCherryTools } from '../../src/tools.js'
-import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.js'
+import type { CherryToolDefinition } from '../../src/tools.js'
+import { properties, registerAll, toolOf } from '../helpers/cherryRegistry.js'
 
 /**
  * Task 8⑧ + Task 10④: literal JSON Schema validation for the WHOLE `cherry_*`
@@ -43,49 +42,9 @@ const MANAGEMENT_TOOLS = ['cherry_pair', 'cherry_unpair'] as const
 /** The complete `cherry_*` registry, in registration order. */
 const ALL_TOOLS = [...READ_TOOLS, ...INTERACTIVE_TOOLS, ...MANAGEMENT_TOOLS] as const
 
-/** The full registry, read-only tools first. */
-function registerAll(): CherryToolDefinition[] {
-  const definitions: CherryToolDefinition[] = []
-  const ctx: CherryToolsContext = {
-    tools: {
-      register(definition) {
-        definitions.push(definition)
-        return () => {}
-      },
-    },
-  }
-  registerCherryTools(ctx, {
-    store: new DeviceStore('/nonexistent/devices.json'),
-    connect: () => {
-      throw new Error('the schema suite never connects')
-    },
-    subs: () => {
-      throw new Error('the schema suite never subscribes')
-    },
-    pair: async () => {
-      throw new Error('the schema suite never pairs')
-    },
-    evict: () => {
-      throw new Error('the schema suite never evicts')
-    },
-  })
-  return definitions
-}
-
 /** Just the six read-only definitions THIS suite owns. */
 function registerReadOnly(): CherryToolDefinition[] {
   return registerAll().filter((definition) => (READ_TOOLS as readonly string[]).includes(definition.name))
-}
-
-function toolOf(name: string): CherryToolDefinition {
-  const found = registerAll().find((definition) => definition.name === name)
-  if (found === undefined) throw new Error(`tool ${name} is not registered`)
-  return found
-}
-
-/** The declared property map of one tool's parameter schema. */
-function properties(definition: CherryToolDefinition): Record<string, Record<string, unknown>> {
-  return definition.parameters.properties as unknown as Record<string, Record<string, unknown>>
 }
 
 describe('tool parameter schemas: the six read-only tools', () => {  it('registers exactly the six read-only tools, each with a literal object-root schema', () => {

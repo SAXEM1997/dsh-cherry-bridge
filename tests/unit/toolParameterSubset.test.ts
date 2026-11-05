@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { DeviceStore } from '../../src/deviceStore.js'
-import { registerCherryTools } from '../../src/tools.js'
 import { createCherrySubagentTool } from '../../src/subagentTool.js'
-import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.js'
+import type { CherryToolDefinition } from '../../src/tools.js'
+import { properties, registerAll, toolOf } from '../helpers/cherryRegistry.js'
 
 /**
  * Issue #219: every `parameters` schema stays inside the JSON Schema subset the
@@ -232,35 +231,6 @@ function subsetViolations(schema: unknown, path = 'parameters'): string[] {
 // The registry under test
 // ---------------------------------------------------------------------------
 
-/** The complete `cherry_*` registry, read from the definitions the host receives. */
-function registerAll(): CherryToolDefinition[] {
-  const definitions: CherryToolDefinition[] = []
-  const ctx: CherryToolsContext = {
-    tools: {
-      register(definition) {
-        definitions.push(definition)
-        return () => {}
-      },
-    },
-  }
-  registerCherryTools(ctx, {
-    store: new DeviceStore('/nonexistent/devices.json'),
-    connect: () => {
-      throw new Error('the subset suite never connects')
-    },
-    subs: () => {
-      throw new Error('the subset suite never subscribes')
-    },
-    pair: async () => {
-      throw new Error('the subset suite never pairs')
-    },
-    evict: () => {
-      throw new Error('the subset suite never evicts')
-    },
-  })
-  return definitions
-}
-
 /**
  * The FIFTEENTH tool: `cherry_subagent`, registered by the subagent subsystem
  * rather than by `registerCherryTools` (issue #232).
@@ -276,17 +246,6 @@ function subagentTool(): CherryToolDefinition {
     resolveDevice: () => 'desk-1',
     startActivation: async () => ({ childId: 'child' }),
   })
-}
-
-/** The declared property map of one tool's parameter schema. */
-function properties(definition: CherryToolDefinition): Record<string, Record<string, unknown>> {
-  return definition.parameters.properties as unknown as Record<string, Record<string, unknown>>
-}
-
-function toolOf(name: string): CherryToolDefinition {
-  const found = registerAll().find((definition) => definition.name === name)
-  if (found === undefined) throw new Error(`tool ${name} is not registered`)
-  return found
 }
 
 // ---------------------------------------------------------------------------
