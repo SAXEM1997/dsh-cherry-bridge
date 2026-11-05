@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { resolveSubagentConfig } from '../../src/subagent.js'
 import { createSubagentHost } from '../../src/subagentHost.js'
 import type { SubagentHostContext, SubagentsService } from '../../src/subagentHost.js'
@@ -76,17 +76,32 @@ function fakeService(options: { refuse?: Error; noActivation?: boolean } = {}): 
   return service
 }
 
-/** A stand-in `ctx.tools`: registration and release, nothing else. */
+/** The step-time context `ctx.tools.register`'s `when` receives (host shape). */
+type ActivationContext = { agent: { id: string } }
+
+/** A stand-in `ctx.tools`: registration, its activation condition, and release. */
 function fakeTools(options: { refuse?: Error } = {}): {
   readonly definitions: CherryToolDefinition[]
-  register(definition: CherryToolDefinition): () => void
+  /**
+   * The SECOND argument each registration carried, positionally. `undefined` at
+   * an index means that call was made with one argument — the distinction a
+   * `{ when: undefined }` literal would erase.
+   */
+  readonly registrations: Array<{ when?: (context: ActivationContext) => boolean } | undefined>
+  register(
+    definition: CherryToolDefinition,
+    registrationOptions?: { when?: (context: ActivationContext) => boolean },
+  ): () => void
 } {
   const definitions: CherryToolDefinition[] = []
+  const registrations: Array<{ when?: (context: ActivationContext) => boolean } | undefined> = []
   return {
     definitions,
-    register(definition) {
+    registrations,
+    register(definition, registrationOptions) {
       if (options.refuse !== undefined) throw options.refuse
       definitions.push(definition)
+      registrations.push(registrationOptions)
       return () => {
         const index = definitions.indexOf(definition)
         if (index >= 0) definitions.splice(index, 1)
@@ -423,5 +438,124 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     // long after the settings page said the subsystem was on.
     expect(host.status().state).toBe('failed')
     expect(tools.definitions).toEqual([])
+  })
+})
+
+/**
+ * ⑥ — the STEP-TIME activation condition (`ctx.tools.register(definition, { when })`).
+ *
+ * Why the tool needs one at all: the scope subsystem hides tools with
+ * `tools.restrict`, but on a host that lacks `restrict` it registers NOTHING
+ * (fail-closed) and therefore never installs a deny layer — so the delegation
+ * tool stayed visible in every workspace, including the ones the operator
+ * excluded. `when` is the one gate that does not depend on that capability: the
+ * host consults it per step and drops the tool from both the declaration list
+ * and dispatch.
+ *
+ * Three things about the host contract shape the code below, and each has its
+ * own case because each is a way to get it wrong silently:
+ *
+ *  1. `when` is called with a CONTEXT OBJECT, not an agent id — reading
+ *     `context.agent.id` is the whole body, and a test that passes an id would
+ *     pin the wrong shape;
+ *  2. a REJECTION is not "unavailable": `ToolsService.resolve` wraps it in a
+ *     `ToolActivationError`, which FAILS THE WHOLE STEP PREPARATION — so a
+ *     throwing predicate must be caught here, not propagated;
+ *  3. the verdict is read at STEP time. Capturing it at registration would pin
+ *     the answer for the life of the process, and a config save that grants a
+ *     workspace would never take effect.
+ */
+describe('the tool is gated per step by the scope judgement (SUB-04)', () => {
+  /** A `when` extracted from the one registration, or a failure naming why not. */
+  function whenOf(tools: ReturnType<typeof fakeTools>): (context: ActivationContext) => boolean {
+    const registration = tools.registrations[0]
+    if (registration?.when === undefined) throw new Error('the tool was registered without a `when`')
+    return registration.when
+  }
+
+  it('⑥a the condition asks `allowedFor` about the STEP’s agent', () => {
+    const service = fakeService()
+    const tools = fakeTools()
+    const asked: string[] = []
+    createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      allowedFor: (agentId) => {
+        asked.push(agentId)
+        return agentId === 'allowed'
+      },
+    }).mount(fakeContext(service, tools))
+    const when = whenOf(tools)
+    expect(when({ agent: { id: 'allowed' } })).toBe(true)
+    expect(when({ agent: { id: 'blocked' } })).toBe(false)
+    // Per CALL, not once at registration: two contexts, two answers, two asks.
+    expect(asked).toEqual(['allowed', 'blocked'])
+  })
+
+  it('⑥b without `allowedFor` the registration is made with ONE argument', () => {
+    // Not `{ when: undefined }`: an unconditional registration is the shape every
+    // host already understands, and a literal option object would be a change to
+    // hosts that never asked for the experiment's scope gate.
+    const service = fakeService()
+    const tools = fakeTools()
+    createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN }).mount(
+      fakeContext(service, tools),
+    )
+    expect(tools.registrations).toHaveLength(1)
+    expect(tools.registrations[0]).toBeUndefined()
+  })
+
+  it('⑥c it is LATE-BOUND: a predicate taken before the answer changes still sees the change', () => {
+    // The production shape: `apply` builds the closure once, long before any
+    // agent exists or any judgement is cached, and the host calls it per step.
+    const service = fakeService()
+    const tools = fakeTools()
+    let visible = false
+    createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      allowedFor: () => visible,
+    }).mount(fakeContext(service, tools))
+    const when = whenOf(tools)
+    expect(when({ agent: { id: 'a1' } })).toBe(false)
+    visible = true
+    expect(when({ agent: { id: 'a1' } })).toBe(true)
+  })
+
+  it('⑥d a throwing predicate answers `false` and logs — it must not fail the step', () => {
+    // `ToolsService.resolve` turns a `when` rejection into a `ToolActivationError`
+    // that fails STEP PREPARATION: propagating would take the whole turn down,
+    // every turn, over one tool. Fail-closed + a log is the only safe answer.
+    const service = fakeService()
+    const tools = fakeTools()
+    const log = vi.fn()
+    createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      allowedFor: () => {
+        throw new Error('scope blew up')
+      },
+      log,
+    }).mount(fakeContext(service, tools))
+    const when = whenOf(tools)
+    expect(when({ agent: { id: 'a1' } })).toBe(false)
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(String(log.mock.calls[0]?.[0])).toContain('作用域')
+  })
+
+  it('⑥e a context with no agent object answers `false` rather than throwing', () => {
+    // Structural, not hypothetical: this file's `ToolsRegistry` types the context
+    // as `{ agent: { id } }`, but the condition is the ONE thing a host calls
+    // into our code from a shape we do not control.
+    const service = fakeService()
+    const tools = fakeTools()
+    createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      allowedFor: () => true,
+    }).mount(fakeContext(service, tools))
+    const when = whenOf(tools) as unknown as (context: unknown) => boolean
+    expect(when({})).toBe(false)
+    expect(when(undefined)).toBe(false)
   })
 })

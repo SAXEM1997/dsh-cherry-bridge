@@ -54,9 +54,29 @@ export interface SubagentsService {
   list?(): readonly { readonly name: string }[]
 }
 
+/**
+ * The step-time activation context `ctx.tools.register`'s `when` receives. Only
+ * `agent` is named: the host also passes `modelSelection` and `signal`, and a
+ * structural type that named them would have to track the host's own type for
+ * fields this file never reads.
+ */
+export interface ActivationContextLike {
+  readonly agent: { readonly id: string }
+}
+
 /** The `ctx.tools` face the tool registration needs, structurally. */
 export interface ToolsRegistry {
-  register(definition: CherryToolDefinition): () => void
+  /**
+   * @param definition - the model-facing tool.
+   * @param options - the host's `ToolRegistrationOptions`. `when` is consulted
+   *   once per step; `false` drops the tool from BOTH the step's declarations
+   *   and its dispatch, and a REJECTION fails step preparation (which is why
+   *   {@link createSubagentHost}'s condition never throws).
+   */
+  register(
+    definition: CherryToolDefinition,
+    options?: { readonly when?: (context: ActivationContextLike) => boolean },
+  ): () => void
 }
 
 /** The ctx this subsystem mounts on. Structural, like every host face here. */
@@ -111,10 +131,29 @@ export function createSubagentHost(parts: {
   resolution: SubagentConfigResolution
   /** The delegation runner, bound to this apply's engine. */
   run: CherryProviderDeps['run']
+  /**
+   * "May this agent's step be offered the tool?" — the scope judgement, read at
+   * STEP time. Absent ⇒ the tool is registered unconditionally, which is what
+   * every host got before the condition existed.
+   *
+   * It exists because `tools.restrict` is not always available: a host without
+   * it makes the scope subsystem register nothing (fail-closed) and install no
+   * deny layer, so before this the delegation tool was visible in EVERY
+   * workspace, excluded ones included. `when` is the one gate that needs no
+   * extra host capability — it is consulted per step and drops the tool from the
+   * declarations and the dispatch alike.
+   *
+   * MUST NOT THROW: the host turns a rejection into a `ToolActivationError` that
+   * fails the whole step preparation, so a broken predicate would take down
+   * every turn over one tool. A throw is caught below and read as "not
+   * available".
+   */
+  allowedFor?: (agentId: string) => boolean
   log?: (...args: unknown[]) => void
 }): SubagentHost {
   const log = parts.log ?? ((): void => {})
   const resolution = parts.resolution
+  const allowedFor = parts.allowedFor
   let status: SubagentSubsystemStatus =
     resolution.kind === 'disabled'
       ? { state: 'pending', reason: '实验性子智能体未启用（默认关闭）' }
@@ -168,24 +207,38 @@ export function createSubagentHost(parts: {
         // A service with no `startActivation` cannot honour the tool: registering
         // it would promise the model a delegation that throws on every call.
         if (typeof startActivation !== 'function') return { problem: '宿主没有 startActivation 接口' }
+        const definition = createCherrySubagentTool({
+          // SUB-04: the CONFIGURED names. A hardcoded literal here would make
+          // `toolName` a config field that validates, defaults and does
+          // nothing — the settings page would accept a rename the registry
+          // never sees.
+          toolName: resolution.config.toolName,
+          providerName: resolution.config.providerName,
+          // The SAME resolution the runner uses, so the tool cannot report a
+          // desktop the run does not address.
+          resolveDevice: (cwd: string) =>
+            resolveTargetDevice(resolution.config.target, resolution.config.routes, cwd),
+          // Bound to the service: `startActivation` is a host method and must
+          // not lose its receiver on the way through this closure.
+          startActivation: (spec: CherryActivationSpec) => startActivation.call(service, spec),
+        })
+        // No predicate ⇒ ONE argument: an unconditional registration, the shape
+        // every host already understands.
+        if (allowedFor === undefined) return { release: tools.register(definition) }
         return {
-          release: tools.register(
-            createCherrySubagentTool({
-              // SUB-04: the CONFIGURED names. A hardcoded literal here would make
-              // `toolName` a config field that validates, defaults and does
-              // nothing — the settings page would accept a rename the registry
-              // never sees.
-              toolName: resolution.config.toolName,
-              providerName: resolution.config.providerName,
-              // The SAME resolution the runner uses, so the tool cannot report a
-              // desktop the run does not address.
-              resolveDevice: (cwd: string) =>
-                resolveTargetDevice(resolution.config.target, resolution.config.routes, cwd),
-              // Bound to the service: `startActivation` is a host method and must
-              // not lose its receiver on the way through this closure.
-              startActivation: (spec: CherryActivationSpec) => startActivation.call(service, spec),
-            }),
-          ),
+          release: tools.register(definition, {
+            when: (context) => {
+              try {
+                return allowedFor(context.agent.id)
+              } catch (error) {
+                // Fail-closed AND swallowed: propagating would fail step
+                // preparation (`ToolActivationError`), taking the whole turn
+                // down over one tool's visibility.
+                log('[cherry-remote] 子智能体工具的作用域判定抛错；本轮按不可见处理', error)
+                return false
+              }
+            },
+          }),
         }
       }
 

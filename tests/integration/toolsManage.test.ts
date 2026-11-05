@@ -15,6 +15,7 @@ import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
+import { SCOPE_DOC_VERSION } from '../../src/toolScope.js'
 
 /**
  * Task 10 integration suite: the MANAGEMENT `cherry_*` tools (`cherry_pair` /
@@ -612,7 +613,17 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     tools: {
       definitions: CherryToolDefinition[]
       registerCalls: number
-      register(definition: CherryToolDefinition): () => void
+      /**
+       * The SECOND argument each registration carried, by tool name. Absent for
+       * a name registered with ONE argument — the distinction a
+       * `{ when: undefined }` literal would erase, and the one that tells an
+       * unconditional registration from a gated one.
+       */
+      registerOptions: Map<string, { when?: (context: { agent: { id: string } }) => boolean }>
+      register(
+        definition: CherryToolDefinition,
+        options?: { when?: (context: { agent: { id: string } }) => boolean },
+      ): () => void
       restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void
       guard(guard: (execution: { name: string; agent?: { id: string } }) => string | undefined): () => void
       schemas(scope?: unknown): ReadonlyArray<{ name: string; description: string; parameters?: unknown }>
@@ -700,9 +711,11 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       tools: {
         definitions: [],
         registerCalls: 0,
-        register(definition) {
+        registerOptions: new Map(),
+        register(definition, options) {
           this.registerCalls += 1
           this.definitions.push(definition)
+          if (options !== undefined) this.registerOptions.set(definition.name, options)
           return () => {
             const index = this.definitions.indexOf(definition)
             if (index >= 0) this.definitions.splice(index, 1)
@@ -869,6 +882,43 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const body = JSON.parse(response.body) as { host: { reason: string; capable: boolean } }
       expect(body.host.capable).toBe(false)
       expect(body.host.reason).toContain('15 个名字')
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳h on a restrict-less host the tool is GATED per step, not left visible (SUB-04)', async () => {
+      // The regression this closes: `tools.restrict` is how the scope subsystem
+      // hides tools, but without it the subsystem registers NOTHING (fail-closed)
+      // and installs no deny layer — so `cherry_subagent`, registered by the
+      // SUBAGENT subsystem, used to stay visible in every workspace, excluded
+      // ones included. `when` needs no extra host capability, so it is the one
+      // gate that survives this host.
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx(false, 'restrict')
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
+      expect(typeof when).toBe('function')
+      // No scope document ⇒ `selected` with an empty list (the D3 default), and
+      // on THIS host no judgement is ever built. Fail-closed: not visible.
+      expect(when!({ agent: { id: 'any-agent' } })).toBe(false)
+      rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    it('⑳h2 under a `global` document the same gate answers visible', async () => {
+      // The other arm, and the reason the condition is `isVisible(doc, id)` and
+      // not `judgement()?.visible`: under `global` every agent is visible,
+      // including one the cache has never seen — a `?? false` simplification
+      // would hide the tool from everyone on exactly this host.
+      const index = await import('../../src/index.js')
+      const ctx = assemblyCtx(false, 'restrict')
+      const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
+      writeFileSync(
+        join(dataDir, 'scope.json'),
+        `${JSON.stringify({ version: SCOPE_DOC_VERSION, revision: 1, mode: 'global', workspaceIds: [] }, null, 2)}\n`,
+      )
+      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
+      expect(when!({ agent: { id: 'any-agent' } })).toBe(true)
       rmSync(dataDir, { recursive: true, force: true })
     })
 

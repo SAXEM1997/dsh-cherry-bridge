@@ -663,6 +663,29 @@ export class ToolScopeState {
   }
 
   /**
+   * "May this agent's step be offered the scope-governed tools at all?" — the
+   * one predicate the delegation tool is registered with
+   * (`ctx.tools.register(definition, { when })`), read at STEP time.
+   *
+   * It is a COMPOSITION of the two things this class already owns, never a
+   * second judgement: {@link isVisible} over the current document and the
+   * agent's own `workspaceId`. A cache miss passes `undefined` straight through,
+   * which is the documented fail-closed reading — `global` answers `true` for
+   * any id including that one, `selected` answers `false`. That fallback is the
+   * whole reason this is a method instead of `judgement()?.visible`: an agent
+   * the cache has never seen is exactly the case a host without
+   * `tools.restrict` is stuck in, because its scope subsystem registers nothing
+   * and therefore never builds a generation.
+   *
+   * LATE-BOUND BY CONSTRUCTION: the caller captures the closure once, at
+   * assembly, and the host calls it per step. Nothing here is cached, so a
+   * config save or a `rebuild()` changes the answer for the very next step.
+   */
+  visibleFor(agentId: string): boolean {
+    return isVisible(this.doc(), this.judgement(agentId)?.workspaceId)
+  }
+
+  /**
    * The same two §4 rules as `#judge`, answered from the CURRENT generation
    * without awaiting anything — the synchronous window's fallback when
    * `judgement()` misses.

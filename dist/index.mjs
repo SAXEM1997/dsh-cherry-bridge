@@ -1959,6 +1959,28 @@ var ToolScopeState = class {
 		return this.#judgements.get(agentId);
 	}
 	/**
+	* "May this agent's step be offered the scope-governed tools at all?" — the
+	* one predicate the delegation tool is registered with
+	* (`ctx.tools.register(definition, { when })`), read at STEP time.
+	*
+	* It is a COMPOSITION of the two things this class already owns, never a
+	* second judgement: {@link isVisible} over the current document and the
+	* agent's own `workspaceId`. A cache miss passes `undefined` straight through,
+	* which is the documented fail-closed reading — `global` answers `true` for
+	* any id including that one, `selected` answers `false`. That fallback is the
+	* whole reason this is a method instead of `judgement()?.visible`: an agent
+	* the cache has never seen is exactly the case a host without
+	* `tools.restrict` is stuck in, because its scope subsystem registers nothing
+	* and therefore never builds a generation.
+	*
+	* LATE-BOUND BY CONSTRUCTION: the caller captures the closure once, at
+	* assembly, and the host calls it per step. Nothing here is cached, so a
+	* config save or a `rebuild()` changes the answer for the very next step.
+	*/
+	visibleFor(agentId) {
+		return isVisible(this.doc(), this.judgement(agentId)?.workspaceId);
+	}
+	/**
 	* The same two §4 rules as `#judge`, answered from the CURRENT generation
 	* without awaiting anything — the synchronous window's fallback when
 	* `judgement()` misses.
@@ -11612,6 +11634,7 @@ const UNSUPPORTED_REASON = "宿主没有 subagents 服务（DSH 版本过低）�
 function createSubagentHost(parts) {
 	const log = parts.log ?? (() => {});
 	const resolution = parts.resolution;
+	const allowedFor = parts.allowedFor;
 	let status = resolution.kind === "disabled" ? {
 		state: "pending",
 		reason: "实验性子智能体未启用（默认关闭）"
@@ -11651,12 +11674,21 @@ function createSubagentHost(parts) {
 				if (tools === void 0) return { problem: "宿主没有 tools 服务" };
 				const startActivation = service.startActivation;
 				if (typeof startActivation !== "function") return { problem: "宿主没有 startActivation 接口" };
-				return { release: tools.register(createCherrySubagentTool({
+				const definition = createCherrySubagentTool({
 					toolName: resolution.config.toolName,
 					providerName: resolution.config.providerName,
 					resolveDevice: (cwd) => resolveTargetDevice(resolution.config.target, resolution.config.routes, cwd),
 					startActivation: (spec) => startActivation.call(service, spec)
-				})) };
+				});
+				if (allowedFor === void 0) return { release: tools.register(definition) };
+				return { release: tools.register(definition, { when: (context) => {
+					try {
+						return allowedFor(context.agent.id);
+					} catch (error) {
+						log("[cherry-remote] 子智能体工具的作用域判定抛错；本轮按不可见处理", error);
+						return false;
+					}
+				} }) };
 			};
 			const register = (service) => {
 				if (service === void 0) {
@@ -14161,6 +14193,7 @@ function apply(ctx, config = {}) {
 	state.disposers.push(host.mount(ctx));
 	const subagents = createSubagentHost({
 		resolution: subagentResolution,
+		allowedFor: (agentId) => scope.visibleFor(agentId),
 		run: (input) => {
 			if (subagentResolution.kind !== "ready") throw new Error("cherry subagent: the subsystem is not configured");
 			const resolved = subagentResolution.config;

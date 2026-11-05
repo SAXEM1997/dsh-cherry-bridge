@@ -744,9 +744,12 @@ selector, `cherry_pair` does not.
 - The 14 tools are decided **per workspace**; the default is `selected` + an
   empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
   document lands on the stricter side; no "unreadable → global" escape).
-- `cherry_subagent` is the ONE exception: it is on the same governed list
-  (`cherryScopeToolNames()`), but the SUBAGENT subsystem registers it, so where
-  scope cannot restrict at all it stays visible and its switch is the only gate.
+- `cherry_subagent` is the ONE exception: same governed list
+  (`cherryScopeToolNames()`), but the SUBAGENT subsystem registers it, so it also
+  carries a step-time `when` (`ToolScopeState.visibleFor` — the same
+  `isVisible(doc, workspaceId)`, read per step). That is the gate that survives a
+  host without `tools.restrict`, where the scope subsystem registers nothing and
+  installs no deny layer; `restrict` + `guard` stay as the belt.
 - A save re-installs or releases the restriction layer for **every live agent**
   and takes effect on the **next turn** — no restart, no new session.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
@@ -756,8 +759,8 @@ selector, `cherry_pair` does not.
   under both the tools stay **unregistered**.
 - `visibility-only` degradation means the execution-side backstop (`tools.guard`)
   is gone but `restrict` still removes the tools from the table — a visibility
-  guarantee, not an execution boundary. The panel only ever claims "this plugin
-  does not shadow them"; upstream `allow`-shaped filtering can still hide them.
+  guarantee, not an execution boundary. The panel claims only that this plugin
+  does not shadow them; upstream `allow` filtering can still hide them.
 - The scope document lives at `<dataDir>/scope.json` (0600, atomic, monotonic
   `revision`), **not** in profile YAML. The one exception: a document that fails
   to parse or has invalid fields is rebuilt on the stricter side with `revision`

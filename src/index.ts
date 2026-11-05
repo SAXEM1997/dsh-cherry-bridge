@@ -1060,6 +1060,17 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // fourteen tools down with it.
   const subagents = createSubagentHost({
     resolution: subagentResolution,
+    // THE STEP-TIME SCOPE GATE (spec §5.7 SUB-04). The scope subsystem hides the
+    // family with `tools.restrict`, but a host WITHOUT that capability makes it
+    // register nothing and install no deny layer — and `cherry_subagent` is
+    // registered by THIS subsystem, so it stayed visible in every workspace,
+    // excluded ones included. `when` is the one gate that needs no extra host
+    // capability: the host consults it per step and drops the tool from the
+    // declarations and the dispatch alike.
+    //
+    // A closure, not a snapshot: `visibleFor` reads the current document and the
+    // current judgement generation, so a config save changes the very next step.
+    allowedFor: (agentId) => scope.visibleFor(agentId),
     // The delegation runs on THIS apply's engine, so the provider and the tools
     // share one pool, one subscription set and one set of caches.
     run: (input) => {
