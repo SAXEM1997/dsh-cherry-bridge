@@ -1371,6 +1371,8 @@ interface ObservationCarry {
   executionId?: string
   terminalStatus?: string
   terminalMessageId?: string
+  /** The peer's own failure classification for the terminal, when it sent one. */
+  terminalError?: { reason: string; message?: string }
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1381,28 @@ interface ObservationCarry {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * The peer's own failure classification on an `execution.updated` payload.
+ *
+ * `error` is schema-optional and its `reason` is a closed enum, so a payload
+ * without a usable reason answers `undefined` rather than a placeholder: "the
+ * peer said why" and "the peer did not" are different facts, and a caller
+ * branches on exactly that difference. Only `reason` and `message` are kept —
+ * `details` and `failure` are opaque blobs the protocol leaves unconstrained,
+ * and they must never reach a model's context (issue #231, SUB-53).
+ *
+ * @param payload - one `execution.updated` payload.
+ * @returns the classification, when the peer sent one.
+ */
+function executionErrorOf(payload: Record<string, unknown>): { reason: string; message?: string } | undefined {
+  const error = payload['error']
+  if (!isRecord(error)) return undefined
+  const reason = optionalString(error['reason'])
+  if (reason === undefined) return undefined
+  const message = optionalString(error['message'])
+  return message === undefined ? { reason } : { reason, message }
 }
 
 /** The peer's failure discriminator, or undefined for a non-protocol error. */
@@ -6272,6 +6296,11 @@ export class CherryToolEngine {
             // The run-scoped cut for the terminal aggregate: the message THIS run
             // persisted, when the peer named one.
             ...(observed.terminalMessageId === undefined ? {} : { terminalMessageId: observed.terminalMessageId }),
+            // The peer's own failure classification. It rides the verdict, so a
+            // content-assembly failure degrades to `aggregateError` WITHOUT
+            // taking the reason down with it (the #3 invariant: a run's verdict
+            // and its identifiers survive a content failure).
+            ...(observed.terminalError === undefined ? {} : { executionError: observed.terminalError }),
           },
           answerDeadline,
         )
@@ -6378,6 +6407,7 @@ export class CherryToolEngine {
     executionId?: string
     terminalStatus?: string
     terminalMessageId?: string
+    terminalError?: { reason: string; message?: string }
     pendingInteractions: Array<{
       interactionId: string
       kind: string
@@ -6389,6 +6419,7 @@ export class CherryToolEngine {
       executionId?: string
       terminalStatus?: string
       terminalMessageId?: string
+      terminalError?: { reason: string; message?: string }
       pendingInteractions: Array<{ interactionId: string; kind: string; summary: string; questions: string[] }>
     } = { pendingInteractions: [] }
 
@@ -6436,6 +6467,7 @@ export class CherryToolEngine {
     state.executionId = options.carry?.executionId
     state.terminalStatus = options.carry?.terminalStatus
     state.terminalMessageId = options.carry?.terminalMessageId
+    state.terminalError = options.carry?.terminalError
 
     // The high-water mark moves INSIDE the fold below, so the next pass skips
     // exactly what this one already consumed without a second scan (which would
@@ -6493,6 +6525,13 @@ export class CherryToolEngine {
       if (awaited === undefined || executionId !== awaited) continue
       state.executionId = executionId
       state.terminalStatus = terminal ? status : undefined
+      // The peer's own classification of a failed terminal, kept as the two
+      // fields it is made of rather than the payload: `reason` is a closed
+      // 16-value enum on the schema and is the only part a caller can act on,
+      // while the raw object carries `details`/`failure` blobs that must never
+      // reach a model's context (issue #231, SUB-53). Dropped for a non-terminal
+      // status, exactly like `terminalStatus` itself.
+      state.terminalError = terminal ? executionErrorOf(payload) : undefined
       // The terminal names the message THIS run persisted, which is the one
       // boundary the terminal aggregate must cut at: the session's history is
       // cumulative, so concatenating every assistant message would re-deliver
@@ -6527,6 +6566,7 @@ export class CherryToolEngine {
       options.carry.executionId = state.executionId
       options.carry.terminalStatus = state.terminalStatus
       options.carry.terminalMessageId = state.terminalMessageId
+      options.carry.terminalError = state.terminalError
       options.carry.scannedSeq = Number.isFinite(scannedSeqNext) ? scannedSeqNext : undefined
     }
     return state

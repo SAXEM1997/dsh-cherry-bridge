@@ -512,6 +512,17 @@ export interface FakeAgentOptions {
    * the omission is faithful, not cosmetic.
    */
   omitExecutionMessageId?: boolean
+  /**
+   * The `error` a FAILED run's terminal `execution.updated` carries.
+   *
+   * Omitted means the long-standing `{reason: 'INTERNAL', message: 'Run
+   * failed'}` every existing fixture already sees, so an unset knob leaves the
+   * wire byte-identical. Set it to model the peer's own classification — the
+   * `reason` is a closed 16-value enum on the schema (`agent.d.ts`, beside
+   * `execution.updated`), and it is the only thing a delegation can report
+   * about a failure that is not a raw payload.
+   */
+  executionError?: { reason: string; message: string; details?: Record<string, unknown> }
   /** Same injection for `agent.executions.cancel` (Task 9⑮ covers both verbs). */
   cancelOutcome?: 'applied' | 'target-unavailable'
   /**
@@ -3939,7 +3950,7 @@ export class FakeCherry {
       durable: terminal,
       ...(terminal ? { history: { messageRevision: '1', historyRevision: '1' } } : {}),
       ...(status === 'failed'
-        ? { error: { reason: 'INTERNAL', message: 'Run failed' } }
+        ? { error: this.#agent().executionError ?? { reason: 'INTERNAL', message: 'Run failed' } }
         : {}),
     }
     this.#executionUpdates.push({ executionId, status, messageId: namesMessage ? messageId : undefined })
