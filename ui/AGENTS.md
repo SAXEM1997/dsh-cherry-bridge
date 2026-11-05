@@ -43,9 +43,11 @@ experimental subagent panel. It builds to `lib/client.js`
   the badge, the "why experimental" sentence and the feedback link ABOVE the
   switch, in every state including every failure state. The user's hard
   requirement is that nobody turns this on without knowing it is experimental,
-  so a label that appears only once it works satisfies nobody. Those three
-  sentences are quoted verbatim by the README pair (#234): a reword is a docs
-  change too, and `tests/unit/uiSubagentPanel.test.ts` ①a pins the wording.
+  so a label that appears only once it works satisfies nobody.
+  `subagent.experimental` (which already ends with 默认关闭) and
+  `subagent.feedback` are quoted verbatim by the README pair (#234), so a reword
+  is a docs change too: ①a pins the panel's wording and ⑤a checks the READMEs
+  against this same dictionary.
 - **A save carries what the form does not show.** `cwdMode`, `routes` and
   `maxInteractionAbandons` have no control on that panel, so `bodyOf` spreads the
   STORED document through and overrides only the rendered fields. Sending just

@@ -22,9 +22,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath, URL as NodeURL } from 'node:url'
 import { SubagentPanel } from '../../ui/src/SubagentPanel'
 import { ApiError } from '../../ui/src/api'
-import { localeStore } from '../../ui/src/i18n'
+import { createTranslator, localeStore } from '../../ui/src/i18n'
 import type {
   SubagentClient,
   SubagentResponse,
@@ -338,5 +340,43 @@ describe('④ the page is bilingual, including the codes', () => {
         'Off by default. Turning it on needs a target device, agent and workspace; a save takes effect when DSH restarts.',
       ),
     ).toBeDefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ⑤ the README pair quotes these sentences, not a paraphrase
+// ---------------------------------------------------------------------------
+
+describe('⑤ the README pair carries the same three sentences', () => {
+  it('⑤a both READMEs quote their language’s experimental, default-off and feedback lines', () => {
+    // The user's hard requirement is that nobody turns this on without knowing
+    // it is experimental, and it was stated for BOTH surfaces: the settings page
+    // and the README. A paraphrase on the page and a reword in the README is how
+    // the two drift apart, so the README is checked against the DICTIONARY — the
+    // one place the page's wording lives — instead of against a second copy.
+    // `URL` here is jsdom's, not Node's: it resolves a relative path against the
+    // DOCUMENT url (`http://localhost:3000`), so `file:` bases are ignored. The
+    // node implementation is imported by name for that reason.
+    const readme = (name: string): string =>
+      readFileSync(fileURLToPath(new NodeURL(`../../${name}`, import.meta.url)), 'utf8')
+
+    for (const [name, locale] of [
+      ['README.md', 'zh'],
+      ['README.en.md', 'en'],
+    ] as const) {
+      const t = createTranslator(locale)
+      const text = readme(name)
+      // `subagent.experimental` carries two of the three phrases (实验性 and
+      // 默认关闭) and `subagent.feedback` the third, so these two sentences are
+      // the whole hard requirement. `subagent.defaultOff` is NOT pinned here:
+      // its content ("needs a device/agent/workspace, restart to apply") is the
+      // README's own prose below, and duplicating it verbatim read like a
+      // copy-paste slip in a document.
+      for (const key of ['subagent.experimental', 'subagent.feedback']) {
+        expect(text, `${name} must quote ${key} verbatim`).toContain(t(key))
+      }
+      // The feedback entry point is the same string as the page's (#234).
+      expect(text).toContain('https://github.com/SAXEM1997/dsh-cherry-bridge/issues')
+    }
   })
 })

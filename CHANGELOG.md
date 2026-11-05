@@ -17,6 +17,70 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.3.0 (2026-11-06)
+
+The subagent feature: a DSH session can hand one self-contained task to a Cherry
+Studio agent on a paired desktop, and the settings page grows a block that turns
+it on. The desktop range is unchanged (**2.1.4 – 2.1.10**), no protocol version
+moved and no existing tool's shape changed — the new surface is a tool
+registration, a settings block, one HTTP route and a config document, and the
+tool drives only peer RPCs the earlier tools already used. The minor digit is the
+honest one: a fifteenth `cherry_*` tool is new capability, not hardening.
+
+### Experimental — off by default
+
+**The headline feature is experimental and off by default.** It spans two systems
+this plugin does not control — DSH's subagent seam and Cherry Studio's own
+sessions and permission model — so its interface and behaviour may change.
+Turning it on needs a target device, agent and workspace, and a save takes effect
+when DSH restarts: the tool is registered during assembly and the plugin does not
+hot-reload. Ideas and bug reports are welcome:
+<https://github.com/SAXEM1997/dsh-cherry-bridge/issues>
+
+- `cherry_subagent` — the fifteenth tool. It starts a run on the configured
+  desktop and returns at once; the child's answer arrives as the run's completion
+  notification. The child does not see the parent conversation and accepts no
+  follow-up messages, so everything it needs has to be in the prompt.
+- **Settings page** — an “Experimental subagent” block: the switch (off), the
+  target fields, the timeout, the current state with its refusal reasons
+  translated from codes (Chinese and English), a notice when the saved document
+  differs from the running assembly, and the feedback link. `cwdMode` and
+  `routes` are shown read-only; `routes` overrides the device and workspace per
+  directory prefix.
+- `GET` / `PUT /cherry-remote/api/subagent` — the configuration document lives in
+  `<dataDir>/subagent.json` (`0600`, atomic write, monotonic `revision`), with
+  `expectedRevision` as an optimistic lock: a save against a stale revision is
+  refused with `409`, like `PUT /scope`.
+- **Config key `subagent`** — the profile seed for the same document; once the
+  page saves one, the document wins.
+
+The delegation path was exercised on a real desktop during the design work
+(three concurrent probes, one task each). Its limits are stated rather than
+implied: one-shot sessions, no sandbox inheritance, the child may decline the
+task, and the concurrency ceiling is unverified above three.
+
+### Changed
+
+- Every tool's parameter schema now stays inside the subset the host's value
+  validator actually enforces (#219). Eight of the fourteen carried keywords the
+  host reads nothing of — `minimum`/`maximum` on the seven numeric faces,
+  `maxLength` on the six token/text faces, an object-valued
+  `additionalProperties` on `cherry_respond`'s `answers` — so they were
+  annotations rather than enforcement, and the day a host site started asserting
+  `parameters` all eight would have failed together. The bounds moved into the
+  descriptions (what a model reads); the parsers still enforce the ceilings.
+
+### Fixed
+
+- A throw from either collector inside `settleRunResult` no longer turns a run
+  result into a rejection (#237). Both collectors are contained and report
+  through the run's own error sink, so the parent gets a settled run either way.
+
+### Documentation
+
+- `docs/e2e-checklist.md` records the 0.2.3 machine-verifiable results, and why
+  the demotion's latency gain cannot be measured on this machine.
+
 ## v0.2.3 (2026-11-05)
 
 Two reconnect-path defects and one diagnostics addition, all on LOCAL faces.

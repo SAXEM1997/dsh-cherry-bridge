@@ -19,7 +19,7 @@
 
 ```mermaid
 flowchart TB
-    T["DSH 会话<br/>14 个 cherry_* 工具"] --> P
+    T["DSH 会话<br/>15 个 cherry_* 工具"] --> P
     W["设置页<br/>设备 · 配对 · 启用范围"] --> P
     P["dsh-cherry-bridge<br/>连接池 · 订阅缓存 · 作用域"]
     P <-->|"ws:// · Noise XX"| C["Cherry Studio 桌面端<br/>二维码配对 · 审批"]
@@ -27,7 +27,7 @@ flowchart TB
 
 - 包名：`dsh-cherry-bridge`，插件 id：`cherry-remote`
 - 传输：默认 `ws://` + Noise XX（加密由 Noise 记录层提供）；桌面端位于 TLS 前置之后时拨 `wss://`，私有 CA 的信任由 `wsTls` 提供
-- 工具面：14 个 `cherry_*` 工具，**按工作区**启用，默认**谁都没有**（见「启用范围」）
+- 工具面：15 个 `cherry_*` 工具（第 15 个 `cherry_subagent` 是**实验性、默认关闭**的跨端委派，见[实验性子智能体](#实验性子智能体)），**按工作区**启用，默认**谁都没有**（见「启用范围」）
 - 设置页与 HTTP 面：宿主 Web 服务器上的同源前缀 `/cherry-remote/api`
 
 ## 安装
@@ -88,6 +88,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | `perSessionCacheBytes` | number | `2097152`（2 MiB） | 每个会话的**本地**订阅事件缓存上限；超出后从最旧一端丢弃（FIFO）并 `warn`，但**最新的单条事件总会保留**——即使它自己就超过上限（此时不打丢弃日志，窗口保持超预算）。 |
 | `rateBudgetPerSecond` | number | `32` | 每设备平滑请求预算（请求/秒）。桌面端共享额度在 ≤2.1.6 是 64 req/s、≥2.1.7 是 256 req/s，且只有新版本才把超限降级为单请求 `RATE_LIMITED`（旧版本直接 close `1011` 终止会话），故按更严格的一代取保守值。内容读取（`agent.content.read`）按 8:1 派生独立一档，且**封顶 512/s**（该额度两代一致）。 |
 | `wsTls` | object | — | 每次 `wss` 拨号的**扁平** `tls.connect` 选项（只接受 `rejectUnauthorized` / `ca`），供桌面端位于私有 CA 或自签 TLS 前置之后时由运维提供信任；配对与重连**两个拨号点**共用。**不写入设备档案、不写日志、不进诊断报告。** 整个对象要么按原样生效、要么整体忽略：未知键或不可用值按名 `warn` 后回退 Node 默认信任库（不部分应用）。 |
+| `subagent` | object | — | 实验性子智能体的 profile 种子（**默认关闭**）。字段与行为见[实验性子智能体](#实验性子智能体)；设置页保存过配置后，`<dataDir>/subagent.json` 优先于本键。 |
 
 > `wsTls.ca` 是 **PEM 内容**（证书文本本身），不是文件路径。
 
@@ -110,6 +111,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 | `cherry_interactions` | 列出该会话**待答**的交互卡（提问 / 审批）。被截断时必带 `truncated`+`truncationReason`；停点可命名时还给出 `resumeCursor`——用 `sessionId` 相同的调用回传为 `cursor` 即可续读（`limit` 计的是过滤**前**的对端条目）。 |
 | `cherry_respond` | 应答交互卡：提问必须全量作答，审批走 `decision`。 |
 | `cherry_cancel` | 取消会话在途执行（`expectedExecutionId` 必填）。 |
+| `cherry_subagent` | 把一个**自包含**任务交给某台已配对设备上的 Cherry agent（**实验性、默认关闭**，见[实验性子智能体](#实验性子智能体)）。子会话看不到当前对话、不接受后续消息；工具立即返回，子运行结束时由运行时通知。带绝对 `cwd` 时回答里给出 `device`（可用它接着调 `cherry_sessions`），但**没有** `cherrySessionId`。 |
 | `cherry_pair` | 用「扫码后页面显示的配对信息」建立与桌面端的配对。 |
 | `cherry_unpair` | 解除配对：断开连接并从设备档案删除。 |
 
@@ -121,6 +123,44 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 交互卡，运行仍活着）、`timeout`（窗口用尽，**不是失败**，随附部分内容，停点可命名时再带游标）、
 `idle`（`cherry_wait` 遇到没有在途执行的会话，立即返回快照）、`subscription-lost`
 （事件订阅丢失且重建失败，运行结局**不可知**，随附修复指引）。
+
+## 实验性子智能体
+
+> 实验性功能：它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。
+>
+> 欢迎贡献思路和问题反馈：[dsh-cherry-bridge issues](https://github.com/SAXEM1997/dsh-cherry-bridge/issues)
+
+打开方式：设置页的「实验性子智能体」区块，或 `cordis.patch.yml` 里的 `subagent` 键：
+
+```yaml
+subagent:
+  enabled: true
+  device: desk-1        # deviceId，或足以指向一台设备的前缀（与其余工具同形）
+  agentId: agent-7      # 该设备上的 Cherry agent id
+  workspaceId: ws-1     # 已注册工作区 id；要系统工作区就改用 workspaceKind: system
+```
+
+**保存或改配置后要重启 DSH 才生效**：工具在装配期注册，本插件不热重载。页面上的保存写进
+`<dataDir>/subagent.json`（`0600`、原子写入、`revision` 单调），一旦存在就优先于 profile 里的
+`subagent` 键。
+
+打开后模型多一个 `cherry_subagent` 工具：把一个自包含任务交给那台设备上的 Cherry agent，工具
+**立即返回**，子运行结束时由运行时通知。子会话**看不到当前对话**，也**不接受后续消息**——它需要
+的一切都得写进 `prompt`。
+
+设置页编辑 `enabled` / `device` / `agentId` / 工作区 / `timeoutMs`（默认 30 分钟，`0` 表示不限）；
+`providerName`、`toolName`、`cwdMode`、`routes`、`maxInteractionAbandons` 只透传——`routes` 只读展示
+（它按子目录前缀覆盖设备与工作区），其余几个要改就走配置文件。
+
+已知限制：
+
+- **一次性**：没有后续消息、没有冷恢复、没有结构化输出、没有进度流；中途进度只能事后 `cherry_read`。
+- **无沙箱继承**：子运行在 Cherry Studio 自己的权限模型下，DSH 的 sandbox 与审批 UI 都不适用。
+- **子可能拒绝任务**：Cherry agent 有自己的角色边界。拒绝是一次**正常完成的运行**，返回的文本就是
+  拒绝本身——不是故障；重试或改写任务前先读回答。
+- **容量未知**：只实测了 3 路并行；更高并发下 Cherry 侧是否限流未验证。
+
+它和其余 `cherry_*` 工具一样受「启用范围」约束：被排除的工作区看不到它。
 
 ## 错误与限制
 
@@ -173,7 +213,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 启用范围面板，以及经
 `/cherry-remote/api/events` SSE 推送的实时状态。
 
-14 个工具**按工作区**决定是否出现，机制是**隐藏而非拒绝**（不在范围的会话里不进工具表，省上下文）：
+15 个工具**按工作区**决定是否出现，机制是**隐藏而非拒绝**（不在范围的会话里不进工具表，省上下文）：
 
 - **默认谁都没有**：作用域文档不存在、损坏或读不出来，都按 `selected` + 空列表处理（fail-closed）。
 - **`仅选定工作区`**：只有勾选的工作区里的会话才可能出现这些工具；没有工作区的会话始终没有。
