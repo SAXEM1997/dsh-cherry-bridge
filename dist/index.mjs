@@ -5377,7 +5377,9 @@ var SessionSubscriptions = class {
 	}
 	/**
 	* `agent.events`: append to the session buffer, enforce the byte budget by
-	* dropping the OLDEST events (logged), advance the cursor, then wake waiters.
+	* dropping the OLDEST events (logged, and never the last remaining one — see
+	* `#trimToBudget`'s floor, issue #221), advance the cursor, then wake
+	* waiters.
 	*
 	* SEQ MONOTONICITY IS ENFORCED HERE, per (sessionId, streamEpoch). The peer is
 	* supposed to deliver each stream position exactly once and in order, and the
@@ -5548,17 +5550,31 @@ var SessionSubscriptions = class {
 			return;
 		}
 	}
-	/** Drops the OLDEST buffered events until the session fits its byte budget. */
+	/**
+	* Drops the OLDEST buffered events until the session fits its byte budget.
+	*
+	* The loop stops at ONE remaining event (issue #221): the budget governs the
+	* window's TAIL, never its head. A single event above the budget — only
+	* reachable when `perSessionCacheBytes` is set below one record's size, since
+	* the transport caps a record at 65,536 bytes — used to be evicted too,
+	* leaving an EMPTY window whose `windowStart` had advanced past it: the event
+	* that just happened, the one thing a reader wants, became unreachable and
+	* every read from the baseline answered `cursor-out-of-window` about content
+	* this layer had held a moment earlier. Keeping it is also the honest
+	* reading of `evicted`: nothing was discarded, so the baseline stays a
+	* servable resume point.
+	*/
 	#trimToBudget(sessionId, state) {
 		if (state.bytes <= this.#perSessionCacheBytes) return;
 		let dropped = 0;
-		while (state.bytes > this.#perSessionCacheBytes && state.buffer.length > 0) {
+		while (state.bytes > this.#perSessionCacheBytes && state.buffer.length > 1) {
 			const removed = state.buffer.shift();
 			state.bytes -= removed.bytes;
 			dropped += 1;
 			state.windowStart = Math.max(state.windowStart, Number(removed.cursor.seq));
 			state.evicted = true;
 		}
+		if (dropped === 0) return;
 		console.warn(`[cherry-remote] session ${sessionId} cache exceeded ${this.#perSessionCacheBytes} bytes; dropped ${dropped} oldest event(s)`);
 	}
 	/** Coalesced wake: each parked waiter settles exactly once. */

@@ -1126,6 +1126,15 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       kind: 'session.updated',
       payload: { idleRevision: 'x'.repeat(1024) },
     })
+    // A SECOND event, because a drop is what reports the budget (issue #221):
+    // the layer never evicts its last remaining event, so one oversized event
+    // would now leave the window over budget and silent. The assertion below is
+    // about the VALUE the assembly handed the layer, so the fixture has to
+    // produce a real drop to observe it.
+    fakeInfo.fake.pushEvent('s-1', {
+      kind: 'session.updated',
+      payload: { idleRevision: 'y'.repeat(1024) },
+    })
 
     // The subscription layer reports the budget it was CONFIGURED with. This is
     // the layer's own observable, so the assertion is about the value the
