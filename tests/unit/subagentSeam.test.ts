@@ -399,6 +399,31 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
     expect(wiring.aborts()).toBe(0)
   })
 
+  it('clips a diagnostic the ATTEMPT returned on the success arm too', async () => {
+    // `settleRunResult` clips in two places: the collected diagnostic on the
+    // failure arm, and one the provider put on a SUCCESSFUL result. Only the
+    // first was covered — deleting the second left all 29 seam cases green.
+    // A provider may legitimately finish `completed` and still explain itself
+    // (a child that declined the task), so this arm is reachable, not dead.
+    const wiring = abortWiring()
+    const settled = await settleRunResult({
+      attempt: async () => ({
+        output: [{ type: 'text', text: 'done' }],
+        stopReason: 'completed' as const,
+        diagnostic: '诊'.repeat(3_000),
+      }),
+      collectOutput: () => [],
+      cancelled: () => false,
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(settled.stopReason).toBe('completed')
+    const diagnostic = settled.diagnostic ?? ''
+    expect(new TextEncoder().encode(diagnostic).byteLength).toBeLessThanOrEqual(SUBAGENT_DIAGNOSTIC_MAX_BYTES)
+    expect(diagnostic.length).toBeGreaterThan(0)
+    expect(diagnostic).not.toContain('\uFFFD')
+  })
+
   it('clips a provider diagnostic to the seam byte ceiling without splitting a character', async () => {
     // The host caps `diagnostic` at 4096 UTF-8 BYTES. A Chinese character is
     // three bytes, so a character-count clip would overshoot by 3x — and a
@@ -429,18 +454,23 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
 describe('#229 externalRunHandle disposes exactly once', () => {
   it('memoizes teardown and settles cancellation on the first dispose', async () => {
     const wiring = abortWiring()
-    let teardowns = 0
-    let cancels = 0
+    // The SEQUENCE, not two counters. Counting alone cannot tell
+    // `requestCancel()`-then-`teardown()` from the reverse, and the order IS the
+    // contract: local cancellation has to settle `result` BEFORE teardown is
+    // awaited, because there is no assumption the child cooperates — a teardown
+    // that waits for a child which is waiting for us is a deadlock. A coverage
+    // review found this case green with the two lines swapped.
+    const calls: string[] = []
     const run: SubagentRun = externalRunHandle({
       id: 'run-1',
       result: Promise.resolve(completedResult()),
       signal: wiring.signal,
       onAbort: wiring.onAbort,
       requestCancel: () => {
-        cancels += 1
+        calls.push('cancel')
       },
       teardown: async () => {
-        teardowns += 1
+        calls.push('teardown')
       },
     })
     const first = run.dispose()
@@ -449,10 +479,58 @@ describe('#229 externalRunHandle disposes exactly once', () => {
     // idempotent, and a second teardown would double-release the child.
     expect(second).toBe(first)
     await first
+    expect(calls).toEqual(['cancel', 'teardown'])
+  })
+
+  it('awaits teardown — dispose settles only once the child is down', async () => {
+    // The seam's third contract is "runs until the child has ACTUALLY stopped".
+    // A fire-and-forget `disposal = parts.teardown()` satisfies every counting
+    // assertion above while returning before the child is down, so the await is
+    // pinned on its own.
+    const wiring = abortWiring()
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const run = externalRunHandle({
+      id: 'run-3',
+      result: Promise.resolve(completedResult()),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+      requestCancel: () => {},
+      teardown: () => gate,
+    })
+    let disposed = false
+    const disposal = run.dispose().then(() => {
+      disposed = true
+    })
+    await Promise.resolve()
+    expect(disposed).toBe(false)
+    release()
+    await disposal
+    expect(disposed).toBe(true)
+  })
+
+  it('a teardown that rejects rejects dispose, and a second call does not retry', async () => {
+    // Memoizing the promise means the failure is delivered to every caller
+    // rather than re-attempted: a retry would run a second teardown against a
+    // child the first one may have half-released.
+    const wiring = abortWiring()
+    let teardowns = 0
+    const run = externalRunHandle({
+      id: 'run-4',
+      result: Promise.resolve(completedResult()),
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+      requestCancel: () => {},
+      teardown: async () => {
+        teardowns += 1
+        throw new Error('teardown blew up')
+      },
+    })
+    await expect(run.dispose()).rejects.toThrow('teardown blew up')
+    await expect(run.dispose()).rejects.toThrow('teardown blew up')
     expect(teardowns).toBe(1)
-    // `requestCancel` runs BEFORE teardown, and only once: it is what makes the
-    // result settle without assuming the child cooperates.
-    expect(cancels).toBe(1)
   })
 
   it('keeps the run id and result on the handle', async () => {
