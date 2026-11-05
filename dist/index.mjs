@@ -8232,23 +8232,57 @@ var CherryToolEngine = class {
 					error: "text-empty",
 					message: "the message text is empty (or whitespace only); the peer requires a non-blank body."
 				};
-				await this.#ensureSubscription(record.deviceId, sessionId);
-				const subscriptions = this.#deps.subs(record.deviceId);
-				const { receipt, baselineSeq } = await this.#admitSend(connection, subscriptions, record.deviceId, sessionId, {
-					args,
-					text
-				});
-				if (args["wait"] === false) return receipt;
-				if (receipt["status"] === "rejected" || receipt["status"] === "interrupted") return receipt;
-				const timeoutMs = waitTimeout(args["timeoutMs"]);
-				return this.#awaitRun(connection, subscriptions, sessionId, {
-					timeoutMs,
-					startedAt: performance.now(),
-					baselineSeq,
-					executionId: typeof receipt["executionId"] === "string" ? receipt["executionId"] : void 0,
-					commandId: typeof receipt["commandId"] === "string" ? receipt["commandId"] : void 0
+				return this.#runOnce({
+					connection,
+					deviceId: record.deviceId,
+					sessionId,
+					text,
+					commandId: optionalString(args["commandId"]),
+					wait: args["wait"] !== false,
+					timeoutMs: waitTimeout(args["timeoutMs"])
 				});
 			}
+		});
+	}
+	/**
+	* ONE command's round trip against an ALREADY-EXISTING session: subscribe,
+	* admit the send, and — unless the caller asked for the receipt alone — wait
+	* out the run and fold the answer this run produced.
+	*
+	* This is the seam a subagent delegation runs on (#231). The point of
+	* extracting it is not code volume but JUDGEMENT: what counts as this run's
+	* terminal, and what counts as this run's text, must be answered the same way
+	* whether a model asked through `cherry_send` or the runtime asked through the
+	* provider. Two implementations of that would drift, and the drift would show
+	* up as a delegation reporting a different answer than the tool for the same
+	* run.
+	*
+	* What it deliberately does NOT do, because those are not shared judgements:
+	*
+	*  - **Create the session.** That is `cherry_create`'s job here, and a
+	*    delegation's own creation step is #231's. The tool face requires a
+	*    `sessionId`; a delegation has none until it makes one.
+	*  - **Act on a pending interaction.** The tool face SURFACES it as the soft
+	*    terminal `awaiting-interaction` so a human can answer; a delegation has no
+	*    human to ask and denies it (#231). Both read the same soft terminal; only
+	*    the reaction differs, so the reaction stays with the caller.
+	*/
+	async #runOnce(request) {
+		const { connection, deviceId, sessionId, text, commandId, wait, timeoutMs } = request;
+		await this.#ensureSubscription(deviceId, sessionId);
+		const subscriptions = this.#deps.subs(deviceId);
+		const { receipt, baselineSeq } = await this.#admitSend(connection, subscriptions, deviceId, sessionId, {
+			commandId,
+			text
+		});
+		if (!wait) return receipt;
+		if (receipt["status"] === "rejected" || receipt["status"] === "interrupted") return receipt;
+		return this.#awaitRun(connection, subscriptions, sessionId, {
+			timeoutMs,
+			startedAt: performance.now(),
+			baselineSeq,
+			executionId: typeof receipt["executionId"] === "string" ? receipt["executionId"] : void 0,
+			commandId: typeof receipt["commandId"] === "string" ? receipt["commandId"] : void 0
 		});
 	}
 	/**
@@ -8293,8 +8327,8 @@ var CherryToolEngine = class {
 	* command which actually started the run.
 	*/
 	async #admitSend(connection, subscriptions, deviceId, sessionId, request) {
-		const { args, text } = request;
-		const callerId = optionalString(args["commandId"]);
+		const { commandId, text } = request;
+		const callerId = optionalString(commandId);
 		const attempt = async (commandId, revisionOverride) => {
 			const remembered = callerId === void 0 || commandId !== callerId ? void 0 : this.#recallCommandBody(deviceId, callerId);
 			if (remembered !== void 0 && remembered.method !== SEND_METHOD) throw commandBodyDiffers();
@@ -8325,7 +8359,7 @@ var CherryToolEngine = class {
 				baselineSeq
 			};
 		};
-		const first = await attempt(this.#commandId(args));
+		const first = await attempt(callerId ?? randomUUID());
 		if (!isStaleRevisionRefusal(first.receipt)) return first;
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord(sessionResult["session"]) ? sessionResult["session"] : {};

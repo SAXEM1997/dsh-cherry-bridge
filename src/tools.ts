@@ -4343,46 +4343,92 @@ export class CherryToolEngine {
           } satisfies Record<string, unknown>
         }
 
-        await this.#ensureSubscription(record.deviceId, sessionId)
-        const subscriptions = this.#deps.subs(record.deviceId)
-
-        // The ADMITTED send: its receipt, and the event-buffer cut taken before
-        // the command that produced it (see `#admitSend`).
-        const { receipt, baselineSeq } = await this.#admitSend(connection, subscriptions, record.deviceId, sessionId, {
-          args,
+        return this.#runOnce({
+          connection,
+          deviceId: record.deviceId,
+          sessionId,
           text,
-        })
-
-        if (args['wait'] === false) {
-          // The caller asked for the receipt only: hand it back untouched.
-          return receipt
-        }
-        if (receipt['status'] === 'rejected' || receipt['status'] === 'interrupted') {
-          // A rejected receipt is the peer's final word on this command; there
-          // is no run to wait for. `interrupted` means the command's OUTCOME IS
-          // UNDETERMINED — a different dimension from the execution terminal
-          // set — so it is likewise an answer, never something to park on.
-          //
-          // `accepted` is deliberately NOT in this set: it is the schema-legal
-          // QUEUED status (the peer admitted the command, its run has not
-          // started yet), so an implicit `wait: true` must keep waiting for the
-          // terminal instead of handing back a non-terminal receipt.
-          return receipt
-        }
-
-        const timeoutMs = waitTimeout(args['timeoutMs'])
-        return this.#awaitRun(connection, subscriptions, sessionId, {
-          timeoutMs,
-          // MONOTONIC, not `Date.now()`: see `#awaitRun`'s `startedAt`.
-          startedAt: performance.now(),
-          // The cut taken BEFORE the (successful) send — see `#admitSend`.
-          // Passed explicitly so the waiter does not re-derive it from a buffer
-          // a fast run has already written into.
-          baselineSeq,
-          executionId: typeof receipt['executionId'] === 'string' ? receipt['executionId'] : undefined,
-          commandId: typeof receipt['commandId'] === 'string' ? receipt['commandId'] : undefined,
+          commandId: optionalString(args['commandId']),
+          wait: args['wait'] !== false,
+          timeoutMs: waitTimeout(args['timeoutMs']),
         })
       },
+    })
+  }
+
+  /**
+   * ONE command's round trip against an ALREADY-EXISTING session: subscribe,
+   * admit the send, and — unless the caller asked for the receipt alone — wait
+   * out the run and fold the answer this run produced.
+   *
+   * This is the seam a subagent delegation runs on (#231). The point of
+   * extracting it is not code volume but JUDGEMENT: what counts as this run's
+   * terminal, and what counts as this run's text, must be answered the same way
+   * whether a model asked through `cherry_send` or the runtime asked through the
+   * provider. Two implementations of that would drift, and the drift would show
+   * up as a delegation reporting a different answer than the tool for the same
+   * run.
+   *
+   * What it deliberately does NOT do, because those are not shared judgements:
+   *
+   *  - **Create the session.** That is `cherry_create`'s job here, and a
+   *    delegation's own creation step is #231's. The tool face requires a
+   *    `sessionId`; a delegation has none until it makes one.
+   *  - **Act on a pending interaction.** The tool face SURFACES it as the soft
+   *    terminal `awaiting-interaction` so a human can answer; a delegation has no
+   *    human to ask and denies it (#231). Both read the same soft terminal; only
+   *    the reaction differs, so the reaction stays with the caller.
+   */
+  async #runOnce(request: {
+    connection: DeviceConnection
+    deviceId: string
+    sessionId: string
+    text: string
+    /** Idempotency id the peer records the command under, when the caller named one. */
+    commandId?: string
+    /** `false` hands back the admitted receipt without waiting for any run. */
+    wait: boolean
+    /** The wait window, measured from the send's own success. */
+    timeoutMs: number
+  }): Promise<Record<string, unknown>> {
+    const { connection, deviceId, sessionId, text, commandId, wait, timeoutMs } = request
+    await this.#ensureSubscription(deviceId, sessionId)
+    const subscriptions = this.#deps.subs(deviceId)
+
+    // The ADMITTED send: its receipt, and the event-buffer cut taken before
+    // the command that produced it (see `#admitSend`).
+    const { receipt, baselineSeq } = await this.#admitSend(connection, subscriptions, deviceId, sessionId, {
+      commandId,
+      text,
+    })
+
+    if (!wait) {
+      // The caller asked for the receipt only: hand it back untouched.
+      return receipt
+    }
+    if (receipt['status'] === 'rejected' || receipt['status'] === 'interrupted') {
+      // A rejected receipt is the peer's final word on this command; there
+      // is no run to wait for. `interrupted` means the command's OUTCOME IS
+      // UNDETERMINED — a different dimension from the execution terminal
+      // set — so it is likewise an answer, never something to park on.
+      //
+      // `accepted` is deliberately NOT in this set: it is the schema-legal
+      // QUEUED status (the peer admitted the command, its run has not
+      // started yet), so an implicit `wait: true` must keep waiting for the
+      // terminal instead of handing back a non-terminal receipt.
+      return receipt
+    }
+
+    return this.#awaitRun(connection, subscriptions, sessionId, {
+      timeoutMs,
+      // MONOTONIC, not `Date.now()`: see `#awaitRun`'s `startedAt`.
+      startedAt: performance.now(),
+      // The cut taken BEFORE the (successful) send — see `#admitSend`.
+      // Passed explicitly so the waiter does not re-derive it from a buffer
+      // a fast run has already written into.
+      baselineSeq,
+      executionId: typeof receipt['executionId'] === 'string' ? receipt['executionId'] : undefined,
+      commandId: typeof receipt['commandId'] === 'string' ? receipt['commandId'] : undefined,
     })
   }
 
@@ -4432,10 +4478,12 @@ export class CherryToolEngine {
     subscriptions: SessionSubscriptions,
     deviceId: string,
     sessionId: string,
-    request: { args: Record<string, unknown>; text: string },
+    // The caller's id, NOT a tool-face argument bag: `#runOnce` runs this path
+    // for a delegation too, and a delegation has no bag to fabricate.
+    request: { commandId?: string; text: string },
   ): Promise<{ receipt: Record<string, unknown>; baselineSeq: number }> {
-    const { args, text } = request
-    const callerId = optionalString(args['commandId'])
+    const { commandId, text } = request
+    const callerId = optionalString(commandId)
     const attempt = async (
       commandId: string,
       revisionOverride?: string,
@@ -4495,7 +4543,9 @@ export class CherryToolEngine {
       return { receipt, baselineSeq }
     }
 
-    const first = await attempt(this.#commandId(args))
+    // Same mint as `#commandId` would perform on a bag: the caller's id, else a
+    // fresh uuid. Spelled out because there is no bag here to hand it.
+    const first = await attempt(callerId ?? randomUUID())
     if (!isStaleRevisionRefusal(first.receipt)) return first
 
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
