@@ -383,3 +383,27 @@ A–G 各节要真人 + Electron 端批准，无法被 CI 化；下表只记录�
 - **`wait: true` 的毫秒级时延**：只有上界，没有工具级计时器。
 - 第二部分其余小节（配对、交互应答、断连恢复、多设备、`/scope`、语言切换）本轮没有重跑：
   它们不在 0.2.2 的改动面上。
+
+### 0.2.3（2026-11-05 · DSH profile `web` · 桌面端 ISV-ZYX）
+
+| 项 | 结果 | 观测 |
+| --- | --- | --- |
+| 装机生效 | 通过 | 版本 `0.2.3`；`dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`、`locale/zh.json`、`locale/en.json` **逐文件 sha256 与 Release tarball 全同**（该 tarball 的 sha1 `36adcc31…` 同时等于 registry 的 `dist.shasum` 与 `releases/latest/download/dsh-cherry-bridge.tgz` 的字节）；`dist/index.mjs` mtime `15:05:15` 早于宿主 PID 1 启动 `15:05:22` |
+| 发送往返（§B 冒烟） | 通过 | 新会话 `dsh-bridge 0.2.3 smoke`，`cherry_send(wait: true)` → `completed`、`text: "pong"`、`cursor.seq` 推到 43；全程 `recentErrors` 为空 |
+| **#218 会话投递台账**（0.2.2 记为「要加字段才能测」的那条） | 通过 | 同一会话两次采样：`cherry_events` **之前** `deliveredBytes=11505`、`unackedBytes=11505`、`acks=0`；**之后** `deliveredBytes=11505`（单调不减）、`unackedBytes=0`、`acks=1`。三个数字各自按定义移动，不是「有字段」而已 |
+| **#220 失败候选降级**（本次主修复，真机唯一证据） | 通过（顺序）/ 见下「未覆盖」 | 把设备的两条地址换成「黑洞在前」（`172.17.14.36` 在前、`10.6.0.4` 在后；我这边 TCP 探测前者是**超时**不是拒绝），PATCH 驱逐后第一趟 `connecting` 持续 **11,205 ms**。随后桌面端**重启**造成断链，失败的那一趟在日志里落成 `all candidate hosts unreachable (last: connect to 172.17.14.36:23333 timed out)` —— `last:` 指的是**最后一个被拨的候选**，而记录顺序是黑洞在前，所以黑洞确实被降到了未试过的 `10.6.0.4` **之后**；不降级时该位置会写成 `10.6.0.4` |
+| 顺序的价值（同一台机、同一对地址、反序对照） | 通过 | 恢复原顺序（可用地址在前）后同样的 PATCH+驱逐：`connecting` 持续 **1,216 ms**。两趟之差 **9,989 ms**，与 `connectTimeoutMs` 的 10 s 吻合——即「先撞死地址」每次重连要付的代价 |
+| 断连恢复（§D） | 通过 | 桌面端重启后**未重新配对**即回到 `connected`；`connectionsBuilt` 在重启前后都是 **2**（实例没被重建，档案里的 `desktopIdentity` pin 也仍然匹配）；档案在实验前后逐字段相同（`hosts` / `ports` / `security` / `forgottenHosts` / `port` / `enabled` / `schemaVersion` / `desktopIdentity` 全部 SAME） |
+
+**本轮未覆盖**（**不是通过**）：
+
+- **降级的毫秒级收益**：本环境只能通过「重启桌面端」制造同一实例上的第二趟拨号，而重启期间**两台地址都会失败**，
+  于是下一趟回到「全部已标记 → 记录序」，黑洞又被排到前面。要直接量到「跳过死地址的那一趟」，
+  需要在只有黑洞被标记时再断一次链（第二次重启）。本轮能断言的是**顺序**（日志里的 `last:`）
+  与**顺序值多少钱**（11,205 ms vs 1,216 ms），不能断言「第二趟只花几百毫秒」。
+- **#221 订阅窗口下限**：需要 `perSessionCacheBytes` 小于一条 record（传输层 `recordBytes = 65,536`），
+  这是运维配置项；默认 2 MiB 下该分支不可达，由 `subscriptions.test.ts` 的 `#221` 覆盖。
+- **桌面端版本号**：本轮没有重读（上一轮记录为 2.1.10）；客户端不从握手读桌面端版本号，`/devices`
+  与 `/diagnostics` 也都不带。
+- 第二部分其余小节（配对、交互应答、多设备、`/scope`、语言切换）本轮没有重跑：它们不在 0.2.3 的改动面上。
+- 本轮创建了一个会话 `dsh-bridge 0.2.3 smoke`（`587ce8e7-1335-4132-9591-684d4949d673`），工具集里没有删除会话的入口，需人工在桌面端删掉。
