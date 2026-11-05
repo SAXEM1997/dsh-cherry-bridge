@@ -203,6 +203,20 @@ describe('② the status is rendered from CODES, and the two failures differ', (
       ),
     ).toBeDefined()
   })
+
+  it('②d says the experiment is scope-gated, including the arm the status cannot show', async () => {
+    renderPanel(stubClient(READY))
+    await screen.findByText('已注册 provider cherry 与工具 cherry_subagent。')
+    // `ready` over a scope that excludes every workspace is the confusing case:
+    // the operator reads "registered", the model never sees the tool, and the
+    // cause is in the OTHER panel. The degraded arm (selected + an unreadable
+    // workspace list) is invisible from this status at all, so it is stated.
+    expect(
+      screen.getByText(
+        '它和其余 14 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
+      ),
+    ).toBeDefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

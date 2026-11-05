@@ -265,15 +265,28 @@ function bodyOf(draft: Draft, stored: SubagentConfig & { revision: number }): Su
   }
 }
 
+/**
+ * The three refusal codes this panel has a sentence for, as a TABLE rather than
+ * an interpolated key.
+ *
+ * A `\`subagent.saveFailure.${code}\`` lookup would read the dictionary with a
+ * key no source file spells, which makes all three sentences look dead to
+ * `tests/unit/i18nUsage.test.ts` — the same reason `ToolScopePanel` keeps a
+ * `SAVE_FAILURE_KEYS` table. A code outside the table falls back to the server's
+ * own verdict, which is the honest line for a refusal this build does not know.
+ */
+const SAVE_FAILURE_KEYS: Record<string, string> = {
+  'subagent-revision-conflict': 'subagent.saveFailure.subagent-revision-conflict',
+  'missing-expected-revision': 'subagent.saveFailure.missing-expected-revision',
+  'invalid-request': 'subagent.saveFailure.invalid-request',
+}
+
 /** A save refusal as a sentence: a known code gets its own, anything else the server's. */
 function failureSentence(t: T, error: unknown): string {
   if (error instanceof Error && error.message === REQUEST_TIMEOUT) return t('subagent.error.timeout')
   if (error instanceof ApiError) {
-    const key = `subagent.saveFailure.${error.code}`
-    const known = t(key)
-    // `t` returns the KEY on a miss, which is the signal that this build has no
-    // sentence for the code; the server's own verdict is then the honest line.
-    return known === key ? t('subagent.serverSaid', { code: error.code, status: error.status }) : known
+    const key = SAVE_FAILURE_KEYS[error.code]
+    return key === undefined ? t('subagent.serverSaid', { code: error.code, status: error.status }) : t(key)
   }
   return error instanceof Error ? error.message : String(error)
 }
@@ -359,6 +372,12 @@ export function SubagentPanel({ client = defaultSubagentClient }: SubagentPanelP
           <p className="cherry-hint">
             {data.source === 'file' ? t('subagent.source.file') : t('subagent.source.config')}
           </p>
+          {/* The experiment is scope-gated exactly like the other fourteen
+              tools, and the degraded arm is invisible from here: under
+              `selected` with an unreadable workspace list NO workspace sees the
+              tool, while the status still says `ready`. Saying so is the
+              difference between "broken" and "your scope excludes it". */}
+          <p className="cherry-hint">{t('subagent.scopeNote')}</p>
           {data.pendingRestart && (
             <p className="cherry-ok" role="status">
               {t('subagent.pendingRestart')}

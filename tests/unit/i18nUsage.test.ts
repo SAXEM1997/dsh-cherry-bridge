@@ -42,7 +42,8 @@
  *     `t(STAGE_KEYS[stage] ?? stage)`: the key is chosen DYNAMICALLY, so no
  *     literal for those ten + ten keys exists anywhere. Reading the tables
  *     themselves is what makes them referenced.
- *  3. **`Object.values` of `ToolScopePanel`'s own key tables** —
+ *  3. **`Object.values` of the panels' own key tables** (`ToolScopePanel`,
+ *     `SubagentPanel`) —
  *     `DEGRADED_KEYS`, `SAVE_FAILURE_KEYS`, and the four module-level `*_KEY`
  *     constants (`SAVE_FAILED_KEY`, `SELECTED_EMPTY_KEY`, `GLOBAL_EMPTY_KEY`,
  *     `EFFECT_NOTE_KEY`). Same reason: `t(DEGRADED_KEYS[note.source] ?? …)` and
@@ -252,6 +253,7 @@ describe('the scanner itself (the guard against a vacuously green file)', () => 
       'ui/src/DeviceCard.tsx',
       'ui/src/PairingWizard.tsx',
       'ui/src/ToolScopePanel.tsx',
+      'ui/src/SubagentPanel.tsx',
       'ui/src/main.tsx',
       'ui/src/types.ts',
       'ui/src/api.ts',

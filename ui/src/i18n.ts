@@ -260,6 +260,8 @@ const zh: Dict = {
   'subagent.saveFailure.missing-expected-revision':
     '保存被拒绝：请求缺少基准 expectedRevision，请重新读取后再保存。',
   'subagent.saveFailure.invalid-request': '保存被拒绝：请求体格式不对。',
+  'subagent.scopeNote':
+    '它和其余 14 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
   'subagent.status.heading': '当前状态',
   'subagent.status.disabled': '未启用（默认关闭）。',
   'subagent.status.awaiting-injection': '等待宿主注入 subagents 服务。',
@@ -502,6 +504,8 @@ const en: Dict = {
   'subagent.saveFailure.missing-expected-revision':
     'The save was refused: the request carried no expectedRevision baseline. Read the document again before saving.',
   'subagent.saveFailure.invalid-request': 'The save was refused: the request body is malformed.',
+  'subagent.scopeNote':
+    'Like the other fourteen tools, it obeys the enabled scope: an excluded workspace does not see it. Under “selected” with an unreadable workspace list, no workspace sees it.',
   'subagent.status.heading': 'Current state',
   'subagent.status.disabled': 'Not enabled (off by default).',
   'subagent.status.awaiting-injection': 'Waiting for the host to inject the subagents service.',
