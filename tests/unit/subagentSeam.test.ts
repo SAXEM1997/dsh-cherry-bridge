@@ -60,12 +60,27 @@ function completedResult(text = 'done'): SubagentResult {
   return { output: [{ type: 'text', text }], stopReason: 'completed' }
 }
 
-/** An abort signal plus the listener handle `settleRunResult` must remove. */
-function abortWiring(): { signal: AbortSignal; onAbort: () => void } {
+/**
+ * An abort signal plus the listener handle `settleRunResult` must remove.
+ *
+ * The listener COUNTS, and `abort()` fires the signal, so "was it removed?" is
+ * observable behaviourally — an `AbortSignal` exposes no listener introspection,
+ * and `settleRunResult`'s docblock promises removal on EVERY path, including the
+ * ones that leave through a throw.
+ */
+function abortWiring(): {
+  signal: AbortSignal
+  onAbort: () => void
+  abort: () => void
+  aborts: () => number
+} {
   const controller = new AbortController()
-  const onAbort = (): void => {}
+  let aborts = 0
+  const onAbort = (): void => {
+    aborts += 1
+  }
   controller.signal.addEventListener('abort', onAbort)
-  return { signal: controller.signal, onAbort }
+  return { signal: controller.signal, onAbort, abort: () => controller.abort(), aborts: () => aborts }
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +310,59 @@ describe('#229 settleRunResult settles three ways and never rejects', () => {
     // is blank" are different, and the seam's ceiling applies to the former.
     expect(settled.diagnostic).toBeUndefined()
     expect(reported).toEqual(['peer exploded', 'collectDiagnostic() failed: no session to read'])
+  })
+
+  it('never reads collectDiagnostic when the run was cancelled', async () => {
+    // The diagnostic describes a FAILURE. A run we cancelled did not fail, and a
+    // cancelled child is exactly the case where the backend read behind that
+    // diagnostic is most likely to fail too (the session may already be gone), so
+    // consulting it would buy a second exception for information nothing reports.
+    // Both cancelled arms are driven: the success one and the throwing one.
+    for (const attempt of [
+      async (): Promise<SubagentResult> => completedResult('late answer'),
+      async (): Promise<SubagentResult> => {
+        throw new Error('aborted by transport')
+      },
+    ]) {
+      const wiring = abortWiring()
+      let diagnosticReads = 0
+      const settled = await settleRunResult({
+        attempt,
+        collectOutput: () => [],
+        collectDiagnostic: () => {
+          diagnosticReads += 1
+          return 'never reported'
+        },
+        cancelled: () => true,
+        signal: wiring.signal,
+        onAbort: wiring.onAbort,
+      })
+      expect(settled.stopReason).toBe('aborted')
+      expect(settled.diagnostic).toBeUndefined()
+      expect(diagnosticReads).toBe(0)
+    }
+  })
+
+  it('removes the abort listener even when a collector throws', async () => {
+    // The `finally` is the one guard a collector's throw cannot skip — but only
+    // if it is actually reached, and only if nothing between the throw and it
+    // leaves the function early. Firing the signal afterwards is the only
+    // behavioural way to see it: a still-attached listener would count.
+    const wiring = abortWiring()
+    const settled = await settleRunResult({
+      attempt: async () => {
+        throw new Error('peer exploded')
+      },
+      collectOutput: () => {
+        throw new Error('snapshot unavailable')
+      },
+      cancelled: () => false,
+      signal: wiring.signal,
+      onAbort: wiring.onAbort,
+    })
+    expect(settled.stopReason).toBe('error')
+    wiring.abort()
+    expect(wiring.aborts()).toBe(0)
   })
 
   it('clips a provider diagnostic to the seam byte ceiling without splitting a character', async () => {
