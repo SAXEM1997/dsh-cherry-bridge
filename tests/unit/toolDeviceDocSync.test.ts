@@ -3,9 +3,8 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-import { DeviceStore } from '../../src/deviceStore.js'
-import { registerCherryTools } from '../../src/tools.js'
-import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.js'
+import type { CherryToolDefinition } from '../../src/tools.js'
+import { registerAll } from '../helpers/cherryRegistry.js'
 
 /**
  * The tool face's DEVICE-SELECTOR contract, kept in sync with what
@@ -82,35 +81,6 @@ const SELECTOR_TOOLS = [
   'cherry_cancel',
   'cherry_unpair',
 ] as const
-
-/** The full registry, wired exactly as `toolSchemas.test.ts` wires it. */
-function registerAll(): CherryToolDefinition[] {
-  const definitions: CherryToolDefinition[] = []
-  const ctx: CherryToolsContext = {
-    tools: {
-      register(definition) {
-        definitions.push(definition)
-        return () => {}
-      },
-    },
-  }
-  registerCherryTools(ctx, {
-    store: new DeviceStore('/nonexistent/devices.json'),
-    connect: () => {
-      throw new Error('the doc-sync suite never connects')
-    },
-    subs: () => {
-      throw new Error('the doc-sync suite never subscribes')
-    },
-    pair: async () => {
-      throw new Error('the doc-sync suite never pairs')
-    },
-    evict: () => {
-      throw new Error('the doc-sync suite never evicts')
-    },
-  })
-  return definitions
-}
 
 /** Whether this tool declares a `device` parameter at all. */
 function hasSelector(definition: CherryToolDefinition): boolean {
