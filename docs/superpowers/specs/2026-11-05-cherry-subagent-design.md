@@ -36,7 +36,7 @@ Claude Code、Codex、以及基于 OAR 的七个外部 runtime：每个 provider
 | D1 | cwd 归属 | 判据换成「共享 / 隔离」，一期只做**声明式**；`cwdMode` 默认 `isolated` | 协议里没有 workspace 路径，无法验证；「本地/远程」不是正确判据（DSH 在容器里，同一台机器路径也可能不同） |
 | D2 | 子中途提问 | 一律 `cherry_respond` `deny`，绝不转发给人；连续放弃超限则整轮 error | 官方三级教义：能掐就掐（claude-code 删工具），不能掐就无人值守回答（codex 回空答案/挑非批准项），没有合法响应就 fail closed |
 | D3 | 目标怎么选 | **不加工具参数**；用 `request.cwd` 匹配配置里的 `routes`，未命中回落默认目标 | 接缝没有 per-call 通道：provider 收到的对象由 `SubagentStartRequest` 锁死字段。`cwd` 是唯一被调用方影响又能到 provider 手里的字符串 |
-| D4 | 工具归谁 | **自己注册 `subagent_cherry`**；provider 同时以 `cherry` 名注册 | 用户从插件市场装，「手改 profile 补丁」是真实门槛，与「装了就 work」冲突 |
+| D4 | 工具归谁 | **自己注册 `cherry_subagent`**（2026-11-05 用户裁决改名，原写 `subagent_cherry`）；provider 同时以 `cherry` 名注册 | 用户从插件市场装，「手改 profile 补丁」是真实门槛，与「装了就 work」冲突；改名的理由是它要成为第 15 个 `cherry_*`，好落在 scope 的 restrict/guard 名单里 |
 | D5 | child id | 接缝 id 用 `randomUUID()`；工具返回值附带 `device` + `cherrySessionId` | 守「id 全局唯一」契约；可检查性（模型能 `cherry_read` 回看）用返回值给出，不混 id 空间 |
 | D6 | 超时 | 默认有限 **30 分钟**，可配，`0` = 不限 | 与官方**刻意分歧**：codex 走「调用方取消」，但我们的调用方是模型，它手里没有取消工具；卡死的运行会占满 `maxActiveSubagents`（默认 8） |
 | D7 | 实验性开关 | **一个开关**，默认关；关着时 provider 与工具都不注册 | 用户选定 |
@@ -140,10 +140,10 @@ Claude Code、Codex、以及基于 OAR 的七个外部 runtime：每个 provider
 
 | # | 规格 |
 | --- | --- |
-| SUB-01 | `subagent` 配置缺省、或 `enabled: false` 时，**不**调用 `subagents.registerProvider`，**不**注册 `subagent_cherry` 工具；`ctx.subagents.list()` 里没有 `cherry` |
+| SUB-01 | `subagent` 配置缺省、或 `enabled: false` 时，**不**调用 `subagents.registerProvider`，**不**注册 `cherry_subagent` 工具；`ctx.subagents.list()` 里没有 `cherry` |
 | SUB-02 | 宿主没有 `subagents` 服务时，整个插件其余功能照常工作；子智能体子系统停在 `unavailable` 并带原因，不抛 |
 | SUB-03 | `enabled: true` 但目标配置不完整（缺 `device` / `agentId` / workspace 二选一）时，子智能体子系统停在 `failed` 并带**可读原因**（列出缺哪一项），插件其余功能照常 |
-| SUB-04 | `enabled: true` 且配置完整时，注册 provider 名 `subagent.providerName`（默认 `cherry`）与工具 `subagent.toolName`（默认 `subagent_cherry`） |
+| SUB-04 | `enabled: true` 且配置完整时，注册 provider 名 `subagent.providerName`（默认 `cherry`）与工具 `subagent.toolName`（默认 `cherry_subagent`） |
 | SUB-05 | provider 的 `capabilities` 四项全 `false`，`inheritsParentContext` 为 `false` |
 | SUB-06 | 卸载/重载插件时 provider 与工具都被摘掉（用 `registerProvider` 返回的 disposer 与工具 disposer） |
 
@@ -228,7 +228,7 @@ Claude Code、Codex、以及基于 OAR 的七个外部 runtime：每个 provider
 
 ```ts
 export const CHERRY_SUBAGENT_PROVIDER_DEFAULT = 'cherry'
-export const CHERRY_SUBAGENT_TOOL_DEFAULT = 'subagent_cherry'
+export const CHERRY_SUBAGENT_TOOL_DEFAULT = 'cherry_subagent'
 export const DEFAULT_SUBAGENT_TIMEOUT_MS = 1_800_000
 export const DEFAULT_MAX_INTERACTION_ABANDONS = 8
 

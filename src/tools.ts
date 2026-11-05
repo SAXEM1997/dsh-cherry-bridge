@@ -1,4 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { MESSAGE_TEXT_MAX_CHARS, SUBAGENT_TITLE_FALLBACK_CHARS } from './defaults.js'
+import { matchRoute } from './subagent.js'
+import type { CherrySubagentRoute, CherrySubagentRunOutcome, SubagentTarget } from './subagent.js'
 import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
@@ -1083,7 +1086,7 @@ const MAX_EXTERNALIZED_BYTES = 32 * 1024 * 1024
 const DEFAULT_CONTENT_READ_CONCURRENCY = 4
 
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
-const TEXT_MAX_LENGTH = 32_768
+const TEXT_MAX_LENGTH = MESSAGE_TEXT_MAX_CHARS
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */
@@ -1169,13 +1172,38 @@ class AssemblyDeadline {
 
   constructor(startedAt: number, windowMs: number) {
     const tail = Math.min(Math.max(windowMs, WAIT_ANSWER_TAIL_FLOOR_MS), WAIT_ANSWER_TAIL_MS)
-    this.instant = startedAt + windowMs + tail
+    // An INFINITE window (a delegation with `timeoutMs: 0`) would make the
+    // instant infinite, and the answer would lose the absolute bound this whole
+    // class exists to impose — under a degrading link every request could then
+    // absorb `transportRetryWaitMs` for as long as the peer felt like it.
+    // `answerWindowFor` is what keeps that from reaching here; the guard is the
+    // second line of defence, so a future caller cannot reintroduce it.
+    this.instant = Number.isFinite(startedAt + windowMs) ? startedAt + windowMs + tail : startedAt + tail
   }
 
   /** Whether the budget is spent (a deadline exactly now counts as spent). */
   expired(): boolean {
     return performance.now() >= this.instant
   }
+}
+
+/**
+ * The window the ANSWER gets, which is deliberately not always the window the
+ * WAIT gets.
+ *
+ * For every finite `timeoutMs` the two are the same — the answer may spend one
+ * bounded tail past the caller's patience, and that is the whole `AssemblyDeadline`
+ * design. `timeoutMs: 0` is the one case where they must differ: SUB-42 makes it
+ * "no wall-clock bound on the WAIT", a decision about how long a parent is
+ * willing to wait for a child, and it says nothing about how long a CONTENT
+ * read may take. An unbounded assembly would be a different promise — one no
+ * caller asked for and no link can honour.
+ *
+ * @param timeoutMs - the wait window; `Infinity` means unbounded.
+ * @returns the finite window the answer's assembly is budgeted with.
+ */
+export function answerWindowFor(timeoutMs: number): number {
+  return Number.isFinite(timeoutMs) ? timeoutMs : WAIT_ANSWER_TAIL_MS
 }
 
 /**
@@ -1371,6 +1399,8 @@ interface ObservationCarry {
   executionId?: string
   terminalStatus?: string
   terminalMessageId?: string
+  /** The peer's own failure classification for the terminal, when it sent one. */
+  terminalError?: { reason: string; message?: string }
 }
 
 // ---------------------------------------------------------------------------
@@ -1379,6 +1409,28 @@ interface ObservationCarry {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * The peer's own failure classification on an `execution.updated` payload.
+ *
+ * `error` is schema-optional and its `reason` is a closed enum, so a payload
+ * without a usable reason answers `undefined` rather than a placeholder: "the
+ * peer said why" and "the peer did not" are different facts, and a caller
+ * branches on exactly that difference. Only `reason` and `message` are kept —
+ * `details` and `failure` are opaque blobs the protocol leaves unconstrained,
+ * and they must never reach a model's context (issue #231, SUB-53).
+ *
+ * @param payload - one `execution.updated` payload.
+ * @returns the classification, when the peer sent one.
+ */
+function executionErrorOf(payload: Record<string, unknown>): { reason: string; message?: string } | undefined {
+  const error = payload['error']
+  if (!isRecord(error)) return undefined
+  const reason = optionalString(error['reason'])
+  if (reason === undefined) return undefined
+  const message = optionalString(error['message'])
+  return message === undefined ? { reason } : { reason, message }
 }
 
 /** The peer's failure discriminator, or undefined for a non-protocol error. */
@@ -1934,16 +1986,27 @@ export function registerCherryToolsWithEngine(
   ctx: CherryToolsContext,
   deps: CherryToolsDeps,
   options: CherryToolEngineOptions = {},
+  /**
+   * An engine the ASSEMBLY already owns, reused instead of building one here.
+   *
+   * The subagent subsystem needs the same engine, and it must not depend on the
+   * tools being registered: the scope subsystem hides the fourteen tools per
+   * workspace (by default in every workspace), while a delegation is a separate
+   * feature an operator can enable on its own. Sharing the instance is what
+   * keeps those two lifecycles independent — and it is the reason the engine is
+   * built in `apply` rather than inside the tool host's injection callback.
+   */
+  shared: CherryToolEngine | undefined = undefined,
 ): { dispose: () => void; engine: CherryToolEngine | undefined } {
   const tools = ctx.tools
   if (tools === undefined) {
     // Headless deployments have no tool registry. Degrade to a warning rather
     // than throwing: the assembly's HTTP/UI half must still come up.
     console.warn('[cherry-remote] ctx.tools is unavailable; the cherry_* tools were not registered')
-    return { dispose: () => {}, engine: undefined }
+    return { dispose: () => {}, engine: shared }
   }
 
-  const engine = new CherryToolEngine(deps, options)
+  const engine = shared ?? new CherryToolEngine(deps, options)
   const disposers = engine.definitions().map((definition) => tools.register(definition))
   return {
     engine,
@@ -1988,6 +2051,33 @@ function defineCherryTool(definition: {
  * share. Kept as one class (rather than per-face closures) so the per-session
  * and per-device state the later faces add has an obvious home.
  */
+/**
+ * A wait that OUR side stopped.
+ *
+ * Deliberately not one of the peer's four terminal statuses: the run did not
+ * end, we stopped listening to it. Encoding our own cancellation as
+ * `status: 'cancelled'` would tell a delegation's parent that the CHILD
+ * cancelled itself, which is a different fact with a different remedy. The tool
+ * face never passes a signal, so it can never see this — it exists for the
+ * subagent delegation, whose parent owns the abort (issue #231, SUB-25).
+ */
+export class RunAbortedError extends Error {
+  /**
+   * The run the wait had attached to, when it had one.
+   *
+   * Carried out of the wait because the caller cancels the child on the way out
+   * and the cache may not know the execution yet — a run cancelled a moment
+   * after it started has an id in the RECEIPT and nothing in the stream.
+   */
+  readonly executionId: string | undefined
+
+  constructor(executionId?: string) {
+    super('the wait was aborted by the caller')
+    this.name = 'RunAbortedError'
+    this.executionId = executionId
+  }
+}
+
 export class CherryToolEngine {
   readonly #deps: CherryToolsDeps
   /**
@@ -4390,6 +4480,23 @@ export class CherryToolEngine {
     wait: boolean
     /** The wait window, measured from the send's own success. */
     timeoutMs: number
+    /**
+     * Break the wait when OUR side cancels. Absent for the tool face, which has
+     * no cancellation channel of its own; supplied by a delegation, whose parent
+     * owns one (SUB-25). An abort throws {@link RunAbortedError} rather than
+     * reporting one of the peer's terminal statuses.
+     */
+    signal?: AbortSignal
+    /**
+     * What to do with a SOFT terminal — an unanswered interaction.
+     *
+     * Absent means "hand it back", which is the tool face: a human may answer.
+     * A delegation supplies a policy instead, because it has no human to ask
+     * (SUB-30). The reaction stays with the caller on purpose — see the method's
+     * docblock — and `'continue'` re-enters the SAME run (same cut, same
+     * execution, same deadline), never a new send.
+     */
+    onInteraction?: (answer: Record<string, unknown>) => Promise<'continue' | 'stop'>
   }): Promise<Record<string, unknown>> {
     const { connection, deviceId, sessionId, text, commandId, wait, timeoutMs } = request
     await this.#ensureSubscription(deviceId, sessionId)
@@ -4419,17 +4526,339 @@ export class CherryToolEngine {
       return receipt
     }
 
-    return this.#awaitRun(connection, subscriptions, sessionId, {
-      timeoutMs,
-      // MONOTONIC, not `Date.now()`: see `#awaitRun`'s `startedAt`.
-      startedAt: performance.now(),
-      // The cut taken BEFORE the (successful) send — see `#admitSend`.
-      // Passed explicitly so the waiter does not re-derive it from a buffer
-      // a fast run has already written into.
-      baselineSeq,
-      executionId: typeof receipt['executionId'] === 'string' ? receipt['executionId'] : undefined,
-      commandId: typeof receipt['commandId'] === 'string' ? receipt['commandId'] : undefined,
+    // MONOTONIC, not `Date.now()`: see `#awaitRun`'s `startedAt`. Taken ONCE,
+    // here, because SUB-40 measures the window from the send's own success —
+    // an interaction round that re-entered with a fresh `startedAt` would hand
+    // the child a new window every time it asked a question.
+    const startedAt = performance.now()
+    // The cut taken BEFORE the (successful) send — see `#admitSend`. Passed
+    // explicitly so the waiter does not re-derive it from a buffer a fast run
+    // has already written into. It does NOT move across interaction rounds: the
+    // run is the same run.
+    let executionId = typeof receipt['executionId'] === 'string' ? receipt['executionId'] : undefined
+    const receiptCommandId = typeof receipt['commandId'] === 'string' ? receipt['commandId'] : undefined
+
+    for (;;) {
+      const answer = await this.#awaitRun(connection, subscriptions, sessionId, {
+        timeoutMs,
+        startedAt,
+        baselineSeq,
+        ...(executionId === undefined ? {} : { executionId }),
+        ...(receiptCommandId === undefined ? {} : { commandId: receiptCommandId }),
+        ...(request.signal === undefined ? {} : { signal: request.signal }),
+      })
+      if (request.onInteraction === undefined || answer['status'] !== 'awaiting-interaction') {
+        return answer
+      }
+      const verdict = await request.onInteraction(answer)
+      if (verdict === 'stop') return answer
+      // STICKY: the soft terminal reports the execution it belongs to, and the
+      // next pass must keep observing THAT run rather than re-adopting whatever
+      // appears after the cut.
+      const named = optionalString(answer['executionId'])
+      if (named !== undefined) executionId = named
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // The subagent delegation seam (#231)
+  // -------------------------------------------------------------------------
+
+  /**
+   * ONE delegation: resolve the target, create the session, run it under the
+   * interaction policy and the deadline, and report what the peer said.
+   *
+   * This is the ONLY door a subagent provider gets into the engine. The provider
+   * is written against `ctx.subagents`' four-field shape and knows nothing about
+   * the rpc surface, while every judgement below — which run is this run, what
+   * counts as its text, what a failure means — is the SAME judgement
+   * `cherry_send` makes, because both go through {@link CherryToolEngine.#runOnce}.
+   * Two implementations of that would drift, and the drift would surface as a
+   * delegation reporting a different answer than the tool for the same run.
+   *
+   * The interaction policy is here, not in the wait: a delegation has no human
+   * to ask, so every card is DENIED and the run continues (SUB-30). A child that
+   * keeps asking is not making progress, so the ceiling turns the loop into a
+   * reported failure instead of an unbounded run (SUB-31). Nothing is ever
+   * surfaced to the DSH user (SUB-32).
+   *
+   * @param input - the resolved target, the route table, the task and its bounds.
+   * @returns what the run amounted to, in the provider's own vocabulary.
+   * @throws when the delegation could not be STARTED — an unreachable device, a
+   *   session the peer refused. Those are infrastructure faults the seam cannot
+   *   express as a run result, and the provider cleans up and rethrows them.
+   */
+  async runSubagentDelegation(input: {
+    target: SubagentTarget
+    routes: readonly CherrySubagentRoute[]
+    /** The seam's resolved child directory; a routing key only, never stat'ed. */
+    cwd: string
+    /** The seam's label, used as the Cherry session title. */
+    label: string | undefined
+    text: string
+    /** `0` means no wall-clock bound (SUB-42). */
+    timeoutMs: number
+    maxInteractionAbandons: number
+    signal: AbortSignal
+    /** Called the moment the Cherry session exists, before any run starts (D5). */
+    onSessionCreated?: (sessionId: string) => void
+  }): Promise<CherrySubagentRunOutcome> {
+    const route = matchRoute(input.routes, input.cwd)
+    const deviceId = route?.device ?? input.target.device
+    // A route may override the workspace without touching the device, which is
+    // the whole point of a per-directory table (SUB-11).
+    const workspace =
+      route?.workspaceId === undefined ? input.target.workspace : { workspaceId: route.workspaceId }
+
+    const resolved = await this.#linkOr(deviceId)
+    if (resolved.link === undefined) {
+      // The verdict is the TOOL vocabulary (`ambiguous-device`, `device-not-found`,
+      // `archive-quarantined`), and it is quoted rather than re-worded: an
+      // operator chasing a delegation failure should see the same words the
+      // device tools use for the same condition.
+      throw new Error(
+        `cherry subagent: the target device is unavailable (${String(resolved.verdict.error)})`,
+      )
+    }
+    const { connection, record } = resolved.link
+
+    // The session is created HERE and nowhere else: `#runOnce` deliberately
+    // requires one, and a delegation's creation step is its own (see its
+    // docblock). Both workspace branches are explicit — an implicit choice would
+    // write into a workspace the operator never named.
+    const title = input.label ?? input.text.trim().slice(0, SUBAGENT_TITLE_FALLBACK_CHARS).trim()
+    const created = await this.#command(connection, 'agent.sessions.create', {
+      commandId: randomUUID(),
+      agentId: input.target.agentId,
+      ...('workspaceId' in workspace
+        ? { workspaceId: workspace.workspaceId }
+        : { workspace: { kind: 'system' as const } }),
+      // SUB-23: the seam's label when it sent one, else the head of the task —
+      // a session list is read by a human scanning titles, and an untitled
+      // session is indistinguishable from every other one.
+      ...(title === undefined ? {} : { title }),
     })
+    const sessionId = optionalString(created['sessionId'])
+    if (sessionId === undefined) {
+      throw new Error(
+        `cherry subagent: the peer created no session (${String(created['error'] ?? 'no sessionId in the receipt')})`,
+      )
+    }
+    input.onSessionCreated?.(sessionId)
+
+    const subscriptions = this.#deps.subs(record.deviceId)
+    let abandons = 0
+    let ceilingHit = false
+    let observedExecutionId: string | undefined
+    let answer: Record<string, unknown>
+    try {
+      answer = await this.#runOnce({
+        connection,
+        deviceId: record.deviceId,
+        sessionId,
+        text: input.text,
+        wait: true,
+        // `0` is the documented "no wall-clock bound" (SUB-42). `#awaitRun`
+        // judges `now >= startedAt + timeoutMs`, so an infinity is the value that
+        // expresses it: the deadline never arrives and the poll interval stays
+        // the ordinary one (`Math.min` against a finite budget).
+        timeoutMs: input.timeoutMs === 0 ? Number.POSITIVE_INFINITY : input.timeoutMs,
+        signal: input.signal,
+        onInteraction: async (soft) => {
+          const interactionId = optionalString(soft['interactionId'])
+          // Unreachable through `#awaitRun` (it always names the oldest pending
+          // card), and 'stop' rather than 'continue' so a peer shape we cannot
+          // answer cannot become a spin.
+          if (interactionId === undefined) return 'stop'
+          abandons += 1
+          observedExecutionId = optionalString(soft['executionId']) ?? observedExecutionId
+          if (abandons >= input.maxInteractionAbandons) {
+            ceilingHit = true
+            // Best effort: the ceiling's answer is the reported error below, and
+            // a cancel that failed must not replace it with a transport fault.
+            await this.#cancelRun(connection, record.deviceId, sessionId, observedExecutionId).catch(() => {})
+            return 'stop'
+          }
+          // A denial that fails is COUNTED, not fatal: the run is stuck on the
+          // same card, so the next pass reports it again and the ceiling above
+          // is what ends the loop.
+          await this.#denyInteraction(connection, record.deviceId, sessionId, interactionId).catch(() => {})
+          return 'continue'
+        },
+      })
+    } catch (error) {
+      if (!(error instanceof RunAbortedError)) throw error
+      // SUB-25: our own cancellation still stops the child, and the partial is
+      // what the peer has persisted so far.
+      await this.#cancelRun(connection, record.deviceId, sessionId, error.executionId).catch(() => {})
+      const partial = await this.#partialText(connection, subscriptions, sessionId).catch(() => '')
+      return { status: 'aborted', text: partial }
+    }
+
+    // A timeout (or any other non-terminal answer) still has to stop the child:
+    // the parent has stopped waiting, and a run left alive on the desktop is
+    // work nobody will read.
+    if (answer['status'] === 'timeout') {
+      await this.#cancelRun(
+        connection,
+        record.deviceId,
+        sessionId,
+        optionalString(answer['executionId']) ?? observedExecutionId,
+      ).catch(() => {})
+    }
+    return this.#foldDelegation(answer, {
+      ceilingHit,
+      maxInteractionAbandons: input.maxInteractionAbandons,
+      timeoutMs: input.timeoutMs,
+    })
+  }
+
+  /**
+   * What a delegation's terminal answer means (SUB-50..54).
+   *
+   * Kept apart from the run so the mapping is a pure function of what the peer
+   * said: `cherry_send`'s caller wants the whole receipt, a parent model wants
+   * one verdict and one sentence.
+   *
+   * The distinctions that are easy to get wrong, and are therefore stated:
+   *
+   *  - **`aggregateError` is NOT an empty answer.** The run settled; only the
+   *    history read behind its text failed. Folding that into "the child said
+   *    nothing" (SUB-51) would report a content failure as a silent child.
+   *  - **A refusal is `completed`.** A Cherry persona may decline the task on
+   *    role grounds; its refusal text IS the output, and calling that a failure
+   *    would teach the parent to retry a decision (SUB-54).
+   *  - **`completed` carries NO diagnostic.** The host appends a result's
+   *    diagnostic to the settlement notification, so one on a success would show
+   *    up in the parent's context as an unexplained warning.
+   */
+  #foldDelegation(
+    answer: Record<string, unknown>,
+    extra: { ceilingHit: boolean; maxInteractionAbandons: number; timeoutMs: number },
+  ): CherrySubagentRunOutcome {
+    const status = String(answer['status'] ?? '')
+    const text = typeof answer['text'] === 'string' ? answer['text'] : ''
+
+    if (extra.ceilingHit || status === 'awaiting-interaction') {
+      return {
+        status: 'error',
+        text,
+        diagnostic:
+          `the child asked for human input ${String(extra.maxInteractionAbandons)} times without finishing; ` +
+          'the run was cancelled. A Cherry child cannot reach a human through a delegation.',
+      }
+    }
+    if (status === 'timeout') {
+      return {
+        status: 'error',
+        text,
+        diagnostic:
+          `the delegation reached its ${String(extra.timeoutMs)} ms timeout and was cancelled; the run may ` +
+          'still be finishing on the desktop. Raise `subagent.timeoutMs` (0 disables the bound) if the child ' +
+          'needs longer.',
+      }
+    }
+    if (typeof answer['aggregateError'] === 'string') {
+      return {
+        status: 'error',
+        text: '',
+        diagnostic: `the run settled but its history could not be read (${answer['aggregateError']})`,
+      }
+    }
+    if (status === 'completed') {
+      return text.trim().length === 0
+        ? { status: 'error', text: '', diagnostic: 'the child completed but produced no text' }
+        : { status: 'completed', text }
+    }
+    // `failed` / `interrupted` / `cancelled`, and anything the peer invents.
+    const error = isRecord(answer['executionError']) ? answer['executionError'] : undefined
+    const reason = error === undefined ? undefined : optionalString(error['reason'])
+    const message = error === undefined ? undefined : optionalString(error['message'])
+    const detail = reason === undefined ? `the run ended ${status}` : `the run ended ${status}: ${reason}`
+    return {
+      status: 'error',
+      text,
+      diagnostic: message === undefined ? detail : `${detail} — ${message}`,
+    }
+  }
+
+  /**
+   * Deny one pending interaction, so the run can continue (SUB-30).
+   *
+   * The staleness triple comes from the CACHE, exactly as `cherry_respond`'s does
+   * (`#interactionSnapshot`): the caller cannot know what the plugin has observed,
+   * and a triple this side invented would be refused by the peer's own fencing.
+   * A card that settled between the wait's report and this call answers nothing
+   * and is not an error — the next pass re-judges the run.
+   */
+  async #denyInteraction(
+    connection: DeviceConnection,
+    deviceId: string,
+    sessionId: string,
+    interactionId: string,
+  ): Promise<void> {
+    await this.#ensureSubscription(deviceId, sessionId)
+    const subscriptions = this.#deps.subs(deviceId)
+    const snapshot = await this.#interactionSnapshot(connection, subscriptions, deviceId, sessionId, interactionId)
+    if (snapshot === undefined) return
+    await this.#command(connection, RESPOND_METHOD, {
+      commandId: randomUUID(),
+      sessionId,
+      interactionId,
+      expectedRevision: snapshot.revision,
+      expectedExecutionId: snapshot.executionId,
+      inputDigest: snapshot.inputDigest,
+      decision: 'deny',
+    })
+  }
+
+  /**
+   * Cancel the session's in-flight run, if it still has one.
+   *
+   * The execution id is the CACHE's, as `cherry_cancel` derives it, and only when
+   * the cache can name one: a run that already settled has nothing to cancel, and
+   * inventing an id would earn `execution-mismatch` from the peer's fencing.
+   */
+  async #cancelRun(
+    connection: DeviceConnection,
+    deviceId: string,
+    sessionId: string,
+    observedExecutionId?: string,
+  ): Promise<void> {
+    await this.#ensureSubscription(deviceId, sessionId)
+    const subscriptions = this.#deps.subs(deviceId)
+    // The OBSERVED id wins when there is one: a delegation knows which run it
+    // started from the receipt, and the cache only learns an execution when its
+    // first event arrives — so a run cancelled moments after it began would
+    // otherwise look like a session with nothing to cancel.
+    const expectedExecutionId =
+      observedExecutionId ?? (await this.#activeExecutionId(connection, subscriptions, deviceId, sessionId))
+    if (expectedExecutionId === undefined) return
+    await this.#command(connection, CANCEL_METHOD, { commandId: randomUUID(), sessionId, expectedExecutionId })
+  }
+
+  /**
+   * The assistant text a cancelled run left behind, on a SHORT budget.
+   *
+   * The peer persists a run's message when it SETTLES, so a run we just cancelled
+   * may have nothing to read yet — empty is then the honest partial, not a
+   * failure. The budget is what keeps this off the teardown's critical path: a
+   * parent giving up should not wait out an assembly.
+   */
+  async #partialText(
+    connection: DeviceConnection,
+    subscriptions: SessionSubscriptions,
+    sessionId: string,
+  ): Promise<string> {
+    const assembled = await this.#terminalResult(
+      connection,
+      subscriptions,
+      sessionId,
+      'cancelled',
+      {},
+      new AssemblyDeadline(performance.now(), 1_000),
+    )
+    return typeof assembled['text'] === 'string' ? assembled['text'] : ''
   }
 
   /**
@@ -6142,6 +6571,16 @@ export class CherryToolEngine {
        * run has nothing earlier to cut at.
        */
       baselineSeq?: number
+      /**
+       * OUR cancellation, checked at the top of every pass.
+       *
+       * Not a peer terminal and not a timeout: the run may still be alive on the
+       * desktop, which is why the caller cancels it explicitly on the way out.
+       * Checked on the pass boundary rather than raced against the park, so the
+       * abort lands within one poll interval (`#waitPollMs`, 25 ms by default)
+       * — a bound this deliberate is worth more than a listener per pass.
+       */
+      signal?: AbortSignal
     },
   ): Promise<Record<string, unknown>> {
     // The deadline and every `now` below are on the SAME monotonic clock as
@@ -6156,7 +6595,7 @@ export class CherryToolEngine {
     // aggregate may spend only the bounded TAIL past the window (see
     // `AssemblyDeadline`), and every request it issues is clamped to that
     // instant.
-    const answerDeadline = new AssemblyDeadline(options.startedAt, options.timeoutMs)
+    const answerDeadline = new AssemblyDeadline(options.startedAt, answerWindowFor(options.timeoutMs))
     let latestExecutionId = options.executionId
     // THE BASELINE: the newest seq already in the buffer when this wait began.
     // The fold below sees only events strictly after it, so a prior run's
@@ -6182,6 +6621,9 @@ export class CherryToolEngine {
     let carriedCursor: AgentCursor | undefined
 
     for (;;) {
+      // OUR cancellation outranks every precondition below: once the parent has
+      // given up, the state of the link is not this wait's answer to give.
+      if (options.signal?.aborted === true) throw new RunAbortedError(latestExecutionId)
       // The link is the precondition for EVERYTHING below: a closed connection
       // cannot deliver the event this wait exists to see, so continuing would
       // only delay the caller's discovery that the run is unobservable.
@@ -6272,6 +6714,11 @@ export class CherryToolEngine {
             // The run-scoped cut for the terminal aggregate: the message THIS run
             // persisted, when the peer named one.
             ...(observed.terminalMessageId === undefined ? {} : { terminalMessageId: observed.terminalMessageId }),
+            // The peer's own failure classification. It rides the verdict, so a
+            // content-assembly failure degrades to `aggregateError` WITHOUT
+            // taking the reason down with it (the #3 invariant: a run's verdict
+            // and its identifiers survive a content failure).
+            ...(observed.terminalError === undefined ? {} : { executionError: observed.terminalError }),
           },
           answerDeadline,
         )
@@ -6378,6 +6825,7 @@ export class CherryToolEngine {
     executionId?: string
     terminalStatus?: string
     terminalMessageId?: string
+    terminalError?: { reason: string; message?: string }
     pendingInteractions: Array<{
       interactionId: string
       kind: string
@@ -6389,6 +6837,7 @@ export class CherryToolEngine {
       executionId?: string
       terminalStatus?: string
       terminalMessageId?: string
+      terminalError?: { reason: string; message?: string }
       pendingInteractions: Array<{ interactionId: string; kind: string; summary: string; questions: string[] }>
     } = { pendingInteractions: [] }
 
@@ -6436,6 +6885,7 @@ export class CherryToolEngine {
     state.executionId = options.carry?.executionId
     state.terminalStatus = options.carry?.terminalStatus
     state.terminalMessageId = options.carry?.terminalMessageId
+    state.terminalError = options.carry?.terminalError
 
     // The high-water mark moves INSIDE the fold below, so the next pass skips
     // exactly what this one already consumed without a second scan (which would
@@ -6493,6 +6943,13 @@ export class CherryToolEngine {
       if (awaited === undefined || executionId !== awaited) continue
       state.executionId = executionId
       state.terminalStatus = terminal ? status : undefined
+      // The peer's own classification of a failed terminal, kept as the two
+      // fields it is made of rather than the payload: `reason` is a closed
+      // 16-value enum on the schema and is the only part a caller can act on,
+      // while the raw object carries `details`/`failure` blobs that must never
+      // reach a model's context (issue #231, SUB-53). Dropped for a non-terminal
+      // status, exactly like `terminalStatus` itself.
+      state.terminalError = terminal ? executionErrorOf(payload) : undefined
       // The terminal names the message THIS run persisted, which is the one
       // boundary the terminal aggregate must cut at: the session's history is
       // cumulative, so concatenating every assistant message would re-deliver
@@ -6527,6 +6984,7 @@ export class CherryToolEngine {
       options.carry.executionId = state.executionId
       options.carry.terminalStatus = state.terminalStatus
       options.carry.terminalMessageId = state.terminalMessageId
+      options.carry.terminalError = state.terminalError
       options.carry.scannedSeq = Number.isFinite(scannedSeqNext) ? scannedSeqNext : undefined
     }
     return state

@@ -14,6 +14,65 @@ type WsDialOptions = {
   ca?: string | Buffer | Array<string | Buffer>;
 };
 //#endregion
+//#region src/subagent.d.ts
+/**
+ * One declared target route.
+ *
+ * A route names a Cherry workspace, and optionally the device that hosts it. The
+ * seam has NO per-call channel for a delegation TARGET — the object a provider
+ * receives is built by the runtime and its fields are fixed
+ * (`@deepseek-ai/dsh-subagent/lib/index.js:1504-1509`).
+ *
+ * `cwd` is the only caller-influenced field that can carry a DIRECTORY, which is
+ * why routing keys on it. It is NOT the only caller-influenced field: `label` and
+ * `prompt` are model-authored too. They are unusable as routing keys for the
+ * opposite reason — a label is a caption, not a path, and matching on prompt text
+ * would make a delegation's destination depend on prose.
+ */
+interface CherrySubagentRoute {
+  /** Directory prefix this route claims, compared after normalization. */
+  readonly cwdPrefix: string;
+  /** Device override; omission keeps the default device. */
+  readonly device?: string;
+  /** Workspace override; omission keeps the default workspace. */
+  readonly workspaceId?: string;
+}
+/**
+ * The operator's configuration for the subagent subsystem.
+ *
+ * Deliberately ONE flat table, readable and writable by a single GET/PUT pair
+ * (#233) with `revision` as the optimistic lock: a shape that could only be read
+ * from profile YAML would have to be re-derived by the settings page, and the two
+ * readings would drift. Every field is optional — the switch is what decides,
+ * and a draft target behind a closed switch is not an error (SUB-01).
+ */
+interface SubagentConfig {
+  /** The switch. Absent or `false` registers nothing (SUB-01). */
+  enabled?: boolean;
+  /** The name the provider is registered under. Default `cherry`. */
+  providerName?: string;
+  /** The name the tool is exposed under. Default `cherry_subagent`. */
+  toolName?: string;
+  /** Device selector — an exact id or a unique prefix, as the tools take it. */
+  device?: string;
+  /** The Cherry agent that runs the delegation. */
+  agentId?: string;
+  /** A registered workspace id, as `cherry_workspaces` reports it. */
+  workspaceId?: string;
+  /** The other arm of the workspace choice; mutually exclusive with {@link workspaceId}. */
+  workspaceKind?: 'system';
+  /** Declaration only (D1): which directory a delegation is told it is in. */
+  cwdMode?: 'isolated' | 'shared';
+  /** Per-directory target overrides, in precedence order (SUB-10..14). */
+  routes?: readonly CherrySubagentRoute[];
+  /** The wait window; `0` means no wall-clock bound (SUB-40..43). */
+  timeoutMs?: number;
+  /** How many interactions one delegation may abandon (SUB-31). */
+  maxInteractionAbandons?: number;
+  /** The revision this config was read at; the next `PUT` quotes it (#233). */
+  revision?: number;
+}
+//#endregion
 //#region src/tools.d.ts
 /**
  * The plugin's tool face: the complete fourteen-tool `cherry_*` family — six
@@ -251,6 +310,16 @@ export declare const inject: string[];
  * {@link assemblyDeps}'s `pair` member.
  */
 export interface CherryBridgeConfig {
+  /**
+   * The EXPERIMENTAL subagent subsystem — off unless this object says otherwise.
+   *
+   * Nothing is registered while it is absent or `enabled: false`: a model should
+   * not see a feature the operator has not turned on, and a delegation is a whole
+   * agent run on someone's desktop rather than a cheap tool call. See
+   * {@link SubagentConfig} for the fields; `resolveSubagentConfig` validates them
+   * and every unusable one is named in the subsystem's own reason.
+   */
+  subagent?: SubagentConfig;
   /**
    * Plugin data directory holding `identity.key` and `devices.json`, both
    * 0600. Omitted follows `$DSH_HOME`, then `~/.dsh`.

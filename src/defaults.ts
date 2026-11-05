@@ -202,3 +202,73 @@ export const LIST_PAGE_CLAMP = 16
  * judged in both directions.
  */
 export const MAX_RESUME_TOKEN_CHARS = 4_096
+
+// ---------------------------------------------------------------------------
+// The subagent subsystem (experimental, off by default — issue #231)
+// ---------------------------------------------------------------------------
+
+/**
+ * The provider name a Cherry delegation is registered under.
+ *
+ * These four values are **numbers and words that also appear in the copy**: the
+ * README pair, the tool description and the settings page all quote them, and a
+ * reader has no way to tell a stale sentence from a changed default. They live
+ * here, once, and `tests/unit/subagentConfig.test.ts` pins them — the same
+ * discipline issue #219 applied to the parameter descriptions.
+ */
+export const CHERRY_SUBAGENT_PROVIDER_DEFAULT = 'cherry'
+
+/**
+ * The tool name a delegation is exposed to the model under.
+ *
+ * `cherry_subagent`, not `subagent_cherry`: it has to read as the fifteenth
+ * `cherry_*` tool so it falls inside the scope subsystem's `restrict`/`guard`
+ * name list without a second convention.
+ */
+export const CHERRY_SUBAGENT_TOOL_DEFAULT = 'cherry_subagent'
+
+/**
+ * How long a delegation waits for the child's terminal, measured from the
+ * send's own success — 30 minutes.
+ *
+ * A delegation is a whole agent run on a desktop, not one tool call: the official
+ * Codex provider carries no timeout at all and the OAR provider's is optional,
+ * so a bound here is a deliberate choice rather than an inherited one. It exists
+ * because the parent cannot see the child's progress, and a delegation that
+ * outlives the operator's patience is better reported as an error naming this
+ * number than left to hang. `0` disables it (SUB-42).
+ */
+export const DEFAULT_SUBAGENT_TIMEOUT_MS = 1_800_000
+
+/**
+ * How many interactions one delegation may abandon before the run is cancelled.
+ *
+ * Cherry children ask their human questions; a delegation has no human to ask,
+ * so every interaction is denied and the run continues (SUB-30). A child that
+ * keeps asking is not making progress, and the ceiling turns that loop into a
+ * reported failure instead of an unbounded run.
+ */
+export const DEFAULT_MAX_INTERACTION_ABANDONS = 8
+
+/**
+ * The protocol's `agent.messages.send.text` ceiling, in characters.
+ *
+ * A PROTOCOL fact, not a policy: the peer's schema refuses a longer body. It
+ * lives here because TWO faces pre-validate against it — `cherry_send`'s tool
+ * arguments and a subagent delegation's assembled prompt — and a second copy
+ * would drift the moment the peer's ceiling moved. Pre-validating is the whole
+ * point: a refusal we can explain beats a schema error round-tripped back from
+ * the wire.
+ */
+export const MESSAGE_TEXT_MAX_CHARS = 32_768
+
+/**
+ * How much of the task becomes the Cherry session's title when the seam sent no
+ * label (SUB-23).
+ *
+ * A session list is read by a human scanning titles, so this is a caption
+ * budget rather than a data one: 60 characters is about one line in the
+ * settings page and in Cherry's own sidebar, and it is enough to tell two
+ * delegations apart.
+ */
+export const SUBAGENT_TITLE_FALLBACK_CHARS = 60

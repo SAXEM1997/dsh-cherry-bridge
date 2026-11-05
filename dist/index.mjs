@@ -1,5 +1,5 @@
 import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, normalize, sep } from "node:path";
 import { chmodSync, closeSync, copyFileSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
@@ -2824,6 +2824,17 @@ const INTERACTIONS_LIST_PAGE_CLAMP = Math.floor(RECORD_BUDGET_BYTES / 25088);
 * judged in both directions.
 */
 const MAX_RESUME_TOKEN_CHARS = 4096;
+/**
+* The protocol's `agent.messages.send.text` ceiling, in characters.
+*
+* A PROTOCOL fact, not a policy: the peer's schema refuses a longer body. It
+* lives here because TWO faces pre-validate against it — `cherry_send`'s tool
+* arguments and a subagent delegation's assembled prompt — and a second copy
+* would drift the moment the peer's ceiling moved. Pre-validating is the whole
+* point: a refusal we can explain beats a schema error round-tripped back from
+* the wire.
+*/
+const MESSAGE_TEXT_MAX_CHARS = 32768;
 //#endregion
 //#region src/connection.ts
 /**
@@ -5592,6 +5603,470 @@ var SessionSubscriptions = class {
 		return state.buffer[state.buffer.length - 1].cursor;
 	}
 };
+/**
+* The capability advertisement of an out-of-process backend: none.
+*
+* A child in another process cannot honour parent-enforced start features
+* (`agentOptions` / `agentPreset` / `outputSchema` / `maxDepth`), so the runtime
+* rejects a request needing any of them BEFORE `start` runs. Advertising one we
+* cannot honour would accept the request and silently ignore it.
+*/
+const NO_START_CAPABILITIES = Object.freeze({
+	agentOptions: false,
+	agentPreset: false,
+	outputSchema: false,
+	depthLimit: false
+});
+/**
+* Clip a diagnostic to the seam's byte ceiling on whole code points.
+*
+* Walks by code point (`for…of`) rather than slicing bytes or characters, so a
+* surrogate pair or a three-byte CJK character is either carried whole or
+* dropped — never split into a replacement character.
+*
+* @param text - the provider-authored detail.
+* @returns the detail, whole, when it fits.
+*/
+function clipDiagnostic(text) {
+	const encoder = new TextEncoder();
+	if (encoder.encode(text).byteLength <= 4096) return text;
+	let out = "";
+	let bytes = 0;
+	for (const character of text) {
+		const size = encoder.encode(character).byteLength;
+		if (bytes + size > 4096) break;
+		out += character;
+		bytes += size;
+	}
+	return out;
+}
+/**
+* Settle a run result under the seam contract: the answer never rejects.
+*
+* The ORDER matters and is the whole point. `cancelled()` is consulted BEFORE the
+* attempt's outcome on both paths, because a child that produced a late answer
+* after we stopped listening did not succeed — reporting it as `completed` would
+* tell the parent a cancelled run finished. Symmetrically, a child that throws
+* after our own cancellation did not fail; `onError` stays silent.
+*
+* @param parts - the attempt, the output snapshot, cancellation state and wiring.
+* @returns the terminal result, always.
+*/
+async function settleRunResult(parts) {
+	/**
+	* The two collectors are the LAST things that can break this function's
+	* promise, and they are exactly the ones a provider supplies from LIVE
+	* backend state (a session snapshot, a session's last error) — so a throw is a
+	* real possibility, not a theoretical one. `externalRunHandle` hands the
+	* result promise straight through with no `.catch` of its own, so an escaping
+	* throw becomes `run.result` REJECTING, which the seam contract forbids. The
+	* `onError` sink was already contained; these two were not.
+	*
+	* Degrading to the empty value is the honest answer, but on its own it is
+	* indistinguishable from a genuinely empty one, so the throw is also REPORTED
+	* through that same sink, labelled with the collector that broke. The report
+	* is itself contained: a sink that throws must not become the rejection this
+	* whole function exists to avoid.
+	*/
+	const report = (label, error, stopReason) => {
+		try {
+			const cause = toError(error);
+			parts.onError?.(new Error(`${label}: ${cause.message}`, { cause }), stopReason);
+		} catch {}
+	};
+	const collectOutput = (stopReason) => {
+		try {
+			return parts.collectOutput();
+		} catch (error) {
+			report("collectOutput() failed", error, stopReason);
+			return [];
+		}
+	};
+	const collectDiagnostic = (stopReason) => {
+		try {
+			return parts.collectDiagnostic?.();
+		} catch (error) {
+			report("collectDiagnostic() failed", error, stopReason);
+			return;
+		}
+	};
+	try {
+		const result = await parts.attempt();
+		if (parts.cancelled()) return {
+			output: collectOutput("aborted"),
+			stopReason: "aborted"
+		};
+		return result.diagnostic === void 0 ? result : {
+			...result,
+			diagnostic: clipDiagnostic(result.diagnostic)
+		};
+	} catch (error) {
+		if (parts.cancelled()) return {
+			output: collectOutput("aborted"),
+			stopReason: "aborted"
+		};
+		try {
+			parts.onError?.(toError(error), "error");
+		} catch {}
+		const collected = collectDiagnostic("error");
+		const diagnostic = collected === void 0 ? void 0 : clipDiagnostic(collected);
+		return {
+			output: collectOutput("error"),
+			...diagnostic === void 0 ? {} : { diagnostic },
+			stopReason: "error"
+		};
+	} finally {
+		parts.signal.removeEventListener("abort", parts.onAbort);
+	}
+}
+/** Coerce a thrown value to an Error without assuming the caller threw one. */
+function toError(value) {
+	return value instanceof Error ? value : new Error(String(value));
+}
+/**
+* Publish the run handle for an external child.
+*
+* `dispose()` memoizes ONE teardown: remove the abort listener, settle local
+* cancellation, then await the backend's teardown. The order is the contract —
+* `requestCancel()` runs before teardown because there is no assumption the child
+* cooperates, and the first `dispose()`'s promise is returned by every later call
+* so a second caller cannot double-release.
+*
+* @param parts - run identity, result, cancellation wiring and teardown.
+* @returns the external run handle.
+*/
+function externalRunHandle(parts) {
+	let disposal;
+	return {
+		id: parts.id,
+		result: parts.result,
+		dispose() {
+			if (disposal !== void 0) return disposal;
+			parts.signal.removeEventListener("abort", parts.onAbort);
+			parts.requestCancel();
+			disposal = Promise.resolve().then(() => parts.teardown());
+			return disposal;
+		}
+	};
+}
+/**
+* Normalize one path for comparison.
+*
+* Collapses `.` and `..`, folds repeated separators, and strips a trailing
+* separator (except on a bare root). Case is NOT folded: a case-insensitive
+* compare would route on a filesystem the user never declared.
+*
+* @param value - the path or prefix to normalize.
+* @returns the normalized path.
+*/
+function normalizeRoutePath(value) {
+	const normalized = normalize(value);
+	if (normalized.length > 1 && normalized.endsWith(sep)) return normalized.slice(0, -sep.length);
+	return normalized;
+}
+/**
+* Find the route that claims a working directory.
+*
+* FIRST declared match wins, not the longest — a declaration order the user
+* writes is a precedence they can read, while longest-prefix silently reorders
+* their intent. Matching is at a PATH SEGMENT boundary: `/workspace/dsh` claims
+* `/workspace/dsh/src` but not `/workspace/dsh2`.
+*
+* @param routes - the declared routes, in precedence order.
+* @param cwd - the resolved child directory from the seam.
+* @returns the matching route, or undefined so the caller falls back.
+*/
+function matchRoute(routes, cwd) {
+	if (routes === void 0 || routes.length === 0) return void 0;
+	const target = normalizeRoutePath(cwd);
+	for (const route of routes) {
+		const prefix = normalizeRoutePath(route.cwdPrefix);
+		if (prefix.length === 0) continue;
+		if (target === prefix || target.startsWith(prefix + sep)) return route;
+	}
+}
+/**
+* Flatten a task to the one string a Cherry run can carry.
+*
+* Runs BEFORE anything is created on the Cherry side, so a task this provider
+* cannot represent is refused rather than degraded: dropping an image block would
+* hand the child a different task than the parent composed, and an empty task
+* would start a run with nothing to do.
+*
+* @param prompt - the task's content blocks.
+* @returns the concatenated text, in order.
+* @throws when a block is not text, when the task is empty after trimming, or
+*   when it is longer than the peer's own body ceiling.
+*/
+function textPrompt(prompt) {
+	if (prompt.length === 0) throw new Error("cherry subagent: the one-shot task must contain only text blocks");
+	const texts = [];
+	for (const block of prompt) {
+		if (block.type !== "text" || typeof block.text !== "string") throw new Error("cherry subagent: the one-shot task must contain only text blocks");
+		texts.push(block.text);
+	}
+	const joined = texts.join("");
+	if (joined.trim().length === 0) throw new Error("cherry subagent: the one-shot task must not be empty");
+	if (joined.length > 32768) throw new Error(`cherry subagent: the one-shot task is ${joined.length} characters, over the ${MESSAGE_TEXT_MAX_CHARS} the peer accepts; shorten it or delegate it in several runs`);
+	return joined;
+}
+/** The output blocks for one run's text; empty when there is nothing to report. */
+function textBlocks(text) {
+	return text.trim().length === 0 ? [] : [{
+		type: "text",
+		text
+	}];
+}
+/**
+* What the runner's outcome means to the seam.
+*
+* `aborted` is the one status the peer never reported: the runner synthesises it
+* when OUR signal ended the wait, which is why it maps to the seam's own
+* `aborted` rather than to an error. Everything that is not `completed` carries
+* a diagnostic when the runner supplied one — and a `completed` result never
+* does, because the host appends a result's diagnostic to the settlement
+* notification and an unexplained warning on a success is worse than silence.
+*
+* @param outcome - what the run amounted to.
+* @returns the seam's result.
+*/
+function toSubagentResult(outcome) {
+	const output = textBlocks(outcome.text);
+	if (outcome.status === "completed") return {
+		output,
+		stopReason: "completed"
+	};
+	if (outcome.status === "aborted") return {
+		output,
+		stopReason: "aborted"
+	};
+	return {
+		output,
+		stopReason: "error",
+		...outcome.diagnostic === void 0 ? {} : { diagnostic: outcome.diagnostic }
+	};
+}
+/**
+* Build the one-shot Cherry provider.
+*
+* The shape the runtime sees is three declarations and one method:
+* `capabilities` is all-false (this provider cannot honour an agent preset, an
+* output schema or a depth limit, and the host refuses such a request BEFORE
+* `start`), `inheritsParentContext` is false (a Cherry child starts fresh), and
+* `start` returns a run handle immediately.
+*
+* ## What `start` refuses, and what it defers
+*
+* A task this provider cannot represent is refused BEFORE anything exists on the
+* Cherry side, so a rejected delegation leaves no orphan session behind (SUB-20,
+* SUB-21) — and so is a request whose signal has already aborted (SUB-24).
+*
+* Everything else DEFERS: an unreachable device, a session the peer refused, a
+* run that failed. `start` returns a run handle at once and those settle through
+* `run.result`, because the alternative is a parent blocked on a device handshake
+* it cannot cancel. The seam's contract draws exactly this line — fail before
+* returning means clean up and reject, fail after means settle through the
+* result — and a run whose handle already exists is on the far side of it.
+*
+* ## The two signals
+*
+* `request.signal` is the parent's. `dispose()` has to stop the child WITHOUT
+* that signal having fired (the host disposes a run for reasons of its own), so
+* the provider owns a LOCAL controller: `deps.run` watches the local one, the
+* parent's abort is forwarded into it, and `requestCancel` aborts it. That is
+* also what makes `settleRunResult`'s `cancelled()` answer `true` on the dispose
+* path — the seam requires a disposed run to settle as `aborted` rather than
+* report a `completed` nobody is listening for.
+*
+* @param deps - the run seam: the one place a delegation touches Cherry Studio.
+* @param options - the registration name; the configured one, defaulting to `cherry`.
+* @returns a provider the runtime can register under the configured name.
+*/
+function createCherryProvider(deps, options = {}) {
+	return {
+		name: options.name ?? "cherry",
+		capabilities: NO_START_CAPABILITIES,
+		inheritsParentContext: false,
+		async start(request) {
+			const text = textPrompt(request.prompt);
+			if (request.signal.aborted) throw new Error("cherry subagent: the request was aborted before startup");
+			const local = new AbortController();
+			const onHostAbort = () => {
+				local.abort();
+			};
+			request.signal.addEventListener("abort", onHostAbort, { once: true });
+			let outcome;
+			let failure;
+			const attempt = deps.run({
+				text,
+				cwd: request.cwd,
+				label: request.label,
+				signal: local.signal
+			}).then((settled) => {
+				outcome = settled;
+				return settled;
+			}, (error) => {
+				failure = error instanceof Error ? error : new Error(String(error));
+				throw failure;
+			});
+			const stopped = attempt.then(() => void 0, () => void 0);
+			return externalRunHandle({
+				id: randomUUID(),
+				result: settleRunResult({
+					attempt: async () => toSubagentResult(await attempt),
+					collectOutput: () => outcome === void 0 ? [] : textBlocks(outcome.text),
+					collectDiagnostic: () => outcome === void 0 ? failure?.message : outcome.diagnostic,
+					cancelled: () => local.signal.aborted,
+					signal: request.signal,
+					onAbort: onHostAbort
+				}),
+				signal: request.signal,
+				onAbort: onHostAbort,
+				requestCancel: () => {
+					local.abort();
+				},
+				teardown: () => stopped
+			});
+		}
+	};
+}
+/** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
+const TIMER_CEILING_MS = 2147483647;
+/** Read one optional non-blank string field, recording a problem when it is unusable. */
+function optionalText(raw, key, problems) {
+	const value = raw[key];
+	if (value === void 0) return void 0;
+	if (typeof value !== "string") {
+		problems.push(`\`${key}\` 必须是字符串（收到 ${shapeName(value)}）`);
+		return;
+	}
+	const trimmed = value.trim();
+	if (trimmed.length === 0) {
+		problems.push(`\`${key}\` 不能为空`);
+		return;
+	}
+	return trimmed;
+}
+/** Read one optional integer in a closed range, recording a problem when it is unusable. */
+function optionalInteger(raw, key, problems, range) {
+	const value = raw[key];
+	if (value === void 0) return void 0;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < range.min || value > range.max) {
+		problems.push(`\`${key}\` 必须是 ${range.min} 到 ${range.max} 之间的整数（收到 ${shapeName(value)}）`);
+		return;
+	}
+	return value;
+}
+/** The shape a config value arrived as, for a value-free problem message. */
+function shapeName(value) {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+	return typeof value;
+}
+/** Validate the route table, recording a problem per unusable entry. */
+function routesOf(raw, problems) {
+	const value = raw["routes"];
+	if (value === void 0) return [];
+	if (!Array.isArray(value)) {
+		problems.push(`\`routes\` 必须是数组（收到 ${shapeName(value)}）`);
+		return [];
+	}
+	const routes = [];
+	value.forEach((entry, index) => {
+		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+			problems.push(`\`routes[${index}]\` 必须是对象（收到 ${shapeName(entry)}）`);
+			return;
+		}
+		const record = entry;
+		const prefix = optionalText(record, "cwdPrefix", []);
+		if (prefix === void 0) {
+			problems.push(`\`routes[${index}]\` 缺少非空的 \`cwdPrefix\``);
+			return;
+		}
+		const device = optionalText(record, "device", problems);
+		const workspaceId = optionalText(record, "workspaceId", problems);
+		routes.push({
+			cwdPrefix: prefix,
+			...device === void 0 ? {} : { device },
+			...workspaceId === void 0 ? {} : { workspaceId }
+		});
+	});
+	return routes;
+}
+/**
+* Resolve the operator's `subagent` config into the decision the assembly acts on.
+*
+* Validation is exhaustive rather than fail-fast: the answer is one `failed`
+* state whose reason lists EVERY unusable field, because an operator fixing a
+* config one reload per mistake is the outcome a first-error-wins validator
+* produces.
+*
+* @param raw - the `subagent` config value, exactly as the host handed it over.
+* @returns `disabled`, `invalid` with the problems, or `ready` with the defaults applied.
+*/
+function resolveSubagentConfig(raw) {
+	if (raw === void 0 || raw === null) return { kind: "disabled" };
+	if (typeof raw !== "object" || Array.isArray(raw)) return {
+		kind: "invalid",
+		problems: [`\`subagent\` 必须是对象（收到 ${shapeName(raw)}）`]
+	};
+	const record = raw;
+	const problems = [];
+	const enabled = record["enabled"];
+	if (enabled !== void 0 && typeof enabled !== "boolean") problems.push(`\`enabled\` 必须是布尔值（收到 ${shapeName(enabled)}）`);
+	if (enabled !== true) return problems.length > 0 ? {
+		kind: "invalid",
+		problems
+	} : { kind: "disabled" };
+	const providerName = optionalText(record, "providerName", problems) ?? "cherry";
+	const toolName = optionalText(record, "toolName", problems) ?? "cherry_subagent";
+	const device = optionalText(record, "device", problems);
+	const agentId = optionalText(record, "agentId", problems);
+	const workspaceId = optionalText(record, "workspaceId", problems);
+	const workspaceKind = record["workspaceKind"];
+	if (workspaceKind !== void 0 && workspaceKind !== "system") problems.push(`\`workspaceKind\` 只接受 "system"（收到 ${shapeName(workspaceKind)}）`);
+	const cwdModeValue = record["cwdMode"];
+	if (cwdModeValue !== void 0 && cwdModeValue !== "isolated" && cwdModeValue !== "shared") problems.push(`\`cwdMode\` 只接受 "isolated" 或 "shared"（收到 ${shapeName(cwdModeValue)}）`);
+	const timeoutMs = optionalInteger(record, "timeoutMs", problems, {
+		min: 0,
+		max: TIMER_CEILING_MS
+	});
+	const maxInteractionAbandons = optionalInteger(record, "maxInteractionAbandons", problems, {
+		min: 1,
+		max: Number.MAX_SAFE_INTEGER
+	});
+	const revision = optionalInteger(record, "revision", problems, {
+		min: 0,
+		max: Number.MAX_SAFE_INTEGER
+	});
+	const routes = routesOf(record, problems);
+	if (device === void 0 && record["device"] === void 0) problems.push("缺少 `device`");
+	if (agentId === void 0 && record["agentId"] === void 0) problems.push("缺少 `agentId`");
+	if (workspaceId !== void 0 && workspaceKind === "system") problems.push("`workspaceId` 与 `workspaceKind: \"system\"` 只能二选一");
+	else if (workspaceId === void 0 && workspaceKind !== "system") problems.push("缺少 `workspaceId`（或 `workspaceKind: \"system\"`）");
+	if (problems.length > 0) return {
+		kind: "invalid",
+		problems
+	};
+	return {
+		kind: "ready",
+		config: {
+			providerName,
+			toolName,
+			target: {
+				device,
+				agentId,
+				workspace: workspaceId === void 0 ? { kind: "system" } : { workspaceId }
+			},
+			cwdMode: cwdModeValue === "shared" ? "shared" : "isolated",
+			routes,
+			timeoutMs: timeoutMs ?? 18e5,
+			maxInteractionAbandons: maxInteractionAbandons ?? 8,
+			revision: revision ?? 0
+		}
+	};
+}
 //#endregion
 //#region src/contentGate.ts
 /**
@@ -6154,7 +6629,7 @@ const MAX_EXTERNALIZED_BYTES = 33554432;
 */
 const DEFAULT_CONTENT_READ_CONCURRENCY = 4;
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
-const TEXT_MAX_LENGTH = 32768;
+const TEXT_MAX_LENGTH = MESSAGE_TEXT_MAX_CHARS;
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
 const DEFAULT_WAIT_TIMEOUT_MS = 12e4;
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */
@@ -6234,13 +6709,31 @@ var AssemblyDeadline = class {
 	instant;
 	constructor(startedAt, windowMs) {
 		const tail = Math.min(Math.max(windowMs, WAIT_ANSWER_TAIL_FLOOR_MS), WAIT_ANSWER_TAIL_MS);
-		this.instant = startedAt + windowMs + tail;
+		this.instant = Number.isFinite(startedAt + windowMs) ? startedAt + windowMs + tail : startedAt + tail;
 	}
 	/** Whether the budget is spent (a deadline exactly now counts as spent). */
 	expired() {
 		return performance.now() >= this.instant;
 	}
 };
+/**
+* The window the ANSWER gets, which is deliberately not always the window the
+* WAIT gets.
+*
+* For every finite `timeoutMs` the two are the same — the answer may spend one
+* bounded tail past the caller's patience, and that is the whole `AssemblyDeadline`
+* design. `timeoutMs: 0` is the one case where they must differ: SUB-42 makes it
+* "no wall-clock bound on the WAIT", a decision about how long a parent is
+* willing to wait for a child, and it says nothing about how long a CONTENT
+* read may take. An unbounded assembly would be a different promise — one no
+* caller asked for and no link can honour.
+*
+* @param timeoutMs - the wait window; `Infinity` means unbounded.
+* @returns the finite window the answer's assembly is budgeted with.
+*/
+function answerWindowFor(timeoutMs) {
+	return Number.isFinite(timeoutMs) ? timeoutMs : WAIT_ANSWER_TAIL_MS;
+}
 /**
 * POLL CADENCE for the waiter loop.
 *
@@ -6264,6 +6757,30 @@ const DEFAULT_WAIT_POLL_MS = 25;
 const SUBSCRIPTION_LOST_GUIDANCE = "the session's event subscription was lost mid-wait and could not be re-established; the run's outcome is unknowable from this wait. Read the session with cherry_read (it does not need a subscription), or call cherry_wait again to rebuild the subscription from a fresh baseline";
 function isRecord(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+/**
+* The peer's own failure classification on an `execution.updated` payload.
+*
+* `error` is schema-optional and its `reason` is a closed enum, so a payload
+* without a usable reason answers `undefined` rather than a placeholder: "the
+* peer said why" and "the peer did not" are different facts, and a caller
+* branches on exactly that difference. Only `reason` and `message` are kept —
+* `details` and `failure` are opaque blobs the protocol leaves unconstrained,
+* and they must never reach a model's context (issue #231, SUB-53).
+*
+* @param payload - one `execution.updated` payload.
+* @returns the classification, when the peer sent one.
+*/
+function executionErrorOf(payload) {
+	const error = payload["error"];
+	if (!isRecord(error)) return void 0;
+	const reason = optionalString(error["reason"]);
+	if (reason === void 0) return void 0;
+	const message = optionalString(error["message"]);
+	return message === void 0 ? { reason } : {
+		reason,
+		message
+	};
 }
 /** The peer's failure discriminator, or undefined for a non-protocol error. */
 function failureReason(error) {
@@ -6644,18 +7161,6 @@ const CHERRY_TOOL_NAMES = [
 	"cherry_unpair"
 ];
 /**
-* Registers the whole `cherry_*` family on `ctx.tools` — exactly the names in
-* {@link CHERRY_TOOL_NAMES}, which the contract suite asserts against this
-* function's own registrations.
-*
-* The registration framework is deliberately thin because Tasks 9/10 extend it:
-* {@link defineCherryTool} is the ONE place a tool declaration is assembled, so
-* those tasks add mutating tools without touching the host seam.
-*/
-function registerCherryTools(ctx, deps, options = {}) {
-	return registerCherryToolsWithEngine(ctx, deps, options).dispose;
-}
-/**
 * The same registration, with the ENGINE it built handed back.
 *
 * Exists for TESTS: the engine's memory bookkeeping (the remembered command
@@ -6668,16 +7173,16 @@ function registerCherryTools(ctx, deps, options = {}) {
 * (`src` is published on purpose, see AGENTS.md → Build facts), so they are a
 * compatibility commitment — which is why this seam is kept minimal.
 */
-function registerCherryToolsWithEngine(ctx, deps, options = {}) {
+function registerCherryToolsWithEngine(ctx, deps, options = {}, shared = void 0) {
 	const tools = ctx.tools;
 	if (tools === void 0) {
 		console.warn("[cherry-remote] ctx.tools is unavailable; the cherry_* tools were not registered");
 		return {
 			dispose: () => {},
-			engine: void 0
+			engine: shared
 		};
 	}
-	const engine = new CherryToolEngine(deps, options);
+	const engine = shared ?? new CherryToolEngine(deps, options);
 	const disposers = engine.definitions().map((definition) => tools.register(definition));
 	return {
 		engine,
@@ -6718,6 +7223,31 @@ function defineCherryTool(definition) {
 * share. Kept as one class (rather than per-face closures) so the per-session
 * and per-device state the later faces add has an obvious home.
 */
+/**
+* A wait that OUR side stopped.
+*
+* Deliberately not one of the peer's four terminal statuses: the run did not
+* end, we stopped listening to it. Encoding our own cancellation as
+* `status: 'cancelled'` would tell a delegation's parent that the CHILD
+* cancelled itself, which is a different fact with a different remedy. The tool
+* face never passes a signal, so it can never see this — it exists for the
+* subagent delegation, whose parent owns the abort (issue #231, SUB-25).
+*/
+var RunAbortedError = class extends Error {
+	/**
+	* The run the wait had attached to, when it had one.
+	*
+	* Carried out of the wait because the caller cancels the child on the way out
+	* and the cache may not know the execution yet — a run cancelled a moment
+	* after it started has an id in the RECEIPT and nothing in the stream.
+	*/
+	executionId;
+	constructor(executionId) {
+		super("the wait was aborted by the caller");
+		this.name = "RunAbortedError";
+		this.executionId = executionId;
+	}
+};
 var CherryToolEngine = class {
 	#deps;
 	/**
@@ -8277,13 +8807,216 @@ var CherryToolEngine = class {
 		});
 		if (!wait) return receipt;
 		if (receipt["status"] === "rejected" || receipt["status"] === "interrupted") return receipt;
-		return this.#awaitRun(connection, subscriptions, sessionId, {
-			timeoutMs,
-			startedAt: performance.now(),
-			baselineSeq,
-			executionId: typeof receipt["executionId"] === "string" ? receipt["executionId"] : void 0,
-			commandId: typeof receipt["commandId"] === "string" ? receipt["commandId"] : void 0
+		const startedAt = performance.now();
+		let executionId = typeof receipt["executionId"] === "string" ? receipt["executionId"] : void 0;
+		const receiptCommandId = typeof receipt["commandId"] === "string" ? receipt["commandId"] : void 0;
+		for (;;) {
+			const answer = await this.#awaitRun(connection, subscriptions, sessionId, {
+				timeoutMs,
+				startedAt,
+				baselineSeq,
+				...executionId === void 0 ? {} : { executionId },
+				...receiptCommandId === void 0 ? {} : { commandId: receiptCommandId },
+				...request.signal === void 0 ? {} : { signal: request.signal }
+			});
+			if (request.onInteraction === void 0 || answer["status"] !== "awaiting-interaction") return answer;
+			if (await request.onInteraction(answer) === "stop") return answer;
+			const named = optionalString(answer["executionId"]);
+			if (named !== void 0) executionId = named;
+		}
+	}
+	/**
+	* ONE delegation: resolve the target, create the session, run it under the
+	* interaction policy and the deadline, and report what the peer said.
+	*
+	* This is the ONLY door a subagent provider gets into the engine. The provider
+	* is written against `ctx.subagents`' four-field shape and knows nothing about
+	* the rpc surface, while every judgement below — which run is this run, what
+	* counts as its text, what a failure means — is the SAME judgement
+	* `cherry_send` makes, because both go through {@link CherryToolEngine.#runOnce}.
+	* Two implementations of that would drift, and the drift would surface as a
+	* delegation reporting a different answer than the tool for the same run.
+	*
+	* The interaction policy is here, not in the wait: a delegation has no human
+	* to ask, so every card is DENIED and the run continues (SUB-30). A child that
+	* keeps asking is not making progress, so the ceiling turns the loop into a
+	* reported failure instead of an unbounded run (SUB-31). Nothing is ever
+	* surfaced to the DSH user (SUB-32).
+	*
+	* @param input - the resolved target, the route table, the task and its bounds.
+	* @returns what the run amounted to, in the provider's own vocabulary.
+	* @throws when the delegation could not be STARTED — an unreachable device, a
+	*   session the peer refused. Those are infrastructure faults the seam cannot
+	*   express as a run result, and the provider cleans up and rethrows them.
+	*/
+	async runSubagentDelegation(input) {
+		const route = matchRoute(input.routes, input.cwd);
+		const deviceId = route?.device ?? input.target.device;
+		const workspace = route?.workspaceId === void 0 ? input.target.workspace : { workspaceId: route.workspaceId };
+		const resolved = await this.#linkOr(deviceId);
+		if (resolved.link === void 0) throw new Error(`cherry subagent: the target device is unavailable (${String(resolved.verdict.error)})`);
+		const { connection, record } = resolved.link;
+		const title = input.label ?? input.text.trim().slice(0, 60).trim();
+		const created = await this.#command(connection, "agent.sessions.create", {
+			commandId: randomUUID(),
+			agentId: input.target.agentId,
+			..."workspaceId" in workspace ? { workspaceId: workspace.workspaceId } : { workspace: { kind: "system" } },
+			...title === void 0 ? {} : { title }
 		});
+		const sessionId = optionalString(created["sessionId"]);
+		if (sessionId === void 0) throw new Error(`cherry subagent: the peer created no session (${String(created["error"] ?? "no sessionId in the receipt")})`);
+		input.onSessionCreated?.(sessionId);
+		const subscriptions = this.#deps.subs(record.deviceId);
+		let abandons = 0;
+		let ceilingHit = false;
+		let observedExecutionId;
+		let answer;
+		try {
+			answer = await this.#runOnce({
+				connection,
+				deviceId: record.deviceId,
+				sessionId,
+				text: input.text,
+				wait: true,
+				timeoutMs: input.timeoutMs === 0 ? Number.POSITIVE_INFINITY : input.timeoutMs,
+				signal: input.signal,
+				onInteraction: async (soft) => {
+					const interactionId = optionalString(soft["interactionId"]);
+					if (interactionId === void 0) return "stop";
+					abandons += 1;
+					observedExecutionId = optionalString(soft["executionId"]) ?? observedExecutionId;
+					if (abandons >= input.maxInteractionAbandons) {
+						ceilingHit = true;
+						await this.#cancelRun(connection, record.deviceId, sessionId, observedExecutionId).catch(() => {});
+						return "stop";
+					}
+					await this.#denyInteraction(connection, record.deviceId, sessionId, interactionId).catch(() => {});
+					return "continue";
+				}
+			});
+		} catch (error) {
+			if (!(error instanceof RunAbortedError)) throw error;
+			await this.#cancelRun(connection, record.deviceId, sessionId, error.executionId).catch(() => {});
+			return {
+				status: "aborted",
+				text: await this.#partialText(connection, subscriptions, sessionId).catch(() => "")
+			};
+		}
+		if (answer["status"] === "timeout") await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer["executionId"]) ?? observedExecutionId).catch(() => {});
+		return this.#foldDelegation(answer, {
+			ceilingHit,
+			maxInteractionAbandons: input.maxInteractionAbandons,
+			timeoutMs: input.timeoutMs
+		});
+	}
+	/**
+	* What a delegation's terminal answer means (SUB-50..54).
+	*
+	* Kept apart from the run so the mapping is a pure function of what the peer
+	* said: `cherry_send`'s caller wants the whole receipt, a parent model wants
+	* one verdict and one sentence.
+	*
+	* The distinctions that are easy to get wrong, and are therefore stated:
+	*
+	*  - **`aggregateError` is NOT an empty answer.** The run settled; only the
+	*    history read behind its text failed. Folding that into "the child said
+	*    nothing" (SUB-51) would report a content failure as a silent child.
+	*  - **A refusal is `completed`.** A Cherry persona may decline the task on
+	*    role grounds; its refusal text IS the output, and calling that a failure
+	*    would teach the parent to retry a decision (SUB-54).
+	*  - **`completed` carries NO diagnostic.** The host appends a result's
+	*    diagnostic to the settlement notification, so one on a success would show
+	*    up in the parent's context as an unexplained warning.
+	*/
+	#foldDelegation(answer, extra) {
+		const status = String(answer["status"] ?? "");
+		const text = typeof answer["text"] === "string" ? answer["text"] : "";
+		if (extra.ceilingHit || status === "awaiting-interaction") return {
+			status: "error",
+			text,
+			diagnostic: `the child asked for human input ${String(extra.maxInteractionAbandons)} times without finishing; the run was cancelled. A Cherry child cannot reach a human through a delegation.`
+		};
+		if (status === "timeout") return {
+			status: "error",
+			text,
+			diagnostic: `the delegation reached its ${String(extra.timeoutMs)} ms timeout and was cancelled; the run may still be finishing on the desktop. Raise \`subagent.timeoutMs\` (0 disables the bound) if the child needs longer.`
+		};
+		if (typeof answer["aggregateError"] === "string") return {
+			status: "error",
+			text: "",
+			diagnostic: `the run settled but its history could not be read (${answer["aggregateError"]})`
+		};
+		if (status === "completed") return text.trim().length === 0 ? {
+			status: "error",
+			text: "",
+			diagnostic: "the child completed but produced no text"
+		} : {
+			status: "completed",
+			text
+		};
+		const error = isRecord(answer["executionError"]) ? answer["executionError"] : void 0;
+		const reason = error === void 0 ? void 0 : optionalString(error["reason"]);
+		const message = error === void 0 ? void 0 : optionalString(error["message"]);
+		const detail = reason === void 0 ? `the run ended ${status}` : `the run ended ${status}: ${reason}`;
+		return {
+			status: "error",
+			text,
+			diagnostic: message === void 0 ? detail : `${detail} — ${message}`
+		};
+	}
+	/**
+	* Deny one pending interaction, so the run can continue (SUB-30).
+	*
+	* The staleness triple comes from the CACHE, exactly as `cherry_respond`'s does
+	* (`#interactionSnapshot`): the caller cannot know what the plugin has observed,
+	* and a triple this side invented would be refused by the peer's own fencing.
+	* A card that settled between the wait's report and this call answers nothing
+	* and is not an error — the next pass re-judges the run.
+	*/
+	async #denyInteraction(connection, deviceId, sessionId, interactionId) {
+		await this.#ensureSubscription(deviceId, sessionId);
+		const subscriptions = this.#deps.subs(deviceId);
+		const snapshot = await this.#interactionSnapshot(connection, subscriptions, deviceId, sessionId, interactionId);
+		if (snapshot === void 0) return;
+		await this.#command(connection, RESPOND_METHOD, {
+			commandId: randomUUID(),
+			sessionId,
+			interactionId,
+			expectedRevision: snapshot.revision,
+			expectedExecutionId: snapshot.executionId,
+			inputDigest: snapshot.inputDigest,
+			decision: "deny"
+		});
+	}
+	/**
+	* Cancel the session's in-flight run, if it still has one.
+	*
+	* The execution id is the CACHE's, as `cherry_cancel` derives it, and only when
+	* the cache can name one: a run that already settled has nothing to cancel, and
+	* inventing an id would earn `execution-mismatch` from the peer's fencing.
+	*/
+	async #cancelRun(connection, deviceId, sessionId, observedExecutionId) {
+		await this.#ensureSubscription(deviceId, sessionId);
+		const subscriptions = this.#deps.subs(deviceId);
+		const expectedExecutionId = observedExecutionId ?? await this.#activeExecutionId(connection, subscriptions, deviceId, sessionId);
+		if (expectedExecutionId === void 0) return;
+		await this.#command(connection, CANCEL_METHOD, {
+			commandId: randomUUID(),
+			sessionId,
+			expectedExecutionId
+		});
+	}
+	/**
+	* The assistant text a cancelled run left behind, on a SHORT budget.
+	*
+	* The peer persists a run's message when it SETTLES, so a run we just cancelled
+	* may have nothing to read yet — empty is then the honest partial, not a
+	* failure. The budget is what keeps this off the teardown's critical path: a
+	* parent giving up should not wait out an assembly.
+	*/
+	async #partialText(connection, subscriptions, sessionId) {
+		const assembled = await this.#terminalResult(connection, subscriptions, sessionId, "cancelled", {}, new AssemblyDeadline(performance.now(), 1e3));
+		return typeof assembled["text"] === "string" ? assembled["text"] : "";
 	}
 	/**
 	* Issues `agent.messages.send` and returns the receipt the caller should act
@@ -9441,7 +10174,7 @@ var CherryToolEngine = class {
 	*/
 	async #awaitRun(connection, subscriptions, sessionId, options) {
 		const deadline = options.startedAt + options.timeoutMs;
-		const answerDeadline = new AssemblyDeadline(options.startedAt, options.timeoutMs);
+		const answerDeadline = new AssemblyDeadline(options.startedAt, answerWindowFor(options.timeoutMs));
 		let latestExecutionId = options.executionId;
 		const baselineSeq = options.baselineSeq ?? this.#newestSeq(subscriptions, sessionId);
 		const observation = {};
@@ -9449,6 +10182,7 @@ var CherryToolEngine = class {
 		let reEnsureFailure = "";
 		let carriedCursor;
 		for (;;) {
+			if (options.signal?.aborted === true) throw new RunAbortedError(latestExecutionId);
 			if (connection.state !== "connected") throw new DeviceUnavailableError(connection.record.deviceId, connection.state);
 			if (!subscriptions.activeSessions().includes(sessionId)) {
 				if (reEnsureAttempted) return this.#subscriptionLostResult(sessionId, latestExecutionId, options.commandId, reEnsureFailure);
@@ -9483,7 +10217,8 @@ var CherryToolEngine = class {
 			if (observed.terminalStatus !== void 0) return await this.#terminalResult(connection, subscriptions, sessionId, observed.terminalStatus, {
 				...latestExecutionId === void 0 ? {} : { executionId: latestExecutionId },
 				...options.commandId === void 0 ? {} : { commandId: options.commandId },
-				...observed.terminalMessageId === void 0 ? {} : { terminalMessageId: observed.terminalMessageId }
+				...observed.terminalMessageId === void 0 ? {} : { terminalMessageId: observed.terminalMessageId },
+				...observed.terminalError === void 0 ? {} : { executionError: observed.terminalError }
 			}, answerDeadline);
 			const now = performance.now();
 			if (now >= deadline) return await this.#timeoutResult(connection, subscriptions, sessionId, {
@@ -9551,6 +10286,7 @@ var CherryToolEngine = class {
 		state.executionId = options.carry?.executionId;
 		state.terminalStatus = options.carry?.terminalStatus;
 		state.terminalMessageId = options.carry?.terminalMessageId;
+		state.terminalError = options.carry?.terminalError;
 		let scannedSeqNext = scannedSeq ?? -Infinity;
 		for (const entry of this.#eventsOf(subscriptions, sessionId)) {
 			const seq = Number(entry["seq"]);
@@ -9587,6 +10323,7 @@ var CherryToolEngine = class {
 			if (awaited === void 0 || executionId !== awaited) continue;
 			state.executionId = executionId;
 			state.terminalStatus = terminal ? status : void 0;
+			state.terminalError = terminal ? executionErrorOf(payload) : void 0;
 			if (terminal) state.terminalMessageId = optionalString(payload["messageId"]);
 		}
 		if (state.terminalStatus === void 0 && awaited !== void 0 && settledBeforeBaseline.has(awaited) && pending.size === 0) {
@@ -9603,6 +10340,7 @@ var CherryToolEngine = class {
 			options.carry.executionId = state.executionId;
 			options.carry.terminalStatus = state.terminalStatus;
 			options.carry.terminalMessageId = state.terminalMessageId;
+			options.carry.terminalError = state.terminalError;
 			options.carry.scannedSeq = Number.isFinite(scannedSeqNext) ? scannedSeqNext : void 0;
 		}
 		return state;
@@ -10693,6 +11431,95 @@ function newestAssistantMessage(messages) {
 		if (message !== void 0 && message.role === "assistant") return [message];
 	}
 	return [];
+}
+//#endregion
+//#region src/subagentHost.ts
+/** The injection key. ONE key, so the subsystem cannot be held pending by another. */
+const INJECT_KEYS$1 = ["subagents"];
+/** The reason text for a host that has no registry at all (SUB-02). */
+const UNSUPPORTED_REASON = "宿主没有 subagents 服务（DSH 版本过低）；子智能体子系统不可用，其余功能不受影响";
+/**
+* Build the subsystem for ONE apply.
+*
+* @param parts - the resolved config and the run seam the provider is built on.
+* @returns the mount handle; `status()` reflects the state at any moment.
+*/
+function createSubagentHost(parts) {
+	const log = parts.log ?? (() => {});
+	const resolution = parts.resolution;
+	let status = resolution.kind === "disabled" ? {
+		state: "pending",
+		reason: "实验性子智能体未启用（默认关闭）"
+	} : resolution.kind === "invalid" ? {
+		state: "failed",
+		reason: resolution.problems.join("；")
+	} : {
+		state: "pending",
+		reason: "等待宿主注入 subagents"
+	};
+	let release;
+	return {
+		mount(ctx) {
+			if (resolution.kind === "disabled") return () => {};
+			if (resolution.kind === "invalid") return () => {};
+			if (ctx.subagents === void 0) {
+				status = {
+					state: "unsupported",
+					reason: UNSUPPORTED_REASON
+				};
+				log(`[cherry-remote] 子智能体子系统未启用：${UNSUPPORTED_REASON}`);
+				return () => {};
+			}
+			const register = (service) => {
+				if (service === void 0) {
+					status = {
+						state: "unsupported",
+						reason: UNSUPPORTED_REASON
+					};
+					return;
+				}
+				try {
+					release = service.registerProvider(createCherryProvider({ run: parts.run }, { name: resolution.config.providerName }));
+					status = {
+						state: "ready",
+						reason: `已注册 provider "${resolution.config.providerName}"`
+					};
+				} catch (error) {
+					status = {
+						state: "failed",
+						reason: `注册 provider 失败：${error instanceof Error ? error.message : String(error)}`
+					};
+					log("[cherry-remote] 子智能体 provider 注册失败", error);
+				}
+			};
+			try {
+				ctx.inject?.(INJECT_KEYS$1, (injected) => {
+					register(injected.subagents);
+					return () => {
+						release?.();
+						release = void 0;
+						status = {
+							state: "pending",
+							reason: "等待宿主注入 subagents"
+						};
+					};
+				});
+			} catch (error) {
+				status = {
+					state: "pending",
+					reason: "等待宿主注入 subagents"
+				};
+				log("[cherry-remote] subagents 注入不可用；子智能体子系统保持 pending", error);
+			}
+			return () => {
+				release?.();
+				release = void 0;
+			};
+		},
+		status() {
+			return status;
+		}
+	};
 }
 //#endregion
 //#region src/toolScopeHost.ts
@@ -13118,12 +13945,33 @@ function apply(ctx, config = {}) {
 		state.pairingProgressListeners.clear();
 		return evictAllConnections();
 	});
+	const engine = new CherryToolEngine(deps);
 	const host = createToolScopeHost({
 		scope,
 		names: CHERRY_TOOL_NAMES,
-		registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryTools(toolsCtx, deps))
+		registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine).dispose)
 	});
 	state.disposers.push(host.mount(ctx));
+	const subagentResolution = resolveSubagentConfig(config.subagent);
+	const subagents = createSubagentHost({
+		resolution: subagentResolution,
+		run: (input) => {
+			if (subagentResolution.kind !== "ready") throw new Error("cherry subagent: the subsystem is not configured");
+			const resolved = subagentResolution.config;
+			return engine.runSubagentDelegation({
+				target: resolved.target,
+				routes: resolved.routes,
+				cwd: input.cwd,
+				label: input.label,
+				text: input.text,
+				timeoutMs: resolved.timeoutMs,
+				maxInteractionAbandons: resolved.maxInteractionAbandons,
+				signal: input.signal
+			});
+		}
+	});
+	state.subagents = subagents;
+	state.disposers.push(subagents.mount(ctx));
 	loadOrCreateIdentity(dataDir).then((identity) => {
 		state.identity = identity.key;
 		state.identityError = void 0;

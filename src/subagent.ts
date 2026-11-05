@@ -37,7 +37,15 @@
  * @module cherry-remote/subagent
  */
 
+import { randomUUID } from 'node:crypto'
 import { normalize, sep } from 'node:path'
+import {
+  CHERRY_SUBAGENT_PROVIDER_DEFAULT,
+  MESSAGE_TEXT_MAX_CHARS,
+  CHERRY_SUBAGENT_TOOL_DEFAULT,
+  DEFAULT_MAX_INTERACTION_ABANDONS,
+  DEFAULT_SUBAGENT_TIMEOUT_MS,
+} from './defaults.js'
 
 // ---------------------------------------------------------------------------
 // The seam's vocabulary
@@ -84,10 +92,30 @@ export interface SubagentCapabilities {
   readonly depthLimit: boolean
 }
 
-/** The task and the caller-owned cancellation a provider receives. */
+/**
+ * The task and the caller-owned cancellation a provider receives.
+ *
+ * The host hands `start` a `ResolvedSubagentStartRequest`, which is this shape
+ * with `cwd` already resolved — so `cwd` is REQUIRED here even though the
+ * unresolved request the runtime builds has it optional. Modelling the optional
+ * form would have forced every reader to answer "what if the runtime did not
+ * resolve it", a state the host cannot produce.
+ *
+ * The four trailing fields exist so this transcription matches the host's, and
+ * they are ALWAYS ABSENT in practice: `NO_START_CAPABILITIES` turns every one of
+ * them off, and the host refuses a request that asks for one BEFORE calling
+ * `start`. They are declared rather than omitted because a type that is narrower
+ * than the host's is a type that lies about what the host may pass.
+ */
 export interface SubagentStartRequest {
-  /** Initial child directory, resolved to an absolute path by the runtime. */
-  readonly cwd?: string
+  /**
+   * Initial child directory, already resolved to an absolute path.
+   *
+   * A ROUTING KEY and nothing more: the host does not check that it exists on
+   * this machine's filesystem before passing an absolute path through, and the
+   * Cherry side is a different machine anyway. Never stat it.
+   */
+  readonly cwd: string
   /** Short display label; the runtime passes it through to `start`. */
   readonly label?: string
   /** The task, as content blocks. */
@@ -96,6 +124,14 @@ export interface SubagentStartRequest {
   readonly parent: unknown
   /** Canonical cancellation channel, before and after startup. */
   readonly signal: AbortSignal
+  /** Refused by capability: this provider declares `agentPreset: false`. */
+  readonly agentPreset?: unknown
+  /** Refused by capability: this provider declares `agentOptions: false`. */
+  readonly agentOptions?: unknown
+  /** Refused by capability: this provider declares `outputSchema: false`. */
+  readonly outputSchema?: unknown
+  /** Refused by capability: this provider declares `depthLimit: false`. */
+  readonly maxDepth?: unknown
 }
 
 /** One registered transport. */
@@ -357,7 +393,12 @@ export function externalRunHandle(parts: ExternalRunHandleParts): SubagentRun {
       if (disposal !== undefined) return disposal
       parts.signal.removeEventListener('abort', parts.onAbort)
       parts.requestCancel()
-      disposal = parts.teardown()
+      // WRAPPED, not assigned bare. A teardown that throws SYNCHRONOUSLY would
+      // leave `disposal` undefined, so the next `dispose()` would run a second
+      // teardown against a child the first one may have half-released — the
+      // exact thing the memo exists to prevent. `Promise.resolve().then` turns
+      // that throw into a rejection the memo can hold.
+      disposal = Promise.resolve().then(() => parts.teardown())
       return disposal
     },
   }
@@ -371,11 +412,15 @@ export function externalRunHandle(parts: ExternalRunHandleParts): SubagentRun {
  * One declared target route.
  *
  * A route names a Cherry workspace, and optionally the device that hosts it. The
- * seam has NO per-call channel for a delegation target — the object a provider
+ * seam has NO per-call channel for a delegation TARGET — the object a provider
  * receives is built by the runtime and its fields are fixed
- * (`@deepseek-ai/dsh-subagent/lib/index.js:1504-1509`) — so `cwd` is the only
- * caller-influenced string that reaches a provider. Routing on it is how a
- * delegation lands in the workspace the user declared for that directory.
+ * (`@deepseek-ai/dsh-subagent/lib/index.js:1504-1509`).
+ *
+ * `cwd` is the only caller-influenced field that can carry a DIRECTORY, which is
+ * why routing keys on it. It is NOT the only caller-influenced field: `label` and
+ * `prompt` are model-authored too. They are unusable as routing keys for the
+ * opposite reason — a label is a caption, not a path, and matching on prompt text
+ * would make a delegation's destination depend on prose.
  */
 export interface CherrySubagentRoute {
   /** Directory prefix this route claims, compared after normalization. */
@@ -444,7 +489,8 @@ export function matchRoute(
  *
  * @param prompt - the task's content blocks.
  * @returns the concatenated text, in order.
- * @throws when a block is not text, or the task is empty after trimming.
+ * @throws when a block is not text, when the task is empty after trimming, or
+ *   when it is longer than the peer's own body ceiling.
  */
 export function textPrompt(prompt: readonly SubagentContentBlock[]): string {
   if (prompt.length === 0) {
@@ -460,6 +506,16 @@ export function textPrompt(prompt: readonly SubagentContentBlock[]): string {
   const joined = texts.join('')
   if (joined.trim().length === 0) {
     throw new Error('cherry subagent: the one-shot task must not be empty')
+  }
+  // The peer's schema refuses a body over this, so a task assembled by a model
+  // would come back as a schema error from the wire. Refusing here — still
+  // before anything exists on the Cherry side — is the same judgement the
+  // empty-task rule makes, one dimension over.
+  if (joined.length > MESSAGE_TEXT_MAX_CHARS) {
+    throw new Error(
+      `cherry subagent: the one-shot task is ${joined.length} characters, over the ${MESSAGE_TEXT_MAX_CHARS} ` +
+        'the peer accepts; shorten it or delegate it in several runs',
+    )
   }
   return joined
 }
@@ -496,21 +552,84 @@ export interface CherryProviderDeps {
    */
   run(input: {
     readonly text: string
-    readonly cwd: string | undefined
+    /** The seam's resolved child directory — a routing key, never stat'ed. */
+    readonly cwd: string
     readonly label: string | undefined
     readonly signal: AbortSignal
   }): Promise<CherrySubagentRunOutcome>
 }
 
+/** The output blocks for one run's text; empty when there is nothing to report. */
+function textBlocks(text: string): SubagentContentBlock[] {
+  return text.trim().length === 0 ? [] : [{ type: 'text', text }]
+}
+
+/**
+ * What the runner's outcome means to the seam.
+ *
+ * `aborted` is the one status the peer never reported: the runner synthesises it
+ * when OUR signal ended the wait, which is why it maps to the seam's own
+ * `aborted` rather than to an error. Everything that is not `completed` carries
+ * a diagnostic when the runner supplied one — and a `completed` result never
+ * does, because the host appends a result's diagnostic to the settlement
+ * notification and an unexplained warning on a success is worse than silence.
+ *
+ * @param outcome - what the run amounted to.
+ * @returns the seam's result.
+ */
+function toSubagentResult(outcome: CherrySubagentRunOutcome): SubagentResult {
+  const output = textBlocks(outcome.text)
+  if (outcome.status === 'completed') return { output, stopReason: 'completed' }
+  if (outcome.status === 'aborted') return { output, stopReason: 'aborted' }
+  return {
+    output,
+    stopReason: 'error',
+    ...(outcome.diagnostic === undefined ? {} : { diagnostic: outcome.diagnostic }),
+  }
+}
+
 /**
  * Build the one-shot Cherry provider.
  *
- * @param deps - the run seam, or undefined while the wiring is still landing.
- * @returns a provider the runtime can register under `cherry`.
+ * The shape the runtime sees is three declarations and one method:
+ * `capabilities` is all-false (this provider cannot honour an agent preset, an
+ * output schema or a depth limit, and the host refuses such a request BEFORE
+ * `start`), `inheritsParentContext` is false (a Cherry child starts fresh), and
+ * `start` returns a run handle immediately.
+ *
+ * ## What `start` refuses, and what it defers
+ *
+ * A task this provider cannot represent is refused BEFORE anything exists on the
+ * Cherry side, so a rejected delegation leaves no orphan session behind (SUB-20,
+ * SUB-21) — and so is a request whose signal has already aborted (SUB-24).
+ *
+ * Everything else DEFERS: an unreachable device, a session the peer refused, a
+ * run that failed. `start` returns a run handle at once and those settle through
+ * `run.result`, because the alternative is a parent blocked on a device handshake
+ * it cannot cancel. The seam's contract draws exactly this line — fail before
+ * returning means clean up and reject, fail after means settle through the
+ * result — and a run whose handle already exists is on the far side of it.
+ *
+ * ## The two signals
+ *
+ * `request.signal` is the parent's. `dispose()` has to stop the child WITHOUT
+ * that signal having fired (the host disposes a run for reasons of its own), so
+ * the provider owns a LOCAL controller: `deps.run` watches the local one, the
+ * parent's abort is forwarded into it, and `requestCancel` aborts it. That is
+ * also what makes `settleRunResult`'s `cancelled()` answer `true` on the dispose
+ * path — the seam requires a disposed run to settle as `aborted` rather than
+ * report a `completed` nobody is listening for.
+ *
+ * @param deps - the run seam: the one place a delegation touches Cherry Studio.
+ * @param options - the registration name; the configured one, defaulting to `cherry`.
+ * @returns a provider the runtime can register under the configured name.
  */
-export function createCherryProvider(deps?: CherryProviderDeps): CherrySubagentProvider {
+export function createCherryProvider(
+  deps: CherryProviderDeps,
+  options: { readonly name?: string } = {},
+): CherrySubagentProvider {
   return {
-    name: 'cherry',
+    name: options.name ?? CHERRY_SUBAGENT_PROVIDER_DEFAULT,
     capabilities: NO_START_CAPABILITIES,
     inheritsParentContext: false,
     async start(request: SubagentStartRequest): Promise<SubagentRun> {
@@ -520,14 +639,306 @@ export function createCherryProvider(deps?: CherryProviderDeps): CherrySubagentP
       if (request.signal.aborted) {
         throw new Error('cherry subagent: the request was aborted before startup')
       }
-      if (deps === undefined) {
-        throw new Error('cherry subagent: the run seam is not wired yet (#231)')
+
+      const local = new AbortController()
+      const onHostAbort = (): void => {
+        local.abort()
       }
-      // #231 fills this body: resolve the target route from `request.cwd`,
-      // create the Cherry session, run the wait loop under the interaction
-      // policy and the deadline, and fold this run's assistant text into a
-      // published SubagentRun. Everything above this line is already final.
-      throw new Error(`cherry subagent: the run seam is not wired yet (#231) for ${text.length} characters`)
+      request.signal.addEventListener('abort', onHostAbort, { once: true })
+
+      // The run's own state, read by the collectors. `outcome` is set the moment
+      // the runner reports; `failure` when it could not even be started. Both are
+      // captured because `settleRunResult` asks for them AFTER the attempt
+      // settles, and by then the promise's value is no longer reachable.
+      let outcome: CherrySubagentRunOutcome | undefined
+      let failure: Error | undefined
+      const attempt = deps.run({ text, cwd: request.cwd, label: request.label, signal: local.signal }).then(
+        (settled) => {
+          outcome = settled
+          return settled
+        },
+        (error: unknown) => {
+          failure = error instanceof Error ? error : new Error(String(error))
+          throw failure
+        },
+      )
+      // Never rejects, so it can be awaited by `teardown` without a catch of its
+      // own: a disposed run is one whose child has stopped, and a run that failed
+      // to start has already stopped.
+      const stopped = attempt.then(
+        () => undefined,
+        () => undefined,
+      )
+
+      return externalRunHandle({
+        // D5: the seam's id is the HOST's `childId`, and the host refuses a
+        // duplicate — so it is minted here, not borrowed from the Cherry session
+        // id (which does not exist yet at this point anyway).
+        id: randomUUID(),
+        result: settleRunResult({
+          attempt: async () => toSubagentResult(await attempt),
+          // A partial only exists once the runner has reported. `cancelled()`
+          // decides whether it is reported at all, and it reads the LOCAL signal
+          // so a dispose settles as aborted.
+          collectOutput: () => (outcome === undefined ? [] : textBlocks(outcome.text)),
+          collectDiagnostic: () =>
+            outcome === undefined
+              ? // The runner could not start: its message is the only account of
+                // why, and it is ours (an unreachable device, a refused session),
+                // not peer content.
+                failure?.message
+              : outcome.diagnostic,
+          cancelled: () => local.signal.aborted,
+          signal: request.signal,
+          onAbort: onHostAbort,
+        }),
+        signal: request.signal,
+        onAbort: onHostAbort,
+        requestCancel: () => {
+          local.abort()
+        },
+        // Awaiting the settlement is what "runs until the child has actually
+        // stopped" means for a remote child: the runner's cancellation path
+        // issues the peer's own `agent.executions.cancel` and then answers.
+        teardown: () => stopped,
+      })
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SubagentConfig — the one table both faces read
+// ---------------------------------------------------------------------------
+
+/**
+ * The operator's configuration for the subagent subsystem.
+ *
+ * Deliberately ONE flat table, readable and writable by a single GET/PUT pair
+ * (#233) with `revision` as the optimistic lock: a shape that could only be read
+ * from profile YAML would have to be re-derived by the settings page, and the two
+ * readings would drift. Every field is optional — the switch is what decides,
+ * and a draft target behind a closed switch is not an error (SUB-01).
+ */
+export interface SubagentConfig {
+  /** The switch. Absent or `false` registers nothing (SUB-01). */
+  enabled?: boolean
+  /** The name the provider is registered under. Default `cherry`. */
+  providerName?: string
+  /** The name the tool is exposed under. Default `cherry_subagent`. */
+  toolName?: string
+  /** Device selector — an exact id or a unique prefix, as the tools take it. */
+  device?: string
+  /** The Cherry agent that runs the delegation. */
+  agentId?: string
+  /** A registered workspace id, as `cherry_workspaces` reports it. */
+  workspaceId?: string
+  /** The other arm of the workspace choice; mutually exclusive with {@link workspaceId}. */
+  workspaceKind?: 'system'
+  /** Declaration only (D1): which directory a delegation is told it is in. */
+  cwdMode?: 'isolated' | 'shared'
+  /** Per-directory target overrides, in precedence order (SUB-10..14). */
+  routes?: readonly CherrySubagentRoute[]
+  /** The wait window; `0` means no wall-clock bound (SUB-40..43). */
+  timeoutMs?: number
+  /** How many interactions one delegation may abandon (SUB-31). */
+  maxInteractionAbandons?: number
+  /** The revision this config was read at; the next `PUT` quotes it (#233). */
+  revision?: number
+}
+
+/** Where a delegation actually lands. */
+export interface SubagentTarget {
+  /** Device selector, as configured. */
+  readonly device: string
+  /** The Cherry agent id. */
+  readonly agentId: string
+  /** The workspace arm: a registered id, or the system workspace. */
+  readonly workspace: { readonly workspaceId: string } | { readonly kind: 'system' }
+}
+
+/** A config that passed validation, with every default applied. */
+export interface ResolvedSubagentConfig {
+  readonly providerName: string
+  readonly toolName: string
+  readonly target: SubagentTarget
+  readonly cwdMode: 'isolated' | 'shared'
+  readonly routes: readonly CherrySubagentRoute[]
+  readonly timeoutMs: number
+  readonly maxInteractionAbandons: number
+  readonly revision: number
+}
+
+/**
+ * What the switch decided.
+ *
+ * Three outcomes, not two, because "off" and "wrong" are different answers: off
+ * registers nothing and says nothing (SUB-01), while wrong stops the subsystem at
+ * `failed` with a reason a human can act on (SUB-03). Folding the second into the
+ * first would hide a broken configuration behind a switch the operator believes
+ * is on.
+ */
+export type SubagentConfigResolution =
+  | { readonly kind: 'disabled' }
+  | { readonly kind: 'invalid'; readonly problems: readonly string[] }
+  | { readonly kind: 'ready'; readonly config: ResolvedSubagentConfig }
+
+/** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
+const TIMER_CEILING_MS = 2_147_483_647
+
+/** Read one optional non-blank string field, recording a problem when it is unusable. */
+function optionalText(
+  raw: Record<string, unknown>,
+  key: string,
+  problems: string[],
+): string | undefined {
+  const value = raw[key]
+  if (value === undefined) return undefined
+  if (typeof value !== 'string') {
+    problems.push(`\`${key}\` 必须是字符串（收到 ${shapeName(value)}）`)
+    return undefined
+  }
+  const trimmed = value.trim()
+  if (trimmed.length === 0) {
+    problems.push(`\`${key}\` 不能为空`)
+    return undefined
+  }
+  return trimmed
+}
+
+/** Read one optional integer in a closed range, recording a problem when it is unusable. */
+function optionalInteger(
+  raw: Record<string, unknown>,
+  key: string,
+  problems: string[],
+  range: { min: number; max: number },
+): number | undefined {
+  const value = raw[key]
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < range.min || value > range.max) {
+    problems.push(`\`${key}\` 必须是 ${range.min} 到 ${range.max} 之间的整数（收到 ${shapeName(value)}）`)
+    return undefined
+  }
+  return value
+}
+
+/** The shape a config value arrived as, for a value-free problem message. */
+function shapeName(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  if (typeof value === 'number' && !Number.isFinite(value)) return String(value)
+  return typeof value
+}
+
+/** Validate the route table, recording a problem per unusable entry. */
+function routesOf(raw: Record<string, unknown>, problems: string[]): CherrySubagentRoute[] {
+  const value = raw['routes']
+  if (value === undefined) return []
+  if (!Array.isArray(value)) {
+    problems.push(`\`routes\` 必须是数组（收到 ${shapeName(value)}）`)
+    return []
+  }
+  const routes: CherrySubagentRoute[] = []
+  value.forEach((entry: unknown, index: number) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      problems.push(`\`routes[${index}]\` 必须是对象（收到 ${shapeName(entry)}）`)
+      return
+    }
+    const record = entry as Record<string, unknown>
+    const prefix = optionalText(record, 'cwdPrefix', [])
+    if (prefix === undefined) {
+      problems.push(`\`routes[${index}]\` 缺少非空的 \`cwdPrefix\``)
+      return
+    }
+    const device = optionalText(record, 'device', problems)
+    const workspaceId = optionalText(record, 'workspaceId', problems)
+    routes.push({
+      cwdPrefix: prefix,
+      ...(device === undefined ? {} : { device }),
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+    })
+  })
+  return routes
+}
+
+/**
+ * Resolve the operator's `subagent` config into the decision the assembly acts on.
+ *
+ * Validation is exhaustive rather than fail-fast: the answer is one `failed`
+ * state whose reason lists EVERY unusable field, because an operator fixing a
+ * config one reload per mistake is the outcome a first-error-wins validator
+ * produces.
+ *
+ * @param raw - the `subagent` config value, exactly as the host handed it over.
+ * @returns `disabled`, `invalid` with the problems, or `ready` with the defaults applied.
+ */
+export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
+  // Absent — and an explicitly empty key, which is the same statement — is the
+  // switch being off, not a mistake to report.
+  if (raw === undefined || raw === null) return { kind: 'disabled' }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    // Present but unreadable. Answering `disabled` here would hide a typo behind
+    // a switch the operator believes is on, so it is a problem by name.
+    return { kind: 'invalid', problems: [`\`subagent\` 必须是对象（收到 ${shapeName(raw)}）`] }
+  }
+  const record = raw as Record<string, unknown>
+  const problems: string[] = []
+
+  const enabled = record['enabled']
+  if (enabled !== undefined && typeof enabled !== 'boolean') {
+    problems.push(`\`enabled\` 必须是布尔值（收到 ${shapeName(enabled)}）`)
+  }
+  if (enabled !== true) {
+    // Off is off: a target left half-written behind a closed switch is a draft.
+    // The only exception is an unreadable `enabled`, which cannot be called off.
+    return problems.length > 0 ? { kind: 'invalid', problems } : { kind: 'disabled' }
+  }
+
+  const providerName = optionalText(record, 'providerName', problems) ?? CHERRY_SUBAGENT_PROVIDER_DEFAULT
+  const toolName = optionalText(record, 'toolName', problems) ?? CHERRY_SUBAGENT_TOOL_DEFAULT
+  const device = optionalText(record, 'device', problems)
+  const agentId = optionalText(record, 'agentId', problems)
+  const workspaceId = optionalText(record, 'workspaceId', problems)
+  const workspaceKind = record['workspaceKind']
+  if (workspaceKind !== undefined && workspaceKind !== 'system') {
+    problems.push(`\`workspaceKind\` 只接受 "system"（收到 ${shapeName(workspaceKind)}）`)
+  }
+  const cwdModeValue = record['cwdMode']
+  if (cwdModeValue !== undefined && cwdModeValue !== 'isolated' && cwdModeValue !== 'shared') {
+    problems.push(`\`cwdMode\` 只接受 "isolated" 或 "shared"（收到 ${shapeName(cwdModeValue)}）`)
+  }
+  const timeoutMs = optionalInteger(record, 'timeoutMs', problems, { min: 0, max: TIMER_CEILING_MS })
+  const maxInteractionAbandons = optionalInteger(record, 'maxInteractionAbandons', problems, {
+    min: 1,
+    max: Number.MAX_SAFE_INTEGER,
+  })
+  const revision = optionalInteger(record, 'revision', problems, { min: 0, max: Number.MAX_SAFE_INTEGER })
+  const routes = routesOf(record, problems)
+
+  // The target: device and agent, plus exactly one arm of the workspace choice.
+  if (device === undefined && record['device'] === undefined) problems.push('缺少 `device`')
+  if (agentId === undefined && record['agentId'] === undefined) problems.push('缺少 `agentId`')
+  if (workspaceId !== undefined && workspaceKind === 'system') {
+    problems.push('`workspaceId` 与 `workspaceKind: "system"` 只能二选一')
+  } else if (workspaceId === undefined && workspaceKind !== 'system') {
+    problems.push('缺少 `workspaceId`（或 `workspaceKind: "system"`）')
+  }
+
+  if (problems.length > 0) return { kind: 'invalid', problems }
+  // Narrowing: the three target fields are present because every missing one
+  // pushed a problem, and a run reaching here has none.
+  const workspace: SubagentTarget['workspace'] =
+    workspaceId === undefined ? { kind: 'system' } : { workspaceId }
+  return {
+    kind: 'ready',
+    config: {
+      providerName,
+      toolName,
+      target: { device: device as string, agentId: agentId as string, workspace },
+      cwdMode: cwdModeValue === 'shared' ? 'shared' : 'isolated',
+      routes,
+      timeoutMs: timeoutMs ?? DEFAULT_SUBAGENT_TIMEOUT_MS,
+      maxInteractionAbandons: maxInteractionAbandons ?? DEFAULT_MAX_INTERACTION_ABANDONS,
+      revision: revision ?? 0,
     },
   }
 }
