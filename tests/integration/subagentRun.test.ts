@@ -6,9 +6,10 @@ import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { registerCherryTools } from '../../src/tools.js'
+import { registerCherryToolsWithEngine } from '../../src/tools.js'
 import type {
   CherryToolDefinition,
+  CherryToolEngine,
   CherryToolEngineOptions,
   CherryToolsContext,
   CherryToolsDeps,
@@ -56,6 +57,7 @@ function makeCtx(): CherryToolsContext & { readonly definitions: CherryToolDefin
 interface Rig {
   fake: FakeCherry
   store: DeviceStore
+  engine: CherryToolEngine
   call(name: string, args?: Record<string, unknown>): Promise<unknown>
   stop(): Promise<void>
 }
@@ -130,12 +132,14 @@ async function makeRig(options: FakeCherryOptions = {}, engine: CherryToolEngine
       throw new Error('the subagent-run suite never evicts')
     },
   }
-  registerCherryTools(ctx, deps, engine)
+  const registered = registerCherryToolsWithEngine(ctx, deps, engine)
+  if (registered.engine === undefined) throw new Error('the engine was not built')
   await connect('dev-A').connect()
 
   const rig: Rig = {
     fake,
     store,
+    engine: registered.engine,
     call: (name, args = {}) => {
       const found = ctx.definitions.find((definition) => definition.name === name)
       if (found === undefined) throw new Error(`tool ${name} is not registered`)
@@ -217,5 +221,191 @@ describe('a failed run reports the peer’s own classification (#231)', () => {
 
     expect(answer['status']).toBe('completed')
     expect('executionError' in answer).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The delegation runner (#231)
+// ---------------------------------------------------------------------------
+
+/** The target every delegation case uses unless it overrides one field. */
+const TARGET = { device: 'dev-A', agentId: 'agent-1', workspace: { workspaceId: 'ws-1' } } as const
+
+/** One delegation, with the bounds the config resolver would have applied. */
+function delegate(
+  rig: Rig,
+  overrides: {
+    text?: string
+    label?: string
+    cwd?: string
+    routes?: readonly { cwdPrefix: string; device?: string; workspaceId?: string }[]
+    timeoutMs?: number
+    maxInteractionAbandons?: number
+    signal?: AbortSignal
+    target?: typeof TARGET
+  } = {},
+): Promise<{ status: string; text: string; diagnostic?: string }> {
+  return rig.engine.runSubagentDelegation({
+    target: overrides.target ?? TARGET,
+    routes: overrides.routes ?? [],
+    cwd: overrides.cwd ?? '/w/dsh',
+    label: overrides.label,
+    text: overrides.text ?? 'summarise the repo',
+    timeoutMs: overrides.timeoutMs ?? 5_000,
+    maxInteractionAbandons: overrides.maxInteractionAbandons ?? 8,
+    signal: overrides.signal ?? new AbortController().signal,
+  })
+}
+
+/** A session whose runs settle `completed` with this reply. */
+function completing(reply: string, extra: Record<string, unknown> = {}): FakeCherryOptions {
+  return {
+    agent: {
+      agents: [AGENT],
+      sessions: [SESSION],
+      workspaces: [{ workspaceId: 'ws-1', name: 'WS One' }],
+      // A whole `FakeMessageRecord`, not `{messageId, text}`: the parts walk
+      // reads `parts`, and a fixture without it fails the assembly rather than
+      // answering.
+      terminalMessage: {
+        messageId: 'm-1',
+        revision: '1',
+        role: 'assistant',
+        status: 'success',
+        parts: [{ kind: 'text', text: reply }],
+      },
+      ...extra,
+    },
+  }
+}
+
+const INTERACTION = {
+  interactionId: 'i-1',
+  revision: '1',
+  executionId: 'e-1',
+  toolCallId: 'c-1',
+  status: 'pending' as const,
+  kind: 'decision' as const,
+  summary: 'May I delete the file?',
+}
+
+describe('a delegation reports what the run amounted to (SUB-22/50..54)', () => {
+  it('②a the normal path folds this run’s assistant text', async () => {
+    const rig = await makeRig(completing('the answer'))
+    const outcome = await delegate(rig)
+    expect(outcome).toEqual({ status: 'completed', text: 'the answer' })
+  })
+
+  it('②b the session title comes from the seam’s `label` (SUB-23)', async () => {
+    const rig = await makeRig(completing('ok'))
+    await delegate(rig, { label: 'review the diff' })
+    const created = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.sessions.create')
+    expect(created.at(-1)?.params['title']).toBe('review the diff')
+  })
+
+  it('②c a child that DECLINES is still `completed` — its refusal text is the output (SUB-54)', async () => {
+    // A Cherry persona may refuse on role grounds. Reporting that as a failure
+    // would teach the parent to retry a decision that will not change.
+    const rig = await makeRig(completing('I cannot help with that request.'))
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('completed')
+    expect(outcome.text).toContain('cannot help')
+    expect(outcome.diagnostic).toBeUndefined()
+  })
+
+  it('②d `completed` with no text is an ERROR, not an empty answer (SUB-51)', async () => {
+    const rig = await makeRig(completing('   '))
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('produced no text')
+  })
+
+  it('②e a peer `failed` becomes `error` carrying the peer’s own reason (SUB-52)', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        runTerminalStatus: 'failed',
+        executionError: { reason: 'RESOURCE_EXHAUSTED', message: 'model quota exhausted' },
+      },
+    })
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('RESOURCE_EXHAUSTED')
+    // Bounded and free of the raw payload: only the two projected fields ride.
+    expect(outcome.diagnostic).not.toContain('{')
+    expect(new TextEncoder().encode(outcome.diagnostic ?? '').byteLength).toBeLessThanOrEqual(4_096)
+  })
+})
+
+describe('a delegation has no human to ask (SUB-30..32)', () => {
+  it('③a every card is DENIED and the run carries on to its terminal', async () => {
+    const rig = await makeRig(completing('finished anyway', { pushInteractionOnRun: INTERACTION, denyKeepsRunAlive: true }))
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('completed')
+    expect(outcome.text).toBe('finished anyway')
+    // The DENIAL, not an approval: the peer records which one it received.
+    const answered = rig.fake.commandCalls.filter((entry) => entry.method === 'agent.interactions.respond')
+    expect(answered.map((entry) => entry.params['decision'])).toEqual(['deny'])
+    // Nothing was surfaced to the DSH user: a delegation never produces an
+    // `ask_user_question`, and this seam has no channel for one.
+    expect(outcome.diagnostic).toBeUndefined()
+  })
+
+  it('③b a child that keeps asking is cancelled at the ceiling and reported (SUB-31)', async () => {
+    const rig = await makeRig(
+      completing('never gets here', {
+        pushInteractionOnRun: INTERACTION,
+        denyKeepsRunAlive: true,
+        interactionSpamOnRun: { count: 20, record: INTERACTION },
+      }),
+    )
+    const outcome = await delegate(rig, { maxInteractionAbandons: 3 })
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('3')
+    expect(outcome.diagnostic).toContain('human input')
+    // It gave up by CANCELLING the run, not by walking away from it.
+    expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
+  })
+})
+
+describe('the deadline is the delegation’s own (SUB-40..42)', () => {
+  it('④a the timeout cancels the run and reports an ERROR — never `cancelled`', async () => {
+    // The race this pins: cancelling makes the peer push a `cancelled` terminal,
+    // and a waiter that re-entered the loop after cancelling would report the
+    // peer's cancellation as the answer. The decision is taken ONCE, from the
+    // timeout, and the cancel happens on the way out.
+    const rig = await makeRig(completing('too late', { runDelayMs: 30_000 }))
+    const outcome = await delegate(rig, { timeoutMs: 150 })
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('timeout')
+    expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
+  })
+
+  it('④b `timeoutMs: 0` is no bound at all, not an instant expiry (SUB-42)', async () => {
+    const rig = await makeRig(completing('took its time', { runDelayMs: 300 }))
+    const outcome = await delegate(rig, { timeoutMs: 0 })
+    expect(outcome.status).toBe('completed')
+    expect(outcome.text).toBe('took its time')
+  })
+})
+
+describe('our own cancellation is not the child’s (SUB-25)', () => {
+  it('⑤a a parent abort cancels the run and reports `aborted`', async () => {
+    const rig = await makeRig(completing('never read', { runDelayMs: 30_000 }))
+    const controller = new AbortController()
+    const pending = delegate(rig, { signal: controller.signal })
+    // Abort while the wait is parked, so the abort channel is what ends it —
+    // not a timeout, which would have to be shorter than this delay.
+    // Wait for the SEND, not for an execution event: a peer that is still
+    // thinking has emitted nothing, and the abort must land on a run that is
+    // genuinely in flight.
+    await vi.waitFor(() => {
+      expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.messages.send')).toBe(true)
+    })
+    controller.abort()
+    const outcome = await pending
+    expect(outcome.status).toBe('aborted')
+    expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
   })
 })

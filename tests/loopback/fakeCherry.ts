@@ -566,6 +566,27 @@ export interface FakeAgentOptions {
    * the peer: send → `interaction.updated` → the tool returns early.
    */
   pushInteractionOnRun?: FakeInteractionRecord
+  /**
+   * Whether a DENIED interaction lets the run continue.
+   *
+   * The default models the peer that abandons the work on a refusal
+   * (`#settleInteraction` resumes a denied run as `cancelled`). A delegation
+   * denies EVERY card and expects the run to carry on (SUB-30), which that
+   * default cannot express — so this knob is the other peer: the tool call is
+   * refused, the agent keeps going and reaches its configured terminal. Unset
+   * leaves every existing fixture byte-identical.
+   */
+  denyKeepsRunAlive?: boolean
+  /**
+   * Keep a run parked on a FRESH interaction after each answer, `count` times.
+   *
+   * `pushInteractionOnRun` pushes exactly one card and the run settles once it is
+   * answered, so "a child that asks nine times" is not expressible with it. Each
+   * new card gets `record.interactionId` suffixed with its 1-based ordinal and
+   * shares the run's execution. After `count` cards the run behaves normally
+   * (resumes on the next answer).
+   */
+  interactionSpamOnRun?: { count: number; record: FakeInteractionRecord }
   /** Delay before `pushInteractionOnRun` lands (default 0). */
   pushInteractionDelayMs?: number
   /**
@@ -1108,6 +1129,8 @@ export class FakeCherry {
    * peer-side half of spec §3.6's 「respond 后可调 cherry_wait 恢复等待」.
    */
   #parkedRuns = new Map<string, { sessionId: string; executionId: string; status: string; messageId: string }>()
+  /** Cards served per execution by `interactionSpamOnRun`, so the count is per RUN. */
+  #interactionSpamServed = new Map<string, number>()
 
   constructor(options: FakeCherryOptions = {}) {
     this.#options = options
@@ -3825,9 +3848,38 @@ export class FakeCherry {
 
     if (parked === undefined) return
     this.#parkedRuns.delete(interaction.interactionId)
-    // A DENIED interaction ends the run as cancelled (the work is abandoned); an
-    // APPROVED/answered one proceeds to its configured terminal.
-    const status2 = status === 'denied' ? 'cancelled' : parked.status
+
+    // SPAM: park the SAME run on the next card instead of letting it settle.
+    const spam = this.#agent().interactionSpamOnRun
+    if (spam !== undefined) {
+      const served = (this.#interactionSpamServed.get(parked.executionId) ?? 0) + 1
+      this.#interactionSpamServed.set(parked.executionId, served)
+      if (served < spam.count) {
+        const next: FakeInteractionRecord = {
+          ...spam.record,
+          interactionId: `${spam.record.interactionId}-${served}`,
+          executionId: parked.executionId,
+          status: 'pending',
+        }
+        this.#interactions.push(next)
+        this.#interactionDigests.set(next.interactionId, this.#digestOf(next))
+        this.#parkedRuns.set(next.interactionId, parked)
+        this.#notify('agent.events', {
+          sessionId: parked.sessionId,
+          subscriptionId: [...this.#subscriptions.values()].find((entry) => entry.sessionId === parked.sessionId)
+            ?.subscriptionId,
+          streamEpoch: this.#journalEpoch,
+          events: [{ kind: 'interaction.updated', seq: String(++this.#watermark), payload: this.#interactionView(next) }],
+        })
+        return
+      }
+    }
+
+    // A DENIED interaction ends the run as cancelled (the work is abandoned)
+    // unless the fixture models a peer that carries on; an APPROVED/answered one
+    // proceeds to its configured terminal.
+    const denied = status === 'denied' && this.#agent().denyKeepsRunAlive !== true
+    const status2 = denied ? 'cancelled' : parked.status
     this.#emitExecutionUpdated(parked.sessionId, parked.executionId, status2, parked.messageId)
     if (status2 !== 'running' && status2 !== 'finalizing' && status2 !== 'awaiting-approval') {
       this.#activeExecutionId = undefined
