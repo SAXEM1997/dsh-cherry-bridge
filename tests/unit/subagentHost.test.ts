@@ -175,7 +175,7 @@ describe('the switch decides before anything else (SUB-01)', () => {
     host.mount(ctx)
     expect(service.registered).toEqual([])
     expect(ctx.injected).toBe(false)
-    expect(host.status().state).toBe('pending')
+    expect(host.status()).toEqual({ state: 'pending', reason: { code: 'disabled' } })
   })
 
   it('①b `enabled: false` with a COMPLETE target is the same nothing', () => {
@@ -193,8 +193,7 @@ describe('a host without the service says so, and the rest of the plugin lives (
     const ctx = fakeContext(undefined)
     const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
     expect(() => host.mount(ctx)).not.toThrow()
-    expect(host.status().state).toBe('unsupported')
-    expect(host.status().reason).toContain('subagents')
+    expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
   })
 
   it('②b it does not even ask for the injection it knows cannot arrive', () => {
@@ -210,10 +209,20 @@ describe('a broken configuration is the operator’s to fix (SUB-03)', () => {
     const ctx = fakeContext(service)
     const host = createSubagentHost({ resolution: resolveSubagentConfig({ enabled: true }), run: RUN })
     host.mount(ctx)
-    expect(host.status().state).toBe('failed')
-    expect(host.status().reason).toContain('device')
-    expect(host.status().reason).toContain('agentId')
-    expect(host.status().reason).toContain('workspaceId')
+    // The status carries the SAME structured problems the resolver produced, not
+    // a rendered sentence: the page translates them, and a string here would be
+    // the Chinese-to-English leak #233 exists to close.
+    expect(host.status()).toEqual({
+      state: 'failed',
+      reason: {
+        code: 'invalid',
+        problems: [
+          { code: 'missing', field: 'device' },
+          { code: 'missing', field: 'agentId' },
+          { code: 'missing', field: 'workspaceId' },
+        ],
+      },
+    })
     expect(service.registered).toEqual([])
   })
 
@@ -223,8 +232,15 @@ describe('a broken configuration is the operator’s to fix (SUB-03)', () => {
       run: RUN,
     })
     host.mount(fakeContext(fakeService()))
-    expect(host.status().state).toBe('failed')
-    expect(host.status().reason).toContain('timeoutMs')
+    expect(host.status()).toEqual({
+      state: 'failed',
+      reason: {
+        code: 'invalid',
+        problems: [
+          { code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'number' },
+        ],
+      },
+    })
   })
 })
 
@@ -234,7 +250,10 @@ describe('a complete configuration registers exactly one provider (SUB-04/06)', 
     const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
     host.mount(fakeContext(service))
     expect(service.listed).toEqual(['cherry'])
-    expect(host.status().state).toBe('ready')
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
     // SUB-05: the two declarations the seam reads.
     expect(service.registered[0]?.capabilities).toEqual({
       agentOptions: false,
@@ -279,8 +298,13 @@ describe('a complete configuration registers exactly one provider (SUB-04/06)', 
     const service = fakeService({ refuse: new Error('DUPLICATE_PROVIDER: cherry') })
     const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
     expect(() => host.mount(fakeContext(service))).not.toThrow()
-    expect(host.status().state).toBe('failed')
-    expect(host.status().reason).toContain('DUPLICATE_PROVIDER')
+    expect(host.status()).toEqual({
+      state: 'failed',
+      // The host's own message travels verbatim: it is a proper noun, not a
+      // sentence this plugin can translate, and inventing a translation for it
+      // would be guessing at the host's vocabulary.
+      reason: { code: 'provider-refused', message: 'DUPLICATE_PROVIDER: cherry' },
+    })
   })
 })
 
@@ -332,7 +356,8 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     const service = fakeService()
     const tools = fakeTools()
     const ctx = fakeContext(service, tools)
-    createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN }).mount(ctx)
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    host.mount(ctx)
     expect(tools.definitions).toHaveLength(1)
     // The host tears the subsystem down when the injected service goes away,
     // independently of the plugin's root effect — the same second path the
@@ -340,6 +365,9 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     for (const effect of ctx.injectedEffects.splice(0)) effect()
     expect(tools.definitions).toEqual([])
     expect(service.registered).toEqual([])
+    // Back to WAITING, not to off: the switch is still on, and a panel that read
+    // this as `disabled` would tell the operator to turn on something already on.
+    expect(host.status()).toEqual({ state: 'pending', reason: { code: 'awaiting-injection' } })
   })
 
   it('⑤e a host with no tool registry still gets the provider, and says why the tool is absent', () => {
@@ -350,12 +378,18 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     // `subagent` tool can drive it. Losing the whole subsystem over a missing
     // tool registry would be the wrong trade.
     expect(service.listed).toEqual(['cherry'])
-    expect(host.status().state).toBe('ready')
     // The ABSENCE is what this case pins, so the reason has to be the
-    // missing-registry one: both arms name the tool, and only one of them says
-    // the host has no `tools` service at all.
-    expect(host.status().reason).toContain('没有 tools 服务')
-    expect(host.status().reason).toContain('cherry_subagent')
+    // missing-registry one. Both arms report `ready-without-tool` and name the
+    // tool, and only the nested problem says which of the two hosts this is.
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: {
+        code: 'ready-without-tool',
+        providerName: 'cherry',
+        toolName: 'cherry_subagent',
+        problem: { code: 'no-tools-service' },
+      },
+    })
   })
 
   it('⑤h a seam with no `startActivation` gets the provider but not the tool', () => {
@@ -369,8 +403,15 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     host.mount(fakeContext(service, tools))
     expect(service.listed).toEqual(['cherry'])
     expect(tools.definitions).toEqual([])
-    expect(host.status().state).toBe('ready')
-    expect(host.status().reason).toContain('startActivation')
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: {
+        code: 'ready-without-tool',
+        providerName: 'cherry',
+        toolName: 'cherry_subagent',
+        problem: { code: 'no-start-activation' },
+      },
+    })
   })
 
   it('⑤i the tool is registered under the CONFIGURED `toolName` (SUB-04)', () => {
@@ -388,9 +429,12 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     expect(tools.definitions.map((definition) => definition.name)).toEqual(['custom_delegate'])
     // The status quotes the CONFIGURED name too: a line that says
     // `cherry_subagent` while the registry holds `custom_delegate` sends the
-    // operator looking for a tool that is not there.
-    expect(host.status().reason).toContain('custom_delegate')
-    expect(host.status().reason).not.toContain('cherry_subagent')
+    // operator looking for a tool that is not there. Exact equality, so no
+    // rendition of the status can name the default as well.
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'custom_delegate' },
+    })
   })
 
   it('⑤j a `startActivation` that uses its RECEIVER keeps working', async () => {
@@ -420,9 +464,17 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
     const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
     expect(() => host.mount(fakeContext(service, tools))).not.toThrow()
     expect(service.listed).toEqual(['cherry'])
-    expect(host.status().state).toBe('ready')
-    expect(host.status().reason).toContain('工具注册被宿主拒绝')
-    expect(host.status().reason).toContain('cherry_subagent')
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: {
+        code: 'ready-without-tool',
+        providerName: 'cherry',
+        toolName: 'cherry_subagent',
+        // The host's own refusal text, carried verbatim — it names the tool the
+        // host thinks collided, which no code of ours could know.
+        problem: { code: 'host-refused', message: 'duplicate tool name: cherry_subagent' },
+      },
+    })
   })
 
   it('⑤l a refused tool registration still releases the provider', () => {
@@ -600,9 +652,15 @@ describe('a host without the activation resolver gets no ungated tool (SUB-04)',
     // The PROVIDER is still registered: the host's own `subagent` tool can drive
     // it, and a missing gate must not cost the operator the whole experiment.
     expect(service.listed).toEqual(['cherry'])
-    expect(host.status().state).toBe('ready')
-    expect(host.status().reason).toContain('tools.resolve')
-    expect(host.status().reason).toContain('工具 "cherry_subagent" 未注册')
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: {
+        code: 'ready-without-tool',
+        providerName: 'cherry',
+        toolName: 'cherry_subagent',
+        problem: { code: 'no-step-condition' },
+      },
+    })
   })
 
   it('⑦b the probe only guards the GATED registration: no `allowedFor` ⇒ no probe', () => {
@@ -615,7 +673,9 @@ describe('a host without the activation resolver gets no ungated tool (SUB-04)',
     host.mount(fakeContext(service, tools))
     expect(tools.definitions).toHaveLength(1)
     expect(tools.registrations[0]).toBeUndefined()
-    expect(host.status().state).toBe('ready')
-    expect(host.status().reason).toContain('已注册 provider')
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
   })
 })

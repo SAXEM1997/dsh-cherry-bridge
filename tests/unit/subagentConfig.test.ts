@@ -21,9 +21,22 @@ import { resolveSubagentConfig } from '../../src/subagent.js'
  *    half-written is not an error: an operator who has not turned the feature on
  *    has not asked for anything (SUB-01).
  *  - `invalid` — enabled, but the target cannot be dialled. The subsystem stops
- *    at `failed` and the problems are the reason a human reads (SUB-03).
+ *    at `failed` and the problems are what the operator is shown (SUB-03).
  *  - `ready` — enabled and complete; the provider and tool names come from here
  *    (SUB-04).
+ *
+ * ## Why a problem is a CODE and not a sentence (#233)
+ *
+ * The settings page is bilingual and this table is its data source. A Chinese
+ * string traveling over the HTTP face is a sentence the English page cannot
+ * translate, so each problem is `{code, field, …params}` and the page owns the
+ * words. That is why these assertions are exact objects: the SHAPE is the
+ * contract, and a sentence creeping back in would be a red test rather than a
+ * page that reads as half-translated.
+ *
+ * `field` is a config PATH (`device`, `routes[0].cwdPrefix`), and `received` is
+ * the SHAPE that arrived (`number`, `null`, `NaN`), never the value: a problem
+ * must not carry what the operator typed into it, because it crosses a wire.
  *
  * `revision` is not decoration: #233's `PUT /cherry-remote/api/subagent` is a
  * read-modify-write with an optimistic lock, so the table has to carry the
@@ -112,32 +125,59 @@ describe('resolution: an incomplete target names what is missing (SUB-03)', () =
     // One problem PER missing field, each naming it: a reason that says
     // "configuration incomplete" makes the operator re-read the docs to find out
     // which field, which is the failure this wording exists to prevent.
-    expect(resolved.problems).toHaveLength(3)
-    expect(resolved.problems.some((p) => p.includes('device'))).toBe(true)
-    expect(resolved.problems.some((p) => p.includes('agentId'))).toBe(true)
-    expect(resolved.problems.some((p) => p.includes('workspaceId'))).toBe(true)
+    expect(resolved.problems).toEqual([
+      { code: 'missing', field: 'device' },
+      { code: 'missing', field: 'agentId' },
+      { code: 'missing', field: 'workspaceId' },
+    ])
   })
 
   it('reports ONLY what is missing — a field that is present is not named', () => {
     const resolved = resolveSubagentConfig({ enabled: true, device: 'desk-1' })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems.some((p) => p.includes('device'))).toBe(false)
-    expect(resolved.problems).toHaveLength(2)
+    expect(resolved.problems).toEqual([
+      { code: 'missing', field: 'agentId' },
+      { code: 'missing', field: 'workspaceId' },
+    ])
   })
 
   it('refuses workspaceId together with workspaceKind, naming both', () => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, workspaceKind: 'system' })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems).toHaveLength(1)
-    expect(resolved.problems[0]).toContain('workspaceId')
-    expect(resolved.problems[0]).toContain('workspaceKind')
+    expect(resolved.problems).toEqual([
+      { code: 'exclusive', field: 'workspaceId', other: 'workspaceKind' },
+    ])
   })
 
-  it('a blank string is missing, not present', () => {
+  it('a blank string is `empty`, and the field is still refused', () => {
+    // Not `missing`: the field IS there, and an operator who typed spaces wants
+    // to be told the value is blank rather than that they left it out.
     const resolved = resolveSubagentConfig({ ...COMPLETE, device: '   ' })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems).toHaveLength(1)
-    expect(resolved.problems[0]).toContain('device')
+    expect(resolved.problems).toEqual([{ code: 'empty', field: 'device' }])
+  })
+
+  it('a non-object `subagent` value is refused by name, never read as off', () => {
+    // An unreadable switch must not present as an OFF one: answering `disabled`
+    // here would hide a typo behind a switch the operator believes is on.
+    expect(resolveSubagentConfig(['enabled', true])).toEqual({
+      kind: 'invalid',
+      problems: [{ code: 'not-object', field: 'subagent', received: 'array' }],
+    })
+    expect(resolveSubagentConfig('yes')).toEqual({
+      kind: 'invalid',
+      problems: [{ code: 'not-object', field: 'subagent', received: 'string' }],
+    })
+  })
+
+  it('a non-boolean `enabled` is a problem, not a closed switch', () => {
+    // `enabled: "true"` is the classic YAML quote slip, and reading it as off is
+    // the one outcome that looks like success: nothing registers, nothing says
+    // why, and the operator's switch shows what they typed.
+    expect(resolveSubagentConfig({ enabled: 'true', device: 'desk-1' })).toEqual({
+      kind: 'invalid',
+      problems: [{ code: 'not-boolean', field: 'enabled', received: 'string' }],
+    })
   })
 })
 
@@ -149,16 +189,20 @@ describe('resolution: `timeoutMs` — 0 is a decision, a negative is a mistake (
   })
 
   it.each([
-    ['a negative', -1],
-    ['NaN', Number.NaN],
-    ['Infinity', Number.POSITIVE_INFINITY],
-    ['a string', '1800000'],
-    ['null', null],
-  ])('%s is refused by name', (_label, value) => {
+    ['a negative', -1, 'number'],
+    ['NaN', Number.NaN, 'NaN'],
+    ['Infinity', Number.POSITIVE_INFINITY, 'Infinity'],
+    ['a string', '1800000', 'string'],
+    ['null', null, 'null'],
+  ])('%s is refused with its range and the shape that arrived', (_label, value, received) => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, timeoutMs: value })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems).toHaveLength(1)
-    expect(resolved.problems[0]).toContain('timeoutMs')
+    // ONE code for a wrong type and for an out-of-range number, because
+    // `optionalInteger` judges both in one guard — and a second code that no
+    // site can emit is a translation the page would carry for nobody.
+    expect(resolved.problems).toEqual([
+      { code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received },
+    ])
   })
 
   it('above the host timer ceiling is refused: setTimeout clamps silently past it', () => {
@@ -167,7 +211,9 @@ describe('resolution: `timeoutMs` — 0 is a decision, a negative is a mistake (
     // than an error, which is exactly what must be caught here.
     const resolved = resolveSubagentConfig({ ...COMPLETE, timeoutMs: 2_147_483_648 })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems[0]).toContain('timeoutMs')
+    expect(resolved.problems).toEqual([
+      { code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'number' },
+    ])
   })
 
   it('exactly the ceiling is legal', () => {
@@ -178,16 +224,52 @@ describe('resolution: `timeoutMs` — 0 is a decision, a negative is a mistake (
 
 describe('resolution: the remaining scalars are validated where they are read', () => {
   it.each([
-    ['cwdMode', 'elsewhere'],
-    ['maxInteractionAbandons', 0],
-    ['maxInteractionAbandons', 2.5],
-    ['providerName', ''],
-    ['toolName', 42],
-    ['revision', -1],
-  ])('%s = %s is refused by name', (key, value) => {
+    [
+      'cwdMode',
+      'elsewhere',
+      { code: 'enum', field: 'cwdMode', allowed: ['isolated', 'shared'], received: 'string' },
+    ],
+    // The OTHER enum, and the one whose accepted set is a single value. It had no
+    // case at all: `workspaceKind: 'system'` exercised the `exclusive` arm
+    // instead, so a widened `allowed` here was invisible.
+    [
+      'workspaceKind',
+      'named',
+      { code: 'enum', field: 'workspaceKind', allowed: ['system'], received: 'string' },
+    ],
+    [
+      'maxInteractionAbandons',
+      0,
+      {
+        code: 'out-of-range',
+        field: 'maxInteractionAbandons',
+        min: 1,
+        max: Number.MAX_SAFE_INTEGER,
+        received: 'number',
+      },
+    ],
+    [
+      'maxInteractionAbandons',
+      2.5,
+      {
+        code: 'out-of-range',
+        field: 'maxInteractionAbandons',
+        min: 1,
+        max: Number.MAX_SAFE_INTEGER,
+        received: 'number',
+      },
+    ],
+    ['providerName', '', { code: 'empty', field: 'providerName' }],
+    ['toolName', 42, { code: 'not-string', field: 'toolName', received: 'number' }],
+    [
+      'revision',
+      -1,
+      { code: 'out-of-range', field: 'revision', min: 0, max: Number.MAX_SAFE_INTEGER, received: 'number' },
+    ],
+  ])('%s = %j is refused with its own code', (key, value, problem) => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, [key]: value })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems.some((p) => p.includes(key))).toBe(true)
+    expect(resolved.problems).toEqual([problem])
   })
 
   it('`cwdMode: shared` is accepted — it is a declaration, not a behaviour switch (D1)', () => {
@@ -198,11 +280,41 @@ describe('resolution: the remaining scalars are validated where they are read', 
 })
 
 describe('resolution: routes are the delegation target table (SUB-10..14)', () => {
-  it('a route without a cwdPrefix is refused, naming the index', () => {
+  it('a route without a cwdPrefix is refused, naming its full path', () => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, routes: [{ device: 'desk-2' }] })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems).toHaveLength(1)
-    expect(resolved.problems[0]).toContain('routes[0]')
+    // Its OWN code, not `missing`: a route prefix that is present but blank is
+    // refused by the same guard, so the sentence has to say "non-empty".
+    expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix', field: 'routes[0].cwdPrefix' }])
+  })
+
+  it('a blank cwdPrefix is refused too — a route that can never match is dead', () => {
+    // `matchRoute` normalizes the prefix and then compares at a segment
+    // boundary, so a prefix of spaces matches nothing: the route is accepted,
+    // listed, and never fires. Refusing it here is the only place the operator
+    // finds out.
+    const resolved = resolveSubagentConfig({ ...COMPLETE, routes: [{ cwdPrefix: '   ' }] })
+    if (resolved.kind !== 'invalid') throw new Error('expected invalid')
+    expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix', field: 'routes[0].cwdPrefix' }])
+  })
+
+  it('a route entry that is not an object is refused by index', () => {
+    const resolved = resolveSubagentConfig({ ...COMPLETE, routes: ['/w/dsh'] })
+    if (resolved.kind !== 'invalid') throw new Error('expected invalid')
+    expect(resolved.problems).toEqual([{ code: 'not-object', field: 'routes[0]', received: 'string' }])
+  })
+
+  it('a route’s own fields are validated under their FULL path', () => {
+    // `routes[0].device`, not `device`: the page highlights the field that is
+    // wrong, and a bare name inside an array entry points at nothing.
+    const resolved = resolveSubagentConfig({
+      ...COMPLETE,
+      routes: [{ cwdPrefix: '/w/dsh', device: 42 }],
+    })
+    if (resolved.kind !== 'invalid') throw new Error('expected invalid')
+    expect(resolved.problems).toEqual([
+      { code: 'not-string', field: 'routes[0].device', received: 'number' },
+    ])
   })
 
   it('a declared route survives resolution in DECLARATION order', () => {
@@ -220,6 +332,6 @@ describe('resolution: routes are the delegation target table (SUB-10..14)', () =
   it('a non-array `routes` is refused by name', () => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, routes: '/w/dsh' })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
-    expect(resolved.problems.some((p) => p.includes('routes'))).toBe(true)
+    expect(resolved.problems).toEqual([{ code: 'not-array', field: 'routes', received: 'string' }])
   })
 })

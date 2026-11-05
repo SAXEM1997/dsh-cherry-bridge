@@ -5992,17 +5992,30 @@ function resolveTargetDevice(target, routes, cwd) {
 }
 /** The largest delay `setTimeout` honours; above it Node fires after ~24.8 days. */
 const TIMER_CEILING_MS = 2147483647;
-/** Read one optional non-blank string field, recording a problem when it is unusable. */
-function optionalText(raw, key, problems) {
+/**
+* Read one optional non-blank string field, recording a problem when it is unusable.
+*
+* @param path - the config path to name in a problem. Defaults to `key`; a route
+*   field passes its full path (`routes[0].device`) so the page highlights the
+*   entry that is wrong rather than a name that occurs in several places.
+*/
+function optionalText(raw, key, problems, path = key) {
 	const value = raw[key];
 	if (value === void 0) return void 0;
 	if (typeof value !== "string") {
-		problems.push(`\`${key}\` 必须是字符串（收到 ${shapeName(value)}）`);
+		problems.push({
+			code: "not-string",
+			field: path,
+			received: shapeName(value)
+		});
 		return;
 	}
 	const trimmed = value.trim();
 	if (trimmed.length === 0) {
-		problems.push(`\`${key}\` 不能为空`);
+		problems.push({
+			code: "empty",
+			field: path
+		});
 		return;
 	}
 	return trimmed;
@@ -6012,40 +6025,76 @@ function optionalInteger(raw, key, problems, range) {
 	const value = raw[key];
 	if (value === void 0) return void 0;
 	if (typeof value !== "number" || !Number.isInteger(value) || value < range.min || value > range.max) {
-		problems.push(`\`${key}\` 必须是 ${range.min} 到 ${range.max} 之间的整数（收到 ${shapeName(value)}）`);
+		problems.push({
+			code: "out-of-range",
+			field: key,
+			min: range.min,
+			max: range.max,
+			received: shapeName(value)
+		});
 		return;
 	}
 	return value;
 }
-/** The shape a config value arrived as, for a value-free problem message. */
+/** `typeof` → the member of {@link ReceivedShape} it names. Total over the eight. */
+const TYPEOF_SHAPES = {
+	string: "string",
+	number: "number",
+	boolean: "boolean",
+	object: "object",
+	undefined: "undefined",
+	function: "function",
+	symbol: "symbol",
+	bigint: "bigint"
+};
+/**
+* The shape a config value arrived as, for a value-free problem.
+*
+* Never the VALUE: these problems ride the HTTP face and end up in a log line,
+* and a config field can hold anything an operator pasted. `array` and `null`
+* are special-cased because `typeof` answers `object` for both, and the
+* distinction is the whole message ("an array where an object belongs").
+*/
 function shapeName(value) {
 	if (value === null) return "null";
 	if (Array.isArray(value)) return "array";
 	if (typeof value === "number" && !Number.isFinite(value)) return String(value);
-	return typeof value;
+	return TYPEOF_SHAPES[typeof value];
 }
 /** Validate the route table, recording a problem per unusable entry. */
 function routesOf(raw, problems) {
 	const value = raw["routes"];
 	if (value === void 0) return [];
 	if (!Array.isArray(value)) {
-		problems.push(`\`routes\` 必须是数组（收到 ${shapeName(value)}）`);
+		problems.push({
+			code: "not-array",
+			field: "routes",
+			received: shapeName(value)
+		});
 		return [];
 	}
 	const routes = [];
 	value.forEach((entry, index) => {
+		const at = `routes[${index}]`;
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-			problems.push(`\`routes[${index}]\` 必须是对象（收到 ${shapeName(entry)}）`);
+			problems.push({
+				code: "not-object",
+				field: at,
+				received: shapeName(entry)
+			});
 			return;
 		}
 		const record = entry;
-		const prefix = optionalText(record, "cwdPrefix", []);
-		if (prefix === void 0) {
-			problems.push(`\`routes[${index}]\` 缺少非空的 \`cwdPrefix\``);
+		const prefix = typeof record["cwdPrefix"] === "string" ? record["cwdPrefix"].trim() : "";
+		if (prefix.length === 0) {
+			problems.push({
+				code: "route-cwd-prefix",
+				field: `${at}.cwdPrefix`
+			});
 			return;
 		}
-		const device = optionalText(record, "device", problems);
-		const workspaceId = optionalText(record, "workspaceId", problems);
+		const device = optionalText(record, "device", problems, `${at}.device`);
+		const workspaceId = optionalText(record, "workspaceId", problems, `${at}.workspaceId`);
 		routes.push({
 			cwdPrefix: prefix,
 			...device === void 0 ? {} : { device },
@@ -6069,12 +6118,20 @@ function resolveSubagentConfig(raw) {
 	if (raw === void 0 || raw === null) return { kind: "disabled" };
 	if (typeof raw !== "object" || Array.isArray(raw)) return {
 		kind: "invalid",
-		problems: [`\`subagent\` 必须是对象（收到 ${shapeName(raw)}）`]
+		problems: [{
+			code: "not-object",
+			field: "subagent",
+			received: shapeName(raw)
+		}]
 	};
 	const record = raw;
 	const problems = [];
 	const enabled = record["enabled"];
-	if (enabled !== void 0 && typeof enabled !== "boolean") problems.push(`\`enabled\` 必须是布尔值（收到 ${shapeName(enabled)}）`);
+	if (enabled !== void 0 && typeof enabled !== "boolean") problems.push({
+		code: "not-boolean",
+		field: "enabled",
+		received: shapeName(enabled)
+	});
 	if (enabled !== true) return problems.length > 0 ? {
 		kind: "invalid",
 		problems
@@ -6085,9 +6142,19 @@ function resolveSubagentConfig(raw) {
 	const agentId = optionalText(record, "agentId", problems);
 	const workspaceId = optionalText(record, "workspaceId", problems);
 	const workspaceKind = record["workspaceKind"];
-	if (workspaceKind !== void 0 && workspaceKind !== "system") problems.push(`\`workspaceKind\` 只接受 "system"（收到 ${shapeName(workspaceKind)}）`);
+	if (workspaceKind !== void 0 && workspaceKind !== "system") problems.push({
+		code: "enum",
+		field: "workspaceKind",
+		allowed: ["system"],
+		received: shapeName(workspaceKind)
+	});
 	const cwdModeValue = record["cwdMode"];
-	if (cwdModeValue !== void 0 && cwdModeValue !== "isolated" && cwdModeValue !== "shared") problems.push(`\`cwdMode\` 只接受 "isolated" 或 "shared"（收到 ${shapeName(cwdModeValue)}）`);
+	if (cwdModeValue !== void 0 && cwdModeValue !== "isolated" && cwdModeValue !== "shared") problems.push({
+		code: "enum",
+		field: "cwdMode",
+		allowed: ["isolated", "shared"],
+		received: shapeName(cwdModeValue)
+	});
 	const timeoutMs = optionalInteger(record, "timeoutMs", problems, {
 		min: 0,
 		max: TIMER_CEILING_MS
@@ -6101,10 +6168,23 @@ function resolveSubagentConfig(raw) {
 		max: Number.MAX_SAFE_INTEGER
 	});
 	const routes = routesOf(record, problems);
-	if (device === void 0 && record["device"] === void 0) problems.push("缺少 `device`");
-	if (agentId === void 0 && record["agentId"] === void 0) problems.push("缺少 `agentId`");
-	if (workspaceId !== void 0 && workspaceKind === "system") problems.push("`workspaceId` 与 `workspaceKind: \"system\"` 只能二选一");
-	else if (workspaceId === void 0 && workspaceKind !== "system") problems.push("缺少 `workspaceId`（或 `workspaceKind: \"system\"`）");
+	if (device === void 0 && record["device"] === void 0) problems.push({
+		code: "missing",
+		field: "device"
+	});
+	if (agentId === void 0 && record["agentId"] === void 0) problems.push({
+		code: "missing",
+		field: "agentId"
+	});
+	if (workspaceId !== void 0 && workspaceKind === "system") problems.push({
+		code: "exclusive",
+		field: "workspaceId",
+		other: "workspaceKind"
+	});
+	else if (workspaceId === void 0 && workspaceKind !== "system") problems.push({
+		code: "missing",
+		field: "workspaceId"
+	});
 	if (problems.length > 0) return {
 		kind: "invalid",
 		problems
@@ -11635,8 +11715,6 @@ function createCherrySubagentTool(parts) {
 //#region src/subagentHost.ts
 /** The injection key. ONE key, so the subsystem cannot be held pending by another. */
 const INJECT_KEYS$1 = ["subagents"];
-/** The reason text for a host that has no registry at all (SUB-02). */
-const UNSUPPORTED_REASON = "宿主没有 subagents 服务（DSH 版本过低）；子智能体子系统不可用，其余功能不受影响";
 /**
 * Build the subsystem for ONE apply.
 *
@@ -11649,13 +11727,16 @@ function createSubagentHost(parts) {
 	const allowedFor = parts.allowedFor;
 	let status = resolution.kind === "disabled" ? {
 		state: "pending",
-		reason: "实验性子智能体未启用（默认关闭）"
+		reason: { code: "disabled" }
 	} : resolution.kind === "invalid" ? {
 		state: "failed",
-		reason: resolution.problems.join("；")
+		reason: {
+			code: "invalid",
+			problems: resolution.problems
+		}
 	} : {
 		state: "pending",
-		reason: "等待宿主注入 subagents"
+		reason: { code: "awaiting-injection" }
 	};
 	let release;
 	return {
@@ -11665,9 +11746,9 @@ function createSubagentHost(parts) {
 			if (ctx.subagents === void 0) {
 				status = {
 					state: "unsupported",
-					reason: UNSUPPORTED_REASON
+					reason: { code: "unsupported" }
 				};
-				log(`[cherry-remote] 子智能体子系统未启用：${UNSUPPORTED_REASON}`);
+				log("[cherry-remote] 子智能体子系统不可用", status.reason);
 				return () => {};
 			}
 			const tools = ctx.tools;
@@ -11683,10 +11764,10 @@ function createSubagentHost(parts) {
 			* @returns the tool's disposer, or the reason there is none.
 			*/
 			const registerTool = (service) => {
-				if (tools === void 0) return { problem: "宿主没有 tools 服务" };
+				if (tools === void 0) return { problem: { code: "no-tools-service" } };
 				const startActivation = service.startActivation;
-				if (typeof startActivation !== "function") return { problem: "宿主没有 startActivation 接口" };
-				if (allowedFor !== void 0 && typeof tools.resolve !== "function") return { problem: "宿主没有 tools.resolve（步骤级激活条件不受支持），无法逐步骤约束可见性；工具不注册（fail-closed）" };
+				if (typeof startActivation !== "function") return { problem: { code: "no-start-activation" } };
+				if (allowedFor !== void 0 && typeof tools.resolve !== "function") return { problem: { code: "no-step-condition" } };
 				const definition = createCherrySubagentTool({
 					toolName: resolution.config.toolName,
 					providerName: resolution.config.providerName,
@@ -11707,7 +11788,7 @@ function createSubagentHost(parts) {
 				if (service === void 0) {
 					status = {
 						state: "unsupported",
-						reason: UNSUPPORTED_REASON
+						reason: { code: "unsupported" }
 					};
 					return;
 				}
@@ -11717,7 +11798,10 @@ function createSubagentHost(parts) {
 				} catch (error) {
 					status = {
 						state: "failed",
-						reason: `注册 provider 失败：${error instanceof Error ? error.message : String(error)}`
+						reason: {
+							code: "provider-refused",
+							message: error instanceof Error ? error.message : String(error)
+						}
 					};
 					log("[cherry-remote] 子智能体 provider 注册失败", error);
 					return;
@@ -11729,7 +11813,10 @@ function createSubagentHost(parts) {
 					if ("problem" in added) toolProblem = added.problem;
 					else releaseTool = added.release;
 				} catch (error) {
-					toolProblem = `工具注册被宿主拒绝：${error instanceof Error ? error.message : String(error)}`;
+					toolProblem = {
+						code: "host-refused",
+						message: error instanceof Error ? error.message : String(error)
+					};
 					log("[cherry-remote] cherry_subagent 工具注册失败", error);
 				}
 				release = () => {
@@ -11738,9 +11825,21 @@ function createSubagentHost(parts) {
 				};
 				const providerName = resolution.config.providerName;
 				const toolName = resolution.config.toolName;
-				status = {
+				status = toolProblem === void 0 ? {
 					state: "ready",
-					reason: toolProblem === void 0 ? `已注册 provider "${providerName}" 与工具 "${toolName}"` : `已注册 provider "${providerName}"；${toolProblem}，工具 "${toolName}" 未注册`
+					reason: {
+						code: "ready",
+						providerName,
+						toolName
+					}
+				} : {
+					state: "ready",
+					reason: {
+						code: "ready-without-tool",
+						providerName,
+						toolName,
+						problem: toolProblem
+					}
 				};
 			};
 			try {
@@ -11751,14 +11850,14 @@ function createSubagentHost(parts) {
 						release = void 0;
 						status = {
 							state: "pending",
-							reason: "等待宿主注入 subagents"
+							reason: { code: "awaiting-injection" }
 						};
 					};
 				});
 			} catch (error) {
 				status = {
 					state: "pending",
-					reason: "等待宿主注入 subagents"
+					reason: { code: "awaiting-injection" }
 				};
 				log("[cherry-remote] subagents 注入不可用；子智能体子系统保持 pending", error);
 			}
