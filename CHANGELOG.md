@@ -17,6 +17,62 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.2.3 (2026-11-05)
+
+Two reconnect-path defects and one diagnostics addition, all on LOCAL faces.
+Verified against desktop **2.1.4 – 2.1.10** — the range and the protocol pins
+(`0.7.0` / `0.2.5`) are unchanged by this release, and no tool, parameter or
+RPC surface moved: the fourteen `cherry_*` tools are the same shapes. The
+version preamble above reserves "new capability" for the minor digit; `#218`
+below ships as a patch by the maintainer's decision, on the same basis as
+0.2.1 — the addition is to the local diagnostics body, never to a peer face.
+
+### Added
+
+- `GET /cherry-remote/api/diagnostics` reports each subscribed session's
+  delivery ledger: `deliveredBytes` (event payload bytes received since that
+  subscription was installed), `unackedBytes` (what the peer may still count as
+  un-acknowledged) and `acks` (successful `agent.subscriptions.ack` calls). Each
+  count belongs to the CURRENT subscription and resets on install. The ledger
+  moved into `ack()` so one place governs both the explicit and the automatic
+  path: a successful ack subtracts what it covered and counts itself, a refused
+  one moves neither. Previously the subtraction lived in the auto-ack caller, so
+  an explicit ack freed the peer's window while the local ledger still called
+  those bytes un-acked (#217).
+
+### Fixed
+
+- **A candidate address that just failed is demoted behind the ones this
+  connection has not tried yet.** Each establishment pass walked
+  `record.hosts` in record order, so a stale candidate sitting first paid its
+  full dial timeout again on EVERY reconnect before the healthy address was
+  reached — a retry more expensive than the failure it recovered from. A host
+  is demoted only by a failure that belongs to THAT ADDRESS (a dial/Noise
+  failure, or a per-address hello/authenticate refusal); cancellation and the
+  pairing-level verdicts (identity mismatch, protocol version, rejected
+  authentication) still end the pass unchanged. Demotion is ORDER, never
+  exclusion: record order is preserved inside each half, and with every host
+  marked the order falls back to the record, so a single-address record keeps
+  dialing it. A mark clears when that host itself connects, so a repaired
+  address returns to the front on its own. Nothing is persisted and
+  `DeviceRecord` is unchanged; a record PATCH already evicts the pooled
+  connection, so marks do not outlive an address edit (#220).
+- **The per-session subscription cache no longer discards its newest event for
+  size.** A budget set below one event's size used to evict that event too,
+  leaving an EMPTY window whose boundary had advanced past it: the event that
+  just happened became unreachable and every read from the baseline answered
+  `cursor-out-of-window` about content the layer had held a moment earlier. The
+  budget now governs the window's tail, never its head — the last remaining
+  event is always kept, the baseline stays a servable resume point, and no drop
+  is logged when nothing was dropped (#221). Both READMEs described the policy
+  as LRU; it has always been FIFO, and both are corrected.
+
+### Upgrade notes
+
+- None required. No archive, config or protocol change: `devices.json` keeps
+  `schemaVersion` 4, `scope.json` keeps its version, and every existing pairing,
+  grant and stored token carries over untouched.
+
 ## v0.2.2 (2026-11-02)
 
 Verified against desktop **2.1.4 – 2.1.10** — the range and the protocol pins
