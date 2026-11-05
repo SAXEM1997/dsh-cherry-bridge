@@ -266,7 +266,7 @@ const zh: Dict = {
   'subagent.status.disabled': '未启用（默认关闭）。',
   'subagent.status.awaiting-injection': '等待宿主注入 subagents 服务。',
   'subagent.status.unsupported':
-    '当前 DSH 版本没有 subagents 服务，这个功能无法使用；其余功能不受影响。本页仍可保存配置，但重启后也不会生效。',
+    '当前 DSH 版本没有 subagents 服务，这个功能无法使用；其余功能不受影响。表单已置为只读——在这个版本上保存也不会生效。',
   'subagent.status.invalid': '开关已打开，但配置还不可用：',
   'subagent.status.provider-refused': '注册 provider 失败：{message}',
   'subagent.status.ready': '已注册 provider {providerName} 与工具 {toolName}。',
@@ -510,7 +510,7 @@ const en: Dict = {
   'subagent.status.disabled': 'Not enabled (off by default).',
   'subagent.status.awaiting-injection': 'Waiting for the host to inject the subagents service.',
   'subagent.status.unsupported':
-    'This DSH version has no subagents service, so the feature cannot work. Nothing else is affected. The page still saves the configuration, but a restart will not make it work either.',
+    'This DSH version has no subagents service, so the feature cannot work. Nothing else is affected. The form is read-only: saving on this version would have no effect.',
   'subagent.status.invalid': 'The switch is on, but the configuration is not usable yet:',
   'subagent.status.provider-refused': 'Registering the provider failed: {message}',
   'subagent.status.ready': 'Registered provider {providerName} and tool {toolName}.',

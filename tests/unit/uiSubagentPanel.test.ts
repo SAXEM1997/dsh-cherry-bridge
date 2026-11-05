@@ -139,10 +139,14 @@ describe('① experimental, off by default, feedback welcome', () => {
 // ---------------------------------------------------------------------------
 
 describe('② the status is rendered from CODES, and the two failures differ', () => {
-  it('②a `unsupported` explains the host and makes the form read-only', async () => {
+  it('②a `unsupported` explains the host, SAYS the form is read-only, and makes it so', async () => {
     renderPanel(stubClient(withStatus('unsupported', { code: 'unsupported' })))
+    // The sentence and the button must agree. The first draft read
+    // 本页仍可保存配置 while `readOnly` disabled the save: an operator was told
+    // to do something the page refuses. The spec review found it; the wording
+    // now states the read-only form instead of promising a save.
     await screen.findByText(
-      '当前 DSH 版本没有 subagents 服务，这个功能无法使用；其余功能不受影响。本页仍可保存配置，但重启后也不会生效。',
+      '当前 DSH 版本没有 subagents 服务，这个功能无法使用；其余功能不受影响。表单已置为只读——在这个版本上保存也不会生效。',
     )
     // Saving cannot help here, and a control that looks effective while it
     // cannot be is the fake switch this ticket exists to prevent.
