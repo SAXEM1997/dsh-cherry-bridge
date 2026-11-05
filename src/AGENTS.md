@@ -433,7 +433,8 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   `entity:<orderKey>:<uuid>`), so the split stops at a fixed field count. The
   three binding verdicts keep their own wording; `MAX_RESUME_TOKEN_CHARS` (4,096,
   shared with `cherry_read`'s `messagesResumeCursor`) is enforced by the parser and
-  declared as the parameter's `maxLength`.
+  stated in the parameter's DESCRIPTION, never as a `maxLength` keyword: the
+  host's enforced parameter subset has none (issue #219).
 - **The checksum is the load-bearing half of that change, not the length.** The
   position is the one field no structural check can validate: measured over
   20,000 random single-character corruptions of the old base64-JSON token,

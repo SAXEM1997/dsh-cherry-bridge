@@ -653,6 +653,18 @@ const MESSAGE_SUMMARIES_PAGE_ITEMS = PAGE_ITEMS_FALLBACK
 /** The largest MESSAGE aggregate a caller may ask for; the per-page clamp still applies. */
 const MAX_AGGREGATE_LIMIT = 1000
 /**
+ * The aggregate `limit` bound as TEXT, for the five parameter descriptions.
+ *
+ * The host's enforced parameter-schema subset has no `minimum`/`maximum` (issue
+ * #219), so the numbers a caller needs live in the description — the part a
+ * model actually reads — while {@link aggregateLimit} is what enforces them: it
+ * CLAMPS, which is why the sentence says clamped rather than refused. ONE
+ * sentence for all five faces so the bounds cannot drift apart.
+ */
+const AGGREGATE_LIMIT_BOUNDS =
+  `(default ${PAGE_ITEMS_FALLBACK}, min 1, max ${MAX_AGGREGATE_LIMIT}; ` +
+  'values outside that range are clamped)'
+/**
  * MESSAGE CEILING for the terminal/timeout/idle aggregate (issue #3).
  *
  * These three results are answers to a WAIT, not listings: the caller asked
@@ -1076,6 +1088,14 @@ const TEXT_MAX_LENGTH = 32_768
 const DEFAULT_WAIT_TIMEOUT_MS = 120_000
 /** The smallest meaningful timeout: below this the wait is a snapshot read. */
 const MIN_WAIT_TIMEOUT_MS = 1
+/**
+ * The wait window as TEXT, shared by `cherry_send` and `cherry_wait` (issue
+ * #219: the host's parameter subset has no `minimum`, and the floor is a CLAMP
+ * in {@link waitTimeout}, not a refusal).
+ */
+const WAIT_TIMEOUT_DESCRIPTION =
+  `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}; a value below ` +
+  `${MIN_WAIT_TIMEOUT_MS} is raised to ${MIN_WAIT_TIMEOUT_MS}). A default, not a cap.`
 
 /**
  * How much EXTRA time a wait ANSWER may spend assembling its content, at most
@@ -2977,9 +2997,7 @@ export class CherryToolEngine {
           device: { type: 'string', description: 'Device selector: exact deviceId, or a unique prefix of a deviceId or display name.' },
           limit: {
             type: 'integer',
-            minimum: 1,
-            maximum: MAX_AGGREGATE_LIMIT,
-            description: 'Maximum number of agents to return in total across pages (default 100).',
+            description: `Maximum number of agents to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`,
           },
           cursor: LIST_CURSOR_PARAMETER,
         },
@@ -3021,9 +3039,7 @@ export class CherryToolEngine {
           agentId: { type: 'string', description: 'The agent whose workspaces to list.' },
           limit: {
             type: 'integer',
-            minimum: 1,
-            maximum: MAX_AGGREGATE_LIMIT,
-            description: 'Maximum number of workspaces to return in total across pages (default 100).',
+            description: `Maximum number of workspaces to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`,
           },
           cursor: LIST_CURSOR_PARAMETER,
         },
@@ -3076,9 +3092,7 @@ export class CherryToolEngine {
           workspaceId: { type: 'string', description: 'Only sessions in this registered workspace.' },
           limit: {
             type: 'integer',
-            minimum: 1,
-            maximum: MAX_AGGREGATE_LIMIT,
-            description: 'Maximum number of sessions to return in total across pages (default 100).',
+            description: `Maximum number of sessions to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`,
           },
           cursor: LIST_CURSOR_PARAMETER,
         },
@@ -3163,17 +3177,14 @@ export class CherryToolEngine {
           sessionId: { type: 'string', description: 'The session to read.' },
           limit: {
             type: 'integer',
-            minimum: 1,
-            maximum: MAX_AGGREGATE_LIMIT,
             description:
-              'Maximum number of messages to return in total across pages (default 100). Distinct from ' +
+              `Maximum number of messages to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}. Distinct from ` +
               'the output budget: the answer may stop earlier with `truncationReason: "aggregate-bytes"`, ' +
               'which a larger `limit` does not extend — the resume token, when one is returned, is how ' +
               'older messages are reached.',
           },
           messagesResumeCursor: {
             type: 'string',
-            maxLength: MAX_RESUME_TOKEN_CHARS,
             description:
               'A `messagesResumeCursor` a previous truncated read (this tool, or cherry_send/cherry_wait) ' +
               'returned: `"cursor:<peer position>"` or `"after:<messageId>"`. Continues the walk at that ' +
@@ -4271,7 +4282,6 @@ export class CherryToolEngine {
           sessionId: { type: 'string', description: 'The session to send into.' },
           text: {
             type: 'string',
-            maxLength: TEXT_MAX_LENGTH,
             description:
               `The message text, which must not be blank. At most ${TEXT_MAX_LENGTH} characters ` +
               '(the protocol ceiling).',
@@ -4282,8 +4292,7 @@ export class CherryToolEngine {
           },
           timeoutMs: {
             type: 'integer',
-            minimum: MIN_WAIT_TIMEOUT_MS,
-            description: `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}). A default, not a cap.`,
+            description: WAIT_TIMEOUT_DESCRIPTION,
           },
           commandId: {
             type: 'string',
@@ -4553,8 +4562,7 @@ export class CherryToolEngine {
           sessionId: { type: 'string', description: 'The session to wait on.' },
           timeoutMs: {
             type: 'integer',
-            minimum: MIN_WAIT_TIMEOUT_MS,
-            description: `How long to wait, in ms (default ${DEFAULT_WAIT_TIMEOUT_MS}). A default, not a cap.`,
+            description: WAIT_TIMEOUT_DESCRIPTION,
           },
         },
         required: ['device', 'sessionId'],
@@ -4715,9 +4723,7 @@ export class CherryToolEngine {
           },
           limit: {
             type: 'integer',
-            minimum: 1,
-            maximum: MAX_AGGREGATE_LIMIT,
-            description: 'Maximum number of interactions to return in total across pages (default 100).',
+            description: `Maximum number of interactions to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`,
           },
           cursor: LIST_CURSOR_PARAMETER,
         },
@@ -4818,8 +4824,8 @@ export class CherryToolEngine {
               kind: { type: 'string', enum: ['answer'] },
               answers: {
                 type: 'object',
-                additionalProperties: { type: 'string' },
-                description: 'Every question text mapped to its answer. Blank answers are refused.',
+                additionalProperties: true,
+                description: 'Every question text mapped to its answer, each value a string. Blank answers are refused.',
               },
             },
             required: ['kind', 'answers'],
@@ -7608,7 +7614,6 @@ const LIST_TOKEN_FIELDS = 4
 /** The `cursor` parameter every list tool shares (issues #65 and #70). */
 const LIST_CURSOR_PARAMETER = {
   type: 'string',
-  maxLength: MAX_RESUME_TOKEN_CHARS,
   description:
     'A `resumeCursor` a previous TRUNCATED answer of this tool returned: replay it with the SAME ' +
     'device and filters to continue from that stop point (`limit` then bounds this answer). A token ' +
