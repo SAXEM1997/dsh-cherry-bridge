@@ -80,7 +80,7 @@ function fakeService(options: { refuse?: Error; noActivation?: boolean } = {}): 
 type ActivationContext = { agent: { id: string } }
 
 /** A stand-in `ctx.tools`: registration, its activation condition, and release. */
-function fakeTools(options: { refuse?: Error } = {}): {
+function fakeTools(options: { refuse?: Error; noResolve?: boolean } = {}): {
   readonly definitions: CherryToolDefinition[]
   /**
    * The SECOND argument each registration carried, positionally. `undefined` at
@@ -88,6 +88,15 @@ function fakeTools(options: { refuse?: Error } = {}): {
    * `{ when: undefined }` literal would erase.
    */
   readonly registrations: Array<{ when?: (context: ActivationContext) => boolean } | undefined>
+  /**
+   * The host's step-time resolver — the CAPABILITY PROBE. `when` support is
+   * detected through it, so a fake without it models a host that predates
+   * `ToolRegistrationOptions` (our `0.2.0-rc.2` snapshot). It is present by
+   * default because every case below except ⑥f describes a host that HAS the
+   * option; leaving it out by default would have quietly tested the refusal path
+   * in all of them.
+   */
+  resolve?: (context: ActivationContext) => Promise<unknown>
   register(
     definition: CherryToolDefinition,
     registrationOptions?: { when?: (context: ActivationContext) => boolean },
@@ -98,6 +107,7 @@ function fakeTools(options: { refuse?: Error } = {}): {
   return {
     definitions,
     registrations,
+    ...(options.noResolve === true ? {} : { resolve: async () => undefined }),
     register(definition, registrationOptions) {
       if (options.refuse !== undefined) throw options.refuse
       definitions.push(definition)
@@ -557,5 +567,55 @@ describe('the tool is gated per step by the scope judgement (SUB-04)', () => {
     const when = whenOf(tools) as unknown as (context: unknown) => boolean
     expect(when({})).toBe(false)
     expect(when(undefined)).toBe(false)
+  })
+})
+
+/**
+ * ⑦ — the CAPABILITY PROBE: a host that predates `ToolRegistrationOptions`.
+ *
+ * The condition is only a leak fix on a host that HONOURS it. `ctx.tools.resolve`
+ * is the resolver that evaluates the conditions, so it ships with the option and
+ * not before — our own host snapshot for `0.2.0-rc.2` (the LOW end of the
+ * advertised `dsh` range) records `register(definition): () => void` with no
+ * options object at all.
+ *
+ * What makes this worth its own cases rather than a comment: such a host IGNORES
+ * a second argument. `register(definition, { when })` succeeds, the tool lands
+ * unconditionally, the status says `ready`, and the leak is back — silently, on
+ * the hosts the fix was written for. Nothing upstream errors, so the refusal has
+ * to come from here.
+ */
+describe('a host without the activation resolver gets no ungated tool (SUB-04)', () => {
+  it('⑦a no `tools.resolve` means the tool is NOT registered, and the reason says why', () => {
+    const service = fakeService()
+    const tools = fakeTools({ noResolve: true })
+    const host = createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      allowedFor: () => true,
+    })
+    host.mount(fakeContext(service, tools))
+    expect(tools.definitions).toEqual([])
+    expect(tools.registrations).toEqual([])
+    // The PROVIDER is still registered: the host's own `subagent` tool can drive
+    // it, and a missing gate must not cost the operator the whole experiment.
+    expect(service.listed).toEqual(['cherry'])
+    expect(host.status().state).toBe('ready')
+    expect(host.status().reason).toContain('tools.resolve')
+    expect(host.status().reason).toContain('工具 "cherry_subagent" 未注册')
+  })
+
+  it('⑦b the probe only guards the GATED registration: no `allowedFor` ⇒ no probe', () => {
+    // Without a condition there is nothing to honour, so an unconditional
+    // registration is exactly right even on the oldest host — and gating it on
+    // `resolve` would break the one path that never needed the option.
+    const service = fakeService()
+    const tools = fakeTools({ noResolve: true })
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    host.mount(fakeContext(service, tools))
+    expect(tools.definitions).toHaveLength(1)
+    expect(tools.registrations[0]).toBeUndefined()
+    expect(host.status().state).toBe('ready')
+    expect(host.status().reason).toContain('已注册 provider')
   })
 })

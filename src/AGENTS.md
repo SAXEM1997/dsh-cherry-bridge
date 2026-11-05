@@ -756,7 +756,8 @@ selector, `cherry_pair` does not.
   never scope-gated, so an excluded workspace can rescue itself.
 - Capability missing is never papered over: `pending` is a neutral wait,
   `unsupported` is a read-only warning with the real cause and save disabled;
-  under both the tools stay **unregistered**.
+  under both the fourteen stay **unregistered** (the delegation tool is the one
+  exception, and it is not left ungated by that — see the bullet above).
 - `visibility-only` degradation means the execution-side backstop (`tools.guard`)
   is gone but `restrict` still removes the tools from the table — a visibility
   guarantee, not an execution boundary. The panel claims only that this plugin

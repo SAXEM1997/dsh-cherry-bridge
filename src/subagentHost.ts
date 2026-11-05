@@ -64,8 +64,32 @@ export interface ActivationContextLike {
   readonly agent: { readonly id: string }
 }
 
+/**
+ * The CAPABILITY PROBE for `when`, and the reason it is here.
+ *
+ * `ctx.tools.resolve` is the step-time resolver: it is what evaluates the
+ * registered conditions, so a host that predates `ToolRegistrationOptions` has
+ * no use for it and does not ship it. Our own host snapshot for `0.2.0-rc.2`
+ * (the low end of the advertised `dsh` range) records exactly
+ * `register(definition): () => void` — no options object at all.
+ *
+ * That matters because such a host IGNORES a second argument rather than
+ * refusing it: `register(definition, { when })` succeeds, the tool is
+ * registered unconditionally, the status is `ready`, and the leak the condition
+ * exists to close persists with nothing anywhere saying so. Refusing to
+ * register is the only honest answer.
+ *
+ * It is a proxy, and a narrow one: `resolve` is the resolver FOR conditions, so
+ * absence is strong evidence the feature is absent, but this plugin has not run
+ * against a host in that window. Stated as a proxy rather than as a version
+ * test because there is no host-version handle at this seam.
+ */
+export interface PredicateCapableTools {
+  resolve?(context: ActivationContextLike): Promise<unknown>
+}
+
 /** The `ctx.tools` face the tool registration needs, structurally. */
-export interface ToolsRegistry {
+export interface ToolsRegistry extends PredicateCapableTools {
   /**
    * @param definition - the model-facing tool.
    * @param options - the host's `ToolRegistrationOptions`. `when` is consulted
@@ -207,6 +231,16 @@ export function createSubagentHost(parts: {
         // A service with no `startActivation` cannot honour the tool: registering
         // it would promise the model a delegation that throws on every call.
         if (typeof startActivation !== 'function') return { problem: '宿主没有 startActivation 接口' }
+        // A host that predates the option ignores it rather than refusing it —
+        // see {@link PredicateCapableTools}. Registering there would leave the
+        // tool ON in every workspace with nothing saying so, which is the exact
+        // failure the condition exists to close, one host generation earlier.
+        if (allowedFor !== undefined && typeof tools.resolve !== 'function') {
+          return {
+            problem:
+              '宿主没有 tools.resolve（步骤级激活条件不受支持），无法逐步骤约束可见性；工具不注册（fail-closed）',
+          }
+        }
         const definition = createCherrySubagentTool({
           // SUB-04: the CONFIGURED names. A hardcoded literal here would make
           // `toolName` a config field that validates, defaults and does

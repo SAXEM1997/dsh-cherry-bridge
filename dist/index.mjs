@@ -1976,6 +1976,18 @@ var ToolScopeState = class {
 	* LATE-BOUND BY CONSTRUCTION: the caller captures the closure once, at
 	* assembly, and the host calls it per step. Nothing here is cached, so a
 	* config save or a `rebuild()` changes the answer for the very next step.
+	*
+	* ONE DELIBERATE DIVERGENCE from the layer install, which composes
+	* `judgement(agent.id) ?? resolveNow(agent)`: this reads the GENERATION ONLY.
+	* So a brand-new agent in a permitted workspace answers `false` until the
+	* async round that judges it lands — the other fourteen tools are offered on
+	* its first step and this one is not. It self-heals on the next round, and it
+	* fails on the STRICTER side, which is the only direction this is allowed to
+	* diverge in: `when` is consulted inside step preparation, where an
+	* unresolved agent must not be read as permission. Adding `resolveNow` here
+	* would close the gap and would also need the agent's `cwd` at this seam;
+	* it was left out so the two gates differ by being conservative, not by
+	* disagreeing about a judged agent.
 	*/
 	visibleFor(agentId) {
 		return isVisible(this.doc(), this.judgement(agentId)?.workspaceId);
@@ -11674,6 +11686,7 @@ function createSubagentHost(parts) {
 				if (tools === void 0) return { problem: "宿主没有 tools 服务" };
 				const startActivation = service.startActivation;
 				if (typeof startActivation !== "function") return { problem: "宿主没有 startActivation 接口" };
+				if (allowedFor !== void 0 && typeof tools.resolve !== "function") return { problem: "宿主没有 tools.resolve（步骤级激活条件不受支持），无法逐步骤约束可见性；工具不注册（fail-closed）" };
 				const definition = createCherrySubagentTool({
 					toolName: resolution.config.toolName,
 					providerName: resolution.config.providerName,
@@ -11898,7 +11911,7 @@ function createToolScopeHost(deps) {
 		};
 		return {
 			capable: false,
-			reason: `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个名字也无法被隐藏`
+			reason: `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`
 		};
 	}
 	function projectAgent(raw) {

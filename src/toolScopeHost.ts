@@ -319,7 +319,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       // `register({ when })` condition built from the SAME visibility
       // judgement, so it is still dropped per step. Claiming "none of them is
       // registered" was true only while this list WAS the whole registry.)
-      reason: `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个名字也无法被隐藏`,
+      reason: `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`,
     }
   }
 

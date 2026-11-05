@@ -620,6 +620,13 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
        * unconditional registration from a gated one.
        */
       registerOptions: Map<string, { when?: (context: { agent: { id: string } }) => boolean }>
+      /**
+       * The step-time resolver, and therefore the `when` CAPABILITY PROBE: a host
+       * without it predates `ToolRegistrationOptions` and the subagent host
+       * refuses to register an ungated tool. Present here because this rig models
+       * the installed 0.2.2-rc.1, which has it; ⑦a/⑦b cover the older host.
+       */
+      resolve(context: { agent: { id: string } }): Promise<unknown>
       register(
         definition: CherryToolDefinition,
         options?: { when?: (context: { agent: { id: string } }) => boolean },
@@ -736,6 +743,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         definitions: [],
         registerCalls: 0,
         registerOptions: new Map(),
+        async resolve() {
+          return undefined
+        },
         register(definition, options) {
           this.registerCalls += 1
           this.definitions.push(definition)
@@ -899,14 +909,21 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       // structurally impossible here. `cherryScopeToolNames()` is
       // `[...CHERRY_TOOL_NAMES, toolName]` — it appends unconditionally, with no
       // deduplication — so `apply` cannot hand the host fourteen names unless it
-      // hands over `CHERRY_TOOL_NAMES` itself. A run that reports "14 个名字" is
-      // therefore running such a tree (a mutation, or a stale transform), not
-      // seeing this assertion flake: `GET /scope` reads THIS apply's
-      // `ToolScopeState` (the HTTP deps are built per apply from
+      // hands over `CHERRY_TOOL_NAMES` itself. A run that reports "14 个受治理的
+      // 名字" is therefore reading such a tree (a mutation, or a stale
+      // transform), not seeing this assertion flake: `GET /scope` reads THIS
+      // apply's `ToolScopeState` (the HTTP deps are built per apply from
       // `state.scope`, assigned one statement earlier), so no earlier case can
       // contribute a count. Ten runs of this file TOGETHER with
       // `toolScopeHost.test.ts` (98 cases each) and three runs of this file
       // alone (46 each) were clean.
+      //
+      // The phrase is pinned with the count inside it rather than as a bare
+      // `15`: this string is the ONLY apply-level surface for the governed list,
+      // so a wording change here is a legitimate reason for this case to go red
+      // (it did, when the sentence was corrected to stop claiming the delegation
+      // tool "cannot be hidden" — that claim stopped being true when the tool
+      // grew its step-time gate).
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx(false, 'restrict')
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
@@ -918,7 +935,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       )
       const body = JSON.parse(response.body) as { host: { reason: string; capable: boolean } }
       expect(body.host.capable).toBe(false)
-      expect(body.host.reason).toContain('15 个名字')
+      expect(body.host.reason).toContain('15 个受治理的名字')
       rmSync(dataDir, { recursive: true, force: true })
     })
 

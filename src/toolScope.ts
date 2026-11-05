@@ -680,6 +680,18 @@ export class ToolScopeState {
    * LATE-BOUND BY CONSTRUCTION: the caller captures the closure once, at
    * assembly, and the host calls it per step. Nothing here is cached, so a
    * config save or a `rebuild()` changes the answer for the very next step.
+   *
+   * ONE DELIBERATE DIVERGENCE from the layer install, which composes
+   * `judgement(agent.id) ?? resolveNow(agent)`: this reads the GENERATION ONLY.
+   * So a brand-new agent in a permitted workspace answers `false` until the
+   * async round that judges it lands — the other fourteen tools are offered on
+   * its first step and this one is not. It self-heals on the next round, and it
+   * fails on the STRICTER side, which is the only direction this is allowed to
+   * diverge in: `when` is consulted inside step preparation, where an
+   * unresolved agent must not be read as permission. Adding `resolveNow` here
+   * would close the gap and would also need the agent's `cwd` at this seam;
+   * it was left out so the two gates differ by being conservative, not by
+   * disagreeing about a judged agent.
    */
   visibleFor(agentId: string): boolean {
     return isVisible(this.doc(), this.judgement(agentId)?.workspaceId)
