@@ -784,6 +784,18 @@ listener, no LAN exposure, no separate credentials**:
 | `POST /pair` | Start a pairing run; returns `202 {claimId}` at once, progress over SSE. |
 | `GET /events` | SSE: `device-state` / `pairing-progress`. |
 | `GET /diagnostics` | Operations report (below). |
+| `GET /subagent` | The experiment's document, its `source`, the RUNNING verdict, `pendingRestart` (#233). |
+| `PUT /subagent` | Save it — read-modify-write, `expectedRevision` required (#233). |
+
+**`/subagent` stores an unusable CONFIG rather than refusing it.** The route
+judges the LOCK and the body's shape; every field verdict belongs to
+`resolveSubagentConfig`, whose `{code, …}` problems come back on the next read as
+a `failed` status — one validator, one set of codes, and the same answer the
+profile YAML gets. Its own refusals are `invalid-request` / `missing-expected-revision`
+(400) and `subagent-revision-conflict` (409). A save does NOT re-register the
+provider: the subsystem mounts once per apply, which is why the body reports
+`pendingRestart` (the saved decision versus the running one) instead of claiming
+a hot reload.
 
 Device-route refusals (`{error}`; the page branches on the CODE): `forbidden` 403
 (the fence, before routing) · `invalid-request` 400 (malformed body, or a device id
