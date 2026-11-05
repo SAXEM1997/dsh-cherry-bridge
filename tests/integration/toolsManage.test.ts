@@ -894,6 +894,19 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       // the subagent subsystem registers it, so an excluded workspace cannot
       // reach the experiment as a way around the bridge. Reverting `apply` to
       // `CHERRY_TOOL_NAMES` turns this red.
+      //
+      // DIAGNOSTIC, because a review reported this as intermittent: FOURTEEN is
+      // structurally impossible here. `cherryScopeToolNames()` is
+      // `[...CHERRY_TOOL_NAMES, toolName]` — it appends unconditionally, with no
+      // deduplication — so `apply` cannot hand the host fourteen names unless it
+      // hands over `CHERRY_TOOL_NAMES` itself. A run that reports "14 个名字" is
+      // therefore running such a tree (a mutation, or a stale transform), not
+      // seeing this assertion flake: `GET /scope` reads THIS apply's
+      // `ToolScopeState` (the HTTP deps are built per apply from
+      // `state.scope`, assigned one statement earlier), so no earlier case can
+      // contribute a count. Ten runs of this file TOGETHER with
+      // `toolScopeHost.test.ts` (98 cases each) and three runs of this file
+      // alone (46 each) were clean.
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx(false, 'restrict')
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
