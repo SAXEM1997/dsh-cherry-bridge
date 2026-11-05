@@ -5823,7 +5823,6 @@ function matchRoute(routes, cwd) {
 	const target = normalizeRoutePath(cwd);
 	for (const route of routes) {
 		const prefix = normalizeRoutePath(route.cwdPrefix);
-		if (prefix.length === 0) continue;
 		if (target === prefix || target.startsWith(prefix + sep)) return route;
 	}
 }
