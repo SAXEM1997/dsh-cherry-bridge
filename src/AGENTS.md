@@ -744,22 +744,28 @@ selector, `cherry_pair` does not.
 - The 14 tools are decided **per workspace**; the default is `selected` + an
   empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
   document lands on the stricter side; no "unreadable → global" escape).
+- `cherry_subagent` is the ONE exception: same governed list
+  (`cherryScopeToolNames()`), but the SUBAGENT subsystem registers it, so it also
+  carries a step-time `when` (`ToolScopeState.visibleFor` — the same
+  `isVisible(doc, workspaceId)`, read per step). That is the gate that survives a
+  host without `tools.restrict`, where the scope subsystem registers nothing and
+  installs no deny layer; `restrict` + `guard` stay as the belt.
 - A save re-installs or releases the restriction layer for **every live agent**
   and takes effect on the **next turn** — no restart, no new session.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - Capability missing is never papered over: `pending` is a neutral wait,
   `unsupported` is a read-only warning with the real cause and save disabled;
-  under both the tools stay **unregistered**.
+  under both the fourteen stay **unregistered** (the delegation tool is the one
+  exception, and it is not left ungated by that — see the bullet above).
 - `visibility-only` degradation means the execution-side backstop (`tools.guard`)
   is gone but `restrict` still removes the tools from the table — a visibility
-  guarantee, not an execution boundary. The panel only ever claims "this plugin
-  does not shadow them"; upstream `allow`-shaped filtering can still hide them.
+  guarantee, not an execution boundary. The panel claims only that this plugin
+  does not shadow them; upstream `allow` filtering can still hide them.
 - The scope document lives at `<dataDir>/scope.json` (0600, atomic, monotonic
   `revision`), **not** in profile YAML. The one exception: a document that fails
   to parse or has invalid fields is rebuilt on the stricter side with `revision`
-  reset to 0, and stays writable. `PUT` is read-modify-write with a required
-  `expectedRevision`; a `PUT` prune is the only path that clears stale ids.
+  reset to 0, and stays writable.
 
 ### HTTP face: endpoints, scope errors and the diagnostics body
 
@@ -941,6 +947,5 @@ faces:
   honour `details.retryable: false`; it has no adaptive page size, so a
   byte-budget `RESOURCE_EXHAUSTED` still does not converge at a fixed limit. Our
   answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
-- Its read path refuses an unusable `byteLength`; we fall back to a slice bound
-  plus the cumulative arm.
+- Its read path refuses an unusable `byteLength` (see above).
 

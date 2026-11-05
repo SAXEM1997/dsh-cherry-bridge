@@ -311,7 +311,15 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       capable: false,
       // B7③: the reason names the REAL gap — never a hardcoded "agents
       // service unavailable", and never a `pending` phrased as "unsupported".
-      reason: `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ 这 ${names.length} 个工具一个都不注册（fail-closed）`,
+      // Both clauses are about SCOPE and both stay true whatever else the
+      // assembly registers: this subsystem registers nothing, and none of the
+      // names it was given can be hidden. (The experimental delegation tool is
+      // registered by the subagent subsystem and is not hidden either — but it
+      // is not left to its switch here: it carries a step-time
+      // `register({ when })` condition built from the SAME visibility
+      // judgement, so it is still dropped per step. Claiming "none of them is
+      // registered" was true only while this list WAS the whole registry.)
+      reason: `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`,
     }
   }
 
@@ -927,7 +935,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       }
     } else {
       degradeToVisibilityOnly(
-        '宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 14 个工具，不是渲染层假过滤）',
+        `宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 ${names.length} 个工具，不是渲染层假过滤）`,
       )
     }
 

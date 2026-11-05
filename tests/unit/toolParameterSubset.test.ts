@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { registerCherryTools } from '../../src/tools.js'
+import { createCherrySubagentTool } from '../../src/subagentTool.js'
 import type { CherryToolDefinition, CherryToolsContext } from '../../src/tools.js'
 
 /**
@@ -260,6 +261,23 @@ function registerAll(): CherryToolDefinition[] {
   return definitions
 }
 
+/**
+ * The FIFTEENTH tool: `cherry_subagent`, registered by the subagent subsystem
+ * rather than by `registerCherryTools` (issue #232).
+ *
+ * It is checked here because the subset is a property of the host, not of which
+ * subsystem happens to declare a schema — and this is the one tool whose
+ * parameters were written after the pin, which is exactly when a forbidden
+ * keyword (`maxLength` on `prompt`, say) is tempting.
+ */
+function subagentTool(): CherryToolDefinition {
+  return createCherrySubagentTool({
+    providerName: 'cherry',
+    resolveDevice: () => 'desk-1',
+    startActivation: async () => ({ childId: 'child' }),
+  })
+}
+
 /** The declared property map of one tool's parameter schema. */
 function properties(definition: CherryToolDefinition): Record<string, Record<string, unknown>> {
   return definition.parameters.properties as unknown as Record<string, Record<string, unknown>>
@@ -276,15 +294,32 @@ function toolOf(name: string): CherryToolDefinition {
 // ---------------------------------------------------------------------------
 
 describe('issue #219: the host-enforced JSON Schema subset', () => {
-  it('#219a: every one of the fourteen parameter schemas is inside the subset', () => {
-    const definitions = registerAll()
+  it('#219a: every one of the fifteen parameter schemas is inside the subset', () => {
+    const definitions = [...registerAll(), subagentTool()]
     // Anchor: the loop must actually walk the whole registry, so a silently
-    // emptied fixture cannot pass this by having nothing to check.
-    expect(definitions).toHaveLength(14)
+    // emptied fixture cannot pass this by having nothing to check. Fifteen, not
+    // fourteen: the delegation tool's schema is judged by the same host.
+    expect(definitions).toHaveLength(15)
     // One flat assertion, not one per tool: a red run then names EVERY offending
     // tool at once, which is the whole point of the pin (they fail together).
     const violations = definitions.flatMap((definition) =>
       subsetViolations(definition.parameters, `${definition.name}.parameters`),
+    )
+    expect(violations).toEqual([])
+  })
+
+  it('#219d: every one of the fifteen OUTPUT schemas is inside the subset too', () => {
+    // The host asserts `output.schema` through the SAME checker, at the SAME
+    // call site (`ctx.tools.register`, `lib/index.js:437`) — and it does so
+    // BEFORE `parameters` is ever looked at. Issue #232 shipped a tool whose
+    // output schema used the AUTHORING dialect (`required: true` on a string
+    // property, which `defineTool` compiles away) and the host rejected the
+    // registration outright: the tool never existed, and every test was green
+    // because no fixture validates. This is the interceptor.
+    const definitions = [...registerAll(), subagentTool()]
+    expect(definitions).toHaveLength(15)
+    const violations = definitions.flatMap((definition) =>
+      subsetViolations(definition.output.schema, `${definition.name}.output.schema`),
     )
     expect(violations).toEqual([])
   })

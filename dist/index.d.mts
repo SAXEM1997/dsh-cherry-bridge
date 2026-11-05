@@ -105,6 +105,25 @@ interface ToolContentBlock {
   type: 'text';
   text: string;
 }
+/**
+ * The execution context the host hands a tool body.
+ *
+ * A transcription of the two fields this plugin reads out of the host's
+ * `ToolRunContext` (`@deepseek-ai/dsh-tools@0.2.2-rc.1`, `contracts.d.ts:231` →
+ * `ToolExecutionInput`): `agent` is OPTIONAL there because a call can arrive
+ * without a delegating agent (a nested/PTC dispatch, a headless run), and
+ * `signal` is the caller's required cancellation.
+ *
+ * `agent` stays `unknown` on purpose: the fourteen `cherry_*` tools address the
+ * PEER and never the calling agent, so nothing in this file should be tempted to
+ * reach into the host's `Agent` shape. The one tool that does need it
+ * (`cherry_subagent`) only forwards it to the seam.
+ */
+interface CherryToolExec {
+  readonly agent?: unknown;
+  /** Required on the host's own contract (`ToolExecutionInput.signal`). */
+  readonly signal: AbortSignal;
+}
 /** The registry-ready definition this plugin hands the host. */
 interface CherryToolDefinition {
   name: string;
@@ -115,7 +134,18 @@ interface CherryToolDefinition {
     schema: Record<string, unknown>;
     render(args: unknown, value: unknown): ToolContentBlock[];
   };
-  execute(args: Record<string, unknown>): Promise<unknown>;
+  /**
+   * Pure synchronous classifier for overlap with sibling tool calls
+   * (`contracts.d.ts:80`). Only `true` opts in; omission is exclusive.
+   */
+  isConcurrencySafe?(args: unknown): boolean;
+  /**
+   * `exec` is optional because the fourteen peer tools ignore it entirely: they
+   * take their cancellation from the host's own rpc timeouts, not from the
+   * caller's signal. A tool that DOES need the calling agent (`cherry_subagent`)
+   * declares it required-by-contract in its own body and throws when absent.
+   */
+  execute(args: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>;
 }
 /** The host's tool registry, as this plugin consumes it. */
 interface ToolsServiceLike {

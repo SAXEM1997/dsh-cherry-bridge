@@ -712,3 +712,69 @@ describe('⑪ one bad item does not affect the others or any judgement (R9)', ()
     expect(first.state.pathUnmatched()).toEqual(second.state.pathUnmatched())
   })
 })
+
+/**
+ * ⑫ — `visibleFor`, the STEP-TIME visibility predicate the experimental
+ * delegation tool is registered with (`ctx.tools.register(definition, { when })`).
+ *
+ * It is a COMPOSITION, never a second judgement: `isVisible(doc, judgement.workspaceId)`
+ * with the workspace id OPTIONAL, so an agent the cache has not seen falls
+ * through to `isVisible(doc, undefined)` — `true` under `global`, `false` under
+ * `selected`. That asymmetry is the whole point, and each arm is a separate case
+ * because a plausible simplification of either one is a silent behaviour change:
+ * `judgement()?.visible ?? false` hides the tool from every agent under `global`,
+ * `?? true` leaks it under `selected`.
+ *
+ * Why it exists at all: on a host without `tools.restrict`, the scope subsystem
+ * registers NOTHING (fail-closed) and therefore never installs a deny layer, so
+ * without this predicate the delegation tool stayed visible in every workspace —
+ * including the ones the operator excluded.
+ */
+describe('⑫ the step-time visibility predicate is late-bound and per agent', () => {
+  it('⑫a `global` keeps an agent with NO judgement visible — the fallback is not fail-closed there', () => {
+    const { state } = makeState({ mode: 'global', workspaceIds: [] })
+    // No rebuild at all: the cache is empty, which is every agent's state on a
+    // host whose scope subsystem never got to run.
+    expect(state.judgement('never-seen')).toBeUndefined()
+    expect(state.visibleFor('never-seen')).toBe(true)
+  })
+
+  it('⑫b `selected` makes an agent with NO judgement invisible', () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    expect(state.judgement('never-seen')).toBeUndefined()
+    expect(state.visibleFor('never-seen')).toBe(false)
+  })
+
+  it('⑫c after a rebuild it answers per agent, from THAT agent’s own workspace', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['IN'] })
+    await state.rebuild(
+      registryFixture(
+        [
+          { id: 'IN', title: 'In', path: '/w/in', sessionIds: ['inside'] },
+          { id: 'OUT', title: 'Out', path: '/w/out', sessionIds: ['outside'] },
+        ],
+        { '/w/in': { id: 'IN', path: '/w/in' }, '/w/out': { id: 'OUT', path: '/w/out' } },
+      ),
+      [
+        { id: 'inside', cwd: '/w/in' },
+        { id: 'outside', cwd: '/w/out' },
+      ],
+    )
+    expect(state.visibleFor('inside')).toBe(true)
+    expect(state.visibleFor('outside')).toBe(false)
+  })
+
+  it('⑫d it is LATE-BOUND: a predicate taken before the first rebuild still sees it', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['IN'] })
+    // The production shape: `apply` builds this closure once, long before any
+    // agent exists, and the host calls it at STEP time. Capturing the verdict at
+    // construction would pin `false` for the life of the process.
+    const predicate = (agentId: string): boolean => state.visibleFor(agentId)
+    expect(predicate('a1')).toBe(false)
+    await state.rebuild(
+      registryFixture([{ id: 'IN', path: '/w/in', sessionIds: ['a1'] }], { '/w/in': { id: 'IN', path: '/w/in' } }),
+      [{ id: 'a1', cwd: '/w/in' }],
+    )
+    expect(predicate('a1')).toBe(true)
+  })
+})
