@@ -377,10 +377,14 @@ describe('⑤ the README pair carries the same three sentences', () => {
       // that, deleting the section left this case green (a sentence anywhere in
       // the file, a fenced code block included, satisfied a presence check).
       expect(text, `${name} must carry the section heading`).toMatch(heading)
-      const at = text.search(heading)
+      // Fenced blocks are stripped: a sentence inside a code block is not the
+      // README telling anyone anything, and `toContain` over raw Markdown cannot
+      // tell the two apart (the reviewer's fifth mutation).
+      const prose = text.replace(/```[\s\S]*?```/g, '')
+      const at = prose.search(heading)
       for (const key of ['subagent.experimental', 'subagent.feedback']) {
-        expect(text, `${name} must quote ${key} verbatim, inside that section`).toContain(t(key))
-        expect(text.indexOf(t(key)), `${name} quotes ${key} before its heading`).toBeGreaterThan(at)
+        expect(prose, `${name} must quote ${key} verbatim, in prose`).toContain(t(key))
+        expect(prose.indexOf(t(key)), `${name} quotes ${key} before its heading`).toBeGreaterThan(at)
       }
       // The feedback entry point is the same string as the page's (#234).
       expect(text).toContain('https://github.com/SAXEM1997/dsh-cherry-bridge/issues')

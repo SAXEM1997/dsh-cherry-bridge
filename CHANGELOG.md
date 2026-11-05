@@ -67,9 +67,8 @@ task, and the concurrency ceiling is unverified above three.
   on six token/text faces (four of them through one shared cursor parameter), and
   an object-valued `additionalProperties` on `cherry_respond`'s `answers` — eight
   tools in all, several carrying more than one kind. Those keywords were
-  annotations rather than enforcement, and the day a host site started asserting
-  `parameters` all eight would have failed on that day. The bounds moved into the
-  descriptions (what a model reads); the parsers still enforce the ceilings.
+  annotations rather than enforcement. The bounds moved into the descriptions
+  (what a model reads); the parsers still enforce the ceilings.
 
 ### Fixed
 
