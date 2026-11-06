@@ -228,7 +228,7 @@ const zh: Dict = {
   'subagent.heading': '实验性子智能体',
   'subagent.badge': '实验性',
   'subagent.experimental':
-    '实验性功能：它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。',
+    '实验性功能：仿 DSH 官方 subagent 的委派方式（与 Claude Code / Codex 的子智能体同一路数），把任务交给 Cherry Studio 桌面端上的 agent 执行、结果以文本回来。它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。',
   'subagent.defaultOff': '默认关闭。打开需要填写目标设备、agent 与工作区；保存后在重启 DSH 时生效。',
   'subagent.feedback': '欢迎贡献思路和问题反馈：',
   'subagent.feedbackLink': 'dsh-cherry-bridge issues',
@@ -489,7 +489,7 @@ const en: Dict = {
   'subagent.heading': 'Experimental subagent',
   'subagent.badge': 'Experimental',
   'subagent.experimental':
-    'Experimental: this spans two systems the plugin does not control — DSH and Cherry Studio — so its interface and behaviour may change. Off by default.',
+    "Experimental: it delegates the way DSH's own subagent does — the same pattern as Claude Code / Codex subagents, where a task goes to a child agent and the result comes back as text — except the child runs on a Cherry Studio desktop agent. It spans two systems the plugin does not control, DSH and Cherry Studio, so its interface and behaviour may change. Off by default.",
   'subagent.defaultOff':
     'Off by default. Turning it on needs a target device, agent and workspace; a save takes effect when DSH restarts.',
   'subagent.feedback': 'Ideas and bug reports are welcome:',

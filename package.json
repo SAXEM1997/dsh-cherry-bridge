@@ -4,7 +4,7 @@
   "type": "module",
   "private": false,
   "packageManager": "npm@10.9.9",
-  "description": "DeepSeek Harness plugin bridging to Cherry Studio desktop instances over remote transport",
+  "description": "DeepSeek Harness plugin bridging to Cherry Studio desktops over remote transport, with an experimental subagent that delegates the way DSH's own subagent does (Claude Code / Codex style) but runs the child on a Cherry Studio agent",
   "license": "MIT",
   "repository": {
     "type": "git",

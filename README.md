@@ -17,6 +17,10 @@
 在 DSH 会话里直接驱动局域网内 Cherry Studio 的 agent：配对、列设备/会话、读历史、
 发消息并等待终态、应答审批与提问卡、取消执行；附一个同源设置页管理设备与工具启用范围。
 
+另含一项**实验性、默认关闭**的能力：**参照 DSH 官方 `subagent` 的委派方式**（与 Claude Code /
+Codex 的子智能体同一路数——把任务交给子 agent 执行，结果以文本回到父侧）实现了同类机制，
+**执行端换成 Cherry Studio 桌面端上的 agent**。见[实验性子智能体](#实验性子智能体)。
+
 ```mermaid
 flowchart TB
     T["DSH 会话<br/>15 个 cherry_* 工具"] --> P
@@ -129,7 +133,7 @@ cherry_interactions → 看待答的提问/审批卡；cherry_respond 作答
 
 ## 实验性子智能体
 
-> 实验性功能：它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。
+> 实验性功能：仿 DSH 官方 subagent 的委派方式（与 Claude Code / Codex 的子智能体同一路数），把任务交给 Cherry Studio 桌面端上的 agent 执行、结果以文本回来。它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。
 >
 > 欢迎贡献思路和问题反馈：[dsh-cherry-bridge issues](https://github.com/SAXEM1997/dsh-cherry-bridge/issues)
 

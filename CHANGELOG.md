@@ -21,7 +21,10 @@ who never open this file.
 
 The subagent feature: a DSH session can hand one self-contained task to a Cherry
 Studio agent on a paired desktop, and the settings page grows a block that turns
-it on. The desktop range is unchanged (**2.1.4 – 2.1.10**) and no protocol
+it on. It follows the delegation shape of DSH's own `subagent` — the same pattern
+as Claude Code / Codex subagents, where a task goes to a child agent and the
+result comes back as text — with the child running on a Cherry Studio desktop
+agent instead. The desktop range is unchanged (**2.1.4 – 2.1.10**) and no protocol
 version moved. No existing tool was renamed and no required argument was added,
 but two shapes DID change and are listed under **Changed** below: eight tools'
 parameter schemas lost keywords the host never enforced, and `cherry_send` /

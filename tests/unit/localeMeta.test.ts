@@ -165,7 +165,7 @@ describe('locale/*.json structure', () => {
     // The English description is the manifest's own, verbatim.
     expect(metaOf('en').description).toBe(pkg.description)
     expect(metaOf('zh').description).toBe(
-      '通过远程传输把本机 DeepSeek Harness 连接到 Cherry Studio 桌面端的插件',
+      '通过远程传输把本机 DeepSeek Harness 连接到 Cherry Studio 桌面端；含实验性子智能体——仿 DSH 官方 subagent / Claude Code · Codex 的子智能体方式，执行端换成 Cherry Studio 的 agent',
     )
   })
 })
@@ -191,7 +191,7 @@ describeIfHost(
       expect(localized.title).toEqual({ en: dictionaries.en['app.title'], zh: dictionaries.zh['app.title'] })
       expect(localized.description).toEqual({
         en: pkg.description,
-        zh: '通过远程传输把本机 DeepSeek Harness 连接到 Cherry Studio 桌面端的插件',
+        zh: '通过远程传输把本机 DeepSeek Harness 连接到 Cherry Studio 桌面端；含实验性子智能体——仿 DSH 官方 subagent / Claude Code · Codex 的子智能体方式，执行端换成 Cherry Studio 的 agent',
       })
 
       // ...and the same values are on DISK, byte-for-byte: the host reads the
