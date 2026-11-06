@@ -302,8 +302,12 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
       **期望**：工具**立即返回**（不是等到子运行结束）；随后运行时通知带来子运行的终态与文本。
       在桌面上确认**新建了一个会话**（标题取自 `label` 或任务开头），且该会话**看不到父对话**。
 - [ ] **4. 子运行的失败分类会传到父侧**：让子任务触发一次失败（例如给一个 Cherry 侧会拒绝的
-      prompt），确认父侧终态回答带 `executionError: {reason, message?}`，且**不带**
-      `details` / `failure` 之类的不透明内容。
+      prompt）。**期望**：父模型拿到的这次委派结果带一段 **`diagnostic` 文本**，里面**引用对端的
+      reason**（形如 `the run ended failed: RESOURCE_EXHAUSTED — <对端原文>`），而不是只说
+      "it failed"；结果本身**不得**包含 `details` / `failure` 这类不透明 blob。
+      **注意观察对象**：委派的父侧拿到的是 seam 的结果（`output` / `diagnostic?` /
+      `stopReason`），**不是** `cherry_send` 的 `executionError` 字段——那个字段只存在于
+      `cherry_send` / `cherry_wait` 的回答上，由环回套件覆盖。
 - [ ] **5. 子拒绝任务是"完成"而不是故障**：让子 agent 因角色边界拒绝任务。**期望**：`status` 为
       `completed`，拒绝文本就是输出；**不得**报成 `failed`。
 - [ ] **6. 关掉开关后工具消失**：设置页取消勾选 → 保存 → 重启 DSH。**期望**：`cherry_subagent`

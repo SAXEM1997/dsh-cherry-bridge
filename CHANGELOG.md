@@ -23,9 +23,9 @@ The subagent feature: a DSH session can hand one self-contained task to a Cherry
 Studio agent on a paired desktop, and the settings page grows a block that turns
 it on. The desktop range is unchanged (**2.1.4 – 2.1.10**) and no protocol
 version moved. No existing tool was renamed and no required argument was added,
-but two shapes DID change and are listed under **Changed**: eight tools' parameter
-schemas lost keywords the host never enforced, and `cherry_send` / `cherry_wait`
-terminal answers gained an optional `executionError`. The new surface is a tool
+but two shapes DID change and are listed under **Changed** below: eight tools'
+parameter schemas lost keywords the host never enforced, and `cherry_send` /
+`cherry_wait` terminal answers gained an optional `executionError`. The new surface is a tool
 registration, a settings block, one HTTP route and a config document, and the
 tool drives only peer RPCs the earlier tools already used. The minor digit is the
 honest one: a fifteenth `cherry_*` tool is new capability, not hardening.
@@ -60,7 +60,7 @@ hot-reload. Ideas and bug reports are welcome:
 The **send** path was exercised on a real desktop during the design work (three
 concurrent probes, one task each). The **delegation** path is verified on
 loopback only: turning the experiment on crashed during assembly until the probe
-fix above, so no real-desktop delegation had ever run. `docs/e2e-checklist.md`
+fix listed under **Fixed**, so no real-desktop delegation had ever run. `docs/e2e-checklist.md`
 §H is the walk that closes this, and it has not been performed for 0.3.0. Its
 limits are stated rather than implied: one-shot sessions, no sandbox
 inheritance, the child may decline the task, and the concurrency ceiling is
@@ -69,10 +69,11 @@ unverified above three.
 ### Changed
 
 - `cherry_send` / `cherry_wait` terminal answers gained an optional
-  `executionError` `{reason, message}` carrying the peer's own failure
-  classification. Absent on `completed`: the host appends a result's diagnostic
-  to the settlement notification, so one on a success would surface in the
-  parent's context as an unexplained warning.
+  `executionError` `{reason, message?}` carrying the peer's own failure
+  classification, reduced to those two fields — the payload's `details` and
+  `failure` blobs never reach a model's context. It rides whatever the peer
+  attached to a TERMINAL event, so a successful run has none in practice; the
+  plugin does not add one.
 - Every tool's parameter schema now stays inside the subset the host's value
   validator actually enforces (#219). Eight of the fourteen carried keywords the
   host reads nothing of: `minimum`/`maximum` on seven numeric faces, `maxLength`
