@@ -36,7 +36,7 @@ import { ApiError, REQUEST_TIMEOUT, defaultSubagentClient } from './api'
 import { useT } from './i18n'
 import type { T } from './i18n'
 import { MANUAL_TARGET_VALUE, targetOptions } from './subagentTargets'
-import type { TargetCandidate, TargetCandidates, TargetFieldState, TargetLabels } from './subagentTargets'
+import type { TargetCandidate, TargetCandidates, TargetFieldState, TargetLabels, TargetProblem } from './subagentTargets'
 import { STATE_KEYS } from './types'
 import type {
   DeviceSummary,
@@ -47,7 +47,6 @@ import type {
   SubagentResponse,
   SubagentSaveRequest,
   SubagentStatus,
-  SubagentTargetsProblem,
   SubagentToolProblem,
 } from './types'
 
@@ -328,10 +327,17 @@ function failureSentence(t: T, error: unknown): string {
  */
 const ID_DISPLAY_LIMIT = 28
 
-/** `<name>（<id>）`, or the bare id when the peer reported no name. */
-function withId(name: string | undefined, id: string): string {
+/**
+ * `<name>（<id>）`, or the bare id when the peer reported no name.
+ *
+ * The JOIN is a dictionary key, not a literal: the brackets around the id are
+ * copy, and a Chinese page wants `（…）` where an English one wants `(…)`. A
+ * literal here would be the only place an English operator met full-width
+ * punctuation.
+ */
+function withId(t: T, name: string | undefined, id: string): string {
   const shown = id.length <= ID_DISPLAY_LIMIT ? id : `${id.slice(0, ID_DISPLAY_LIMIT - 1)}…`
-  return name === undefined || name === '' ? shown : `${name}（${shown}）`
+  return name === undefined || name === '' ? shown : t('subagent.targets.withId', { name, id: shown })
 }
 
 /**
@@ -351,7 +357,7 @@ const TARGET_PROBLEM_KEYS: Record<string, string> = {
 }
 
 /** A candidate-refresh failure as a sentence: by CODE, never the server's prose. */
-function targetProblemText(t: T, problem: SubagentTargetsProblem): string {
+function targetProblemText(t: T, problem: TargetProblem): string {
   const key = TARGET_PROBLEM_KEYS[problem.code]
   return key === undefined
     ? t('subagent.targets.problem.unreachable', { code: problem.code })
@@ -364,10 +370,18 @@ function targetProblemText(t: T, problem: SubagentTargetsProblem): string {
  * `GET /subagent/targets` answers its refusals IN BAND (`{problem}` at 200), so
  * anything that THROWS is off-contract and has no body to read: a timeout
  * (`REQUEST_TIMEOUT`), a dead socket (`TypeError`), or a 4xx this page caused.
- * Each gets a synthetic code so the renderer has one shape to handle — and the
- * codes are the panel's own, never the endpoint's.
+ * Each gets a synthetic code so the renderer has one shape to handle. An
+ * `ApiError` keeps the SERVER's code (it is a refusal this page caused, and the
+ * code names which); the other two are the panel's own.
+ *
+ * NOTHING here prints `problem.message`: the endpoint's sentences are English
+ * templates, and this page is Chinese. The trade is real and worth stating —
+ * `archive-quarantined`'s recovery guidance lives in its `message` and is
+ * therefore not shown. Translating the code is what the rest of this page does
+ * with server verdicts, and one English paragraph in the middle of a Chinese
+ * form is worse than a sentence that names the code.
  */
-function thrownProblem(t: T, error: unknown): SubagentTargetsProblem {
+function thrownProblem(t: T, error: unknown): TargetProblem {
   if (error instanceof ApiError) return { code: error.code, message: error.message }
   if (error instanceof Error && error.message === REQUEST_TIMEOUT) {
     return { code: 'request-timeout', message: t('subagent.targets.problem.unreachable', { code: 'request-timeout' }) }
@@ -432,36 +446,24 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
   const [workspaceAnswer, setWorkspaceAnswer] = useState<
     { key: string; candidates: TargetCandidates; systemWorkspace: boolean } | undefined
   >(undefined)
-  /**
-   * The agent the WORKSPACE list was asked for.
-   *
-   * Not `draft.agentId`: that field can also hold hand-typed text, and asking the
-   * endpoint once per keystroke would turn a typo into a burst of peer walks. It
-   * moves when the document loads and when the operator PICKS from the list —
-   * the two moments the answer can change.
-   */
-  const [chosenAgentId, setChosenAgentId] = useState('')
-  /**
-   * True once the operator picked a DIFFERENT agent than the stored one.
-   *
-   * The device half needs no flag: "the device changed" is DERIVED from the draft
-   * (see `deviceChanged`), which is both simpler and safer — a derived value
-   * comes back if the operator undoes the edit, while a cleared one does not.
-   * This flag cannot be derived because the workspace's owner is the agent's ID,
-   * and the ID alone does not say whether it was chosen or merely typed.
-   */
-  const [agentChanged, setAgentChanged] = useState(false)
   /** The operator asked to type a value by hand instead of picking one. */
   const [manual, setManual] = useState<'device' | 'agent' | 'workspace' | undefined>(undefined)
+  /**
+   * The device the AGENT list is asked for.
+   *
+   * Not `draft.device`: the manual box edits that on every keystroke, and each
+   * one would be a real peer walk. This moves when the document loads, when the
+   * operator PICKS a device, and when they leave the manual box — the moments the
+   * answer can actually change.
+   */
+  const [committedDevice, setCommittedDevice] = useState('')
 
   const accept = useCallback((answer: SubagentResponse) => {
     setData(answer)
     setDraft(draftOf(answer.subagent))
-    setChosenAgentId(answer.subagent.agentId ?? '')
+    setCommittedDevice(answer.subagent.device?.trim() ?? '')
     // A re-read (or a save) is a new baseline: the document now says what the
-    // operator meant, so the "choose it again" prompt and the hand-entry choice
-    // both stop applying.
-    setAgentChanged(false)
+    // operator meant, so the hand-entry choice stops applying.
     setManual(undefined)
   }, [])
 
@@ -492,7 +494,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
   // WITHIN one key. Across keys it is the cross-device mistake this ticket
   // exists to prevent: device B's form would keep offering device A's
   // workspaces, and a save would write A's workspace into B's document.
-  const device = draft?.device.trim() ?? ''
+  const device = committedDevice
   useEffect(() => {
     if (device === '') {
       // Nothing to ask. `undefined` rather than a `ready: []` answer, so the
@@ -511,7 +513,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
             ? { kind: 'unavailable', problem: answer.problem }
             : {
                 kind: 'ready',
-                items: answer.agents.map((agent) => ({ value: agent.agentId, label: withId(agent.name, agent.agentId) })),
+                items: answer.agents.map((agent) => ({ value: agent.agentId, label: withId(t, agent.name, agent.agentId) })),
               },
           // A truncated list is REAL but incomplete, and the operator is about to
           // pick from it: saying so is the difference between "that agent is not
@@ -539,11 +541,23 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
         ? { kind: 'ready', items: [] }
         : { kind: 'loading' }
       : agentAnswer.candidates
+  /**
+   * The agent the WORKSPACE list may be asked about: the draft's, when the list
+   * for this device names it.
+   *
+   * DERIVED, not remembered. A remembered copy of "which agent did we choose"
+   * goes stale the moment the operator types an id by hand — the workspace list
+   * would keep offering the PREVIOUS agent's workspaces, and a save would send
+   * the new agent with the old workspace. That is the same cross-contamination
+   * this ticket forbids across devices, one level down.
+   */
+  const draftAgentId = draft?.agentId.trim() ?? ''
+  const chosenAgentId =
+    agentCandidates.kind === 'ready' && agentCandidates.items.some((candidate) => candidate.value === draftAgentId)
+      ? draftAgentId
+      : ''
   /** The chosen agent is on THIS device's list, so the workspace walk may run. */
-  const chosenAgentKnown =
-    chosenAgentId !== '' &&
-    agentCandidates.kind === 'ready' &&
-    agentCandidates.items.some((candidate) => candidate.value === chosenAgentId)
+  const chosenAgentKnown = chosenAgentId !== ''
   const workspaceKey = `${device}\u0000${chosenAgentId}`
 
   useEffect(() => {
@@ -564,7 +578,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                 kind: 'ready',
                 items: (answer.workspaces ?? []).map((workspace) => ({
                   value: workspace.workspaceId,
-                  label: withId(workspace.name, workspace.workspaceId),
+                  label: withId(t, workspace.name, workspace.workspaceId),
                 })),
               },
           systemWorkspace: 'problem' in answer ? false : answer.systemWorkspace === true,
@@ -596,7 +610,9 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
     agentAnswer !== undefined && agentAnswer.device === device ? agentAnswer.truncated : undefined
 
   const save = async (): Promise<void> => {
-    if (draft === undefined || data === undefined) return
+    // `effective` is undefined exactly when `draft` is, so this one check covers
+    // both — and it is what lets the body be built from a NON-optional draft.
+    if (effective === undefined || data === undefined) return
     setBusy(true)
     setSaved(false)
     setFailure(undefined)
@@ -604,7 +620,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
       // The PUT answers the same body the GET does, so the panel replaces its
       // whole state with it: a save that only patched `revision` would leave the
       // status describing the previous apply.
-      accept(await client.put(bodyOf(effective ?? draft, data.subagent)))
+      accept(await client.put(bodyOf(effective, data.subagent)))
       setSaved(true)
     } catch (error) {
       // The draft is NOT reset: the operator's edit survives the refusal, and a
@@ -636,6 +652,8 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
   // derived one simply stops applying while the edit is in flight.
   const storedDevice = data?.subagent.device ?? ''
   const deviceChanged = draft !== undefined && draft.device.trim() !== storedDevice
+  // The same rule one level down, derived for the same reason.
+  const agentChanged = draft !== undefined && draftAgentId !== (data?.subagent.agentId ?? '')
   // The workspace belongs to the agent, so it goes stale when EITHER moves.
   const workspaceStale = deviceChanged || agentChanged
 
@@ -672,7 +690,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
         value: device.deviceId,
         // The STATE is part of the label on purpose: delegating to a device that
         // is not `connected` fails, and that is worth knowing BEFORE choosing.
-        label: `${withId(device.displayName, device.deviceId)} · ${t(STATE_KEYS[device.state])}`,
+        label: `${withId(t, device.displayName, device.deviceId)} · ${t(STATE_KEYS[device.state])}`,
       })),
     },
   }
@@ -754,7 +772,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                   // come back if the operator puts the old device back — a state
                   // clear could not do that.
                   setDraft({ ...draft, device: value })
-                  setChosenAgentId('')
+                  setCommittedDevice(value.trim())
                 }}
               />
               {manual === 'device' && (
@@ -765,6 +783,12 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                     value={draft.device}
                     disabled={readOnly}
                     onChange={(event) => setDraft({ ...draft, device: event.target.value })}
+                    // Committed on the way OUT, not per keystroke: every
+                    // keystroke would otherwise be a real walk of the peer.
+                    onBlur={(event) => setCommittedDevice(event.target.value.trim())}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') setCommittedDevice(event.currentTarget.value.trim())
+                    }}
                   />
                 </label>
               )}
@@ -785,11 +809,6 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                   }
                   setManual(undefined)
                   setDraft({ ...draft, agentId: value })
-                  setChosenAgentId(value)
-                  // The workspace belongs to the agent, so it goes stale one
-                  // level down — and unlike the device, this one cannot be
-                  // derived, because a typed id says nothing about the choice.
-                  setAgentChanged(value !== (data?.subagent.agentId ?? ''))
                 }}
               />
               {manual === 'agent' && (

@@ -439,6 +439,8 @@ export interface SubagentSaveRequest extends SubagentConfig {
   expectedRevision: number
 }
 
+import type { TargetProblem } from './subagentTargets'
+
 /** One agent a device's peer reported — `GET /subagent/targets`'s `agents[]` row. */
 export interface SubagentTargetAgent {
   agentId: string
@@ -473,22 +475,14 @@ export interface SubagentTargetsListing {
 }
 
 /**
- * The endpoint's refusal body.
+ * `GET /subagent/targets`: a listing or a problem, never both.
  *
- * `code` is a plain string on purpose: the page must survive a NEWER server
- * answering a code this build has never heard of (it renders its fallback
- * sentence). `message` is the server's sentence — ENGLISH, from the peer or from
- * the plugin's own templates — so the page translates the CODE and only falls
- * back to `message` where the text is the peer's own words.
+ * The problem type is `TargetProblem` from `./subagentTargets` — ONE declaration,
+ * because the panel hands the value straight to `targetOptions`' field state. A
+ * second, structurally identical interface here would be two names for one fact,
+ * and the day one grows a field the other would silently not.
  */
-export interface SubagentTargetsProblem {
-  code: string
-  message: string
-  [field: string]: unknown
-}
-
-/** `GET /subagent/targets`: a listing or a problem, never both. */
-export type SubagentTargetsResponse = SubagentTargetsListing | { problem: SubagentTargetsProblem }
+export type SubagentTargetsResponse = SubagentTargetsListing | { problem: TargetProblem }
 
 /** The panel's HTTP seam: the default is the same-origin client, tests inject a stub. */
 export interface SubagentClient {

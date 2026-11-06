@@ -622,9 +622,84 @@ describe('⑦ the three target fields are drop-downs with names', () => {
     }
   })
 
+  it('⑦g a device change never shows the PREVIOUS device’s agents while the new list loads', async () => {
+    // The keyed-staleness rule, tested where it matters: "keep the old list while
+    // the new one loads" is safe only within ONE key. Across keys it is the
+    // cross-device mistake — desk-2's form offering desk-1's agents, one save
+    // away from writing A's target into B's document.
+    let release: (answer: SubagentTargetsResponse) => void = () => {}
+    const client = stubClient(READY, (device) =>
+      device === 'desk-1'
+        ? Promise.resolve(CANDIDATES)
+        : new Promise<SubagentTargetsResponse>((resolve) => {
+            release = resolve
+          }),
+    )
+    renderPanel(client, DEVICES)
+    await screen.findByRole('option', { name: 'Cherry Seven（agent-7）' })
+
+    fireEvent.change(screen.getByLabelText('目标设备'), { target: { value: 'desk-2' } })
+    expect(screen.queryByRole('option', { name: 'Cherry Seven（agent-7）' })).toBeNull()
+    expect(screen.getByText('正在读取可选目标…')).toBeDefined()
+
+    release({ agents: [{ agentId: 'agent-b', name: 'Only B' }] })
+    await screen.findByRole('option', { name: 'Only B（agent-b）' })
+    // …and the OLD device's agent never comes back.
+    expect(screen.queryByRole('option', { name: 'Cherry Seven（agent-7）' })).toBeNull()
+  })
+
+  it('⑦h a HAND-TYPED agent invalidates the workspace too, so no save mixes the two', async () => {
+    // The half the stored-copy version got wrong: a remembered "chosen agent"
+    // is not updated by the manual box, so the workspace list kept offering the
+    // PREVIOUS agent's workspaces and a save sent the new agent with the old
+    // workspace. Derived, the two move together.
+    const client = stubClient(READY)
+    renderPanel(client)
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    fireEvent.change(agent, { target: { value: MANUAL_TARGET_VALUE } })
+    fireEvent.change((await screen.findByLabelText('agent id')) as HTMLInputElement, {
+      target: { value: 'agent-9' },
+    })
+    const workspace = (await screen.findByLabelText('工作区 id')) as HTMLSelectElement
+    expect(workspace.value).toBe('')
+    expect(screen.getByText('agent 已更换，工作区已清空，请重新选择。')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.agentId).toBe('agent-9')
+    // The OLD agent's workspace must not ride along.
+    expect(client.puts[0]!.workspaceId).toBe('')
+  })
+
+  it('⑦i a thrown candidate call becomes a sentence, not a crash', async () => {
+    // The endpoint answers its refusals IN BAND, so anything that THROWS is
+    // off-contract: a wedged transport, or a 4xx this page caused. Both land on
+    // the same synthetic problem.
+    renderPanel(stubClient(READY, async () => Promise.reject(new Error('socket died'))))
+    expect(await screen.findByText('取不到可选目标（client-error），可以继续手工填写。')).toBeDefined()
+    // …and the stored value survives the failure.
+    const agent = screen.getByLabelText('目标 agent') as HTMLSelectElement
+    expect(agent.value).toBe('agent-7')
+  })
+
+  it('⑦j a nameless candidate shows its id alone, and a long id is clipped in the DISPLAY only', async () => {
+    const longId = 'agent-id-that-is-far-too-long-to-show-in-a-drop-down'
+    renderPanel(
+      stubClient(READY, async () => ({
+        agents: [{ agentId: 'agent-nameless' }, { agentId: longId, name: 'Long One' }],
+      })),
+    )
+    // No name: the id is the whole label. The endpoint's own contract is that the
+    // page falls back to the id rather than showing an empty row.
+    expect(await screen.findByRole('option', { name: 'agent-nameless' })).toBeDefined()
+    const clipped = screen.getByRole('option', { name: /^Long One（agent-id-that-is-far-too-lo…）$/ })
+    // The DISPLAY is clipped; the value is the whole id, which is what a save sends.
+    expect((clipped as HTMLOptionElement).value).toBe(longId)
+  })
+
   it('⑦f `unsupported` disables the drop-downs with the rest of the form', async () => {
     const client = stubClient(
-      withStatus('unsupported', { code: 'unsupported', reason: 'no service' }),
+      withStatus('unsupported', { code: 'unsupported' }),
     )
     renderPanel(client, DEVICES)
     const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
