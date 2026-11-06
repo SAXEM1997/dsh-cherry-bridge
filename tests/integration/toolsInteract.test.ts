@@ -366,6 +366,29 @@ describe('interactive cherry tools over a real loopback channel', () => {
     expect(result.workspaceKind).toBe('system')
   })
 
+  it('①d a peer with NO system workspace fails the delegation — the gap #263 cannot close here', async () => {
+    // The fake accepted a system workspace unconditionally until #263 gave it a
+    // switch, which is why the panel could store a configuration that cannot
+    // work and nothing noticed. This case pins the failure at the place it
+    // really happens: `agent.sessions.create`, far from the settings page.
+    //
+    // It is deliberately NOT a promise that the delegation recovers. #263 makes
+    // the page refuse to OFFER the combination and shows an existing one as the
+    // contradiction it is; the saved document still fails here, and a case that
+    // went green would mean someone changed that without saying so.
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], systemWorkspace: false, refuseSystemWorkspace: true },
+    })
+
+    // It THROWS rather than answering a verdict, which is the second half of why
+    // this path went unnoticed: the settings page's save succeeded, the assembly
+    // reported `ready`, and the operator's first real delegation raised from
+    // inside a tool call.
+    await expect(
+      rig.call('cherry_create', { device: 'dev-A', agentId: 'agent-1', workspace: 'system' }),
+    ).rejects.toThrow('System workspace is not available')
+  })
+
   // -------------------------------------------------------------------------
   // ② cherry_send: terminal aggregation, including a {ref} part
   // -------------------------------------------------------------------------

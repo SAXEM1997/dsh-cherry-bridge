@@ -444,7 +444,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
     { device: string; candidates: TargetCandidates; truncated?: readonly string[] } | undefined
   >(undefined)
   const [workspaceAnswer, setWorkspaceAnswer] = useState<
-    { key: string; candidates: TargetCandidates; systemWorkspace: boolean } | undefined
+    { key: string; candidates: TargetCandidates; systemWorkspace: boolean | undefined } | undefined
   >(undefined)
   /** The operator asked to type a value by hand instead of picking one. */
   const [manual, setManual] = useState<'device' | 'agent' | 'workspace' | undefined>(undefined)
@@ -581,7 +581,10 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                   label: withId(t, workspace.name, workspace.workspaceId),
                 })),
               },
-          systemWorkspace: 'problem' in answer ? false : answer.systemWorkspace === true,
+          // A `problem` means the catalog could not be READ, which is not the
+          // same fact as "this peer has no system workspace". `undefined` keeps
+          // the two apart all the way to the radio.
+          systemWorkspace: 'problem' in answer ? undefined : answer.systemWorkspace,
         })
       })
       .catch((error: unknown) => {
@@ -589,7 +592,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
         setWorkspaceAnswer({
           key: workspaceKey,
           candidates: { kind: 'unavailable', problem: thrownProblem(t, error) },
-          systemWorkspace: false,
+          systemWorkspace: undefined,
         })
       })
     return () => {
@@ -603,8 +606,16 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
         ? { kind: 'ready', items: [] }
         : { kind: 'loading' }
       : workspaceAnswer.candidates
+  /**
+   * `true` supported, `false` the peer SAYS it has none, `undefined` we could not
+   * ask. Three states, because "unknown" must not be rendered as "unsupported":
+   * an offline desktop is still configurable, and disabling a control on a failed
+   * request would be the page inventing a fact.
+   */
   const systemWorkspace =
-    workspaceAnswer !== undefined && workspaceAnswer.key === workspaceKey && workspaceAnswer.systemWorkspace
+    workspaceAnswer !== undefined && workspaceAnswer.key === workspaceKey
+      ? workspaceAnswer.systemWorkspace
+      : undefined
   /** The lists are only as good as the key they answered for. */
   const truncatedLists =
     agentAnswer !== undefined && agentAnswer.device === device ? agentAnswer.truncated : undefined
@@ -796,6 +807,18 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
               {deviceChanged && (
                 <p className="cherry-hint">{t('subagent.targets.reselectAgent')}</p>
               )}
+              {/* The system workspace has NO id — it is the protocol's
+                  `{ kind: 'system' }` branch and never appears in `items` — so
+                  it stays a RADIO, not a list entry (#263). */}
+              {systemWorkspace === false && (
+                <p className="cherry-hint">{t('subagent.workspace.systemUnavailable')}</p>
+              )}
+              {systemWorkspace === false && draft.workspace === 'system' && (
+                // Shown, never rewritten: the operator chose this, and a page
+                // that quietly changed it would be editing a document nobody
+                // asked it to edit.
+                <p className="cherry-hint">{t('subagent.workspace.systemConflict')}</p>
+              )}
 
               <TargetSelect
                 label={t('subagent.agentId')}
@@ -857,7 +880,10 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                     type="radio"
                     name="subagent-workspace"
                     checked={draft.workspace === 'system'}
-                    disabled={readOnly}
+                    // Disabled only on a KNOWN absence (#263). A failed read
+                    // leaves it usable, because "we could not ask" is not "the
+                    // peer has none".
+                    disabled={readOnly || systemWorkspace === false}
                     onChange={() => setDraft({ ...draft, workspace: 'system' })}
                   />
                   {t('subagent.workspace.system')}
@@ -895,15 +921,6 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                   )}
                   {workspaceProblem !== undefined && (
                     <p className="cherry-hint">{targetProblemText(t, workspaceProblem)}</p>
-                  )}
-                  {/* The system workspace has NO id — it is the protocol's
-                      `{ kind: 'system' }` branch and never appears in `items` —
-                      so it stays a RADIO, not a list entry. Disabling it when
-                      the peer has none is #263; SAYING so is this ticket's,
-                      because `systemWorkspace` is the answer to a question only
-                      the candidate walk can ask. */}
-                  {chosenAgentKnown && !systemWorkspace && workspaceCandidates.kind === 'ready' && (
-                    <p className="cherry-hint">{t('subagent.targets.systemUnavailable')}</p>
                   )}
                 </>
               )}

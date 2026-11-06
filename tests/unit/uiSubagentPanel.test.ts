@@ -708,3 +708,75 @@ describe('⑦ the three target fields are drop-downs with names', () => {
     expect(agent.disabled).toBe(true)
   })
 })
+
+// ---------------------------------------------------------------------------
+// ⑧ the system workspace, when the peer has none (#263)
+// ---------------------------------------------------------------------------
+
+describe('⑧ the system workspace radio tells the truth about the peer', () => {
+  it('⑧a `systemWorkspace: false` disables the radio and says why', async () => {
+    // The failure this prevents: the radio is choosable, `resolveSubagentConfig`
+    // says `ready`, the save succeeds, the restart reports ready — and the FIRST
+    // real delegation dies in `agent.sessions.create`. Same shape as #246: the
+    // failure point is pushed somewhere the operator is not looking.
+    renderPanel(stubClient(READY, async () => ({ agents: CANDIDATES.agents as never, workspaces: [], systemWorkspace: false })))
+    const radio = (await screen.findByLabelText('系统工作区')) as HTMLInputElement
+    expect(radio.disabled).toBe(true)
+    expect(screen.getByText('这台桌面不支持系统工作区，请选一个已注册的工作区。')).toBeDefined()
+    // Saving is NOT blocked: an offline device cannot be judged, and a refusal to
+    // save would lose the operator's edit for a fact this page may not have.
+    expect((screen.getByRole('button', { name: '保存子智能体配置' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('⑧b `systemWorkspace: true` leaves the radio usable', async () => {
+    renderPanel(stubClient(READY, async () => ({ agents: CANDIDATES.agents as never, workspaces: [], systemWorkspace: true })))
+    const radio = (await screen.findByLabelText('系统工作区')) as HTMLInputElement
+    expect(radio.disabled).toBe(false)
+    expect(screen.queryByText('这台桌面不支持系统工作区，请选一个已注册的工作区。')).toBeNull()
+  })
+
+  it('⑧c a candidate source that cannot be READ does not pretend to know', async () => {
+    // "Unknown" is not "unsupported". Disabling here would be the panel inventing
+    // a fact from a failed request — and an offline desktop must still be
+    // configurable (the data-preservation rule #261 sets).
+    renderPanel(stubClient(READY, async () => ({ problem: { code: 'device-unavailable', message: 'offline' } })))
+    const radio = (await screen.findByLabelText('系统工作区')) as HTMLInputElement
+    expect(radio.disabled).toBe(false)
+    expect(screen.queryByText('这台桌面不支持系统工作区，请选一个已注册的工作区。')).toBeNull()
+  })
+
+  it('⑧e a workspace walk that FAILS leaves the radio usable — unknown is not unsupported', async () => {
+    // The agents walk succeeds and the workspace walk does not: the panel knows
+    // which agents exist and NOTHING about their catalogs. Treating that as
+    // "no system workspace" would disable a control on a fact nobody established.
+    renderPanel(
+      stubClient(READY, async (_device, agentId) =>
+        agentId === undefined
+          ? { agents: CANDIDATES.agents as never }
+          : { problem: { code: 'peer-timeout', message: 'the peer did not answer' } },
+      ),
+    )
+    const radio = (await screen.findByLabelText('系统工作区')) as HTMLInputElement
+    expect(radio.disabled).toBe(false)
+    expect(screen.queryByText('这台桌面不支持系统工作区，请选一个已注册的工作区。')).toBeNull()
+  })
+
+  it('⑧d a STORED system workspace on a peer without one is shown as the contradiction it is', async () => {
+    const stored: SubagentResponse = {
+      ...READY,
+      subagent: { ...READY.subagent, workspaceKind: 'system', workspaceId: undefined },
+    }
+    const client = stubClient(stored, async () => ({ agents: CANDIDATES.agents as never, workspaces: [], systemWorkspace: false }))
+    renderPanel(client)
+    expect(
+      await screen.findByText('当前保存的是系统工作区，但这台桌面不支持它；委派会失败。'),
+    ).toBeDefined()
+    // The value is SHOWN, never silently rewritten: the operator chose it, and a
+    // page that quietly changed it would be editing a document they did not ask
+    // to edit.
+    expect((screen.getByLabelText('系统工作区') as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.workspaceKind).toBe('system')
+  })
+})
