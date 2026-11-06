@@ -240,6 +240,33 @@ interface Draft {
   workspace: 'registry' | 'system'
   workspaceId: string
   timeoutMs: string
+  /**
+   * The DEVICE `agentId` was read or chosen under (#271).
+   *
+   * An agent id is only meaningful together with the device it was listed on,
+   * so the pairing — not the value — is what decides whether the agent still
+   * applies. Seeded from the stored document (whose agent belongs to its own
+   * device) and rewritten on every pick or hand-typed edit of the agent field.
+   */
+  agentScope: string
+  /**
+   * The `(device, agentId)` pair `workspaceId` was chosen under (#271), as
+   * {@link workspaceScopeOf} builds it. Same reasoning one level down: a
+   * workspace belongs to an agent.
+   */
+  workspaceScope: string
+}
+
+/**
+ * The pair a workspace id is meaningful under, as ONE comparable string.
+ *
+ * `JSON.stringify` of the two halves rather than a `\0` join: the protocol's id
+ * schema forbids lone surrogates but permits a NUL (#261), so a separator an id
+ * may contain could make two different pairs compare equal. The value is
+ * internal and never displayed.
+ */
+function workspaceScopeOf(device: string, agentId: string): string {
+  return JSON.stringify([device, agentId])
 }
 
 /** Seed the form from a document. `revision` and the unrendered fields stay behind. */
@@ -251,6 +278,11 @@ function draftOf(config: SubagentConfig): Draft {
     workspace: config.workspaceKind === 'system' ? 'system' : 'registry',
     workspaceId: config.workspaceId ?? '',
     timeoutMs: config.timeoutMs === undefined ? '' : String(config.timeoutMs),
+    // The stored values were read TOGETHER, so they scope each other. Seeding
+    // these from the document is what makes an untouched form send the values
+    // back unchanged.
+    agentScope: (config.device ?? '').trim(),
+    workspaceScope: workspaceScopeOf((config.device ?? '').trim(), (config.agentId ?? '').trim()),
   }
 }
 
@@ -662,33 +694,55 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
   // device box, and would not give it back when they typed it away again; a
   // derived one simply stops applying while the edit is in flight.
   const storedDevice = data?.subagent.device ?? ''
-  const deviceChanged = draft !== undefined && draft.device.trim() !== storedDevice
-  // The same rule one level down, derived for the same reason.
-  const agentChanged = draft !== undefined && draftAgentId !== (data?.subagent.agentId ?? '')
-  // The workspace belongs to the agent, so it goes stale when EITHER moves.
-  const workspaceStale = deviceChanged || agentChanged
+  const storedAgentId = data?.subagent.agentId ?? ''
+  const draftDevice = draft?.device.trim() ?? ''
+
+  // Does a value still APPLY? (#271)
+  //
+  // The question is not "has the device changed since the last SAVE" but "was
+  // this value read under the device that is in the box NOW". Comparing with the
+  // stored document — which is what this did first — stays true for the whole
+  // time an operator is filling the form in, so every pick below the first was
+  // blanked the instant it was made: the reported symptom was that the second
+  // drop-down only took effect if you saved the first one first.
+  const agentApplies = draft !== undefined && draftAgentId !== '' && draftDevice === draft.agentScope
+  const workspaceApplies =
+    draft !== undefined &&
+    draft.workspaceId.trim() !== '' &&
+    draft.workspaceScope === workspaceScopeOf(draftDevice, draftAgentId)
+
+  /** A value the operator can see, that no longer applies to what is above it. */
+  const agentInvalidated = draft !== undefined && draftAgentId !== '' && !agentApplies
+  const workspaceInvalidated =
+    draft !== undefined && draft.workspaceId.trim() !== '' && !workspaceApplies
 
   // The draft the FORM and the SAVE both use: the stale halves are blanked in one
   // place, so the control cannot show one thing while the body sends another.
+  // Nothing is destroyed on the way past — a value keeps the scope it was read
+  // under, and starts applying again if the scope comes back.
   const effective: Draft | undefined =
     draft === undefined
       ? undefined
       : {
           ...draft,
-          agentId: deviceChanged ? '' : draft.agentId,
-          workspaceId: workspaceStale ? '' : draft.workspaceId,
+          agentId: agentApplies ? draft.agentId : '',
+          workspaceId: workspaceApplies ? draft.workspaceId : '',
         }
 
   const agentField: TargetFieldState = {
     // `current: ''` is what makes #261 render the field UNSELECTED: its own rule
     // is that an empty draft falls back to the stored value, which is right for
-    // "not touched" and wrong for "no longer applies".
-    current: deviceChanged ? '' : (data?.subagent.agentId ?? ''),
+    // "not touched" and wrong for "no longer applies". The stored agent is only
+    // "current" for the stored device — that is the whole scoping rule.
+    current: draftDevice === storedDevice ? storedAgentId : '',
     draft: manual === 'agent' ? MANUAL_TARGET_VALUE : (effective?.agentId ?? ''),
     candidates: agentCandidates,
   }
   const workspaceField: TargetFieldState = {
-    current: workspaceStale ? '' : (data?.subagent.workspaceId ?? ''),
+    current:
+      draftDevice === storedDevice && draftAgentId === storedAgentId
+        ? (data?.subagent.workspaceId ?? '')
+        : '',
     draft: manual === 'workspace' ? MANUAL_TARGET_VALUE : (effective?.workspaceId ?? ''),
     candidates: workspaceCandidates,
   }
@@ -778,10 +832,10 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                     return
                   }
                   setManual(undefined)
-                  // ONLY the device moves here. The two downstream values are
-                  // blanked by the `deviceChanged` derivation, which means they
-                  // come back if the operator puts the old device back — a state
-                  // clear could not do that.
+                  // ONLY the device moves here. The two downstream values stop
+                  // APPLYING, because their scopes still name the old device —
+                  // and a value scoped to a device the operator returns to starts
+                  // applying again (#271).
                   setDraft({ ...draft, device: value })
                   setCommittedDevice(value.trim())
                 }}
@@ -804,7 +858,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                 </label>
               )}
               <p className="cherry-hint">{t('subagent.deviceHint')}</p>
-              {deviceChanged && (
+              {agentInvalidated && (
                 <p className="cherry-hint">{t('subagent.targets.reselectAgent')}</p>
               )}
               {/* The system workspace has NO id — it is the protocol's
@@ -831,7 +885,11 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                     return
                   }
                   setManual(undefined)
-                  setDraft({ ...draft, agentId: value })
+                  // The pick is scoped to the device it came from (#271). NOT a
+                  // clear of the workspace: the scope comparison below already
+                  // makes the old workspace stop applying, and it comes back if
+                  // the operator puts this agent back.
+                  setDraft({ ...draft, agentId: value, agentScope: draft.device.trim() })
                 }}
               />
               {manual === 'agent' && (
@@ -841,7 +899,13 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                     type="text"
                     value={draft.agentId}
                     disabled={readOnly}
-                    onChange={(event) => setDraft({ ...draft, agentId: event.target.value })}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        agentId: event.target.value,
+                        agentScope: draft.device.trim(),
+                      })
+                    }
                   />
                 </label>
               )}
@@ -902,7 +966,11 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                         return
                       }
                       setManual(undefined)
-                      setDraft({ ...draft, workspaceId: value })
+                      setDraft({
+                        ...draft,
+                        workspaceId: value,
+                        workspaceScope: workspaceScopeOf(draft.device.trim(), draft.agentId.trim()),
+                      })
                     }}
                   />
                   {manual === 'workspace' && (
@@ -912,11 +980,17 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                         type="text"
                         value={draft.workspaceId}
                         disabled={readOnly}
-                        onChange={(event) => setDraft({ ...draft, workspaceId: event.target.value })}
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            workspaceId: event.target.value,
+                            workspaceScope: workspaceScopeOf(draft.device.trim(), draft.agentId.trim()),
+                          })
+                        }
                       />
                     </label>
                   )}
-                  {workspaceStale && (
+                  {workspaceInvalidated && (
                     <p className="cherry-hint">{t('subagent.targets.reselectWorkspace')}</p>
                   )}
                   {workspaceProblem !== undefined && (

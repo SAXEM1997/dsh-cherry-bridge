@@ -588,6 +588,59 @@ describe('⑦ the three target fields are drop-downs with names', () => {
     await waitFor(() => expect(client.puts).toHaveLength(1))
     expect(client.puts[0]!.device).toBe('desk-2')
     expect(client.puts[0]!.agentId).toBe('')
+    // …and the workspace that belonged to the OLD agent goes with it. Nothing
+    // was picked for the new device, so the body must not pair one device with
+    // another one's workspace.
+    expect(client.puts[0]!.workspaceId).toBe('')
+  })
+
+  it('⑦k a NEW device can be given a new agent AND a new workspace without saving in between', async () => {
+    // #271, reported from a real desktop: "the second drop-down only takes
+    // effect if you save the first one first". The invalidation was derived
+    // against the SAVED device, so it stayed armed for as long as the draft
+    // differed from the document — which is exactly the whole time an operator
+    // is filling the form in. Every pick below the first was blanked again the
+    // instant it was made, and a save silently sent ''.
+    const client = stubClient(READY)
+    renderPanel(client, DEVICES)
+    const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    fireEvent.change(device, { target: { value: 'desk-2' } })
+
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    await waitFor(() => expect(agent.value).toBe(''))
+    fireEvent.change(agent, { target: { value: 'agent-9' } })
+    // The pick belongs to the device it was chosen under, so it applies.
+    expect(agent.value).toBe('agent-9')
+
+    const workspace = (await screen.findByLabelText('工作区 id')) as HTMLSelectElement
+    await waitFor(() => expect(screen.getByRole('option', { name: 'Repo Nine（ws-9）' })).toBeDefined())
+    fireEvent.change(workspace, { target: { value: 'ws-9' } })
+    expect(workspace.value).toBe('ws-9')
+
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]).toMatchObject({ device: 'desk-2', agentId: 'agent-9', workspaceId: 'ws-9' })
+  })
+
+  it('⑦l a HAND-TYPED agent also applies to the new device, without a save in between', async () => {
+    // The same defect through the escape hatch: the manual box writes the draft
+    // per keystroke, so the derived invalidation blanked it on every render too.
+    const client = stubClient(READY)
+    renderPanel(client, DEVICES)
+    const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    fireEvent.change(device, { target: { value: 'desk-2' } })
+
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    await waitFor(() => expect(agent.value).toBe(''))
+    fireEvent.change(agent, { target: { value: MANUAL_TARGET_VALUE } })
+    const box = (await screen.findByLabelText('agent id')) as HTMLInputElement
+    fireEvent.change(box, { target: { value: 'agent-hand' } })
+    expect(box.value).toBe('agent-hand')
+
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.device).toBe('desk-2')
+    expect(client.puts[0]!.agentId).toBe('agent-hand')
   })
 
   it('⑦d an unreachable candidate source KEEPS the stored value and explains itself in Chinese', async () => {
