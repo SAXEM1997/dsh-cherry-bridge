@@ -244,6 +244,12 @@ function delegate(
     maxInteractionAbandons?: number
     signal?: AbortSignal
     target?: typeof TARGET
+    /**
+     * The session the delegation created. A delegation makes its OWN session, so
+     * a case that has to reach into that session's peer-side state (a
+     * subscription reset) has no other way to name it.
+     */
+    onSessionCreated?: (sessionId: string) => void
   } = {},
 ): Promise<{ status: string; text: string; diagnostic?: string }> {
   return rig.engine.runSubagentDelegation({
@@ -255,6 +261,7 @@ function delegate(
     timeoutMs: overrides.timeoutMs ?? 5_000,
     maxInteractionAbandons: overrides.maxInteractionAbandons ?? 8,
     signal: overrides.signal ?? new AbortController().signal,
+    onSessionCreated: overrides.onSessionCreated,
   })
 }
 
@@ -490,5 +497,69 @@ describe('our own cancellation is not the child’s (SUB-25)', () => {
     const outcome = await pending
     expect(outcome.status).toBe('aborted')
     expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
+  })
+})
+
+describe('a receipt is not a run, and a lost subscription is not an ending (#248)', () => {
+  it('⑥a a REJECTED send never started a run, so nothing is "the run ended"', async () => {
+    // `#runOnce` hands a rejected receipt back untouched — there is no run to
+    // wait for. Folding it through the terminal branch invented one and dropped
+    // the peer's own reason, which is the only thing that tells an operator
+    // whether to retry, fix the target, or free the ledger.
+    const rig = await makeRig(completing('never ran', { sendOutcome: 'busy' }))
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    // The peer's words, both halves: the machine-readable reason and its message.
+    expect(outcome.diagnostic).toContain('CONFLICT')
+    expect(outcome.diagnostic).toContain('Session is busy')
+    // NOT the fabricated run terminal. That phrasing is the whole bug: it reads
+    // as "a child ran and ended this way", which never happened.
+    expect(outcome.diagnostic).not.toContain('the run ended')
+    // Nothing to cancel: the peer refused the command, so no child exists.
+    expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(false)
+  })
+
+  it('⑥b a lost subscription says the outcome is UNKNOWABLE, and cancels the child', async () => {
+    // Two failures in one answer. The FOLD reported "the run ended
+    // subscription-lost" — a run terminal it never observed — and dropped both
+    // the reason and the recovery routes the result carries. The RUNNER left the
+    // child alive: the parent has stopped observing it, which is exactly the
+    // abandoned work the timeout branch's own comment forbids.
+    const rig = await makeRig(completing('never read', { runDelayMs: 30_000 }))
+    let created: string | undefined
+    const pending = delegate(rig, {
+      timeoutMs: 20_000,
+      onSessionCreated: (id) => {
+        created = id
+      },
+    })
+    await vi.waitFor(() => {
+      expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.messages.send')).toBe(true)
+    })
+    if (created === undefined) throw new Error('the delegation reported no session')
+    // The peer's OWN record of the run it admitted, captured BEFORE the cancel
+    // clears it: the only format-independent way to say "the cancel named THIS
+    // child" without reading the receipt the delegation never hands out.
+    const runId = rig.fake.activeExecutionId
+    expect(runId).toBeDefined()
+    // The peer drops the subscription AND refuses every re-subscribe.
+    rig.fake.pushResetRequired(created)
+    rig.fake.refuseSubscriptions('RESOURCE_EXHAUSTED')
+    const outcome = await pending
+    expect(outcome.status).toBe('error')
+    // The verdict is UNOBSERVED, not failed — a different sentence, and the one
+    // that stops a parent from reporting a healthy child as broken.
+    expect(outcome.diagnostic).toMatch(/unknown|unknowable/i)
+    // The recovery route rides along; without it the parent has a dead end.
+    expect(outcome.diagnostic).toContain('cherry_read')
+    // And the child was stopped rather than abandoned — pinned as the WORK, not
+    // as the wire call: `some(...) === true` stayed green with the cancel aimed
+    // at another session or at an id the peer never minted, which is the
+    // difference between stopping this child and telling the peer to stop
+    // nothing.
+    const cancels = rig.fake.commandCallsFor('agent.executions.cancel')
+    expect(cancels).toHaveLength(1)
+    expect(cancels[0]!['sessionId']).toBe(created)
+    expect(cancels[0]!['expectedExecutionId']).toBe(runId)
   })
 })
