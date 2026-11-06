@@ -166,6 +166,11 @@ function installFetch(responses: Array<[string, string, Response]>): Harness {
     ...responses,
     ['GET', '/cherry-remote/api/scope', scopeSnapshot()],
     ['GET', '/cherry-remote/api/subagent', subagentSnapshot()],
+    // #262: the subagent panel asks for candidates as soon as a document names a
+    // device. No fixture here does yet, so this row is defence rather than
+    // necessity — and it is the difference between a future fixture failing on
+    // "unexpected request" and failing on the thing it actually tests.
+    ['GET', '/cherry-remote/api/subagent/targets', jsonResponse(200, { agents: [] })],
   ]
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -174,7 +179,11 @@ function installFetch(responses: Array<[string, string, Response]>): Harness {
     calls.push({ url, method, body: raw === undefined ? undefined : JSON.parse(String(raw)), at: counter++ })
     order.push(`fetch ${method} ${url}`)
     for (const [responseMethod, responseUrl, response] of table) {
-      if (responseMethod === method && url.endsWith(responseUrl)) return response
+      // A candidate request carries a query string (`?device=…`), so the suffix
+      // comparison ignores it. Registered paths never carry one, so this only
+      // widens what matches, never narrows it.
+      const bare = url.split('?')[0] ?? url
+      if (responseMethod === method && (url.endsWith(responseUrl) || bare.endsWith(responseUrl))) return response
     }
     throw new Error(`unexpected request: ${method} ${url}`)
   })

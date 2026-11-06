@@ -439,8 +439,58 @@ export interface SubagentSaveRequest extends SubagentConfig {
   expectedRevision: number
 }
 
+import type { TargetProblem } from './subagentTargets'
+
+/** One agent a device's peer reported — `GET /subagent/targets`'s `agents[]` row. */
+export interface SubagentTargetAgent {
+  agentId: string
+  /**
+   * Optional ON THE WIRE, and the page must survive its absence: the endpoint's
+   * own contract is "the page falls back to the id", so a peer that reports no
+   * names still gets a usable list rather than an empty one.
+   */
+  name?: string
+  emoji?: string
+}
+
+/** One registered workspace — the same row shape, keyed by `workspaceId`. */
+export interface SubagentTargetWorkspace {
+  workspaceId: string
+  name?: string
+}
+
+/**
+ * The endpoint's success body: exactly the four keys the page renders.
+ *
+ * `workspaces` and `systemWorkspace` are present ONLY when the request carried an
+ * `agentId` (a workspace belongs to an agent), so their absence means "not
+ * asked", never "none". `truncated` says the walk stopped at its safety bound —
+ * the list is real but incomplete, which the page reports rather than hides.
+ */
+export interface SubagentTargetsListing {
+  agents: readonly SubagentTargetAgent[]
+  workspaces?: readonly SubagentTargetWorkspace[]
+  systemWorkspace?: boolean
+  truncated?: { lists: readonly string[]; reason: string }
+}
+
+/**
+ * `GET /subagent/targets`: a listing or a problem, never both.
+ *
+ * The problem type is `TargetProblem` from `./subagentTargets` — ONE declaration,
+ * because the panel hands the value straight to `targetOptions`' field state. A
+ * second, structurally identical interface here would be two names for one fact,
+ * and the day one grows a field the other would silently not.
+ */
+export type SubagentTargetsResponse = SubagentTargetsListing | { problem: TargetProblem }
+
 /** The panel's HTTP seam: the default is the same-origin client, tests inject a stub. */
 export interface SubagentClient {
   get(): Promise<SubagentResponse>
   put(body: SubagentSaveRequest): Promise<SubagentResponse>
+  /**
+   * The candidate source (#260). `agentId` is what makes the answer carry the
+   * workspace half; without it the page is asking only "which agents exist here".
+   */
+  targets(device: string, agentId?: string): Promise<SubagentTargetsResponse>
 }

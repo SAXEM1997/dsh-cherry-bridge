@@ -244,7 +244,10 @@ export function App({
 
       {/* The experiment: OFF by default, labelled as experimental where the
           operator turns it on, never only after it works (#233). */}
-      <SubagentPanel {...(subagentClient === undefined ? {} : { client: subagentClient })} />
+      <SubagentPanel
+        {...(subagentClient === undefined ? {} : { client: subagentClient })}
+        devices={sorted}
+      />
 
       <section className="cherry-panel" aria-labelledby="cherry-devices-title">
         <h3 id="cherry-devices-title">{t('app.devices.heading')}</h3>

@@ -27,11 +27,14 @@ import { fileURLToPath, URL as NodeURL } from 'node:url'
 import { SubagentPanel } from '../../ui/src/SubagentPanel'
 import { ApiError } from '../../ui/src/api'
 import { createTranslator, localeStore } from '../../ui/src/i18n'
+import { MANUAL_TARGET_VALUE } from '../../ui/src/subagentTargets'
 import type {
+  DeviceSummary,
   SubagentClient,
   SubagentResponse,
   SubagentSaveRequest,
   SubagentStatusReason,
+  SubagentTargetsResponse,
 } from '../../ui/src/types'
 
 afterEach(() => {
@@ -75,11 +78,46 @@ const READY: SubagentResponse = {
   pendingRestart: false,
 }
 
-/** A stub client that records every PUT and answers like the real route. */
-function stubClient(answer: SubagentResponse = DISABLED): SubagentClient & { puts: SubagentSaveRequest[] } {
+/**
+ * The candidate answer the stub gives unless a case says otherwise.
+ *
+ * It names the two ids `READY` and the older cases already use, so a case that
+ * selects one is selecting from a real list rather than relying on the
+ * unknown-value escape hatch.
+ */
+const CANDIDATES: SubagentTargetsResponse = {
+  agents: [
+    { agentId: 'agent-7', name: 'Cherry Seven' },
+    { agentId: 'agent-9', name: 'Cherry Nine' },
+  ],
+  workspaces: [
+    { workspaceId: 'ws-1', name: 'Repo One' },
+    { workspaceId: 'ws-9', name: 'Repo Nine' },
+  ],
+  systemWorkspace: true,
+}
+
+/**
+ * A stub client that records every PUT and answers like the real route.
+ *
+ * `targets` defaults to an EMPTY listing rather than a problem: every case that
+ * predates #262 is about the form's save/lock behaviour, and an empty list is the
+ * quietest answer that still lets the panel render. A case that cares passes its
+ * own.
+ */
+function stubClient(
+  answer: SubagentResponse = DISABLED,
+  targets: (device: string, agentId?: string) => Promise<SubagentTargetsResponse> = async () => CANDIDATES,
+): SubagentClient & { puts: SubagentSaveRequest[]; targetCalls: [string, string | undefined][] } {
   const puts: SubagentSaveRequest[] = []
+  const targetCalls: [string, string | undefined][] = []
   return {
     puts,
+    targetCalls,
+    targets: async (device, agentId) => {
+      targetCalls.push([device, agentId])
+      return targets(device, agentId)
+    },
     get: async () => answer,
     put: async (body) => {
       puts.push(body)
@@ -96,9 +134,15 @@ function stubClient(answer: SubagentResponse = DISABLED): SubagentClient & { put
   }
 }
 
-const renderPanel = (client: SubagentClient): void => {
-  render(createElement(SubagentPanel, { client }))
+const renderPanel = (client: SubagentClient, devices: readonly DeviceSummary[] = []): void => {
+  render(createElement(SubagentPanel, { client, devices }))
 }
+
+/** The devices `App` hands down, sorted the way it sorts them. */
+const DEVICES: DeviceSummary[] = [
+  { deviceId: 'desk-1', displayName: 'Desk One', state: 'connected', enabled: true, hosts: [], port: 1, ports: {}, forgottenHosts: [] },
+  { deviceId: 'desk-2', displayName: 'Desk Two', state: 'offline', enabled: true, hosts: [], port: 1, ports: {}, forgottenHosts: [] },
+]
 
 // ---------------------------------------------------------------------------
 // ① the hard requirement, and the default
@@ -252,9 +296,18 @@ describe('③ a save is a read-modify-write, locked on what was read', () => {
       ...READY,
       subagent: { ...READY.subagent, routes: [{ cwdPrefix: '/repo/a', workspaceId: 'ws-2' }] },
     })
-    renderPanel(client)
-    const device = (await screen.findByLabelText('目标设备')) as HTMLInputElement
-    fireEvent.change(device, { target: { value: '  desk-2  ' } })
+    renderPanel(client, DEVICES)
+    // The device is a DROP-DOWN now (#262), so a hand-typed id — the only place
+    // a value with spaces can still come from — arrives through the manual
+    // sentinel. The trim assertion is still worth keeping: the box is real.
+    const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    fireEvent.change(device, { target: { value: MANUAL_TARGET_VALUE } })
+    const deviceBox = (await screen.findByLabelText('设备 id')) as HTMLInputElement
+    fireEvent.change(deviceBox, { target: { value: '  desk-2  ' } })
+    // The prompt is visible WHILE the edit is pending — that is the point of it.
+    // After the save the document agrees with the draft again and the line goes
+    // away, so asserting it afterwards would be asserting the opposite.
+    expect(screen.getByText('设备已更换，目标 agent 已清空，请重新选择。')).toBeDefined()
     fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
 
     await waitFor(() => expect(client.puts).toHaveLength(1))
@@ -271,7 +324,10 @@ describe('③ a save is a read-modify-write, locked on what was read', () => {
     // control here either: a save that sent only the rendered half would
     // re-route every delegated directory, silently.
     expect(body.routes).toEqual([{ cwdPrefix: '/repo/a', workspaceId: 'ws-2' }])
-    expect(body.agentId).toBe('agent-7')
+    // NOT 'agent-7': the device changed, and an agent id belongs to a device
+    // (#262). Keeping it would write desk-1's agent onto desk-2 — the silent
+    // cross-device mistake the "choose it again" prompt exists to prevent.
+    expect(body.agentId).toBe('')
     expect(body.timeoutMs).toBe(1_800_000)
     await screen.findByText('已保存。')
     // The save answered `pendingRestart: true`, and the panel says so rather
@@ -294,7 +350,7 @@ describe('③ a save is a read-modify-write, locked on what was read', () => {
       throw conflict
     }
     renderPanel(client)
-    const agent = (await screen.findByLabelText('目标 agent')) as HTMLInputElement
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
     fireEvent.change(agent, { target: { value: 'agent-9' } })
     fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
 
@@ -440,8 +496,10 @@ describe('⑥ every rendered control reaches the save body', () => {
   it('⑥c the agent box reaches the body, trimmed', async () => {
     const client = stubClient(READY)
     renderPanel(client)
-    const agent = (await screen.findByLabelText('目标 agent')) as HTMLInputElement
-    fireEvent.change(agent, { target: { value: '  agent-9  ' } })
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    fireEvent.change(agent, { target: { value: MANUAL_TARGET_VALUE } })
+    const agentBox = (await screen.findByLabelText('agent id')) as HTMLInputElement
+    fireEvent.change(agentBox, { target: { value: '  agent-9  ' } })
     fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
     await waitFor(() => expect(client.puts).toHaveLength(1))
     expect(client.puts[0]!.agentId).toBe('agent-9')
@@ -464,12 +522,189 @@ describe('⑥ every rendered control reaches the save body', () => {
     // job, and a case that expected the old id to survive would be asserting
     // that the save did not work.
     fireEvent.click(screen.getByLabelText('指定已注册的工作区'))
-    const idBox = (await screen.findByLabelText('工作区 id')) as HTMLInputElement
-    expect(idBox.value).toBe('')
+    const idSelect = (await screen.findByLabelText('工作区 id')) as HTMLSelectElement
+    // UNSELECTED, and visibly so: the save really did clear the id, so the
+    // control comes back on the empty option rather than showing a value the
+    // document no longer has.
+    expect(idSelect.value).toBe('')
+    expect(idSelect.selectedOptions[0]?.textContent).toBe('（未选择）')
+    fireEvent.change(idSelect, { target: { value: MANUAL_TARGET_VALUE } })
+    const idBox = (await screen.findByLabelText('工作区 id（手工）')) as HTMLInputElement
     fireEvent.change(idBox, { target: { value: ' ws-9 ' } })
     fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
     await waitFor(() => expect(client.puts).toHaveLength(2))
     expect(client.puts[1]!.workspaceKind).toBeUndefined()
     expect(client.puts[1]!.workspaceId).toBe('ws-9')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ⑦ the candidate source (#262)
+// ---------------------------------------------------------------------------
+
+describe('⑦ the three target fields are drop-downs with names', () => {
+  it('⑦a the device options carry the name, the id and the STATE', async () => {
+    // `READY` names desk-1; `DISABLED` names nothing, and then the control is
+    // correctly on the empty option.
+    renderPanel(stubClient(READY), DEVICES)
+    const select = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    // Asserted on the SELECTED OPTION, not on a request body: a control that
+    // showed nothing while its state was right is exactly the failure a body
+    // assertion cannot see.
+    expect(select.value).toBe('desk-1')
+    expect(select.selectedOptions[0]?.textContent).toBe('Desk One（desk-1） · 已连接')
+    // The state belongs in the label: choosing an offline device makes every
+    // delegation fail, and that is worth knowing BEFORE choosing.
+    expect(screen.getByRole('option', { name: 'Desk Two（desk-2） · 离线' })).toBeDefined()
+  })
+
+  it('⑦b picking an agent from the list selects it, and only the id reaches the body', async () => {
+    const client = stubClient(READY)
+    renderPanel(client)
+    const select = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    // The NAME is what the operator reads; the id is what is stored.
+    expect(screen.getByRole('option', { name: 'Cherry Nine（agent-9）' })).toBeDefined()
+    fireEvent.change(select, { target: { value: 'agent-9' } })
+    expect(select.value).toBe('agent-9')
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.agentId).toBe('agent-9')
+  })
+
+  it('⑦c a device change leaves the agent UNSELECTED, says why, and never re-sends the old id', async () => {
+    const client = stubClient(READY)
+    renderPanel(client, DEVICES)
+    const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    fireEvent.change(device, { target: { value: 'desk-2' } })
+
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    expect(agent.value).toBe('')
+    expect(agent.selectedOptions[0]?.textContent).toBe('（未选择）')
+    // Still OFFERED: "unselected" must not mean "nothing to choose".
+    expect(screen.getByRole('option', { name: 'Cherry Seven（agent-7）' })).toBeDefined()
+    expect(screen.getByText('设备已更换，目标 agent 已清空，请重新选择。')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.device).toBe('desk-2')
+    expect(client.puts[0]!.agentId).toBe('')
+  })
+
+  it('⑦d an unreachable candidate source KEEPS the stored value and explains itself in Chinese', async () => {
+    const problem = { code: 'device-unavailable', message: 'device "desk-1" is offline, not connected' }
+    renderPanel(stubClient(READY, async () => ({ problem })))
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    // #261's unknown option: the value is still selectable, so the form neither
+    // blanks nor forgets it — a failed READ is not a decision to erase anything.
+    expect(agent.value).toBe('agent-7')
+    expect(agent.selectedOptions[0]?.textContent).toBe('当前值（未知）：agent-7')
+    // The CODE is translated; the server's English prose never reaches a Chinese
+    // page (it would read as an English sentence in the middle of the form).
+    expect(screen.getByText('目标设备当前不可用，请先连接再选择。')).toBeDefined()
+    expect(screen.queryByText('device "desk-1" is offline, not connected')).toBeNull()
+  })
+
+  it('⑦e asks by DEVICE first, and adds the agent only once that agent is known to be there', async () => {
+    // The endpoint refuses an unknown `agentId` with a whole-body problem, so a
+    // request carrying a stale one would throw away the very list the operator
+    // needs to correct it. The agent list is therefore asked for by device alone.
+    const client = stubClient(READY)
+    renderPanel(client, DEVICES)
+    await screen.findByRole('option', { name: 'Cherry Seven（agent-7）' })
+    await waitFor(() => expect(client.targetCalls.some(([, agentId]) => agentId === 'agent-7')).toBe(true))
+    const asked = client.targetCalls
+    expect(asked[0]).toEqual(['desk-1', undefined])
+    // Every call names the same device, and no call ever carries an id the list
+    // did not name.
+    for (const [device, agentId] of asked) {
+      expect(device).toBe('desk-1')
+      if (agentId !== undefined) expect(agentId).toBe('agent-7')
+    }
+  })
+
+  it('⑦g a device change never shows the PREVIOUS device’s agents while the new list loads', async () => {
+    // The keyed-staleness rule, tested where it matters: "keep the old list while
+    // the new one loads" is safe only within ONE key. Across keys it is the
+    // cross-device mistake — desk-2's form offering desk-1's agents, one save
+    // away from writing A's target into B's document.
+    let release: (answer: SubagentTargetsResponse) => void = () => {}
+    const client = stubClient(READY, (device) =>
+      device === 'desk-1'
+        ? Promise.resolve(CANDIDATES)
+        : new Promise<SubagentTargetsResponse>((resolve) => {
+            release = resolve
+          }),
+    )
+    renderPanel(client, DEVICES)
+    await screen.findByRole('option', { name: 'Cherry Seven（agent-7）' })
+
+    fireEvent.change(screen.getByLabelText('目标设备'), { target: { value: 'desk-2' } })
+    expect(screen.queryByRole('option', { name: 'Cherry Seven（agent-7）' })).toBeNull()
+    expect(screen.getByText('正在读取可选目标…')).toBeDefined()
+
+    release({ agents: [{ agentId: 'agent-b', name: 'Only B' }] })
+    await screen.findByRole('option', { name: 'Only B（agent-b）' })
+    // …and the OLD device's agent never comes back.
+    expect(screen.queryByRole('option', { name: 'Cherry Seven（agent-7）' })).toBeNull()
+  })
+
+  it('⑦h a HAND-TYPED agent invalidates the workspace too, so no save mixes the two', async () => {
+    // The half the stored-copy version got wrong: a remembered "chosen agent"
+    // is not updated by the manual box, so the workspace list kept offering the
+    // PREVIOUS agent's workspaces and a save sent the new agent with the old
+    // workspace. Derived, the two move together.
+    const client = stubClient(READY)
+    renderPanel(client)
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    fireEvent.change(agent, { target: { value: MANUAL_TARGET_VALUE } })
+    fireEvent.change((await screen.findByLabelText('agent id')) as HTMLInputElement, {
+      target: { value: 'agent-9' },
+    })
+    const workspace = (await screen.findByLabelText('工作区 id')) as HTMLSelectElement
+    expect(workspace.value).toBe('')
+    expect(screen.getByText('agent 已更换，工作区已清空，请重新选择。')).toBeDefined()
+
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.agentId).toBe('agent-9')
+    // The OLD agent's workspace must not ride along.
+    expect(client.puts[0]!.workspaceId).toBe('')
+  })
+
+  it('⑦i a thrown candidate call becomes a sentence, not a crash', async () => {
+    // The endpoint answers its refusals IN BAND, so anything that THROWS is
+    // off-contract: a wedged transport, or a 4xx this page caused. Both land on
+    // the same synthetic problem.
+    renderPanel(stubClient(READY, async () => Promise.reject(new Error('socket died'))))
+    expect(await screen.findByText('取不到可选目标（client-error），可以继续手工填写。')).toBeDefined()
+    // …and the stored value survives the failure.
+    const agent = screen.getByLabelText('目标 agent') as HTMLSelectElement
+    expect(agent.value).toBe('agent-7')
+  })
+
+  it('⑦j a nameless candidate shows its id alone, and a long id is clipped in the DISPLAY only', async () => {
+    const longId = 'agent-id-that-is-far-too-long-to-show-in-a-drop-down'
+    renderPanel(
+      stubClient(READY, async () => ({
+        agents: [{ agentId: 'agent-nameless' }, { agentId: longId, name: 'Long One' }],
+      })),
+    )
+    // No name: the id is the whole label. The endpoint's own contract is that the
+    // page falls back to the id rather than showing an empty row.
+    expect(await screen.findByRole('option', { name: 'agent-nameless' })).toBeDefined()
+    const clipped = screen.getByRole('option', { name: /^Long One（agent-id-that-is-far-too-lo…）$/ })
+    // The DISPLAY is clipped; the value is the whole id, which is what a save sends.
+    expect((clipped as HTMLOptionElement).value).toBe(longId)
+  })
+
+  it('⑦f `unsupported` disables the drop-downs with the rest of the form', async () => {
+    const client = stubClient(
+      withStatus('unsupported', { code: 'unsupported' }),
+    )
+    renderPanel(client, DEVICES)
+    const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
+    expect(device.disabled).toBe(true)
+    expect(agent.disabled).toBe(true)
   })
 })
