@@ -4774,9 +4774,12 @@ export class CherryToolEngine {
 
     // A timeout or a LOST SUBSCRIPTION still has to stop the child: in both the
     // parent has stopped OBSERVING the run, and a child left alive on the
-    // desktop is work nobody will read. Those two are the only answers that can
-    // leave one running — the four terminal statuses have already ended it, and
-    // a rejected RECEIPT never started one.
+    // desktop is work nobody will read. The other answers do not need it:
+    // `awaiting-interaction` arrives here only through the ceiling (which has
+    // already cancelled) or through a card with no id (unreachable), the four
+    // terminal statuses have ended the run, and a rejected RECEIPT never started
+    // one. A receipt `interrupted` — the command's outcome is undetermined, so
+    // its run MAY be alive — is the one case this does not cover (issue #250).
     if (answer['status'] === 'timeout' || answer['status'] === 'subscription-lost') {
       await this.#cancelRun(
         connection,
