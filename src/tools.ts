@@ -4629,6 +4629,15 @@ export class CherryToolEngine {
       // STICKY: the soft terminal reports the execution it belongs to, and the
       // next pass must keep observing THAT run rather than re-adopting whatever
       // appears after the cut.
+      //
+      // No test bites this line, and that is a fact about the CALLERS rather
+      // than a gap in the suite: the delegation is the only supplier of
+      // `onInteraction` and it starts exactly one run, so re-adoption would find
+      // the same id again. (The tool face never loops — it has no policy, so it
+      // returns at the soft terminal.) The pin stays because it states the
+      // loop's invariant instead of depending on that coincidence, and the day a
+      // caller starts a second run on the same session it is the difference
+      // between waiting on this run and on the next one.
       const named = optionalString(answer['executionId'])
       if (named !== undefined) executionId = named
     }
