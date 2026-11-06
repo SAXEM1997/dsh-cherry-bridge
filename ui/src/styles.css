@@ -99,6 +99,13 @@
   color: #3fb950;
 }
 
+/* A saved change that is not live yet: the same amber as `connecting`. Green
+   would read as "done" for something the operator still has to act on, and
+   `.cherry-hint` fades it to 0.7 — this line has to be read first (#273). */
+.cherry-notice {
+  color: #d29922;
+}
+
 .cherry-error {
   color: #f85149;
 }

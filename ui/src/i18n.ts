@@ -283,6 +283,9 @@ const zh: Dict = {
   'subagent.scopeNote':
     '它和其余 14 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
   'subagent.status.heading': '当前状态',
+  // #273: the verdict describes the RUNNING assembly, so when a restart is owed
+  // the heading has to say which document it is judging.
+  'subagent.status.heading.pending': '当前状态（正在运行的配置）',
   'subagent.status.disabled': '未启用（默认关闭）。',
   'subagent.status.awaiting-injection': '等待宿主注入 subagents 服务。',
   'subagent.status.unsupported':
@@ -548,6 +551,7 @@ const en: Dict = {
   'subagent.scopeNote':
     'Like the other fourteen tools, it obeys the enabled scope: an excluded workspace does not see it. Under “selected” with an unreadable workspace list, no workspace sees it.',
   'subagent.status.heading': 'Current state',
+  'subagent.status.heading.pending': 'Current state (the running configuration)',
   'subagent.status.disabled': 'Not enabled (off by default).',
   'subagent.status.awaiting-injection': 'Waiting for the host to inject the subagents service.',
   'subagent.status.unsupported':
