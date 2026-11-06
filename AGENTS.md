@@ -166,6 +166,17 @@ recovery / multi-device coexistence must be exercised by hand on a real desktop.
 Tag `vX.Y.Z`, publish to npm (`publishConfig` pins the public registry), and
 attach the notes to the GitHub release.
 
+**The release notes have a fixed shape** (the CHANGELOG section ships verbatim as
+the GitHub release body, so this is the published text, not an internal summary):
+
+- one **summary paragraph** first — what the release is and what it does not
+  change, stated as fact, no exclamation marks, no marketing words, no promises
+  the tests cannot back;
+- then the change list, **one line per PR**: a PR carrying several technical
+  changes still gets exactly one line. Mechanism, root cause and measurement
+  tables belong in the issue and the PR, never in the release body;
+- **both languages in two parts**, Chinese first, English second.
+
 **Three destinations from one artefact.** The tarball `npm pack --dry-run`
 checks is all three:
 
@@ -194,13 +205,17 @@ checks is all three:
    `@X.Y.Z` and `#vX.Y.Z` specs in `README.md` and `README.en.md`. npm serves
    the README captured in the tarball, so a pin bumped after the publish is
    stale on the npm page.
-3. **Re-attach the version-INDEPENDENT release asset.** The market entry
-   (`awesome-dsh-plugin`, `data/plugins/SAXEM1997__dsh-cherry-bridge.yml`)
-   points at `releases/latest/download/dsh-cherry-bridge.tgz`, so **every**
-   release must attach the tarball under exactly that name (not
+3. **Re-attach the version-INDEPENDENT release asset.** A plugin-catalog entry
+   (`awesome-dsh-plugin`, `data/plugins/<owner>__<repo>.yml`) points at
+   `releases/latest/download/dsh-cherry-bridge.tgz`, so **every** release must
+   attach the tarball under exactly that name (not
    `dsh-cherry-bridge-X.Y.Z.tgz`). Verify that URL answers 200 and that its sha1
    equals the npm tarball's: without the asset the download URL 404s for every
    catalog user (0.1.5 did exactly that).
+   **This package has no catalog entry yet** — `data/plugins/SAXEM1997__dsh-cherry-bridge.yml`
+   was never submitted (checked 2026-11-06: a `cherry-bridge` search over that
+   repository returns 0 files). Creating it is a separate PR to that repository,
+   and it must not land before the release whose asset it advertises.
 
 **Retry discipline.** Re-read the published state before retrying (the stage
 id, `dist-tags`, the asset URL) — the silent failures above look like success

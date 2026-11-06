@@ -157,7 +157,7 @@ describe('① experimental, off by default, feedback welcome', () => {
     expect(screen.getByText('实验性')).toBeDefined()
     expect(
       screen.getByText(
-        '实验性功能：它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。',
+        '实验性功能：仿 DSH 官方 subagent 的委派方式（与 Claude Code / Codex 的子智能体同一路数），把任务交给 Cherry Studio 桌面端上的 agent 执行、结果以文本回来。它跨了 DSH 与 Cherry Studio 两个不受本插件控制的系统，接口与行为都可能变。默认关闭。',
       ),
     ).toBeDefined()
     expect(screen.getByText('默认关闭。打开需要填写目标设备、agent 与工作区；保存后在重启 DSH 时生效。')).toBeDefined()

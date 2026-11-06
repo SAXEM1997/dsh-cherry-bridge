@@ -19,6 +19,12 @@ devices/sessions, read history, send messages and wait for a terminal state,
 answer approval and question cards, cancel executions — plus a same-origin
 settings page for device and tool-scope management.
 
+It also carries one **experimental, off-by-default** capability: **it follows the
+delegation shape of DSH's own `subagent`** — the same pattern as Claude Code /
+Codex subagents, where a task goes to a child agent and the result comes back as
+text — with **the child running on a Cherry Studio desktop agent** instead. See
+[Experimental subagent](#experimental-subagent).
+
 ```mermaid
 flowchart TB
     T["DSH sessions<br/>15 cherry_* tools"] --> P
@@ -145,7 +151,7 @@ context.
 
 ## Experimental subagent
 
-> Experimental: this spans two systems the plugin does not control — DSH and Cherry Studio — so its interface and behaviour may change. Off by default.
+> Experimental: it delegates the way DSH's own subagent does — the same pattern as Claude Code / Codex subagents, where a task goes to a child agent and the result comes back as text — except the child runs on a Cherry Studio desktop agent. It spans two systems the plugin does not control, DSH and Cherry Studio, so its interface and behaviour may change. Off by default.
 >
 > Ideas and bug reports are welcome: [dsh-cherry-bridge issues](https://github.com/SAXEM1997/dsh-cherry-bridge/issues)
 
