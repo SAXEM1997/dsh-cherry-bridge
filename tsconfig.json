@@ -39,6 +39,13 @@
   // is NOT a jsdom test); `_research/**` is a vendored upstream checkout, not
   // this plugin's source, so it is neither built nor typechecked here.
   //
+  // `subagentTargets.test.ts` is routed the same way for a DIFFERENT reason than
+  // the three DOM files: it is a PURE module (no DOM, no React), and it needs the
+  // UI project only because it imports `ui/src/subagentTargets.ts`, whose
+  // extension-less relative specifier this project's `nodenext` resolution
+  // rejects. It would typecheck under either option set; it can only RESOLVE
+  // under one.
+  //
   // `i18nUsage.test.ts` is routed by the same rule as `i18n.test.ts`: it imports
   // `ui/src/**` (the KEYS tables), so it must be checked by the UI project only.
   // `i18nParity.test.ts` follows it for the same reason (it reads the two
@@ -59,6 +66,7 @@
     "tests/unit/uiScopePanel.test.ts",
     "tests/unit/i18nParity.test.ts",
     "tests/unit/uiSubagentPanel.test.ts",
+    "tests/unit/subagentTargets.test.ts",
     "tests/integration/clientBundle.test.ts",
     "_research"
   ]

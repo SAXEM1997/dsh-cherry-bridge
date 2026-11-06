@@ -14,6 +14,11 @@
   // and the server project deliberately excludes exactly these files so each is
   // checked by exactly one project (see `tests/unit/projectCoverage.test.ts`).
   //
+  // `subagentTargets.test.ts` is here although it needs NO DOM: the routing rule
+  // is "a test that imports `ui/src/**` belongs to the project whose resolution
+  // can express that import", and `tsconfig.json`'s `nodenext` rejects the
+  // extension-less relative specifier every `ui/**` consumer uses.
+  //
   // `ui/src/dev.tsx` is intentionally INCLUDED, not excluded: it typechecks
   // today, and it is the only consumer of the dev-only `ui/index.html` harness
   // — excluding it would let the harness rot silently against the components it
@@ -49,6 +54,7 @@
     "tests/unit/uiScopePanel.test.ts",
     "tests/unit/i18nParity.test.ts",
     "tests/unit/uiSubagentPanel.test.ts",
+    "tests/unit/subagentTargets.test.ts",
     "tests/integration/clientBundle.test.ts"
   ]
 }
