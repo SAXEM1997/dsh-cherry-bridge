@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createSubagentConfigDocument } from '../../src/subagentConfigStore.js'
+import { resolveSubagentConfig } from '../../src/subagent.js'
+import { DEFAULT_SUBAGENT_TIMEOUT_MS } from '../../src/defaults.js'
 
 /**
  * Issue #233 — the experiment's configuration document.
@@ -163,6 +165,30 @@ describe('saving: a monotonic revision and an atomic 0600 write', () => {
       })
     } finally {
       fixtureUnderTest.dispose()
+    }
+  })
+})
+
+describe('saving: a field the caller omits stays omitted (#251)', () => {
+  it('③f a body with no `timeoutMs` stores no key, and the resolver supplies the default', () => {
+    // The wire promise the settings page makes when the operator CLEARS the
+    // timeout box: `JSON.stringify` drops the key, `save()` writes the body as
+    // the document, so an absent key stays absent on disk — and
+    // `resolveSubagentConfig` is then the only place a number can come back
+    // from. Pinned end to end because ⑥a of `uiSubagentPanel` only proves the
+    // key leaves the browser.
+    const { document, dispose, file } = fixture()
+    try {
+      const saved = document.save(ENABLED, 0)
+      expect(saved.ok).toBe(true)
+      const stored = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+      expect(Object.prototype.hasOwnProperty.call(stored, 'timeoutMs')).toBe(false)
+      const resolution = resolveSubagentConfig(document.read().document)
+      expect(resolution.kind).toBe('ready')
+      if (resolution.kind !== 'ready') throw new Error('expected a ready resolution')
+      expect(resolution.config.timeoutMs).toBe(DEFAULT_SUBAGENT_TIMEOUT_MS)
+    } finally {
+      dispose()
     }
   })
 })

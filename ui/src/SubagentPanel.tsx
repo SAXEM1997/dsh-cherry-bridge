@@ -265,6 +265,12 @@ function bodyOf(draft: Draft, stored: SubagentConfig & { revision: number }): Su
     // `undefined` is dropped by `JSON.stringify`, which is exactly "the operator
     // cleared it" — the server then stores no value and the resolver applies the
     // default, so the re-read shows what was actually stored.
+    //
+    // The non-finite half is not about typed input: a `type="number"` box cannot
+    // produce one. It guards a HAND-EDITED document — `draftOf` renders the
+    // stored value with `String(...)`, so a `null` or a stray string reaches the
+    // box as text and `Number()` of it is not finite. Re-sending that would
+    // write the garbage back; clearing it is the repair.
     ...(draft.timeoutMs.trim() === '' || !Number.isFinite(timeout)
       ? { timeoutMs: undefined }
       : { timeoutMs: timeout }),
