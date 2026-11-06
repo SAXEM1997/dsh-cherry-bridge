@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { LastCandidateHostError, QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
+import { DeviceUnavailableError, TransportLostError } from './connection.js'
 import type { DeviceState, EffectiveLimits } from './connection.js'
 import { PairingError } from './pairing.js'
 import type { PairWithPayloadOptions } from './pairing.js'
@@ -1567,7 +1568,7 @@ function deviceProblem(verdict: DeviceVerdict): TargetsProblem {
         // send the operator to the same place.
         message: verdict.guidance,
         archive: verdict.archive,
-        preservedAs: verdict.preservedAs ?? null,
+        ...(verdict.preservedAs === undefined ? {} : { preservedAs: verdict.preservedAs }),
       }
     case 'device-unavailable':
       return {
@@ -1586,12 +1587,30 @@ function deviceProblem(verdict: DeviceVerdict): TargetsProblem {
 /**
  * A thrown wire failure as the page's `problem`.
  *
- * THREE codes, because the operator's next move differs: a refusal means the
- * peer said no (the message is its own text, unstranslated — it is the only
- * place the peer's words reach the page), a timeout means the bound ran out
- * (retrying is reasonable), and a transport failure means the link is gone
- * (reconnecting is). The peer's text is BOUNDED by `failureText`: it is
- * peer-controlled, and this body is rendered in a browser.
+ * FIVE arms, because the operator's next move differs — and because the first
+ * draft of this face had three and mislabelled two real classes (review finding,
+ * #260):
+ *
+ *  - `peer-refused` — the peer said no. `message` is its own text, untranslated:
+ *    this is the one place the peer's words reach the page.
+ *  - `peer-timeout` — the bound ran out; retrying is reasonable.
+ *  - `device-unavailable` — the device left `connected` while a page was in
+ *    flight. `Connection.#businessRequest` THROWS `DeviceUnavailableError` for
+ *    that (`src/connection.ts`), so this arm is the one place the ticket's
+ *    "catch it and map it" actually applies: `listTargets` answers the verdict
+ *    in band when the device is already down, but a link that drops BETWEEN the
+ *    resolution and a page arrives here as a throw.
+ *  - `transport` — the link died and the read was already replayed once
+ *    (`TransportLostError`); reconnecting is the move.
+ *  - `peer-protocol` — the peer answered something this plugin REFUSES: a page
+ *    whose `items` is not an array, a cursor that never advances, a walk that
+ *    keeps answering empty pages. Reported as `transport` in the first draft,
+ *    which told the operator to check their network about a broken peer. A
+ *    local wiring fault lands here too (the assembly's engine is missing), and
+ *    the message — never the code — is what distinguishes them.
+ *
+ * `message` is BOUNDED by `failureText`: it is peer-controlled text rendered in
+ * a browser.
  */
 function wireProblem(error: unknown): TargetsProblem {
   if (error instanceof JsonRpcRequestError) {
@@ -1609,7 +1628,18 @@ function wireProblem(error: unknown): TargetsProblem {
   if (error instanceof RequestTimeoutError) {
     return { code: 'peer-timeout', message: failureText(error), timeoutMs: error.timeoutMs }
   }
-  return { code: 'transport', message: failureText(error) }
+  if (error instanceof DeviceUnavailableError) {
+    return {
+      code: 'device-unavailable',
+      message: `device "${error.device}" is ${error.state}, not connected`,
+      device: error.device,
+      state: error.state,
+    }
+  }
+  if (error instanceof TransportLostError) {
+    return { code: 'transport', message: failureText(error), device: error.device }
+  }
+  return { code: 'peer-protocol', message: failureText(error) }
 }
 
 /**

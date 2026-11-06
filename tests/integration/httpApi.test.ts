@@ -16,6 +16,7 @@ import type { SubagentConfigResolution } from '../../src/subagent.js'
 import { createSubagentConfigDocument } from '../../src/subagentConfigStore.js'
 import type { SubagentSubsystemStatus } from '../../src/subagentHost.js'
 import { JsonRpcRequestError, RequestTimeoutError } from '../../src/rpc/jsonRpcClient.js'
+import { DeviceUnavailableError, TransportLostError } from '../../src/connection.js'
 import type { SubagentTargetsOutcome } from '../../src/tools.js'
 import { LOG_TEXT_MAX } from '../../src/text.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
@@ -2449,7 +2450,28 @@ describe('⑪ the settings page’s candidate source (#260)', () => {
       },
       {
         verdict: { error: 'archive-quarantined', guidance: 'move it aside', archive: '/data/devices.json' },
-        problem: { code: 'archive-quarantined', archive: '/data/devices.json', preservedAs: null },
+        // The message is the STORE's own recovery instruction, not a sentence
+        // this route invents: the page and the tools must send the operator to
+        // the same place.
+        problem: { code: 'archive-quarantined', message: 'move it aside', archive: '/data/devices.json' },
+      },
+      {
+        // The same verdict WITH the preservation copy: `preservedAs` is the one
+        // optional member a store may or may not have produced, and the operator
+        // needs it to find the copy. Both arms are in this table so neither the
+        // field nor its absence can be hard-coded.
+        verdict: {
+          error: 'archive-quarantined',
+          guidance: 'move it aside',
+          archive: '/data/devices.json',
+          preservedAs: '/data/devices.json.corrupt',
+        },
+        problem: {
+          code: 'archive-quarantined',
+          message: 'move it aside',
+          archive: '/data/devices.json',
+          preservedAs: '/data/devices.json.corrupt',
+        },
       },
       {
         verdict: { error: 'device-unavailable', device: 'dev-1', state: 'offline' },
@@ -2467,6 +2489,12 @@ describe('⑪ the settings page’s candidate source (#260)', () => {
       expect(json.problem).toMatchObject(problem)
       expect(typeof json.problem.message).toBe('string')
       expect(json.problem.message.length).toBeGreaterThan(0)
+      // The EXACT key set, not just the expected ones: an extra field is a field
+      // the page would have to ignore, and `toMatchObject` cannot see one. This
+      // is what makes the optional members (`known`, `candidates`,
+      // `preservedAs`, `state`) load-bearing rather than decorative.
+      const expectedKeys = [...new Set(['code', 'message', ...Object.keys(problem)])].sort()
+      expect(Object.keys(json.problem).sort()).toEqual(expectedKeys)
       // Success and failure are mutually exclusive: a problem body names no list,
       // so a page that renders both cannot show stale rows beside an error.
       expect(json.agents).toBeUndefined()
@@ -2498,18 +2526,58 @@ describe('⑪ the settings page’s candidate source (#260)', () => {
 
     expect(status).toBe(200)
     expect(json.problem).toMatchObject({ code: 'peer-timeout', timeoutMs: 1_500 })
+    // The mutual-exclusion rule holds on EVERY failure arm, not just the device
+    // ones: a page that renders both cannot show stale rows beside an error.
+    expect(json.agents).toBeUndefined()
+    expect(json.workspaces).toBeUndefined()
   })
 
-  it('⑪f anything else on the wire becomes `transport`', async () => {
-    // The link died, or a transport error surfaced: neither is the peer saying
-    // no and neither is a timeout, but both are still "candidates unavailable".
-    const { deps } = candidate(() => Promise.reject(new Error('socket closed')))
+  it('⑪f a link that died mid-read becomes `transport`', async () => {
+    // `TransportLostError` is what `Connection.#businessRequest` raises after a
+    // read has already been replayed once and the link died again, so it is the
+    // one class that really means "reconnect".
+    const { deps } = candidate(() =>
+      Promise.reject(new TransportLostError('dev-1', 'offline', 'agent.agents.list')),
+    )
     mount({ subagent: deps })
 
     const { status, json } = await call('/subagent/targets?device=dev-1')
 
     expect(status).toBe(200)
-    expect(json.problem).toMatchObject({ code: 'transport', message: 'socket closed' })
+    expect(json.problem).toMatchObject({ code: 'transport', device: 'dev-1' })
+  })
+
+  it('⑪f2 a device that drops MID-READ becomes `device-unavailable`, not `transport`', async () => {
+    // `listTargets` answers `device-unavailable` in band when the device is
+    // already down, but a link that drops BETWEEN the resolution and a page
+    // arrives here as a THROW from `Connection.#businessRequest`. Classifying it
+    // as `transport` (the first draft did) told the operator to check their
+    // network about a device that had simply gone away.
+    const { deps } = candidate(() => Promise.reject(new DeviceUnavailableError('dev-1', 'offline')))
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(json.problem).toMatchObject({ code: 'device-unavailable', device: 'dev-1', state: 'offline' })
+    expect(json.agents).toBeUndefined()
+  })
+
+  it('⑪f3 a peer that breaks the protocol becomes `peer-protocol`, never `transport`', async () => {
+    // The aggregate REFUSES a page whose `items` is not an array, a cursor that
+    // never advances and a run of empty pages — all as plain `Error`s. None of
+    // them is a transport failure, and telling the operator to check the network
+    // about a broken peer sends them to the wrong place.
+    const { deps } = candidate(() =>
+      Promise.reject(new Error('agent.agents.list: peer answered a page whose `items` is not an array')),
+    )
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(json.problem.code).toBe('peer-protocol')
+    expect(json.problem.message).toContain('items')
   })
 
   it('⑪g the body is a WHITELIST: nothing the seam did not name rides out', async () => {
@@ -2557,6 +2625,12 @@ describe('⑪ the settings page’s candidate source (#260)', () => {
   it('⑪j an assembly that wires no experiment answers 404, like the rest of the family', async () => {
     mount()
     expect((await call('/subagent/targets?device=dev-1')).status).toBe(404)
+    // The router drops EMPTY path segments, so a trailing slash reaches the same
+    // branch. It must reach the same VERDICT too — a review asked whether the
+    // slash form could slip past the missing-slice guard and answer 200.
+    const slashed = await call('/subagent/targets/?device=dev-1')
+    expect(slashed.status).toBe(404)
+    expect(slashed.json.error).toBe('not-found')
   })
 
   it('⑪k the fence covers this route too: cross-site, rebound and unmarked-host requests are refused', async () => {
