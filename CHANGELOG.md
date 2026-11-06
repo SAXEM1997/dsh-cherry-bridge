@@ -21,8 +21,11 @@ who never open this file.
 
 The subagent feature: a DSH session can hand one self-contained task to a Cherry
 Studio agent on a paired desktop, and the settings page grows a block that turns
-it on. The desktop range is unchanged (**2.1.4 – 2.1.10**), no protocol version
-moved and no existing tool's shape changed — the new surface is a tool
+it on. The desktop range is unchanged (**2.1.4 – 2.1.10**) and no protocol
+version moved. No existing tool was renamed and no required argument was added,
+but two shapes DID change and are listed under **Changed** below: eight tools'
+parameter schemas lost keywords the host never enforced, and `cherry_send` /
+`cherry_wait` terminal answers gained an optional `executionError`. The new surface is a tool
 registration, a settings block, one HTTP route and a config document, and the
 tool drives only peer RPCs the earlier tools already used. The minor digit is the
 honest one: a fifteenth `cherry_*` tool is new capability, not hardening.
@@ -54,13 +57,23 @@ hot-reload. Ideas and bug reports are welcome:
 - **Config key `subagent`** — the profile seed for the same document; once the
   page saves one, the document wins.
 
-The delegation path was exercised on a real desktop during the design work
-(three concurrent probes, one task each). Its limits are stated rather than
-implied: one-shot sessions, no sandbox inheritance, the child may decline the
-task, and the concurrency ceiling is unverified above three.
+The **send** path was exercised on a real desktop during the design work (three
+concurrent probes, one task each). The **delegation** path is verified on
+loopback only: turning the experiment on crashed during assembly until the probe
+fix listed under **Fixed**, so no real-desktop delegation had ever run. `docs/e2e-checklist.md`
+§H is the walk that closes this, and it has not been performed for 0.3.0. Its
+limits are stated rather than implied: one-shot sessions, no sandbox
+inheritance, the child may decline the task, and the concurrency ceiling is
+unverified above three.
 
 ### Changed
 
+- `cherry_send` / `cherry_wait` terminal answers gained an optional
+  `executionError` `{reason, message?}` carrying the peer's own failure
+  classification, reduced to those two fields — the payload's `details` and
+  `failure` blobs never reach a model's context. It rides whatever the peer
+  attached to a TERMINAL event, so a successful run has none in practice; the
+  plugin does not add one.
 - Every tool's parameter schema now stays inside the subset the host's value
   validator actually enforces (#219). Eight of the fourteen carried keywords the
   host reads nothing of: `minimum`/`maximum` on seven numeric faces, `maxLength`
@@ -72,6 +85,15 @@ task, and the concurrency ceiling is unverified above three.
 
 ### Fixed
 
+- A delegation no longer reports a peer REFUSAL or a lost subscription as a
+  finished run (#248). The first never started a child, so "the run ended
+  rejected" invented one and dropped the peer's reason; the second's outcome is
+  unknowable, and the child is now cancelled rather than left running with
+  nobody reading it.
+- Turning the experiment on no longer crashes the assembly (#246): the
+  `subagents` probe read an undeclared service off the plugin root context,
+  which throws on a real cordis host, so enabling it took the fourteen tools and
+  the settings page down with it.
 - A throw from either collector inside `settleRunResult` no longer turns a run
   result into a rejection (#237). Both collectors are contained and report
   through the run's own error sink, so the parent gets a settled run either way.
@@ -79,7 +101,9 @@ task, and the concurrency ceiling is unverified above three.
 ### Documentation
 
 - `docs/e2e-checklist.md` records the 0.2.3 machine-verifiable results, and why
-  the demotion's latency gain cannot be measured on this machine.
+  the demotion's latency gain cannot be measured on this machine. It also gains
+  **§H**, the real-desktop walk for the experiment; the 0.3.0 record section is
+  filled in by that walk, not in advance.
 
 ## v0.2.3 (2026-11-05)
 
