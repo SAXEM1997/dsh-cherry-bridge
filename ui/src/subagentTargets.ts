@@ -45,10 +45,21 @@
 /**
  * The sentinel value of the trailing "type it by hand" option.
  *
- * NUL-prefixed so it cannot collide with a real id: every id this plugin handles
- * is an `opaqueId` that travels through JSON and a URL query, and a NUL cannot
- * appear in either. It is a CONSTANT rather than a sentence — the panel
- * translates the LABEL, and this value must never be rendered.
+ * NUL-prefixed to make a collision with a real id implausible — NOT impossible,
+ * and the difference matters. The protocol's id type is
+ * `opaqueId = unicodeText.min(1).max(256)`, whose only character rule forbids
+ * LONE SURROGATES, so a peer may legitimately send a NUL. (An earlier comment
+ * here claimed a NUL "cannot appear in JSON or a URL query"; both encodings
+ * carry one — `\u0000` and `%00` — so that claim was simply wrong, and a
+ * standards review caught it.)
+ *
+ * The guarantee therefore comes from the RESERVED-VALUE FILTER below, not from
+ * this constant: a candidate naming the sentinel is dropped, so even a colliding
+ * id cannot produce two options sharing one value. The NUL only makes that drop
+ * cost nothing in practice.
+ *
+ * It is a CONSTANT rather than a sentence — the panel translates the LABEL, and
+ * this value must never be rendered.
  */
 export const MANUAL_TARGET_VALUE = '\u0000manual'
 
@@ -74,9 +85,13 @@ export type TargetCandidates =
 /**
  * The `problem` body `GET /subagent/targets` answers with (#260).
  *
- * `code` is the closed set the page branches on and `message` is the sentence it
- * shows; the remaining fields differ per code (`known`, `candidates`, `state`,
- * `timeoutMs`, …) and this module passes them through untouched.
+ * `code` is a plain `string` on purpose, NOT the endpoint's closed set spelled
+ * out as a union: the page must survive a NEWER server that answers a code this
+ * build has never heard of (it renders its fallback sentence), and a union here
+ * would turn that into a compile error in a consumer that cannot do anything
+ * about it. `message` is the sentence the page shows; the remaining fields
+ * differ per code (`known`, `candidates`, `state`, `timeoutMs`, …) and this
+ * module passes them through untouched.
  */
 export interface TargetProblem {
   readonly code: string
@@ -151,10 +166,33 @@ function effectiveValue(field: TargetFieldState): string {
  *     no candidate names it — this is the ONE line that makes a stored-but-gone
  *     id selectable instead of invisible;
  *  4. the manual sentinel, ALWAYS last.
+ *
+ * ## Two values are RESERVED, and a candidate claiming one is dropped
+ *
+ * `''` is the control's "nothing chosen" value and {@link MANUAL_TARGET_VALUE}
+ * is its "type it by hand" value. A candidate naming either one cannot be shown
+ * beside the option that owns that value without producing TWO options with one
+ * value — the browser then picks whichever comes first, and "which option is
+ * selected" stops being answerable. That is the same class of defect this module
+ * exists to prevent, one level down.
+ *
+ * Dropping is the honest resolution rather than a merge: `''` is not an id at
+ * all, and the sentinel carries a NUL no REAL agent or workspace id has ever
+ * been seen to carry. Inventing a display for either would put a row in front of
+ * the operator that cannot mean anything. The alternative — letting the
+ * duplicate through — was the first draft, and a review found it.
+ *
+ * Note the honest scope of the sentinel's claim: the protocol's `opaqueId` is
+ * `unicodeText.min(1).max(256)`, which does NOT forbid a NUL, so a hostile or
+ * broken peer really could name the sentinel. THIS FILTER is what keeps the
+ * invariant true in that case; the constant's NUL only makes it a curiosity
+ * rather than a collision the operator would ever meet.
  */
 export function targetOptions(field: TargetFieldState, labels: TargetLabels): TargetOptions {
   const selected = effectiveValue(field)
-  const candidates = field.candidates.kind === 'ready' ? field.candidates.items : []
+  const candidates = (field.candidates.kind === 'ready' ? field.candidates.items : []).filter(
+    (candidate) => candidate.value !== '' && candidate.value !== MANUAL_TARGET_VALUE,
+  )
   const options: TargetOption[] = []
 
   if (selected === '') {

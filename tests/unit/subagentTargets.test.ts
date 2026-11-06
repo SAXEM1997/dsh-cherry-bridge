@@ -192,6 +192,39 @@ describe('③ the empty draft', () => {
     ])
   })
 
+  it('③d a candidate naming a RESERVED value is dropped, not shown beside the option that owns it', () => {
+    // `''` and the sentinel are the control's own values. A peer naming either
+    // one cannot be represented without two options sharing a value, so the row
+    // is dropped: neither can be a real target, and a row the operator can see
+    // but never select is worse than a row that is not there.
+    const answer = targetOptions(
+      {
+        current: '',
+        draft: '',
+        candidates: {
+          kind: 'ready',
+          items: [
+            { value: '', label: 'Blank id' },
+            { value: MANUAL_TARGET_VALUE, label: 'Sentinel-ish' },
+            A,
+          ],
+        },
+      },
+      LABELS,
+    )
+
+    expect(answer.options).toEqual([
+      { value: '', label: 'nothing-chosen', empty: true },
+      { value: 'agent-a', label: 'Agent A' },
+      { value: MANUAL_TARGET_VALUE, label: 'type-it-myself', manual: true },
+    ])
+    // …and the reserved value a candidate claimed still selects the option that
+    // OWNS it, so a stored sentinel keeps working.
+    expect(targetOptions({ current: MANUAL_TARGET_VALUE, draft: '', candidates: READY }, LABELS).selected).toBe(
+      MANUAL_TARGET_VALUE,
+    )
+  })
+
   it('③c no candidates and nothing stored leaves the empty option and the sentinel', () => {
     const answer = targetOptions({ current: '', draft: '', candidates: LOADING }, LABELS)
 
@@ -214,37 +247,81 @@ describe('④ the one invariant', () => {
     { kind: 'ready', items: [] },
     { kind: 'ready', items: [A] },
     { kind: 'ready', items: [A, B] },
+    // A peer naming one of the control's OWN values. Review finding (#261): the
+    // first draft's fixtures used only real ids, so the sweep could not see the
+    // duplicate these produce.
+    { kind: 'ready', items: [{ value: '', label: 'Blank id' }, A] },
+    { kind: 'ready', items: [{ value: MANUAL_TARGET_VALUE, label: 'Sentinel-ish' }, A] },
   ]
-  const VALUES = ['', 'agent-a', 'agent-b', 'agent-zzz', MANUAL_TARGET_VALUE]
+  /** Values a field can hold, WITHOUT the manual sentinel. */
+  const PLAIN = ['', 'agent-a', 'agent-b', 'agent-zzz']
+  /** …and with it, for the cases that are about the sentinel. */
+  const ALL = [...PLAIN, MANUAL_TARGET_VALUE]
 
-  it('④a `selected` is always the value of one of the options', () => {
+  /**
+   * The invariant assertion, as one helper so every case below states the same
+   * property. The message names the combination, because a bare `false` in a
+   * 343-cell sweep is unattributable.
+   */
+  function expectSelectedOffered(
+    current: string,
+    draft: string,
+    candidates: TargetCandidates,
+    label: string,
+  ): void {
+    const answer = targetOptions({ current, draft, candidates }, LABELS)
+    expect(
+      answer.options.some((option) => option.value === answer.selected),
+      `${label}: no option for selected=${JSON.stringify(answer.selected)} ` +
+        `(current=${JSON.stringify(current)}, draft=${JSON.stringify(draft)}, ` +
+        `candidates=${candidates.kind}${candidates.kind === 'ready' ? `/${candidates.items.length}` : ''})`,
+    ).toBe(true)
+  }
+
+  it('④a the invariant holds over every combination of candidates × current × draft', () => {
     // The failure this catches: a `<select>` renders BLANK for a value it cannot
     // match, while the form state still holds the right value — so every
     // request-body assertion in the suite stays green and the operator sees an
     // empty control.
+    //
+    // This sweep deliberately EXCLUDES the sentinel, which is what makes it the
+    // case that isolates the injected-`unknown` guard: deleting the injection
+    // turns this red, deleting the trailing sentinel does not.
     let checked = 0
     for (const candidates of CANDIDATE_STATES) {
-      for (const current of VALUES) {
-        for (const draft of VALUES) {
-          const answer = targetOptions({ current, draft, candidates }, LABELS)
-          expect(
-            answer.options.some((option) => option.value === answer.selected),
-            `no option for selected=${JSON.stringify(answer.selected)} ` +
-              `(current=${JSON.stringify(current)}, draft=${JSON.stringify(draft)}, ` +
-              `candidates=${candidates.kind}${candidates.kind === 'ready' ? `/${candidates.items.length}` : ''})`,
-          ).toBe(true)
+      for (const current of PLAIN) {
+        for (const draft of PLAIN) {
+          expectSelectedOffered(current, draft, candidates, '④a')
           checked += 1
         }
       }
     }
     // The table really was walked, so a shrunken loop cannot pass silently.
-    expect(checked).toBe(CANDIDATE_STATES.length * VALUES.length * VALUES.length)
+    expect(checked).toBe(CANDIDATE_STATES.length * PLAIN.length * PLAIN.length)
   })
 
-  it('④b the manual sentinel is ALWAYS the last option, and exactly one of them', () => {
+  it('④b the invariant also holds when the field itself holds the sentinel', () => {
+    // The sentinel is a value the control can hold, so it is a value the sweep
+    // must include — and a stored sentinel is the state a page reaches after the
+    // operator chose manual entry and saved.
+    let checked = 0
     for (const candidates of CANDIDATE_STATES) {
-      for (const current of VALUES) {
-        for (const draft of VALUES) {
+      for (const current of ALL) {
+        for (const draft of ALL) {
+          expectSelectedOffered(current, draft, candidates, '④b')
+          checked += 1
+        }
+      }
+    }
+    expect(checked).toBe(CANDIDATE_STATES.length * ALL.length * ALL.length)
+  })
+
+  it('④c the manual sentinel is ALWAYS the last option, and exactly one of them', () => {
+    // This is the case that isolates the trailing-sentinel guard: it never
+    // mentions the injected option, so deleting the injection leaves it green.
+    for (const candidates of CANDIDATE_STATES) {
+      for (const current of ALL) {
+        for (const draft of ALL) {
           const { options } = targetOptions({ current, draft, candidates }, LABELS)
           const manuals = options.filter((option) => option.manual === true)
           expect(manuals).toHaveLength(1)
@@ -254,24 +331,25 @@ describe('④ the one invariant', () => {
     }
   })
 
-  it('④c option values are unique, so the browser has no tie to break', () => {
-    // Two options with one value is the same class of defect: the control shows
-    // whichever the browser picks, and the operator cannot tell which one they
-    // selected. The candidate list is not deduped (a peer listing an id twice is
-    // a peer fault), but nothing this module INJECTS may collide with it.
+  it('④d option values are unique, so the browser has no tie to break', () => {
+    // Two options with one value is the same class of defect as a blank control:
+    // the browser shows whichever comes first and "which option is selected"
+    // stops being answerable. This is the assertion that caught the first
+    // draft's duplicate `''` (a candidate naming the control's own empty value)
+    // and its duplicate sentinel.
     for (const candidates of CANDIDATE_STATES) {
-      for (const current of VALUES) {
-        for (const draft of VALUES) {
-          const { options } = targetOptions({ current, draft, candidates }, LABELS)
-          const injected = options.filter((option) => option.unknown === true || option.empty === true || option.manual === true)
-          const injectedValues = injected.map((option) => option.value)
-          expect(new Set(injectedValues).size).toBe(injectedValues.length)
-          // An injected option never repeats a value a candidate already names.
-          if (candidates.kind === 'ready') {
-            for (const option of injected) {
-              expect(candidates.items.some((item) => item.value === option.value)).toBe(false)
-            }
-          }
+      for (const current of ALL) {
+        for (const draft of ALL) {
+          const answer = targetOptions({ current, draft, candidates }, LABELS)
+          const values = answer.options.map((option) => option.value)
+          expect(new Set(values).size, `duplicate option value in ${JSON.stringify(values)}`).toBe(values.length)
+          // The reserved values are owned by at most one option each, never two.
+          // The empty value is offered exactly when the control holds it; the
+          // sentinel is offered always (it is the way back to manual entry).
+          const emptyOptions = answer.options.filter((option) => option.value === '')
+          expect(emptyOptions.length).toBeLessThanOrEqual(1)
+          expect(emptyOptions).toHaveLength(answer.selected === '' ? 1 : 0)
+          expect(answer.options.filter((option) => option.value === MANUAL_TARGET_VALUE)).toHaveLength(1)
         }
       }
     }
@@ -307,9 +385,20 @@ describe('⑤ the labels are the caller’s', () => {
     expect(emptyAnswer.options.map((option) => option.label)).toEqual(['EMPTY-HERE', 'Agent A', 'Agent B', 'MANUAL-HERE'])
   })
 
-  it('⑤b the manual sentinel cannot collide with an id that could reach this field', () => {
-    // A real id travels through JSON and a URL query, so it cannot carry a NUL.
+  it('⑤b the sentinel is a value no real id carries, and a colliding one is dropped rather than trusted', () => {
+    // NOT "a NUL is impossible in an id": the protocol's `opaqueId` is
+    // `unicodeText.min(1).max(256)`, which permits one. What actually protects
+    // the invariant is the reserved-value filter, so the second half of this case
+    // drives the collision instead of arguing it away.
     expect(MANUAL_TARGET_VALUE).toContain('\u0000')
     expect(MANUAL_TARGET_VALUE).not.toBe('')
+
+    const colliding = targetOptions(
+      { current: '', draft: '', candidates: { kind: 'ready', items: [{ value: MANUAL_TARGET_VALUE, label: 'Peer id' }] } },
+      LABELS,
+    )
+    const values = colliding.options.map((option) => option.value)
+    expect(new Set(values).size).toBe(values.length)
+    expect(colliding.options.filter((option) => option.value === MANUAL_TARGET_VALUE)).toHaveLength(1)
   })
 })
