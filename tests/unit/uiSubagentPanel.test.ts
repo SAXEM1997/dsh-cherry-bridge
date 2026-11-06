@@ -391,3 +391,85 @@ describe('⑤ the README pair carries the same three sentences', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// ⑥ the form actually reaches the request body
+// ---------------------------------------------------------------------------
+
+/**
+ * `bodyOf` is the one place a rendered field becomes a stored field, and until
+ * #251 no case read the body for four of its five wirings: replacing `enabled`,
+ * `agentId`, the workspace radio or `timeoutMs` with a constant left every UI
+ * case green. These are the assertions that make the form a form.
+ */
+describe('⑥ every rendered control reaches the save body', () => {
+  it('⑥a clearing the timeout box CLEARS the field instead of re-sending the stored one', async () => {
+    // `...stored` puts the stored `timeoutMs` in the body FIRST, so "leave the
+    // field out" only ever meant "do not override it" — the box could not be
+    // cleared, whatever the comment promised.
+    const client = stubClient(READY)
+    renderPanel(client)
+    const box = (await screen.findByLabelText('单次委托超时（毫秒；0 表示不限）')) as HTMLInputElement
+    expect(box.value).toBe('1800000')
+    fireEvent.change(box, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    // Asserted on the WIRE form, because that is what the server parses: the
+    // stub client hands the object over in process, where an explicit
+    // `timeoutMs: undefined` is still an own key. `JSON.stringify` drops it, so
+    // the server sees no field at all — and it writes the body as the document,
+    // supplying the default only when the field is missing.
+    const wire = JSON.parse(JSON.stringify(client.puts[0])) as Record<string, unknown>
+    expect(Object.prototype.hasOwnProperty.call(wire, 'timeoutMs')).toBe(false)
+  })
+
+  it('⑥b the enable switch reaches the body, both ways', async () => {
+    const client = stubClient(READY)
+    renderPanel(client)
+    const toggle = (await screen.findByRole('checkbox')) as HTMLInputElement
+    expect(toggle.checked).toBe(true)
+    fireEvent.click(toggle)
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    // FALSE, not merely absent: an omitted `enabled` would leave the stored
+    // document's `true` in place and the feature would stay on.
+    expect(client.puts[0]!.enabled).toBe(false)
+  })
+
+  it('⑥c the agent box reaches the body, trimmed', async () => {
+    const client = stubClient(READY)
+    renderPanel(client)
+    const agent = (await screen.findByLabelText('目标 agent')) as HTMLInputElement
+    fireEvent.change(agent, { target: { value: '  agent-9  ' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.agentId).toBe('agent-9')
+  })
+
+  it('⑥d the workspace radio picks the KIND, and switching back undoes it', async () => {
+    const client = stubClient(READY)
+    renderPanel(client)
+    await screen.findByText('目标设备')
+    fireEvent.click(screen.getByLabelText('系统工作区'))
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    // BOTH halves: `workspaceKind` is what the server reads, and a stale
+    // `workspaceId` beside it would name a workspace the kind says to ignore.
+    expect(client.puts[0]!.workspaceKind).toBe('system')
+    expect(client.puts[0]!.workspaceId).toBeUndefined()
+
+    // Switching back, and naming a workspace: the previous save really did
+    // clear the id, so the box comes back EMPTY — re-typing is the operator's
+    // job, and a case that expected the old id to survive would be asserting
+    // that the save did not work.
+    fireEvent.click(screen.getByLabelText('指定已注册的工作区'))
+    const idBox = (await screen.findByLabelText('工作区 id')) as HTMLInputElement
+    expect(idBox.value).toBe('')
+    fireEvent.change(idBox, { target: { value: ' ws-9 ' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(2))
+    expect(client.puts[1]!.workspaceKind).toBeUndefined()
+    expect(client.puts[1]!.workspaceId).toBe('ws-9')
+  })
+})
