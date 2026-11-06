@@ -259,10 +259,15 @@ function bodyOf(draft: Draft, stored: SubagentConfig & { revision: number }): Su
     ...(draft.workspace === 'system'
       ? { workspaceKind: 'system' as const, workspaceId: undefined }
       : { workspaceKind: undefined, workspaceId: draft.workspaceId.trim() }),
-    // An empty or unparseable box leaves the field OUT rather than sending a
-    // value the operator did not type: the resolver then applies the default,
-    // and the re-read shows what was actually stored.
-    ...(draft.timeoutMs.trim() === '' || !Number.isFinite(timeout) ? {} : { timeoutMs: timeout }),
+    // An empty or unparseable box must CLEAR the field, not merely fail to
+    // override it: `...stored` above already carries the stored value, so
+    // omitting the key left it in place and the box could never be emptied.
+    // `undefined` is dropped by `JSON.stringify`, which is exactly "the operator
+    // cleared it" — the server then stores no value and the resolver applies the
+    // default, so the re-read shows what was actually stored.
+    ...(draft.timeoutMs.trim() === '' || !Number.isFinite(timeout)
+      ? { timeoutMs: undefined }
+      : { timeoutMs: timeout }),
     expectedRevision: stored.revision,
   }
 }
