@@ -24,7 +24,7 @@ import type { CherryToolDefinition } from './tools.js'
  * | state | means | who can fix it |
  * | --- | --- | --- |
  * | `pending` | the switch is off, or the injection has not arrived | the operator (turn it on) / the host |
- * | `unsupported` | the unGATED lookup found no `subagents`, so this host has none — a PROVISIONAL verdict on a host that can still inject one later | nobody: the host is too old |
+ * | `unsupported` | the unGATED lookup found no `subagents` — a PROVISIONAL verdict, because the injection may still deliver one | nobody, once it settles; the host, if it was only late |
  * | `failed` | enabled, but the config cannot be dialled, or the name is taken | the operator (fix the config) |
  * | `ready` | the provider is registered | — |
  *
@@ -164,18 +164,23 @@ export interface SubagentHostContext {
   inject?<T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown
   /**
    * cordis' optional service lookup — the unGATED read. There is deliberately
-   * NO `subagents?:` property here: the plugin root ctx is a strict reflection
-   * proxy whose `get` trap THROWS `cannot get property "subagents" without
-   * inject` for a service the root fibre did not declare (the root `inject` is
-   * `['tools']`), and `?.` does not help because the getter itself throws. Issue
-   * #7 shipped broken this way and regressed 0.2.0; see `resolveTrustedHosts`
-   * in `httpApi.ts`. Absent ⇒ `undefined`, never a throw.
+   * NO `subagents?:` property here: the ctx is a strict reflection proxy
+   * (`ReflectService.handler.get`) that resolves ONLY what the fibre's own chain
+   * already holds — the property on the target, or a provision on this fibre or
+   * an ancestor. `subagents` arrives from a SIBLING plugin, so it is in neither,
+   * and a property read throws: `cannot get property "subagents" without inject`,
+   * or `cannot get required service … in inactive context` once the name is in
+   * our `inject` list. `?.` does not help — the getter itself throws. Issue #7
+   * shipped broken this way and regressed 0.2.0; see `resolveTrustedHosts` in
+   * `httpApi.ts`. `ctx.get(name)` is the unGATED lookup: absent ⇒ `undefined`,
+   * never a throw.
    */
   get?(name: string): unknown
   /**
    * The tool registry, probed at MOUNT time off the plugin root ctx — a
-   * property read, which is legal HERE and only here: `tools` is in the root
-   * fibre's `inject` list, so the proxy answers it.
+   * property read, which is legal HERE and only here: `tools` is a REQUIRED
+   * dependency of this plugin (the root `inject` list), so cordis has already
+   * committed it to our own fibre and the proxy resolves it from there.
    *
    * It is deliberately NOT part of {@link INJECT_KEYS}: the provider does not
    * need `ctx.tools` (the host's own `subagent` tool can drive it), so gating the
