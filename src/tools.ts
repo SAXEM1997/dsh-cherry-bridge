@@ -4857,6 +4857,11 @@ export class CherryToolEngine {
       const refusal = isRecord(answer['error']) ? answer['error'] : undefined
       const reason = refusal === undefined ? undefined : optionalString(refusal['reason'])
       const message = refusal === undefined ? undefined : optionalString(refusal['message'])
+      // The `reason === undefined` arm is DEFENSIVE: the peer's rejected-receipt
+      // schema requires both fields, so no fixture can reach it and the fake
+      // cannot be made to. It stays because a malformed answer must still read
+      // as a refusal rather than as a run that ended — which is the bug this
+      // branch exists to close.
       const detail =
         reason === undefined
           ? 'the peer refused the delegation; no child was started'
@@ -4943,11 +4948,16 @@ export class CherryToolEngine {
     // first event arrives — so a run cancelled moments after it began would
     // otherwise look like a session with nothing to cancel.
     //
-    // And a caller that already knows which run to stop needs NO subscription:
+    // And a caller that already knows which run to stop needs no SUBSCRIPTION:
     // `#ensureSubscription` is what makes the cache able to NAME a run, which is
     // the fallback's problem alone. Requiring it unconditionally made the cancel
     // die on the very fault it was recovering from — a lost subscription is one
     // of the two answers that ask for a cancel, so the child was never stopped.
+    //
+    // It is not a promise that the cancel LANDS: this still rides the
+    // connection, and every call site is best-effort (`.catch(() => {})`), so a
+    // lost LINK loses the cancel exactly as before. What changed is that the
+    // subscription is no longer a second, unrelated way to lose it.
     let expectedExecutionId = observedExecutionId
     if (expectedExecutionId === undefined) {
       await this.#ensureSubscription(deviceId, sessionId)

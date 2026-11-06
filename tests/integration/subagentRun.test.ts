@@ -537,6 +537,11 @@ describe('a receipt is not a run, and a lost subscription is not an ending (#248
       expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.messages.send')).toBe(true)
     })
     if (created === undefined) throw new Error('the delegation reported no session')
+    // The peer's OWN record of the run it admitted, captured BEFORE the cancel
+    // clears it: the only format-independent way to say "the cancel named THIS
+    // child" without reading the receipt the delegation never hands out.
+    const runId = rig.fake.activeExecutionId
+    expect(runId).toBeDefined()
     // The peer drops the subscription AND refuses every re-subscribe.
     rig.fake.pushResetRequired(created)
     rig.fake.refuseSubscriptions('RESOURCE_EXHAUSTED')
@@ -547,7 +552,14 @@ describe('a receipt is not a run, and a lost subscription is not an ending (#248
     expect(outcome.diagnostic).toMatch(/unknown|unknowable/i)
     // The recovery route rides along; without it the parent has a dead end.
     expect(outcome.diagnostic).toContain('cherry_read')
-    // And the child was stopped rather than abandoned.
-    expect(rig.fake.commandCalls.some((entry) => entry.method === 'agent.executions.cancel')).toBe(true)
+    // And the child was stopped rather than abandoned — pinned as the WORK, not
+    // as the wire call: `some(...) === true` stayed green with the cancel aimed
+    // at another session or at an id the peer never minted, which is the
+    // difference between stopping this child and telling the peer to stop
+    // nothing.
+    const cancels = rig.fake.commandCallsFor('agent.executions.cancel')
+    expect(cancels).toHaveLength(1)
+    expect(cancels[0]!['sessionId']).toBe(created)
+    expect(cancels[0]!['expectedExecutionId']).toBe(runId)
   })
 })
