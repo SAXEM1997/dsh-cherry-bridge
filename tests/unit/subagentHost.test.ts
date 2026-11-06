@@ -322,8 +322,9 @@ describe('a host without the service says so, and the rest of the plugin lives (
     // A host with `ctx.get` but no `ctx.inject` can never deliver a LATE
     // service, so the unGATED lookup is the only source there will ever be —
     // and skipping it would lose a provider this host is perfectly able to run.
-    // This is also the one mount path that returns its OWN disposer instead of
-    // handing one to the injected fibre, so the release is asserted here.
+    // The release is asserted here because this path reaches `register` without
+    // the injected fibre, and a provider nobody can release is a leak the
+    // disposer contract cannot see from the outside.
     const service = fakeService()
     const probe = strictContext({ service, noInject: true })
     const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
@@ -343,7 +344,12 @@ describe('a host without the service says so, and the rest of the plugin lives (
     // "waiting for the host" forever over a service the host already has.
     const service = fakeService()
     const probe = strictContext({ service, refuseInject: true })
-    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    const log = vi.fn()
+    const host = createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      log,
+    })
     expect(() => host.mount(probe.ctx)).not.toThrow()
     expect(probe.injectedKeys).toEqual([])
     expect(service.registered).toHaveLength(1)
@@ -351,13 +357,29 @@ describe('a host without the service says so, and the rest of the plugin lives (
       state: 'ready',
       reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
     })
+    // The operator's one clue that the seam arrived by the fallback rather than
+    // by injection. EXACTLY one line: the service was found, so the "unavailable"
+    // line must not also fire — two lines for one event read as two events.
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(String(log.mock.calls[0]?.[0])).toContain('注入被宿主拒绝')
   })
 
   it('②h a refused injection with NO service is `unsupported`, not `pending`', () => {
     const probe = strictContext({ refuseInject: true })
-    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    const log = vi.fn()
+    const host = createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      log,
+    })
     expect(() => host.mount(probe.ctx)).not.toThrow()
     expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+    // TWO lines, and the ORDER is the story: the injection was refused, and the
+    // lookup then found nothing. Collapsing them into one would lose which of
+    // the two happened on a host where only one did.
+    expect(log).toHaveBeenCalledTimes(2)
+    expect(String(log.mock.calls[0]?.[0])).toContain('注入被宿主拒绝')
+    expect(String(log.mock.calls[1]?.[0])).toContain('子智能体子系统不可用')
   })
 
   it('②i an injection that delivers and THEN throws does not register twice', () => {
