@@ -439,8 +439,64 @@ export interface SubagentSaveRequest extends SubagentConfig {
   expectedRevision: number
 }
 
+/** One agent a device's peer reported — `GET /subagent/targets`'s `agents[]` row. */
+export interface SubagentTargetAgent {
+  agentId: string
+  /**
+   * Optional ON THE WIRE, and the page must survive its absence: the endpoint's
+   * own contract is "the page falls back to the id", so a peer that reports no
+   * names still gets a usable list rather than an empty one.
+   */
+  name?: string
+  emoji?: string
+}
+
+/** One registered workspace — the same row shape, keyed by `workspaceId`. */
+export interface SubagentTargetWorkspace {
+  workspaceId: string
+  name?: string
+}
+
+/**
+ * The endpoint's success body: exactly the four keys the page renders.
+ *
+ * `workspaces` and `systemWorkspace` are present ONLY when the request carried an
+ * `agentId` (a workspace belongs to an agent), so their absence means "not
+ * asked", never "none". `truncated` says the walk stopped at its safety bound —
+ * the list is real but incomplete, which the page reports rather than hides.
+ */
+export interface SubagentTargetsListing {
+  agents: readonly SubagentTargetAgent[]
+  workspaces?: readonly SubagentTargetWorkspace[]
+  systemWorkspace?: boolean
+  truncated?: { lists: readonly string[]; reason: string }
+}
+
+/**
+ * The endpoint's refusal body.
+ *
+ * `code` is a plain string on purpose: the page must survive a NEWER server
+ * answering a code this build has never heard of (it renders its fallback
+ * sentence). `message` is the server's sentence — ENGLISH, from the peer or from
+ * the plugin's own templates — so the page translates the CODE and only falls
+ * back to `message` where the text is the peer's own words.
+ */
+export interface SubagentTargetsProblem {
+  code: string
+  message: string
+  [field: string]: unknown
+}
+
+/** `GET /subagent/targets`: a listing or a problem, never both. */
+export type SubagentTargetsResponse = SubagentTargetsListing | { problem: SubagentTargetsProblem }
+
 /** The panel's HTTP seam: the default is the same-origin client, tests inject a stub. */
 export interface SubagentClient {
   get(): Promise<SubagentResponse>
   put(body: SubagentSaveRequest): Promise<SubagentResponse>
+  /**
+   * The candidate source (#260). `agentId` is what makes the answer carry the
+   * workspace half; without it the page is asking only "which agents exist here".
+   */
+  targets(device: string, agentId?: string): Promise<SubagentTargetsResponse>
 }

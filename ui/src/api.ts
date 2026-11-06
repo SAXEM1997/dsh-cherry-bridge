@@ -19,6 +19,7 @@ import type {
   SubagentClient,
   SubagentResponse,
   SubagentSaveRequest,
+  SubagentTargetsResponse,
 } from './types'
 
 /** A refused call, carrying the server's structured error verbatim. */
@@ -255,8 +256,28 @@ export async function putSubagent(body: SubagentSaveRequest): Promise<SubagentRe
   return result as SubagentResponse
 }
 
-/** The production {@link SubagentClient}: the two same-origin calls above. */
+/**
+ * `GET /subagent/targets` — the ids and NAMES behind the three target fields
+ * (#260, consumed by #262).
+ *
+ * A refusal is a 200 with `{problem}`, not a 4xx: the endpoint resolves a device
+ * and walks a peer, and "the device is offline" is an ANSWER to the question, not
+ * a malformed request. Only a missing `device` is a 400, so `ApiError` here means
+ * this page sent something the route rejects outright.
+ */
+export async function getSubagentTargets(
+  device: string,
+  agentId?: string,
+): Promise<SubagentTargetsResponse> {
+  const query = new URLSearchParams({ device })
+  if (agentId !== undefined && agentId !== '') query.set('agentId', agentId)
+  const body = await request(`${API_BASE}/subagent/targets?${query.toString()}`)
+  return body as SubagentTargetsResponse
+}
+
+/** The production {@link SubagentClient}: the three same-origin calls above. */
 export const defaultSubagentClient: SubagentClient = {
   get: () => getSubagent(),
   put: (body) => putSubagent(body),
+  targets: (device, agentId) => getSubagentTargets(device, agentId),
 }
