@@ -20,7 +20,7 @@ import type { SubagentConfig, SubagentConfigResolution } from './subagent.js'
 import { createSubagentConfigDocument } from './subagentConfigStore.js'
 import type { SubagentConfigDocument } from './subagentConfigStore.js'
 import { createSubagentHost } from './subagentHost.js'
-import type { SubagentHost, SubagentHostContext } from './subagentHost.js'
+import type { SubagentHost } from './subagentHost.js'
 import { createToolScopeHost, registerAtomically } from './toolScopeHost.js'
 import type { RefreshSummary } from './toolScopeHost.js'
 import { registerHttpApi } from './httpApi.js'
@@ -1144,7 +1144,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
     },
   })
   state.subagents = subagents
-  state.disposers.push(subagents.mount(ctx as unknown as SubagentHostContext))
+  state.disposers.push(subagents.mount(ctx))
 
   void loadOrCreateIdentity(dataDir).then(
     (identity) => {
