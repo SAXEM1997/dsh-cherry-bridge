@@ -208,6 +208,92 @@ export interface CherryArchiveQuarantined {
 }
 
 /**
+ * One selectable agent, projected for a settings-page dropdown (#260).
+ *
+ * The row is the DROPDOWN's, not the peer's: `name` is what an operator reads,
+ * and `agentId` is what gets saved. The peer's item also carries an optional
+ * `model { modelId, providerId, name }`; it is deliberately NOT projected —
+ * nothing selects a target by model, and shipping it would put a per-agent
+ * provider summary on a page that ignores it. A caller that ever needs it adds
+ * it to this row, in this one place.
+ *
+ * `name` is OPTIONAL here although the protocol types it as required: this face
+ * projects a `Record<string, unknown>` off the wire, so a row without a usable
+ * name is reported as nameless rather than given an invented label. The page
+ * falls back to the id.
+ */
+export interface SubagentTargetAgent {
+  agentId: string
+  name?: string
+  /** The peer's emoji, when it sent one — the same glyph the desktop shows. */
+  emoji?: string
+}
+
+/** One selectable registered workspace, projected for the same dropdown. */
+export interface SubagentTargetWorkspace {
+  workspaceId: string
+  name?: string
+}
+
+/** The two lists {@link SubagentTargetsOutcome} can report a truncation for. */
+export type SubagentTargetsListName = 'agents' | 'workspaces'
+
+/**
+ * Which of the two walks stopped before the peer ran out, and why.
+ *
+ * A LIST, because one flag for two walks cannot say which one was cut: an
+ * agent list of 1,001 beside three workspaces truncates exactly one of them, and
+ * "truncated: true" would leave the page guessing. The reason is stated once —
+ * both walks share one bound and one breaker, so they stop for the same reason.
+ */
+export interface SubagentTargetsTruncation {
+  lists: SubagentTargetsListName[]
+  reason: CherryTruncationReason
+}
+
+/**
+ * The settings page's candidate answer (#260): what a device offers as a
+ * subagent target.
+ *
+ * `workspaces` and `systemWorkspace` are present only when the caller named an
+ * `agentId` — a workspace belongs to an agent, and answering workspaces for no
+ * agent would be answering about nothing. `agents` is present in BOTH cases:
+ * the page renders one form, and asking twice for two halves of it would let
+ * the halves disagree.
+ */
+export interface SubagentTargetsListing {
+  agents: SubagentTargetAgent[]
+  workspaces?: SubagentTargetWorkspace[]
+  /**
+   * The peer's own `systemWorkspace` flag, passed through verbatim.
+   *
+   * It says a system workspace EXISTS on this agent, not that selecting it will
+   * work: the protocol notes that old catalogs do not imply system support, so a
+   * peer may advertise the flag and still refuse `{kind: 'system'}` at
+   * `agent.sessions.create`.
+   */
+  systemWorkspace?: boolean
+  truncated?: SubagentTargetsTruncation
+}
+
+/**
+ * {@link CherryToolEngine.listTargets}'s answer: a candidate listing, or the
+ * device verdict that prevented one.
+ *
+ * The four verdicts are the TOOL face's own members — same discriminants, same
+ * fields — so the HTTP face maps them instead of translating a parallel set of
+ * codes. They ride IN BAND rather than being thrown: the settings page has to
+ * render "candidates are unavailable right now, type the id" for all four, and
+ * an exception would make every one of them a 500 on the way out.
+ */
+export type SubagentTargetsOutcome =
+  | CherryDeviceNotFound
+  | CherryAmbiguousDevice
+  | CherryArchiveQuarantined
+  | CherryDeviceUnavailable
+  | SubagentTargetsListing
+
+/**
  * Why an aggregate stopped before the peer said it was done.
  *
  * TWO scopes carry these reasons, and the scope — not the reason — decides
@@ -1468,8 +1554,17 @@ function executionErrorOf(payload: Record<string, unknown>): { reason: string; m
   return message === undefined ? { reason } : { reason, message }
 }
 
-/** The peer's failure discriminator, or undefined for a non-protocol error. */
-function failureReason(error: unknown): string | undefined {
+/**
+ * The peer's failure discriminator, or undefined for a non-protocol error.
+ *
+ * EXPORTED for the HTTP face's candidate seam (#260), which classifies the same
+ * `JsonRpcRequestError` into `peer-refused` + `reason`. It had grown a second
+ * copy there, and two copies of "where the peer puts its reason" is exactly the
+ * kind of rule that drifts. (It is ALSO duplicated in `subscriptions.ts`; that
+ * pair predates this and is tracked separately, because this module is the one
+ * the HTTP face may import without a cycle.)
+ */
+export function failureReason(error: unknown): string | undefined {
   if (!(error instanceof JsonRpcRequestError)) return undefined
   const data = error.data
   if (isRecord(data) && typeof data['reason'] === 'string') return data['reason']
@@ -2535,6 +2630,73 @@ export class CherryToolEngine {
   }
 
   /**
+   * The settings page's candidate source (#260): the agents on a device, and —
+   * when `agentId` names one — that agent's workspaces.
+   *
+   * WHY IT IS A METHOD HERE AND NOT A FIFTEENTH TOOL. The page needs exactly the
+   * two capabilities the read tools already have: the shared device resolution
+   * (`#resolve`, including the `connecting` wait and the quarantine precedence)
+   * and the page-aggregating walk (`#aggregate`). Both are private to this
+   * engine, and the HTTP face has no RPC channel at all — so a route that built
+   * its own requests would grow a SECOND pagination, timeout and error story
+   * beside the one every tool uses. This is the one seam; the route only maps
+   * its answer onto a body.
+   *
+   * THE VERDICTS RIDE IN BAND, and that is deliberate. `#requireConnection`
+   * THROWS `DeviceUnavailableError` for a non-connected device, which is right
+   * for a tool whose result is consumed as data and wrong here: all four device
+   * verdicts mean the same thing to a dropdown ("candidates unavailable right
+   * now"), so an exception would turn each of them into a 500 on the way out.
+   * `#resolve` answers all four — including `not-found`, whose `known` list
+   * `#requireConnection`'s plain `Error` cannot carry — so it is used directly
+   * rather than through `#linkOr`.
+   *
+   * PEER ERRORS ARE NOT TRANSLATED. A refusal, a request timeout and a
+   * transport failure propagate as themselves; the stable string codes the
+   * HTTP face reports (`peer-refused` / `peer-timeout` / `transport`) belong to
+   * that face, and classifying here would give the plugin two classifications
+   * of one error.
+   *
+   * The walk has NO caller bound: the endpoint takes no `limit`, a dropdown
+   * wants everything the device has, and the aggregate's own safety breaker is
+   * what stops a pathological list. A stop is therefore always attributed
+   * `'safety-bound'` — honest, because a caller cannot widen it.
+   */
+  async listTargets(device: string, agentId?: string): Promise<SubagentTargetsOutcome> {
+    // Quarantine FIRST: a quarantined archive serves an EMPTY view, so every
+    // selector below would miss and this would answer `not-found` about a store
+    // that still holds valid pairings.
+    const quarantined = this.#quarantineVerdict()
+    if (quarantined !== undefined) return quarantined
+
+    const resolved = await this.#resolve(device)
+    if (this.#isVerdict(resolved)) return resolved
+    const { connection } = resolved
+
+    const walk = { limit: MAX_AGGREGATE_LIMIT }
+    const agentPage = await this.#walkAgents(connection, walk)
+    const truncated: SubagentTargetsListName[] = agentPage.truncated ? ['agents'] : []
+
+    const listing: SubagentTargetsListing = {
+      agents: projectTargetAgents(agentPage.items),
+    }
+
+    if (agentId !== undefined) {
+      const workspaceWalk = await this.#walkWorkspaces(connection, agentId, walk)
+      if (workspaceWalk.page.truncated) truncated.push('workspaces')
+      listing.workspaces = projectTargetWorkspaces(workspaceWalk.page.items)
+      listing.systemWorkspace = workspaceWalk.systemWorkspace
+    }
+
+    if (truncated.length > 0) {
+      // Both walks share one bound and one breaker, so a stop has one reason
+      // between them; `lists` is what says WHICH list was cut.
+      listing.truncated = { lists: truncated, reason: agentPage.truncationReason ?? 'safety-bound' }
+    }
+    return listing
+  }
+
+  /**
    * The `{ notFound: true }` member of a store resolution as the tool-face
    * verdict, with the ids the caller could have meant.
    */
@@ -2966,6 +3128,56 @@ export class CherryToolEngine {
     }
   }
 
+  /**
+   * The `agent.agents.list` walk, shared by `cherry_agents` and the settings
+   * page's candidate seam ({@link CherryToolEngine.listTargets}).
+   *
+   * ONE extractor, because the page's own shape check is not optional: a peer
+   * answering a non-array `items` is a protocol violation the walk refuses, and
+   * a second copy of that reading is a second place to forget it.
+   */
+  #walkAgents(
+    connection: DeviceConnection,
+    walk: AggregateWalk<Record<string, unknown>>,
+  ): Promise<CherryPage<Record<string, unknown>>> {
+    return this.#aggregate(
+      connection,
+      'agent.agents.list',
+      {},
+      (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+      walk,
+    )
+  }
+
+  /**
+   * The `agent.workspaces.list` walk plus the page-level `systemWorkspace` flag,
+   * shared by `cherry_workspaces` and {@link CherryToolEngine.listTargets}.
+   *
+   * The flag is read HERE, once: it rides every page rather than any item, so a
+   * caller that folded it itself would have to re-derive "the last page read
+   * wins" — and the two callers would eventually disagree about which page.
+   */
+  async #walkWorkspaces(
+    connection: DeviceConnection,
+    agentId: string,
+    walk: AggregateWalk<Record<string, unknown>>,
+  ): Promise<{ page: CherryPage<Record<string, unknown>>; systemWorkspace: boolean }> {
+    let systemWorkspace = false
+    const page = await this.#aggregate(
+      connection,
+      'agent.workspaces.list',
+      { agentId },
+      (result) => {
+        // The flag rides on every page; the last page read wins, and the real
+        // peer always sends it.
+        if (typeof result['systemWorkspace'] === 'boolean') systemWorkspace = result['systemWorkspace']
+        return { ...arrayOf(result['items']), nextCursor: result['nextCursor'] }
+      },
+      walk,
+    )
+    return { page, systemWorkspace }
+  }
+
   // -------------------------------------------------------------------------
   // ① cherry_devices
   // -------------------------------------------------------------------------
@@ -3174,13 +3386,10 @@ export class CherryToolEngine {
         const { connection, record } = resolved.link
         const binding: ListResumeBinding = { method: 'agent.agents.list', deviceId: record.deviceId, params: {} }
         const resume = this.#listResume(args['cursor'], binding)
-        const page = await this.#aggregate(
-          connection,
-          'agent.agents.list',
-          {},
-          (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
-          { limit: aggregateLimit(args['limit']), ...(resume === undefined ? {} : { resume }) },
-        )
+        const page = await this.#walkAgents(connection, {
+          limit: aggregateLimit(args['limit']),
+          ...(resume === undefined ? {} : { resume }),
+        })
         return this.#listPage(page, binding)
       },
     })
@@ -3218,19 +3427,10 @@ export class CherryToolEngine {
         const params = { agentId }
         const binding: ListResumeBinding = { method: 'agent.workspaces.list', deviceId: record.deviceId, params }
         const resume = this.#listResume(args['cursor'], binding)
-        let systemWorkspace = false
-        const page = await this.#aggregate(
-          connection,
-          'agent.workspaces.list',
-          params,
-          (result) => {
-            // The flag rides on every page; the last page read wins, and the
-            // real peer always sends it.
-            if (typeof result['systemWorkspace'] === 'boolean') systemWorkspace = result['systemWorkspace']
-            return { ...arrayOf(result['items']), nextCursor: result['nextCursor'] }
-          },
-          { limit: aggregateLimit(args['limit']), ...(resume === undefined ? {} : { resume }) },
-        )
+        const { page, systemWorkspace } = await this.#walkWorkspaces(connection, agentId, {
+          limit: aggregateLimit(args['limit']),
+          ...(resume === undefined ? {} : { resume }),
+        })
         return { ...this.#listPage(page, binding), systemWorkspace }
       },
     })
@@ -7799,6 +7999,41 @@ function arrayOf(value: unknown): {
   }
   const items = value.filter(isRecord)
   return { items, dropped: value.length - items.length }
+}
+
+/**
+ * One agent row off the wire as the settings page's dropdown row (#260).
+ *
+ * A row with no usable `agentId` is DROPPED rather than labelled: an id-less
+ * agent can be neither selected nor saved, and inventing one would put a target
+ * on the page that no save could ever honour. A row with an id but no `name` is
+ * KEPT and reported nameless — the page falls back to the id, which is exactly
+ * what an operator would have typed by hand.
+ */
+function projectTargetAgents(items: readonly Record<string, unknown>[]): SubagentTargetAgent[] {
+  const rows: SubagentTargetAgent[] = []
+  for (const item of items) {
+    // `optionalString` already refuses the empty string, so `undefined` here
+    // means "absent OR empty" — one rule, in one place.
+    const agentId = optionalString(item['agentId'])
+    if (agentId === undefined) continue
+    const name = optionalString(item['name'])
+    const emoji = optionalString(item['emoji'])
+    rows.push({ agentId, ...(name === undefined ? {} : { name }), ...(emoji === undefined ? {} : { emoji }) })
+  }
+  return rows
+}
+
+/** The same projection for the workspace list — id plus label, nothing else. */
+function projectTargetWorkspaces(items: readonly Record<string, unknown>[]): SubagentTargetWorkspace[] {
+  const rows: SubagentTargetWorkspace[] = []
+  for (const item of items) {
+    const workspaceId = optionalString(item['workspaceId'])
+    if (workspaceId === undefined) continue
+    const name = optionalString(item['name'])
+    rows.push({ workspaceId, ...(name === undefined ? {} : { name }) })
+  }
+  return rows
 }
 
 /** The caller's aggregate limit, defaulting to one page and capped at the max. */

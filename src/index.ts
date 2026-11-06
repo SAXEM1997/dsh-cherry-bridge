@@ -380,6 +380,17 @@ interface AssemblyState {
    * onto the new config. `undefined` = Node's default trust store.
    */
   wsTls: WsDialOptions | undefined
+  /**
+   * The engine THIS apply built, or `undefined` before it is built.
+   *
+   * Held on the state rather than closed over because the HTTP face's deps are
+   * assembled BEFORE the engine exists (the engine is built at the end of
+   * `apply`, after the scope host that needs its tool names), so the one thing
+   * that reaches it — the candidate seam behind `GET /subagent/targets` (#260) —
+   * must resolve it lazily. A re-apply replaces it, so a request can never read
+   * a previous assembly's engine.
+   */
+  engine?: CherryToolEngine
   readonly connections: Map<string, DeviceConnection>
   /**
    * One subscription layer per device, sharing nothing with its siblings: the
@@ -845,6 +856,25 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
       },
       status: () => state.subagents?.status() ?? { state: 'pending', reason: { code: 'awaiting-injection' } },
       running: () => state.subagentResolution,
+      /**
+       * The candidate seam behind `GET /subagent/targets` (#260).
+       *
+       * Resolved through the state on every CALL, not captured: `assemblyDeps()`
+       * runs before `apply` builds the engine, and a re-apply must move this face
+       * onto the new engine (whose pool, caches and store are the new ones).
+       *
+       * The engine is always built by `apply` before any request can be
+       * dispatched, so the throw below is a wiring fault rather than a state a
+       * served request can observe — and it is a THROW rather than an empty
+       * candidate list on purpose: an empty list is a claim ("this device has no
+       * agents"), which is the one answer that would make an operator save a
+       * broken configuration believing the dropdown had been read.
+       */
+      targets: (device, agentId) => {
+        const engine = state.engine
+        if (engine === undefined) throw new Error('cherry-remote: the candidate seam is not wired yet')
+        return engine.listTargets(device, agentId)
+      },
     },
     /**
      * The pairing seam, shared by `cherry_pair` and `POST /pair`.
@@ -1083,6 +1113,11 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // scope default is "no workspace has the tools", so a delegation would fail
   // exactly when an operator enabled only the experiment.
   const engine = new CherryToolEngine(deps)
+  // Published on the state for the HTTP face's candidate seam (#260), whose deps
+  // object was built before this line ran. Assigned HERE rather than at the end
+  // of `apply` so no later failure can leave the seam pointing at a previous
+  // apply's engine.
+  state.engine = engine
   // Resolved BEFORE the scope host because the scope host needs the delegation
   // tool's NAME: the experiment is configured, and `toolName` is one of its
   // fields, so the governed list cannot be a module constant.
