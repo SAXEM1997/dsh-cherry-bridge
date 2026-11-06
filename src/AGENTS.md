@@ -786,6 +786,7 @@ listener, no LAN exposure, no separate credentials**:
 | `GET /diagnostics` | Operations report (below). |
 | `GET /subagent` | The experiment's document, its `source`, the RUNNING verdict, `pendingRestart` (#233). |
 | `PUT /subagent` | Save it — read-modify-write, `expectedRevision` required (#233). |
+| `GET /subagent/targets` | The dropdowns' candidates — `?device=<selector>[&agentId=<id>]`. ALWAYS `200`; a device that cannot answer rides as `{problem:{code,…}}` (#260). |
 
 **`/subagent` stores an unusable CONFIG rather than refusing it.** The route
 judges the LOCK and the body's shape; every field verdict belongs to

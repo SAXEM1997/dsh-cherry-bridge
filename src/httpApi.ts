@@ -13,6 +13,8 @@ import { resolveSubagentConfig, sameSubagentResolution } from './subagent.js'
 import type { SubagentConfigResolution } from './subagent.js'
 import type { SubagentConfigDocument, StoredSubagentConfig } from './subagentConfigStore.js'
 import type { SubagentSubsystemStatus } from './subagentHost.js'
+import type { SubagentTargetsListing, SubagentTargetsOutcome } from './tools.js'
+import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { failureText } from './text.js'
 
 /**
@@ -218,6 +220,28 @@ export interface CherryHttpDeps {
      * two different facts, and only their difference says "restart".
      */
     running(): SubagentConfigResolution | undefined
+    /**
+     * The device's candidate targets (#260) — the agents it offers, plus one
+     * agent's workspaces — behind `GET /subagent/targets`.
+     *
+     * It lives on THIS slice because it serves THIS route family: the settings
+     * page is the only caller, and an assembly that wired no experiment has no
+     * page to serve, so the whole `/subagent` family answering 404 together is
+     * one branch rather than two. It is not a fact about the experiment though —
+     * the method itself only reads the device.
+     *
+     * The seam exists because the HTTP face has no RPC channel at all
+     * ({@link ConnectionLike} carries no `rpc`, and the device resolution plus
+     * the page-aggregating walk are `CherryToolEngine` internals), so a route
+     * that built its own requests would grow a second pagination, timeout and
+     * error story beside the one every tool uses. The engine's `listTargets` is
+     * the ONE implementation; this face only maps its answer onto a body.
+     *
+     * LAZY like its three siblings, and for the same reason: this deps object is
+     * built BEFORE the engine exists (`src/index.ts`), so a captured function
+     * would be a function on the previous assembly.
+     */
+    targets(device: string, agentId?: string): Promise<SubagentTargetsOutcome>
   }
   /**
    * `pairWithPayload`, as the assembly exposes it. The HTTP face calls it for
@@ -536,6 +560,22 @@ function matchPath(req: HttpRequestLike): RouteMatch | undefined {
 function decodeSegment(segment: string): string | undefined {
   try {
     return decodeURIComponent(segment)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The request's query string, or `undefined` for a URL this runtime cannot parse.
+ *
+ * A separate read from {@link matchPath} on purpose: the router judges the PATH,
+ * and a route that also takes filters asks for them here. An unparsable URL is
+ * `undefined` rather than a throw — the caller decides what a missing filter
+ * means, and every caller so far answers the same `400 invalid-request`.
+ */
+function queryParams(req: HttpRequestLike): URLSearchParams | undefined {
+  try {
+    return new URL(req.url ?? '/', 'http://localhost').searchParams
   } catch {
     return undefined
   }
@@ -1129,6 +1169,15 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
       return
     }
 
+    // #260: the candidate source behind the settings page's three dropdowns.
+    // Deliberately NOT given a 405 arm of its own: it is a read-only sibling of
+    // the document route, so a non-GET falls through to the unmatched-route 404
+    // exactly like `/devices`' undeclared actions do. Inventing a second method
+    // vocabulary for one path would be a new answer to learn.
+    if (first === 'subagent' && second === 'targets' && match.segments.length === 2) {
+      if (method === 'GET') return await subagentTargets(req, res, route)
+    }
+
     writeError(res, 404, 'not-found', 'unknown route')
   } catch (error) {
     // Defense in depth: the routes below handle their own failures, so reaching
@@ -1403,6 +1452,164 @@ async function saveSubagentDocument(
     return
   }
   writeJson(res, 200, subagentBody(deps, result.stored))
+}
+
+/**
+ * `GET /cherry-remote/api/subagent/targets?device=<selector>[&agentId=<id>]`
+ * (#260): the candidates the settings page's three dropdowns offer.
+ *
+ * EVERY ANSWER IS `200`. A device that is offline, unpaired, quarantined or
+ * merely unable to name itself is not a malformed request — it is a form that
+ * has to be filled in by hand this time, and a 4xx/5xx would turn "type the id"
+ * into "the plugin is broken". The ONE 400 is the request-shape refusal: a call
+ * with no `device` names nothing, and letting it through would resolve to a miss
+ * and report `not-found` about a selector nobody sent.
+ *
+ * The body is built FIELD BY FIELD from a whitelist, like `/diagnostics`: this
+ * route adds nothing to what the seam answered, so a field the seam never names
+ * cannot ride out, and a credential reaching the seam through a future change is
+ * still not served here.
+ */
+async function subagentTargets(req: HttpRequestLike, res: HttpResponseLike, route: RouteContext): Promise<void> {
+  const deps = route.deps.subagent
+  if (deps === undefined) {
+    writeError(res, 404, 'not-found', 'this assembly wires no subagent document')
+    return
+  }
+  const query = queryParams(req)
+  const device = query?.get('device') ?? ''
+  if (device === '') {
+    writeError(res, 400, 'invalid-request', 'a `device` query parameter is required')
+    return
+  }
+  // An EMPTY `agentId` is not "no agent": the page always sends the key, and an
+  // empty value there means the operator has not chosen one yet, which is the
+  // agents-only answer.
+  const agentId = query?.get('agentId') ?? ''
+  let outcome: SubagentTargetsOutcome
+  try {
+    outcome = await deps.targets(device, agentId === '' ? undefined : agentId)
+  } catch (error) {
+    // The three wire failures. They are NOT verdicts the seam could answer in
+    // band — it deliberately leaves peer errors as themselves — and each one is
+    // still "candidates unavailable", so none may become a 500.
+    writeJson(res, 200, { problem: wireProblem(error) })
+    return
+  }
+  if ('error' in outcome) {
+    writeJson(res, 200, { problem: deviceProblem(outcome) })
+    return
+  }
+  writeJson(res, 200, listingBody(outcome))
+}
+
+/** The success body: exactly the four keys the page renders, nothing else. */
+function listingBody(listing: SubagentTargetsListing): Record<string, unknown> {
+  return {
+    agents: listing.agents.map((agent) => ({
+      agentId: agent.agentId,
+      ...(agent.name === undefined ? {} : { name: agent.name }),
+      ...(agent.emoji === undefined ? {} : { emoji: agent.emoji }),
+    })),
+    ...(listing.workspaces === undefined
+      ? {}
+      : {
+          workspaces: listing.workspaces.map((workspace) => ({
+            workspaceId: workspace.workspaceId,
+            ...(workspace.name === undefined ? {} : { name: workspace.name }),
+          })),
+        }),
+    ...(listing.systemWorkspace === undefined ? {} : { systemWorkspace: listing.systemWorkspace }),
+    ...(listing.truncated === undefined
+      ? {}
+      : { truncated: { lists: [...listing.truncated.lists], reason: listing.truncated.reason } }),
+  }
+}
+
+/** The four device verdicts {@link CherryToolEngine.listTargets} answers in band. */
+type DeviceVerdict = Extract<SubagentTargetsOutcome, { error: string }>
+
+/** One `problem` body: a stable `code` for the page to branch on, plus a sentence for the operator. */
+interface TargetsProblem {
+  code: string
+  message: string
+  [field: string]: unknown
+}
+
+/**
+ * A device verdict as the page's `problem`.
+ *
+ * The four codes are the TOOL face's own discriminants, verbatim: the settings
+ * page and a model reading a tool result should not have to learn two
+ * vocabularies for "this device is not there". The message is ours (the page
+ * renders it); the peer's own text is never in here — see {@link wireProblem}.
+ */
+function deviceProblem(verdict: DeviceVerdict): TargetsProblem {
+  switch (verdict.error) {
+    case 'not-found':
+      return {
+        code: 'not-found',
+        message: `no paired device matches "${verdict.device}"`,
+        device: verdict.device,
+        known: [...verdict.known],
+      }
+    case 'ambiguous-device':
+      return {
+        code: 'ambiguous-device',
+        message: `the device selector matches ${verdict.candidates.length} paired device(s); use an exact device id`,
+        device: verdict.device,
+        candidates: [...verdict.candidates],
+      }
+    case 'archive-quarantined':
+      return {
+        code: 'archive-quarantined',
+        // The recovery instruction is the store's own, so the page and the tools
+        // send the operator to the same place.
+        message: verdict.guidance,
+        archive: verdict.archive,
+        preservedAs: verdict.preservedAs ?? null,
+      }
+    case 'device-unavailable':
+      return {
+        code: 'device-unavailable',
+        message: `device "${verdict.device}" is ${verdict.state}, not connected`,
+        device: verdict.device,
+        state: verdict.state,
+      }
+    default:
+      // Unreachable through the type, and still not a throw: a future verdict
+      // member must surface as a problem the form can render.
+      return { code: 'transport', message: 'the device answered an unknown verdict' }
+  }
+}
+
+/**
+ * A thrown wire failure as the page's `problem`.
+ *
+ * THREE codes, because the operator's next move differs: a refusal means the
+ * peer said no (the message is its own text, unstranslated — it is the only
+ * place the peer's words reach the page), a timeout means the bound ran out
+ * (retrying is reasonable), and a transport failure means the link is gone
+ * (reconnecting is). The peer's text is BOUNDED by `failureText`: it is
+ * peer-controlled, and this body is rendered in a browser.
+ */
+function wireProblem(error: unknown): TargetsProblem {
+  if (error instanceof JsonRpcRequestError) {
+    const data = error.data
+    const reason =
+      typeof data === 'object' && data !== null && typeof (data as { reason?: unknown }).reason === 'string'
+        ? ((data as { reason: string }).reason)
+        : undefined
+    return {
+      code: 'peer-refused',
+      message: failureText(error),
+      ...(reason === undefined ? {} : { reason }),
+    }
+  }
+  if (error instanceof RequestTimeoutError) {
+    return { code: 'peer-timeout', message: failureText(error), timeoutMs: error.timeoutMs }
+  }
+  return { code: 'transport', message: failureText(error) }
 }
 
 /**

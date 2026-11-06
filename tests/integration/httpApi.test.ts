@@ -15,6 +15,8 @@ import { resolveSubagentConfig } from '../../src/subagent.js'
 import type { SubagentConfigResolution } from '../../src/subagent.js'
 import { createSubagentConfigDocument } from '../../src/subagentConfigStore.js'
 import type { SubagentSubsystemStatus } from '../../src/subagentHost.js'
+import { JsonRpcRequestError, RequestTimeoutError } from '../../src/rpc/jsonRpcClient.js'
+import type { SubagentTargetsOutcome } from '../../src/tools.js'
 import { LOG_TEXT_MAX } from '../../src/text.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 
@@ -2249,6 +2251,8 @@ describe('⑩ the experiment’s document (#233)', () => {
       document: createSubagentConfigDocument({ file: join(dataDir, 'subagent.json'), seed: options.seed }),
       running: () => options.running,
       status: (): SubagentSubsystemStatus => ({ state: 'pending', reason: { code: 'disabled' } }),
+      // The document routes never read the candidate seam; ⑪ supplies its own.
+      targets: () => Promise.reject(new Error('the document routes do not list targets')),
     }
   }
 
@@ -2342,6 +2346,241 @@ describe('⑩ the experiment’s document (#233)', () => {
     expect(bad.status).toBe(400)
     expect(bad.json.error).toBe('invalid-request')
     expect(existsSync(join(dataDir, 'subagent.json'))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ⑪ the settings page's candidate source (#260)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /subagent/targets` is the dropdown's data source: the agents on a
+ * device, plus an agent's workspaces. Its whole point is that a device which
+ * cannot answer is NOT a broken page — every failure is `200` with a `problem`
+ * the form renders as "candidates unavailable, type the id".
+ *
+ * The seam is stubbed here on purpose: `CherryToolEngine.listTargets` is driven
+ * end-to-end against the loopback peer in `subagentTargets.test.ts`, so these
+ * cases own the OTHER half — the HTTP status, the body's whitelist and the
+ * fence.
+ */
+describe('⑪ the settings page’s candidate source (#260)', () => {
+  type Seam = NonNullable<CherryHttpDeps['subagent']>
+
+  const LISTING = {
+    agents: [
+      { agentId: 'agent-1', name: 'Agent One' },
+      { agentId: 'agent-2', name: 'Agent Two', emoji: '🤖' },
+    ],
+    workspaces: [{ workspaceId: 'ws-1', name: 'Repo One' }],
+    systemWorkspace: true,
+  }
+
+  /**
+   * The deps slice, with the candidate seam answering `answer` (or throwing it).
+   *
+   * `calls` records the arguments the route forwarded, which is the only way to
+   * tell "the route passed `agentId`" from "the route dropped it" — the body
+   * would look the same against a stub that ignores its arguments.
+   */
+  function candidate(answer: unknown | (() => Promise<unknown>)): {
+    deps: Seam
+    calls: Array<{ device: string; agentId?: string }>
+  } {
+    const calls: Array<{ device: string; agentId?: string }> = []
+    return {
+      calls,
+      deps: {
+        document: createSubagentConfigDocument({ file: join(dataDir, 'subagent.json'), seed: undefined }),
+        running: () => undefined,
+        status: (): SubagentSubsystemStatus => ({ state: 'pending', reason: { code: 'disabled' } }),
+        targets: (device, agentId) => {
+          calls.push(agentId === undefined ? { device } : { device, agentId })
+          // The fixtures below are deliberately NOT all listings (some are bare
+          // verdicts, one carries extra keys to prove the whitelist), so the
+          // answer is handed through as the seam's own union.
+          return (typeof answer === 'function' ? (answer as () => Promise<unknown>)() : Promise.resolve(answer)) as Promise<
+            SubagentTargetsOutcome
+          >
+        },
+      },
+    }
+  }
+
+  it('⑪a answers the listing and carries no `problem`', async () => {
+    const { deps, calls } = candidate(LISTING)
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(json).toEqual(LISTING)
+    expect(json.problem).toBeUndefined()
+    expect(calls).toEqual([{ device: 'dev-1' }])
+  })
+
+  it('⑪b forwards `agentId` when the page asks about one agent', async () => {
+    const { deps, calls } = candidate(LISTING)
+    mount({ subagent: deps })
+
+    expect((await call('/subagent/targets?device=dev-1&agentId=agent-1')).status).toBe(200)
+    expect(calls).toEqual([{ device: 'dev-1', agentId: 'agent-1' }])
+
+    // An EMPTY `agentId` is "not chosen yet", not an agent whose id is empty:
+    // the page sends the key as soon as the field exists, and forwarding `''`
+    // would ask the peer about an agent that cannot exist.
+    expect((await call('/subagent/targets?device=dev-1&agentId=')).status).toBe(200)
+    expect(calls).toEqual([{ device: 'dev-1', agentId: 'agent-1' }, { device: 'dev-1' }])
+  })
+
+  it('⑪c every DEVICE verdict is a 200 with a problem the form can render', async () => {
+    // The four verdicts the engine answers in band. Each one means the same
+    // thing to the page ("no candidates right now"), so none of them may be a
+    // 4xx/5xx: a 500 here is the settings page telling the operator the plugin
+    // is broken when the device is merely offline.
+    const CASES = [
+      {
+        verdict: { error: 'not-found', device: 'dev-9', known: ['dev-1'] },
+        problem: { code: 'not-found', device: 'dev-9', known: ['dev-1'] },
+      },
+      {
+        verdict: { error: 'ambiguous-device', device: 'desk', candidates: ['Desk A', 'Desk B'] },
+        problem: { code: 'ambiguous-device', device: 'desk', candidates: ['Desk A', 'Desk B'] },
+      },
+      {
+        verdict: { error: 'archive-quarantined', guidance: 'move it aside', archive: '/data/devices.json' },
+        problem: { code: 'archive-quarantined', archive: '/data/devices.json', preservedAs: null },
+      },
+      {
+        verdict: { error: 'device-unavailable', device: 'dev-1', state: 'offline' },
+        problem: { code: 'device-unavailable', device: 'dev-1', state: 'offline' },
+      },
+    ] as const
+
+    for (const { verdict, problem } of CASES) {
+      const { deps } = candidate(verdict)
+      mount({ subagent: deps })
+
+      const { status, json } = await call('/subagent/targets?device=dev-1')
+
+      expect(status).toBe(200)
+      expect(json.problem).toMatchObject(problem)
+      expect(typeof json.problem.message).toBe('string')
+      expect(json.problem.message.length).toBeGreaterThan(0)
+      // Success and failure are mutually exclusive: a problem body names no list,
+      // so a page that renders both cannot show stale rows beside an error.
+      expect(json.agents).toBeUndefined()
+      expect(json.workspaces).toBeUndefined()
+    }
+  })
+
+  it('⑪d a peer refusal becomes `peer-refused`, carrying the peer’s own reason and text', async () => {
+    // The seam deliberately does NOT translate peer errors (see its docblock):
+    // these three codes are the HTTP face's, so the classification is asserted
+    // here, on the real error classes the rpc layer throws.
+    const { deps } = candidate(() =>
+      Promise.reject(new JsonRpcRequestError(1000, 'Agent not found', { reason: 'NOT_FOUND' })),
+    )
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1&agentId=nope')
+
+    expect(status).toBe(200)
+    expect(json.problem).toMatchObject({ code: 'peer-refused', reason: 'NOT_FOUND', message: 'Agent not found' })
+    expect(json.agents).toBeUndefined()
+  })
+
+  it('⑪e a request that times out becomes `peer-timeout` with the bound that ran out', async () => {
+    const { deps } = candidate(() => Promise.reject(new RequestTimeoutError('agent.agents.list', 1_500)))
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(json.problem).toMatchObject({ code: 'peer-timeout', timeoutMs: 1_500 })
+  })
+
+  it('⑪f anything else on the wire becomes `transport`', async () => {
+    // The link died, or a transport error surfaced: neither is the peer saying
+    // no and neither is a timeout, but both are still "candidates unavailable".
+    const { deps } = candidate(() => Promise.reject(new Error('socket closed')))
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(json.problem).toMatchObject({ code: 'transport', message: 'socket closed' })
+  })
+
+  it('⑪g the body is a WHITELIST: nothing the seam did not name rides out', async () => {
+    // Same rule as `/diagnostics`: a field the route does not name cannot leak,
+    // so a credential reaching this seam by a future change is still not served.
+    const { deps } = candidate({
+      ...LISTING,
+      accessToken: 'super-secret-token',
+      messages: [{ text: 'LEAK-PROBE-message' }],
+      parts: [{ text: 'LEAK-PROBE-part' }],
+    })
+    mount({ subagent: deps })
+
+    const { status, res } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(res.body).not.toContain('super-secret-token')
+    expect(res.body).not.toContain('LEAK-PROBE')
+    expect(res.body).not.toContain('accessToken')
+  })
+
+  it('⑪h a request with no `device` is the one 400 — a malformed request, not a missing candidate', async () => {
+    const { deps, calls } = candidate(LISTING)
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets')
+
+    expect(status).toBe(400)
+    expect(json.error).toBe('invalid-request')
+    // Refused before any device work: an empty selector would otherwise resolve
+    // to a miss and answer `not-found` about a selector nobody sent.
+    expect(calls).toEqual([])
+  })
+
+  it('⑪i a non-GET stays the unmatched-route 404 — no new 405 for this path', async () => {
+    const { deps } = candidate(LISTING)
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1', { method: 'POST', body: '{}' })
+
+    expect(status).toBe(404)
+    expect(json.error).toBe('not-found')
+  })
+
+  it('⑪j an assembly that wires no experiment answers 404, like the rest of the family', async () => {
+    mount()
+    expect((await call('/subagent/targets?device=dev-1')).status).toBe(404)
+  })
+
+  it('⑪k the fence covers this route too: cross-site, rebound and unmarked-host requests are refused', async () => {
+    const { deps } = candidate(LISTING)
+    mount({ subagent: deps })
+
+    const crossed = await call('/subagent/targets?device=dev-1', {
+      origin: 'http://evil.example.com',
+      headers: { 'sec-fetch-site': 'cross-site' },
+    })
+    expect(crossed.status).toBe(403)
+
+    const rebound = await call('/subagent/targets?device=dev-1', { host: 'evil.example.com' })
+    expect(rebound.status).toBe(403)
+
+    const crossSite = await call('/subagent/targets?device=dev-1', {
+      origin: `http://${HOST}`,
+      headers: { 'sec-fetch-site': 'cross-site' },
+    })
+    expect(crossSite.status).toBe(403)
+
+    // …and the same-origin browser read is admitted, so the fence is a filter
+    // rather than a wall.
+    expect((await call('/subagent/targets?device=dev-1', { origin: `http://${HOST}` })).status).toBe(200)
   })
 })
 
@@ -2506,6 +2745,26 @@ describe('plugin assembly (index.ts apply)', () => {
     // And the RUNNING verdict is untouched by the save: a route that reported
     // the saved document's decision here would be claiming a hot reload.
     expect(saved.json.status).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+    ctx.effects[0]?.()
+  })
+
+  it('wires the candidate seam to the REAL engine, so the route reads this apply’s own archive (#260)', async () => {
+    // The ⑪ cases above supply their own seam, so they cannot tell "the route
+    // calls the engine" from "the route calls a stub". This case drives the real
+    // `apply`, and the one observation that distinguishes them is `known`: only
+    // the engine reads the assembly's own store, and only that store knows
+    // `dev-1` exists.
+    const index = await import('../../src/index.js')
+    // The assembly opens `<dataDir>/devices.json`; seeding it BEFORE apply is the
+    // only way the store the engine reads holds a device.
+    new DeviceStore(join(dataDir, 'devices.json')).upsert(record())
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+
+    const answered = await call('/subagent/targets?device=no-such-device', {}, ctx.server)
+
+    expect(answered.status).toBe(200)
+    expect(answered.json.problem).toMatchObject({ code: 'not-found', known: ['dev-1'] })
     ctx.effects[0]?.()
   })
 
