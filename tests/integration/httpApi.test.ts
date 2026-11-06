@@ -2518,6 +2518,20 @@ describe('⑪ the settings page’s candidate source (#260)', () => {
     expect(json.agents).toBeUndefined()
   })
 
+  it('⑪d2 a refusal with no `data.reason` still classifies, and names no reason', async () => {
+    // Not every peer error carries the discriminator — `JsonRpcRequestError.data`
+    // is `unknown`, and a malformed one is `undefined`. The code still says
+    // `peer-refused`; what must NOT happen is an invented reason or a literal
+    // `"reason": null` the page would have to special-case.
+    const { deps } = candidate(() => Promise.reject(new JsonRpcRequestError(1000, 'peer said no', undefined)))
+    mount({ subagent: deps })
+
+    const { status, json } = await call('/subagent/targets?device=dev-1')
+
+    expect(status).toBe(200)
+    expect(json.problem).toEqual({ code: 'peer-refused', message: 'peer said no' })
+  })
+
   it('⑪e a request that times out becomes `peer-timeout` with the bound that ran out', async () => {
     const { deps } = candidate(() => Promise.reject(new RequestTimeoutError('agent.agents.list', 1_500)))
     mount({ subagent: deps })

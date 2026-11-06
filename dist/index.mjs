@@ -6940,7 +6940,16 @@ function executionErrorOf(payload) {
 		message
 	};
 }
-/** The peer's failure discriminator, or undefined for a non-protocol error. */
+/**
+* The peer's failure discriminator, or undefined for a non-protocol error.
+*
+* EXPORTED for the HTTP face's candidate seam (#260), which classifies the same
+* `JsonRpcRequestError` into `peer-refused` + `reason`. It had grown a second
+* copy there, and two copies of "where the peer puts its reason" is exactly the
+* kind of rule that drifts. (It is ALSO duplicated in `subscriptions.ts`; that
+* pair predates this and is tracked separately, because this module is the one
+* the HTTP face may import without a cycle.)
+*/
 function failureReason(error) {
 	if (!(error instanceof JsonRpcRequestError)) return void 0;
 	const data = error.data;
@@ -13050,34 +13059,26 @@ async function readJsonBody(req) {
 }
 /** Splits the pathname under the API prefix; undefined = not this route's. */
 function matchPath(req) {
-	let pathname;
+	let url;
 	try {
-		pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+		url = new URL(req.url ?? "/", "http://localhost");
 	} catch {
 		return;
 	}
-	if (pathname === "/cherry-remote/api") return { segments: [] };
+	const pathname = url.pathname;
+	if (pathname === "/cherry-remote/api") return {
+		segments: [],
+		query: url.searchParams
+	};
 	if (!pathname.startsWith(`/cherry-remote/api/`)) return void 0;
-	return { segments: pathname.slice(19).split("/").filter((segment) => segment !== "") };
+	return {
+		segments: pathname.slice(19).split("/").filter((segment) => segment !== ""),
+		query: url.searchParams
+	};
 }
 function decodeSegment(segment) {
 	try {
 		return decodeURIComponent(segment);
-	} catch {
-		return;
-	}
-}
-/**
-* The request's query string, or `undefined` for a URL this runtime cannot parse.
-*
-* A separate read from {@link matchPath} on purpose: the router judges the PATH,
-* and a route that also takes filters asks for them here. An unparsable URL is
-* `undefined` rather than a throw — the caller decides what a missing filter
-* means, and every caller so far answers the same `400 invalid-request`.
-*/
-function queryParams(req) {
-	try {
-		return new URL(req.url ?? "/", "http://localhost").searchParams;
 	} catch {
 		return;
 	}
@@ -13554,7 +13555,7 @@ async function handleRequest(req, res, route) {
 			return;
 		}
 		if (first === "subagent" && second === "targets" && match.segments.length === 2) {
-			if (method === "GET") return await subagentTargets(req, res, route);
+			if (method === "GET") return await subagentTargets(match.query, res, route);
 		}
 		writeError(res, 404, "not-found", "unknown route");
 	} catch (error) {
@@ -13791,19 +13792,18 @@ async function saveSubagentDocument(req, res, route) {
 * cannot ride out, and a credential reaching the seam through a future change is
 * still not served here.
 */
-async function subagentTargets(req, res, route) {
+async function subagentTargets(query, res, route) {
 	const deps = route.deps.subagent;
 	if (deps === void 0) {
 		writeError(res, 404, "not-found", "this assembly wires no subagent document");
 		return;
 	}
-	const query = queryParams(req);
-	const device = query?.get("device") ?? "";
+	const device = query.get("device") ?? "";
 	if (device === "") {
 		writeError(res, 400, "invalid-request", "a `device` query parameter is required");
 		return;
 	}
-	const agentId = query?.get("agentId") ?? "";
+	const agentId = query.get("agentId") ?? "";
 	let outcome;
 	try {
 		outcome = await deps.targets(device, agentId === "" ? void 0 : agentId);
@@ -13870,10 +13870,6 @@ function deviceProblem(verdict) {
 			device: verdict.device,
 			state: verdict.state
 		};
-		default: return {
-			code: "transport",
-			message: "the device answered an unknown verdict"
-		};
 	}
 }
 /**
@@ -13906,8 +13902,7 @@ function deviceProblem(verdict) {
 */
 function wireProblem(error) {
 	if (error instanceof JsonRpcRequestError) {
-		const data = error.data;
-		const reason = typeof data === "object" && data !== null && typeof data.reason === "string" ? data.reason : void 0;
+		const reason = failureReason(error);
 		return {
 			code: "peer-refused",
 			message: failureText(error),

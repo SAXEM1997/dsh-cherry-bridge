@@ -14,6 +14,7 @@ import { resolveSubagentConfig, sameSubagentResolution } from './subagent.js'
 import type { SubagentConfigResolution } from './subagent.js'
 import type { SubagentConfigDocument, StoredSubagentConfig } from './subagentConfigStore.js'
 import type { SubagentSubsystemStatus } from './subagentHost.js'
+import { failureReason } from './tools.js'
 import type { SubagentTargetsListing, SubagentTargetsOutcome } from './tools.js'
 import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { failureText } from './text.js'
@@ -542,41 +543,35 @@ async function readJsonBody(req: HttpRequestLike): Promise<Record<string, unknow
 
 interface RouteMatch {
   segments: string[]
+  /**
+   * The URL's query string, parsed ONCE by the router.
+   *
+   * Carried here rather than re-parsed per route: `new URL(...)` on the same
+   * input cannot fail after {@link matchPath} has already succeeded on it, so a
+   * second parse could only be a try/catch no test can reach — the shape the
+   * candidate route's first draft had.
+   */
+  query: URLSearchParams
 }
 
 /** Splits the pathname under the API prefix; undefined = not this route's. */
 function matchPath(req: HttpRequestLike): RouteMatch | undefined {
-  let pathname: string
+  let url: URL
   try {
-    pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+    url = new URL(req.url ?? '/', 'http://localhost')
   } catch {
     return undefined
   }
-  if (pathname === HTTP_API_PREFIX) return { segments: [] }
+  const pathname = url.pathname
+  if (pathname === HTTP_API_PREFIX) return { segments: [], query: url.searchParams }
   if (!pathname.startsWith(`${HTTP_API_PREFIX}/`)) return undefined
   const rest = pathname.slice(HTTP_API_PREFIX.length + 1)
-  return { segments: rest.split('/').filter((segment) => segment !== '') }
+  return { segments: rest.split('/').filter((segment) => segment !== ''), query: url.searchParams }
 }
 
 function decodeSegment(segment: string): string | undefined {
   try {
     return decodeURIComponent(segment)
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * The request's query string, or `undefined` for a URL this runtime cannot parse.
- *
- * A separate read from {@link matchPath} on purpose: the router judges the PATH,
- * and a route that also takes filters asks for them here. An unparsable URL is
- * `undefined` rather than a throw — the caller decides what a missing filter
- * means, and every caller so far answers the same `400 invalid-request`.
- */
-function queryParams(req: HttpRequestLike): URLSearchParams | undefined {
-  try {
-    return new URL(req.url ?? '/', 'http://localhost').searchParams
   } catch {
     return undefined
   }
@@ -1176,7 +1171,7 @@ async function handleRequest(req: HttpRequestLike, res: HttpResponseLike, route:
     // exactly like `/devices`' undeclared actions do. Inventing a second method
     // vocabulary for one path would be a new answer to learn.
     if (first === 'subagent' && second === 'targets' && match.segments.length === 2) {
-      if (method === 'GET') return await subagentTargets(req, res, route)
+      if (method === 'GET') return await subagentTargets(match.query, res, route)
     }
 
     writeError(res, 404, 'not-found', 'unknown route')
@@ -1471,14 +1466,17 @@ async function saveSubagentDocument(
  * cannot ride out, and a credential reaching the seam through a future change is
  * still not served here.
  */
-async function subagentTargets(req: HttpRequestLike, res: HttpResponseLike, route: RouteContext): Promise<void> {
+async function subagentTargets(
+  query: URLSearchParams,
+  res: HttpResponseLike,
+  route: RouteContext,
+): Promise<void> {
   const deps = route.deps.subagent
   if (deps === undefined) {
     writeError(res, 404, 'not-found', 'this assembly wires no subagent document')
     return
   }
-  const query = queryParams(req)
-  const device = query?.get('device') ?? ''
+  const device = query.get('device') ?? ''
   if (device === '') {
     writeError(res, 400, 'invalid-request', 'a `device` query parameter is required')
     return
@@ -1486,7 +1484,7 @@ async function subagentTargets(req: HttpRequestLike, res: HttpResponseLike, rout
   // An EMPTY `agentId` is not "no agent": the page always sends the key, and an
   // empty value there means the operator has not chosen one yet, which is the
   // agents-only answer.
-  const agentId = query?.get('agentId') ?? ''
+  const agentId = query.get('agentId') ?? ''
   let outcome: SubagentTargetsOutcome
   try {
     outcome = await deps.targets(device, agentId === '' ? undefined : agentId)
@@ -1577,10 +1575,6 @@ function deviceProblem(verdict: DeviceVerdict): TargetsProblem {
         device: verdict.device,
         state: verdict.state,
       }
-    default:
-      // Unreachable through the type, and still not a throw: a future verdict
-      // member must surface as a problem the form can render.
-      return { code: 'transport', message: 'the device answered an unknown verdict' }
   }
 }
 
@@ -1614,11 +1608,9 @@ function deviceProblem(verdict: DeviceVerdict): TargetsProblem {
  */
 function wireProblem(error: unknown): TargetsProblem {
   if (error instanceof JsonRpcRequestError) {
-    const data = error.data
-    const reason =
-      typeof data === 'object' && data !== null && typeof (data as { reason?: unknown }).reason === 'string'
-        ? ((data as { reason: string }).reason)
-        : undefined
+    // ONE rule for where the peer puts its discriminator (`data.reason`), shared
+    // with the tool face rather than re-derived here.
+    const reason = failureReason(error)
     return {
       code: 'peer-refused',
       message: failureText(error),

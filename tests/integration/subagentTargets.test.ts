@@ -373,7 +373,7 @@ describe('listTargets: the settings page’s candidate source (#260)', () => {
     rmSync(join(file, '..'), { recursive: true, force: true })
   })
 
-  it('⑫b a row with no id is dropped, and a row with no name is kept nameless', async () => {
+  it('⑫ a row with no id is dropped, and a row with no name is kept nameless', async () => {
     // Both halves are deliberate. An id-less row can be neither selected nor
     // saved, so it is not a target — and inventing an id would put one on the
     // page that no save could honour. A NAMELESS row IS a target (its id is
@@ -408,7 +408,7 @@ describe('listTargets: the settings page’s candidate source (#260)', () => {
     expect(outcome.workspaces).toEqual([{ workspaceId: 'ws-9' }])
   })
 
-  it('⑫ the projection carries no credential and no page-sized payload', async () => {
+  it('⑬ the projection carries no credential and no page-sized payload', async () => {
     // The row shape is the DROPDOWN's, not the peer's: an id and a label. Every
     // extra field is a field the settings page would have to ignore, and the
     // access token is the one thing that must never ride out of this seam.
