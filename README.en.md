@@ -138,6 +138,11 @@ in flight and returned the snapshot immediately), and `subscription-lost` (the
 subscription was lost and could not be rebuilt, so the outcome is
 **unknowable**; repair guidance ships with it).
 
+A terminal answer carries `executionError: {reason, message?}` when the peer
+supplied a failure classification — **only those two fields**: opaque parts the
+protocol leaves unconstrained (`details`, `failure`) never reach a model's
+context.
+
 ## Experimental subagent
 
 > Experimental: this spans two systems the plugin does not control — DSH and Cherry Studio — so its interface and behaviour may change. Off by default.
@@ -272,8 +277,11 @@ exporting `./client`). Through the `settings.section` slot it registers a
 (paste → 6-digit code → verdict), a scope panel, and live state pushed over the
 same-origin SSE feed (`/cherry-remote/api/events`).
 
-The 15 tools appear **per workspace** (the fifteenth, `cherry_subagent`, exists only while the experiment is on and its configuration is usable), by **hiding, not refusing** (in an
-out-of-scope session they never enter the tool table, saving context):
+The 15 tools appear **per workspace**, by **hiding, not refusing** (in an
+out-of-scope session they never enter the tool table, saving context). The
+fifteenth, `cherry_subagent`, has stricter terms for existing at all: the
+experiment on, its configuration usable, and the host providing a subagent
+service — missing any one of the three and it is not registered:
 
 - **Default is nobody**: a missing, corrupt or unreadable scope document is
   treated as `selected` + an empty list (fail-closed).
@@ -286,7 +294,11 @@ out-of-scope session they never enter the tool table, saving context):
 - **Scope governs tools only**: the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - **No pretending**: on `pending` / `unsupported` host capability the panel says
-  so and the tools stay **unregistered** (fail-closed).
+  so and the fourteen stay **unregistered** (fail-closed). The fifteenth,
+  `cherry_subagent`, is the one exception — it is registered by the subagent
+  subsystem on its own switch, so a scope degradation does not remove it; it
+  carries a **per-step** visibility condition instead, so the degradation does
+  not make it visible everywhere either.
 
 For development run `npm run dev:ui` — a DSH host must already be running at
 `http://127.0.0.1:23023`; override with
