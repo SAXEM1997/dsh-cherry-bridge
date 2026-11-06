@@ -280,8 +280,11 @@ same-origin SSE feed (`/cherry-remote/api/events`).
 The 15 tools appear **per workspace**, by **hiding, not refusing** (in an
 out-of-scope session they never enter the tool table, saving context). The
 fifteenth, `cherry_subagent`, has stricter terms for existing at all: the
-experiment on, its configuration usable, and the host providing a subagent
-service — missing any one of the three and it is not registered:
+experiment on, its configuration usable, the host providing a subagent service,
+**and that service able to honour the tool** — no `startActivation`, or no
+`tools.resolve` while the scope gate is installed, and it is not registered
+(fail-closed), with the status naming which one (`ready-without-tool`'s
+`problem`):
 
 - **Default is nobody**: a missing, corrupt or unreadable scope document is
   treated as `selected` + an empty list (fail-closed).
