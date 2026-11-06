@@ -138,6 +138,16 @@ const renderPanel = (client: SubagentClient, devices: readonly DeviceSummary[] =
   render(createElement(SubagentPanel, { client, devices }))
 }
 
+/**
+ * True when `first` comes before `second` in document order.
+ *
+ * Asserting "the label is above the verdict" is the whole point of #273, and
+ * `getByText` alone cannot say where a node sits: an order-free assertion would
+ * stay green with the notice back at the bottom.
+ */
+const precedes = (first: Node, second: Node): boolean =>
+  (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+
 /** The devices `App` hands down, sorted the way it sorts them. */
 const DEVICES: DeviceSummary[] = [
   { deviceId: 'desk-1', displayName: 'Desk One', state: 'connected', enabled: true, hosts: [], port: 1, ports: {}, forgottenHosts: [] },
@@ -360,6 +370,55 @@ describe('③ a save is a read-modify-write, locked on what was read', () => {
     expect((screen.getByLabelText('目标 agent') as HTMLInputElement).value).toBe('agent-9')
     // The recovery is an explicit click, not an automatic re-read.
     expect(screen.getByRole('button', { name: '重新读取' })).toBeDefined()
+  })
+
+  // #273 — the shape a real desktop produced. The form was complete and saved,
+  // the running assembly still held the older document (no workspaceId), and
+  // the panel printed 「workspaceId 不能为空」 above a green restart notice. Read
+  // top-down that says "your form is wrong", which sent an operator looking for
+  // a field that was filled in.
+  const RUNNING_INVALID: SubagentResponse = {
+    ...READY,
+    status: {
+      state: 'failed',
+      reason: {
+        code: 'invalid',
+        problems: [
+          { code: 'empty', field: 'workspaceId' },
+          { code: 'missing', field: 'workspaceId' },
+        ],
+      },
+    },
+    pendingRestart: true,
+  }
+
+  it('③d a restart owed labels the verdict as the RUNNING config, above the verdict', async () => {
+    renderPanel(stubClient(RUNNING_INVALID))
+    const notice = await screen.findByText('已保存，但当前装配仍在用旧配置：重启 DSH 后生效。')
+    // The class IS the contract here: `cherry-ok` is green, which reads as
+    // "done" for something the operator still has to act on, and that was half
+    // of #273. Nothing else in the suite would notice a revert to it, so this
+    // line is what makes the colour change testable at all — a deliberate
+    // rename should fail here and be updated on purpose.
+    expect(notice.className).toBe('cherry-notice')
+    // The heading names the object the verdict is about.
+    const heading = screen.getByText('当前状态（正在运行的配置）')
+    const verdict = screen.getByText('开关已打开，但配置还不可用：')
+    expect(precedes(notice, verdict)).toBe(true)
+    expect(precedes(heading, verdict)).toBe(true)
+    // The label must not swallow the problems: they are the reason a restart is
+    // worth doing, and hiding them would trade one misread for another.
+    expect(screen.getByText('workspaceId 不能为空')).toBeDefined()
+    expect(screen.getByText('缺少 workspaceId')).toBeDefined()
+  })
+
+  it('③e with nothing owed the heading carries no qualifier', async () => {
+    renderPanel(stubClient(READY))
+    await screen.findByText('已注册 provider cherry 与工具 cherry_subagent。')
+    expect(screen.getByText('当前状态')).toBeDefined()
+    // A qualifier on a verdict that IS about the saved document would be a lie
+    // in the other direction.
+    expect(screen.queryByText('当前状态（正在运行的配置）')).toBeNull()
   })
 })
 

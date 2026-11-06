@@ -786,7 +786,24 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
 
       {data !== undefined && (
         <>
-          <h4>{t('subagent.status.heading')}</h4>
+          {/* #273: `status` is the decision this ASSEMBLY made, not a verdict
+              on the form below — `pendingRestart` is the only thing that says
+              the two differ. Printed unlabelled and after the restart notice,
+              a stale `invalid` read as "your form is wrong", and the operator
+              went looking for a field that was already filled in. The notice
+              therefore comes FIRST, the heading names the document being
+              judged, and the problems stay visible: they are the reason the
+              restart is worth doing. */}
+          <h4>
+            {data.pendingRestart
+              ? t('subagent.status.heading.pending')
+              : t('subagent.status.heading')}
+          </h4>
+          {data.pendingRestart && (
+            <p className="cherry-notice" role="status">
+              {t('subagent.pendingRestart')}
+            </p>
+          )}
           <StatusBlock status={data.status} />
           <p className="cherry-hint">
             {data.source === 'file' ? t('subagent.source.file') : t('subagent.source.config')}
@@ -797,11 +814,6 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
               tool, while the status still says `ready`. Saying so is the
               difference between "broken" and "your scope excludes it". */}
           <p className="cherry-hint">{t('subagent.scopeNote')}</p>
-          {data.pendingRestart && (
-            <p className="cherry-ok" role="status">
-              {t('subagent.pendingRestart')}
-            </p>
-          )}
           <p className="cherry-hint cherry-mono">
             {t('subagent.revision', { revision: data.subagent.revision })}
           </p>
