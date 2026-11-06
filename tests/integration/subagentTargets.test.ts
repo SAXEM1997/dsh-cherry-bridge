@@ -234,12 +234,24 @@ describe('listTargets: the settings page’s candidate source (#260)', () => {
       { workspaceId: 'ws-1', name: 'Repo One' },
       { workspaceId: 'ws-2', name: 'Repo Two' },
     ])
-    // The peer's flag is passed through verbatim. The loopback fake hardcodes
-    // `true` today (a knob for the `false` case is #263's job), so this asserts
-    // the passthrough, not a fixture choice.
+    // The peer's flag is passed through verbatim — `true` here because the fake's
+    // default is `true`, `false` in the case below because #263 gave it a switch.
     expect(outcome.systemWorkspace).toBe(true)
     // The walk is scoped to the agent the caller named.
     expect(rig.fake.readCallsFor('agent.workspaces.list')[0]).toMatchObject({ agentId: 'agent-001' })
+  })
+
+  it('③b a catalog that says it has NO system workspace is passed through as `false`', async () => {
+    // #263's whole premise: the page must be able to tell "this desktop has none"
+    // from "we could not ask". `false` is the peer's own word; a missing key is
+    // the agents-only answer, and the two must never collapse into one.
+    const rig = await makeRig({
+      agent: { agents: agentsFixture(1), workspaces: [{ workspaceId: 'ws-1', name: 'Repo One' }], systemWorkspace: false },
+    })
+
+    const outcome = (await rig.engine.listTargets('dev-A', 'agent-000')) as { systemWorkspace?: boolean }
+
+    expect(outcome.systemWorkspace).toBe(false)
   })
 
   it('④ a selector that matches nothing answers not-found with the ids it could have meant', async () => {

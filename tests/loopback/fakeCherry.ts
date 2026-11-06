@@ -340,6 +340,25 @@ export interface FakeAgentOptions {
   agents?: FakeAgentRecord[]
   workspaces?: FakeWorkspaceRecord[]
   /**
+   * Whether the peer's workspace CATALOG advertises a system workspace (#263).
+   *
+   * Defaults to `true`, which is what this fake has always answered and what
+   * every existing case assumes. `false` models a desktop whose catalog says it
+   * has none — the protocol is explicit that "old catalogs do not imply system
+   * support", so a client that offers the choice anyway stores a configuration
+   * that cannot work.
+   */
+  systemWorkspace?: boolean
+  /**
+   * Refuse `agent.sessions.create` when it asks for the SYSTEM workspace (#263).
+   *
+   * Defaults to `false` (accept, as this fake always has). `true` is the peer
+   * behaviour the catalog's `systemWorkspace: false` predicts, and it is the
+   * failure this fake could not previously express: the configuration saves, the
+   * assembly reports ready, and only the first real delegation dies.
+   */
+  refuseSystemWorkspace?: boolean
+  /**
    * Sessions the read face serves. Task 9's create face PUSHES into this array
    * (the peer's `createSessionTx` really does add a row), so a test can assert
    * the two-step read-back of a session it just created.
@@ -3126,7 +3145,10 @@ export class FakeCherry {
         if (!(this.#agent().agents ?? []).some((agent) => agent.agentId === agentId)) {
           throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Agent not found' })
         }
-        return { ...this.#page(method, this.#agent().workspaces ?? [], params), systemWorkspace: true }
+        return {
+          ...this.#page(method, this.#agent().workspaces ?? [], params),
+          systemWorkspace: this.#options.agent?.systemWorkspace ?? true,
+        }
       }
       case 'agent.sessions.list': {
         const agentId = params['agentId'] as string | undefined
@@ -3562,6 +3584,11 @@ export class FakeCherry {
         ? (params['workspaceId'] as string)
         : ((params['workspace'] as { id?: string } | undefined)?.id ?? '')
     const systemWorkspace = params['workspaceId'] === undefined
+    if (systemWorkspace && this.#options.agent?.refuseSystemWorkspace === true) {
+      // The receipt the real desktop answers when its catalog has no system
+      // workspace: the choice is not supported, not malformed.
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'System workspace is not available' })
+    }
     const sessionId = `session-${randomUUID().slice(0, 8)}`
     // Materialize the array before pushing (the same fix `#appendTerminalMessage`
     // carries): `sessions` is optional in the fixture, so an `?.push` silently
