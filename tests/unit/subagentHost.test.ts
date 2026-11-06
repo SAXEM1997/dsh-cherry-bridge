@@ -122,8 +122,7 @@ function fakeTools(options: { refuse?: Error; noResolve?: boolean } = {}): {
 
 /**
  * A host ctx that delivers the injection SYNCHRONOUSLY, the way cordis does for
- * a service that is already loaded — which is what makes the mount-time probe a
- * sound way to detect `unsupported`.
+ * a service that is already loaded.
  *
  * `tools` is optional so the two faces can be told apart: a host that has
  * `subagents` but no `tools` registry must still register the PROVIDER (the
@@ -149,14 +148,75 @@ function fakeContext(
     get injected(): boolean {
       return injectedKeys.length > 0
     },
-    ...(service === undefined ? {} : { subagents: service }),
     ...(tools === null ? {} : { tools }),
+    // The unGATED lookup, which is the ONLY way this file lets a ctx expose the
+    // service: `SubagentHostContext` has no `subagents` property at all, because
+    // reading one on a real cordis ctx throws (②d).
+    get(name: string): unknown {
+      return name === 'subagents' ? service : undefined
+    },
     inject<T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown {
       injectedKeys.push([...keys])
       const effect = cb({ subagents: service } as T)
       if (typeof effect === 'function') injectedEffects.push(effect)
       return undefined
     },
+  }
+}
+
+/**
+ * A host ctx shaped like cordis' STRICT REFLECTION PROXY: reading a property the
+ * plugin root fibre did not declare THROWS, whether or not the service exists.
+ *
+ * This is the one fake an ordinary object cannot stand in for, and the reason
+ * the `ctx.subagents` probe survived a whole review round. cordis hands the
+ * plugin root a proxy whose `get` trap raises `cannot get property "<name>"
+ * without inject` for anything outside the root `inject` list — here `['tools']`,
+ * exactly as `src/index.ts` declares it — and `?.` does not help, because the
+ * getter itself throws. Issue #7 shipped broken this way and regressed 0.2.0
+ * (see `resolveTrustedHosts` in `src/httpApi.ts`); this file pins the third
+ * occurrence, so only `tools` and the two cordis methods are readable.
+ */
+function strictContext(options: {
+  service?: SubagentsService
+  tools?: ReturnType<typeof fakeTools>
+  /** Omit to model a host with no dynamic injection at all. */
+  noInject?: boolean
+  /** Model a host that refuses the injection outright (it throws). */
+  refuseInject?: boolean
+  /** Model a host that delivers the callback and THEN throws (a pathological order). */
+  refuseAfterDelivering?: boolean
+}): { ctx: SubagentHostContext; injectedKeys: string[][] } {
+  const injectedKeys: string[][] = []
+  const tools = options.tools ?? fakeTools()
+  const target: Record<string, unknown> = {
+    tools,
+    get(name: string): unknown {
+      return name === 'subagents' ? options.service : undefined
+    },
+  }
+  if (options.noInject !== true) {
+    target['inject'] = <T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown => {
+      if (options.refuseInject === true) throw new Error('cannot inject "subagents" on this ctx')
+      injectedKeys.push([...keys])
+      cb({ subagents: options.service } as T)
+      if (options.refuseAfterDelivering === true) throw new Error('injection torn down mid-call')
+      return undefined
+    }
+  }
+  const readable = new Set(['tools', 'get', 'inject'])
+  return {
+    injectedKeys,
+    ctx: new Proxy(target, {
+      get(object, property, receiver) {
+        // Symbols are let through: nothing in `mount` reads one, and answering
+        // `undefined` keeps a debugging `console.log` of the ctx from throwing
+        // over the very thing this fake exists to model.
+        if (typeof property === 'symbol') return undefined
+        if (readable.has(property)) return Reflect.get(object, property, receiver)
+        throw new Error(`cannot get property "${property}" without inject`)
+      },
+    }) as unknown as SubagentHostContext,
   }
 }
 
@@ -196,10 +256,145 @@ describe('a host without the service says so, and the rest of the plugin lives (
     expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
   })
 
-  it('②b it does not even ask for the injection it knows cannot arrive', () => {
+  it('②b it still ASKS for the injection: "never" is not knowable at mount', () => {
+    // The verdict is provisional, not a latch. cordis' `inject` exists for the
+    // service that arrives LATER, and a host that applies the seam after this
+    // plugin would otherwise keep a working feature disabled forever. ②a still
+    // pins the immediate verdict; this pins that the gate stays open.
     const ctx = fakeContext(undefined)
-    createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN }).mount(ctx)
-    expect(ctx.injected).toBe(false)
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    host.mount(ctx)
+    expect(ctx.injected).toBe(true)
+    expect(ctx.injectedKeys).toEqual([['subagents']])
+    expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+  })
+
+  it('②c a service that arrives AFTER mount flips `unsupported` to `ready`', () => {
+    // The fake's `inject` fires synchronously; this is the late arrival it
+    // cannot model, driven by hand through the same callback `mount` installed.
+    const service = fakeService()
+    const callbacks: Array<(ctx: unknown) => void | (() => void)> = []
+    const ctx = {
+      tools: fakeTools(),
+      get: (name: string) => (name === 'subagents' ? undefined : undefined),
+      inject<T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown {
+        expect([...keys]).toEqual(['subagents'])
+        callbacks.push(cb as (ctx: unknown) => void | (() => void))
+        return undefined
+      },
+    }
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    host.mount(ctx)
+    expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+    expect(service.registered).toEqual([])
+    for (const cb of callbacks) cb({ subagents: service })
+    expect(service.registered).toHaveLength(1)
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
+  })
+
+  it('②d a THROWING proxy ctx mounts without a throw (the cordis get-trap hazard)', () => {
+    // The regression this pins: `ctx.subagents` as a PROPERTY READ throws on a
+    // real host, so `apply` died and took the fourteen tools and the settings
+    // page with it. A plain object fake passes against both implementations —
+    // only a proxy whose get trap refuses undeclared keys can tell them apart.
+    const service = fakeService()
+    const probe = strictContext({ service })
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    expect(() => host.mount(probe.ctx)).not.toThrow()
+    expect(service.registered).toHaveLength(1)
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
+  })
+
+  it('②e the same proxy with NO service is `unsupported`, not a throw', () => {
+    const probe = strictContext({})
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    expect(() => host.mount(probe.ctx)).not.toThrow()
+    expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+  })
+
+  it('②f no dynamic injection: the service found by `ctx.get` is registered directly', () => {
+    // A host with `ctx.get` but no `ctx.inject` can never deliver a LATE
+    // service, so the unGATED lookup is the only source there will ever be —
+    // and skipping it would lose a provider this host is perfectly able to run.
+    // The release is asserted here because this path reaches `register` without
+    // the injected fibre, and a provider nobody can release is a leak the
+    // disposer contract cannot see from the outside.
+    const service = fakeService()
+    const probe = strictContext({ service, noInject: true })
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    const dispose = host.mount(probe.ctx)
+    expect(service.registered).toHaveLength(1)
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
+    dispose()
+    expect(service.registered).toEqual([])
+  })
+
+  it('②g a REFUSED injection falls back to the lookup instead of going `pending`', () => {
+    // A host that throws from `ctx.inject` is not waiting for anything: no
+    // injection is coming. Reporting `pending` there left the panel saying
+    // "waiting for the host" forever over a service the host already has.
+    const service = fakeService()
+    const probe = strictContext({ service, refuseInject: true })
+    const log = vi.fn()
+    const host = createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      log,
+    })
+    expect(() => host.mount(probe.ctx)).not.toThrow()
+    expect(probe.injectedKeys).toEqual([])
+    expect(service.registered).toHaveLength(1)
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
+    // The operator's one clue that the seam arrived by the fallback rather than
+    // by injection. EXACTLY one line: the service was found, so the "unavailable"
+    // line must not also fire — two lines for one event read as two events.
+    expect(log).toHaveBeenCalledTimes(1)
+    expect(String(log.mock.calls[0]?.[0])).toContain('注入被宿主拒绝')
+  })
+
+  it('②h a refused injection with NO service is `unsupported`, not `pending`', () => {
+    const probe = strictContext({ refuseInject: true })
+    const log = vi.fn()
+    const host = createSubagentHost({
+      resolution: resolveSubagentConfig(READY_CONFIG),
+      run: RUN,
+      log,
+    })
+    expect(() => host.mount(probe.ctx)).not.toThrow()
+    expect(host.status()).toEqual({ state: 'unsupported', reason: { code: 'unsupported' } })
+    // TWO lines, and the ORDER is the story: the injection was refused, and the
+    // lookup then found nothing. Collapsing them into one would lose which of
+    // the two happened on a host where only one did.
+    expect(log).toHaveBeenCalledTimes(2)
+    expect(String(log.mock.calls[0]?.[0])).toContain('注入被宿主拒绝')
+    expect(String(log.mock.calls[1]?.[0])).toContain('子智能体子系统不可用')
+  })
+
+  it('②i an injection that delivers and THEN throws does not register twice', () => {
+    // The fallback must not add a second provider over one the callback already
+    // registered: the service answers a duplicate name with a refusal, which
+    // would report `failed` over a seam that is working.
+    const service = fakeService()
+    const probe = strictContext({ service, refuseAfterDelivering: true })
+    const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })
+    expect(() => host.mount(probe.ctx)).not.toThrow()
+    expect(service.registered).toHaveLength(1)
+    expect(host.status()).toEqual({
+      state: 'ready',
+      reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' },
+    })
   })
 })
 

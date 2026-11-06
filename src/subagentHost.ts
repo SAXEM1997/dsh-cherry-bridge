@@ -24,7 +24,7 @@ import type { CherryToolDefinition } from './tools.js'
  * | state | means | who can fix it |
  * | --- | --- | --- |
  * | `pending` | the switch is off, or the injection has not arrived | the operator (turn it on) / the host |
- * | `unsupported` | this host has no `ctx.subagents` at all | nobody: the host is too old |
+ * | `unsupported` | the unGATED lookup found no `subagents` — a PROVISIONAL verdict, because the injection may still deliver one | nobody, once it settles; the host, if it was only late |
  * | `failed` | enabled, but the config cannot be dialled, or the name is taken | the operator (fix the config) |
  * | `ready` | the provider is registered | — |
  *
@@ -158,16 +158,29 @@ export interface ToolsRegistry extends PredicateCapableTools {
 export interface SubagentHostContext {
   /**
    * Dynamic injection. The callback runs when `subagents` is available on this
-   * ctx, which for an already-loaded service is immediately — the reason the
-   * probe below can treat "absent at mount" as `unsupported`.
+   * ctx — immediately for a service already loaded, or later for one whose
+   * plugin is applied after this one, which is exactly what `inject` exists for.
    */
   inject?<T>(keys: readonly string[], cb: (ctx: T) => void | (() => void)): unknown
-  /** Present on the plugin root ctx once a subagent registry is loaded. */
-  subagents?: SubagentsService | undefined
   /**
-   * The tool registry, probed at MOUNT time off the plugin root ctx — the same
-   * static probe `toolScopeHost` makes, and for the same reason: a host without
-   * it will never have it.
+   * cordis' optional service lookup — the unGATED read. There is deliberately
+   * NO `subagents?:` property here: the ctx is a strict reflection proxy
+   * (`ReflectService.handler.get`) that resolves ONLY what the fibre's own chain
+   * already holds — the property on the target, or a provision on this fibre or
+   * an ancestor. `subagents` arrives from a SIBLING plugin, so it is in neither,
+   * and a property read throws: `cannot get property "subagents" without inject`,
+   * or `cannot get required service … in inactive context` once the name is in
+   * our `inject` list. `?.` does not help — the getter itself throws. Issue #7
+   * shipped broken this way and regressed 0.2.0; see `resolveTrustedHosts` in
+   * `httpApi.ts`. `ctx.get(name)` is the unGATED lookup: absent ⇒ `undefined`,
+   * never a throw.
+   */
+  get?(name: string): unknown
+  /**
+   * The tool registry, probed at MOUNT time off the plugin root ctx — a
+   * property read, which is legal HERE and only here: `tools` is a REQUIRED
+   * dependency of this plugin (the root `inject` list), so cordis has already
+   * committed it to our own fibre and the proxy resolves it from there.
    *
    * It is deliberately NOT part of {@link INJECT_KEYS}: the provider does not
    * need `ctx.tools` (the host's own `subagent` tool can drive it), so gating the
@@ -180,6 +193,21 @@ export interface SubagentHostContext {
 /** The injected ctx's face. */
 interface SubagentInjectedContext {
   subagents?: SubagentsService | undefined
+}
+
+/**
+ * Narrows the untyped `ctx.get` answer.
+ *
+ * A service without `registerProvider` is not the seam we consume, and reading
+ * its methods would crash on a shape we only guessed at; anything else reads as
+ * "not here (yet)". The interface's one REQUIRED member is therefore the whole
+ * test.
+ */
+function asSubagentsService(value: unknown): SubagentsService | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  return typeof (value as { registerProvider?: unknown }).registerProvider === 'function'
+    ? (value as SubagentsService)
+    : undefined
 }
 
 /** The injection key. ONE key, so the subsystem cannot be held pending by another. */
@@ -245,22 +273,11 @@ export function createSubagentHost(parts: {
       // every problem the resolver found.
       if (resolution.kind === 'invalid') return () => {}
 
-      // The STATIC probe, at mount time and off the plugin ROOT ctx — the same
-      // shape `toolScopeHost` uses for `tools`, and for the same reason: a host
-      // that will never have the service must say so, while "the injection has
-      // not arrived yet" is a different state that resolves itself.
-      if (ctx.subagents === undefined) {
-        status = { state: 'unsupported', reason: { code: 'unsupported' } }
-        // The CODE, not a second copy of the sentence the page shows: a log line
-        // that paraphrases the panel's wording is one more place for the two to
-        // disagree, and an operator reading this log has the page open anyway.
-        log('[cherry-remote] 子智能体子系统不可用', status.reason)
-        return () => {}
-      }
-
-      // The SECOND static probe, and the same reasoning: `ctx.tools` either
-      // exists on this host or never will. Captured here, at mount time, so the
-      // injected callback reads a value that cannot change under it.
+      // The static probe of `tools`, off the plugin ROOT ctx — a property read,
+      // legal because `tools` IS in the root fibre's inject list (unlike
+      // `subagents`; see {@link SubagentHostContext.get}). Captured here, at
+      // mount time, so the injected callback reads a value that cannot change
+      // under it.
       const tools = ctx.tools
 
       /**
@@ -381,29 +398,59 @@ export function createSubagentHost(parts: {
               }
       }
 
-      try {
-        ctx.inject?.(INJECT_KEYS, (injected: SubagentInjectedContext) => {
-          register(injected.subagents)
-          // The callback's return value is the effect's disposer: the host tears
-          // the registration down when the injected fibre goes away, which is
-          // SUB-06's unload path.
-          return () => {
-            release?.()
-            release = undefined
-            status = { state: 'pending', reason: { code: 'awaiting-injection' } }
-          }
-        })
-      } catch (error) {
-        // The host refused the injection. Stay `pending` rather than `failed`:
-        // nothing about the operator's configuration is wrong.
-        status = { state: 'pending', reason: { code: 'awaiting-injection' } }
-        log('[cherry-remote] subagents 注入不可用；子智能体子系统保持 pending', error)
-      }
+      // The service probe, and the ONLY legal way to make it: `ctx.get`, never a
+      // property read (see {@link SubagentHostContext.get} — the property read
+      // throws on a real cordis ctx, which is how issue #7 shipped broken).
+      const present = asSubagentsService(ctx.get?.('subagents'))
 
-      return () => {
+      const teardown = (): void => {
         release?.()
         release = undefined
       }
+
+      if (typeof ctx.inject === 'function') {
+        // A PROVISIONAL verdict, never a latch. `ctx.inject` is what makes the
+        // service reach us, and cordis fires it for a service whose plugin is
+        // applied LATER — so an absent one here is "not yet" as much as "never",
+        // and `register` overwrites this the moment the injection lands.
+        if (present === undefined) status = { state: 'unsupported', reason: { code: 'unsupported' } }
+        try {
+          ctx.inject(INJECT_KEYS, (injected: SubagentInjectedContext) => {
+            register(injected.subagents)
+            // The callback's return value is the effect's disposer: the host
+            // tears the registration down when the injected fibre goes away,
+            // which is SUB-06's unload path.
+            return () => {
+              teardown()
+              status = { state: 'pending', reason: { code: 'awaiting-injection' } }
+            }
+          })
+          return teardown
+        } catch (error) {
+          // The host refused the injection. That is never `failed` — nothing
+          // about the operator's configuration is wrong — and it is not
+          // `pending` either: no injection is coming, so the unGATED lookup is
+          // all there will ever be.
+          log('[cherry-remote] subagents 注入被宿主拒绝；改用 ctx.get 的静态结果', error)
+        }
+      }
+
+      // No dynamic injection at all, or the host refused it. Either way the
+      // unGATED lookup is the only source there will ever be, so "absent" here
+      // IS permanent — the one place `unsupported` is a verdict, not a guess.
+      if (present === undefined) {
+        status = { state: 'unsupported', reason: { code: 'unsupported' } }
+        // The CODE, not a second copy of the sentence the page shows: a log line
+        // that paraphrases the panel's wording is one more place for the two to
+        // disagree, and an operator reading this log has the page open anyway.
+        log('[cherry-remote] 子智能体子系统不可用', status.reason)
+        return () => {}
+      }
+      // A host that fired the callback and THEN threw would otherwise register
+      // twice, which the service answers with a duplicate-name refusal — a
+      // `failed` status over a seam that works.
+      if (release === undefined) register(present)
+      return teardown
     },
 
     status(): SubagentSubsystemStatus {

@@ -11851,6 +11851,18 @@ function createCherrySubagentTool(parts) {
 }
 //#endregion
 //#region src/subagentHost.ts
+/**
+* Narrows the untyped `ctx.get` answer.
+*
+* A service without `registerProvider` is not the seam we consume, and reading
+* its methods would crash on a shape we only guessed at; anything else reads as
+* "not here (yet)". The interface's one REQUIRED member is therefore the whole
+* test.
+*/
+function asSubagentsService(value) {
+	if (typeof value !== "object" || value === null) return void 0;
+	return typeof value.registerProvider === "function" ? value : void 0;
+}
 /** The injection key. ONE key, so the subsystem cannot be held pending by another. */
 const INJECT_KEYS$1 = ["subagents"];
 /**
@@ -11881,14 +11893,6 @@ function createSubagentHost(parts) {
 		mount(ctx) {
 			if (resolution.kind === "disabled") return () => {};
 			if (resolution.kind === "invalid") return () => {};
-			if (ctx.subagents === void 0) {
-				status = {
-					state: "unsupported",
-					reason: { code: "unsupported" }
-				};
-				log("[cherry-remote] 子智能体子系统不可用", status.reason);
-				return () => {};
-			}
 			const tools = ctx.tools;
 			/**
 			* Register the model-facing tool against the service we just registered a
@@ -11980,29 +11984,42 @@ function createSubagentHost(parts) {
 					}
 				};
 			};
-			try {
-				ctx.inject?.(INJECT_KEYS$1, (injected) => {
-					register(injected.subagents);
-					return () => {
-						release?.();
-						release = void 0;
-						status = {
-							state: "pending",
-							reason: { code: "awaiting-injection" }
-						};
-					};
-				});
-			} catch (error) {
-				status = {
-					state: "pending",
-					reason: { code: "awaiting-injection" }
-				};
-				log("[cherry-remote] subagents 注入不可用；子智能体子系统保持 pending", error);
-			}
-			return () => {
+			const present = asSubagentsService(ctx.get?.("subagents"));
+			const teardown = () => {
 				release?.();
 				release = void 0;
 			};
+			if (typeof ctx.inject === "function") {
+				if (present === void 0) status = {
+					state: "unsupported",
+					reason: { code: "unsupported" }
+				};
+				try {
+					ctx.inject(INJECT_KEYS$1, (injected) => {
+						register(injected.subagents);
+						return () => {
+							teardown();
+							status = {
+								state: "pending",
+								reason: { code: "awaiting-injection" }
+							};
+						};
+					});
+					return teardown;
+				} catch (error) {
+					log("[cherry-remote] subagents 注入被宿主拒绝；改用 ctx.get 的静态结果", error);
+				}
+			}
+			if (present === void 0) {
+				status = {
+					state: "unsupported",
+					reason: { code: "unsupported" }
+				};
+				log("[cherry-remote] 子智能体子系统不可用", status.reason);
+				return () => {};
+			}
+			if (release === void 0) register(present);
+			return teardown;
 		},
 		status() {
 			return status;
