@@ -4772,10 +4772,12 @@ export class CherryToolEngine {
       return { status: 'aborted', text: partial }
     }
 
-    // A timeout (or any other non-terminal answer) still has to stop the child:
-    // the parent has stopped waiting, and a run left alive on the desktop is
-    // work nobody will read.
-    if (answer['status'] === 'timeout') {
+    // A timeout or a LOST SUBSCRIPTION still has to stop the child: in both the
+    // parent has stopped OBSERVING the run, and a child left alive on the
+    // desktop is work nobody will read. Those two are the only answers that can
+    // leave one running — the four terminal statuses have already ended it, and
+    // a rejected RECEIPT never started one.
+    if (answer['status'] === 'timeout' || answer['status'] === 'subscription-lost') {
       await this.#cancelRun(
         connection,
         record.deviceId,
@@ -4847,6 +4849,40 @@ export class CherryToolEngine {
         ? { status: 'error', text: '', diagnostic: 'the child completed but produced no text' }
         : { status: 'completed', text }
     }
+    // A RECEIPT, not a run. `#runOnce` hands the peer's refusal back untouched
+    // because there is nothing to wait for, so the generic branch below would
+    // invent a run ("the run ended rejected") and drop the reason — the only
+    // thing that says whether to retry, fix the target, or free the ledger.
+    if (status === 'rejected') {
+      const refusal = isRecord(answer['error']) ? answer['error'] : undefined
+      const reason = refusal === undefined ? undefined : optionalString(refusal['reason'])
+      const message = refusal === undefined ? undefined : optionalString(refusal['message'])
+      const detail =
+        reason === undefined
+          ? 'the peer refused the delegation; no child was started'
+          : `the peer refused the delegation (${reason}); no child was started`
+      return {
+        status: 'error',
+        text: '',
+        diagnostic: message === undefined ? detail : `${detail} — ${message}`,
+      }
+    }
+    // The run's outcome was never OBSERVED. Reporting a terminal here — the old
+    // `the run ended subscription-lost` — states as fact something this side
+    // cannot know, and drops the two routes that do work.
+    if (status === 'subscription-lost') {
+      const reason = optionalString(answer['reason'])
+      return {
+        status: 'error',
+        text: '',
+        // The peer's own reason in parentheses, never paraphrased: the guidance
+        // that follows already says what a lost subscription IS, so repeating it
+        // here would be two sentences for one fact.
+        diagnostic:
+          `the delegation could not observe the run${reason === undefined ? '' : ` (${reason})`}. ` +
+          `The child may still be running. ${SUBSCRIPTION_LOST_GUIDANCE}`,
+      }
+    }
     // `failed` / `interrupted` / `cancelled`, and anything the peer invents.
     const error = isRecord(answer['executionError']) ? answer['executionError'] : undefined
     const reason = error === undefined ? undefined : optionalString(error['reason'])
@@ -4902,14 +4938,22 @@ export class CherryToolEngine {
     sessionId: string,
     observedExecutionId?: string,
   ): Promise<void> {
-    await this.#ensureSubscription(deviceId, sessionId)
-    const subscriptions = this.#deps.subs(deviceId)
     // The OBSERVED id wins when there is one: a delegation knows which run it
     // started from the receipt, and the cache only learns an execution when its
     // first event arrives — so a run cancelled moments after it began would
     // otherwise look like a session with nothing to cancel.
-    const expectedExecutionId =
-      observedExecutionId ?? (await this.#activeExecutionId(connection, subscriptions, deviceId, sessionId))
+    //
+    // And a caller that already knows which run to stop needs NO subscription:
+    // `#ensureSubscription` is what makes the cache able to NAME a run, which is
+    // the fallback's problem alone. Requiring it unconditionally made the cancel
+    // die on the very fault it was recovering from — a lost subscription is one
+    // of the two answers that ask for a cancel, so the child was never stopped.
+    let expectedExecutionId = observedExecutionId
+    if (expectedExecutionId === undefined) {
+      await this.#ensureSubscription(deviceId, sessionId)
+      const subscriptions = this.#deps.subs(deviceId)
+      expectedExecutionId = await this.#activeExecutionId(connection, subscriptions, deviceId, sessionId)
+    }
     if (expectedExecutionId === undefined) return
     await this.#command(connection, CANCEL_METHOD, { commandId: randomUUID(), sessionId, expectedExecutionId })
   }

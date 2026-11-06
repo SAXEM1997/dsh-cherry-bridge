@@ -9096,7 +9096,7 @@ var CherryToolEngine = class {
 				text: await this.#partialText(connection, subscriptions, sessionId).catch(() => "")
 			};
 		}
-		if (answer["status"] === "timeout") await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer["executionId"]) ?? observedExecutionId).catch(() => {});
+		if (answer["status"] === "timeout" || answer["status"] === "subscription-lost") await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer["executionId"]) ?? observedExecutionId).catch(() => {});
 		return this.#foldDelegation(answer, {
 			ceilingHit,
 			maxInteractionAbandons: input.maxInteractionAbandons,
@@ -9148,6 +9148,25 @@ var CherryToolEngine = class {
 			status: "completed",
 			text
 		};
+		if (status === "rejected") {
+			const refusal = isRecord$1(answer["error"]) ? answer["error"] : void 0;
+			const reason = refusal === void 0 ? void 0 : optionalString(refusal["reason"]);
+			const message = refusal === void 0 ? void 0 : optionalString(refusal["message"]);
+			const detail = reason === void 0 ? "the peer refused the delegation; no child was started" : `the peer refused the delegation (${reason}); no child was started`;
+			return {
+				status: "error",
+				text: "",
+				diagnostic: message === void 0 ? detail : `${detail} — ${message}`
+			};
+		}
+		if (status === "subscription-lost") {
+			const reason = optionalString(answer["reason"]);
+			return {
+				status: "error",
+				text: "",
+				diagnostic: `the delegation could not observe the run${reason === void 0 ? "" : ` (${reason})`}. The child may still be running. ${SUBSCRIPTION_LOST_GUIDANCE}`
+			};
+		}
 		const error = isRecord$1(answer["executionError"]) ? answer["executionError"] : void 0;
 		const reason = error === void 0 ? void 0 : optionalString(error["reason"]);
 		const message = error === void 0 ? void 0 : optionalString(error["message"]);
@@ -9190,9 +9209,12 @@ var CherryToolEngine = class {
 	* inventing an id would earn `execution-mismatch` from the peer's fencing.
 	*/
 	async #cancelRun(connection, deviceId, sessionId, observedExecutionId) {
-		await this.#ensureSubscription(deviceId, sessionId);
-		const subscriptions = this.#deps.subs(deviceId);
-		const expectedExecutionId = observedExecutionId ?? await this.#activeExecutionId(connection, subscriptions, deviceId, sessionId);
+		let expectedExecutionId = observedExecutionId;
+		if (expectedExecutionId === void 0) {
+			await this.#ensureSubscription(deviceId, sessionId);
+			const subscriptions = this.#deps.subs(deviceId);
+			expectedExecutionId = await this.#activeExecutionId(connection, subscriptions, deviceId, sessionId);
+		}
 		if (expectedExecutionId === void 0) return;
 		await this.#command(connection, CANCEL_METHOD, {
 			commandId: randomUUID(),
