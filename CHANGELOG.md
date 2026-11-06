@@ -19,94 +19,112 @@ who never open this file.
 
 ## v0.3.0 (2026-11-06)
 
-The subagent feature: a DSH session can hand one self-contained task to a Cherry
-Studio agent on a paired desktop, and the settings page grows a block that turns
-it on. It follows the delegation shape of DSH's own `subagent` — the same pattern
-as Claude Code / Codex subagents, where a task goes to a child agent and the
-result comes back as text — with the child running on a Cherry Studio desktop
-agent instead. The desktop range is unchanged (**2.1.4 – 2.1.10**) and no protocol
-version moved. No existing tool was renamed and no required argument was added,
-but two shapes DID change and are listed under **Changed** below: eight tools'
-parameter schemas lost keywords the host never enforced, and `cherry_send` /
-`cherry_wait` terminal answers gained an optional `executionError`. The new surface is a tool
-registration, a settings block, one HTTP route and a config document, and the
-tool drives only peer RPCs the earlier tools already used. The minor digit is the
-honest one: a fifteenth `cherry_*` tool is new capability, not hardening.
+**中文**
 
-### Experimental — off by default
+本版新增第十五个工具 `cherry_subagent`：DSH 会话把一个自包含任务交给已配对桌面上的
+Cherry Studio agent，工具立即返回，子运行的终态与文本随后由运行时通知带回。实现方式参照
+DSH 官方 `subagent` 的委派（与 Claude Code / Codex 的子智能体同一路数——任务交给子 agent、
+结果以文本回到父侧），**执行端换成 Cherry Studio 桌面端上的 agent**。该能力**实验性、默认
+关闭**，打开后需重启 DSH 生效；它跨了 DSH 与 Cherry Studio 两个本插件不控制的系统，接口
+与行为都可能变。桌面端兼容范围不变（**2.1.4 – 2.1.10**），协议版本未动，没有工具改名、
+没有新增必填参数，两处形状变化列在「变更」里。范围如实说明：发送路径与**一次委派**都在真机
+上跑过（工具立即返回、子运行终态与文本带回、子侧看不到父对话）；失败分类、子拒绝、关掉开关
+后消失三条仍只有环回证据，`docs/e2e-checklist.md` §H 的其余步骤尚未走查。
 
-**The headline feature is experimental and off by default.** It spans two systems
-this plugin does not control — DSH's subagent seam and Cherry Studio's own
-sessions and permission model — so its interface and behaviour may change.
-Turning it on needs a target device, agent and workspace, and a save takes effect
-when DSH restarts: the tool is registered during assembly and the plugin does not
-hot-reload. Ideas and bug reports are welcome:
-<https://github.com/SAXEM1997/dsh-cherry-bridge/issues>
+**新增**
 
-- `cherry_subagent` — the fifteenth tool. It starts a run on the configured
-  desktop and returns at once; the child's answer arrives as the run's completion
-  notification. The child does not see the parent conversation and accepts no
-  follow-up messages, so everything it needs has to be in the prompt.
-- **Settings page** — an “Experimental subagent” block: the switch (off), the
-  target fields, the timeout, the current state with its refusal reasons
-  translated from codes (Chinese and English), a notice when the saved document
-  differs from the running assembly, and the feedback link. `cwdMode` and
-  `routes` are shown read-only; `routes` overrides the device and workspace per
-  directory prefix.
-- `GET` / `PUT /cherry-remote/api/subagent` — the configuration document lives in
-  `<dataDir>/subagent.json` (`0600`, atomic write, monotonic `revision`), with
-  `expectedRevision` as an optimistic lock: a save against a stale revision is
-  refused with `409`, like `PUT /scope`.
-- **Config key `subagent`** — the profile seed for the same document; once the
-  page saves one, the document wins.
+- #235 转写 `ctx.subagents` 座席，立起 provider 骨架。
+- #240 provider `start()` 走通全路径，并加上注册开关。
+- #241 注册 `cherry_subagent` 的工具面。
+- #242 设置页新增「实验性子智能体」区块，默认关闭。
+- #243 README 一对与发布说明写明这是实验性功能。
+- #264 新增 `GET /cherry-remote/api/subagent/targets`，供设置页取候选。
+- #266 新增 `subagentTargets` 纯模块：候选状态到下拉选项的唯一规则。
+- #267 面板的三个目标字段改为带名字的下拉。
+- #268 对端没有系统工作区时，设置页当场说明并禁用该选项。
+- #270 把「仿 DSH 官方 subagent」的定位写进面板说明、插件行与 README 开头。
+- #272 目标值按「读取它的设备」判定是否仍然适用，修掉「下一个下拉选了不生效」。
 
-The **send** path was exercised on a real desktop during the design work (three
-concurrent probes, one task each). The **delegation** path is verified on
-loopback only: turning the experiment on crashed during assembly until the probe
-fix listed under **Fixed**, so no real-desktop delegation had ever run. `docs/e2e-checklist.md`
-§H is the walk that closes this, and it has not been performed for 0.3.0. Its
-limits are stated rather than implied: one-shot sessions, no sandbox
-inheritance, the child may decline the task, and the concurrency ceiling is
-unverified above three.
+**变更**
 
-### Changed
+- #227 每个工具的参数 schema 收进宿主真正校验的子集：八个工具的注解式关键字改写成描述文本，边界仍由解析器执行。
+- #236 抽出 `runOnce`，作为「发送并折叠回执」的共享接缝。
 
-- `cherry_send` / `cherry_wait` terminal answers gained an optional
-  `executionError` `{reason, message?}` carrying the peer's own failure
-  classification, reduced to those two fields — the payload's `details` and
-  `failure` blobs never reach a model's context. It rides whatever the peer
-  attached to a TERMINAL event, so a successful run has none in practice; the
-  plugin does not add one.
-- Every tool's parameter schema now stays inside the subset the host's value
-  validator actually enforces (#219). Eight of the fourteen carried keywords the
-  host reads nothing of: `minimum`/`maximum` on seven numeric faces, `maxLength`
-  on six token/text faces (four of them through one shared cursor parameter), and
-  an object-valued `additionalProperties` on `cherry_respond`'s `answers` — eight
-  tools in all, several carrying more than one kind. Those keywords were
-  annotations rather than enforcement. The bounds moved into the descriptions
-  (what a model reads); the parsers still enforce the ceilings.
+**修复**
 
-### Fixed
+- #238 两个 collector 收容，运行结果不再因抛错变成 rejection。
+- #247 `ctx.subagents` 探针改用 unGATED 查找，打开开关不再让 `apply` 抛错。
+- #249 被拒绝的回执与丢失的订阅都不再报成「运行结束」。
+- #252 清空超时框现在真的清掉字段。
 
-- A delegation no longer reports a peer REFUSAL or a lost subscription as a
-  finished run (#248). The first never started a child, so "the run ended
-  rejected" invented one and dropped the peer's reason; the second's outcome is
-  unknowable, and the child is now cancelled rather than left running with
-  nobody reading it.
-- Turning the experiment on no longer crashes the assembly (#246): the
-  `subagents` probe read an undeclared service off the plugin root context,
-  which throws on a real cordis host, so enabling it took the fourteen tools and
-  the settings page down with it.
-- A throw from either collector inside `settleRunResult` no longer turns a run
-  result into a rejection (#237). Both collectors are contained and report
-  through the run's own error sink, so the parent gets a settled run either way.
+**文档与测试**
 
-### Documentation
+- #225 e2e 清单记录 0.2.3 的机读结果。
+- #226 说明降级带来的延迟收益在本机测不出来。
+- #244 钉住两条回执回声，删掉一个走不到的路由守卫。
+- #245 测试里的 registry 夹具收拢到一处。
+- #253 说明 STICKY 软终态那条钉为什么当前测不到。
+- #255 0.3.0 发布说明与 README 一对如实化，e2e 清单补上 §H 走查。
+- #274 e2e 清单记录 0.3.0 的真机走查结果（§H 步骤 1–3）。
 
-- `docs/e2e-checklist.md` records the 0.2.3 machine-verifiable results, and why
-  the demotion's latency gain cannot be measured on this machine. It also gains
-  **§H**, the real-desktop walk for the experiment; the 0.3.0 record section is
-  filled in by that walk, not in advance.
+---
+
+**English**
+
+This release adds a fifteenth tool, `cherry_subagent`: a DSH session hands one
+self-contained task to a Cherry Studio agent on a paired desktop, the tool
+returns at once, and the run's terminal state and text arrive as a runtime
+notification. It follows the delegation shape of DSH's own `subagent` — the same
+pattern as Claude Code / Codex subagents, where a task goes to a child agent and
+the result comes back as text — with **the child running on a Cherry Studio
+desktop agent instead**. The capability is **experimental and off by default**;
+turning it on takes effect when DSH restarts. It spans two systems this plugin
+does not control, DSH and Cherry Studio, so its interface and behaviour may
+change. The desktop range is unchanged (**2.1.4 – 2.1.10**), no protocol version
+moved, no tool was renamed and no required argument was added; two shape changes
+are listed under **Changed**. Stated as fact rather than implied: the send path
+and **one delegation** have run on a real desktop (the tool returned at once, the
+run's terminal state and text came back, and the child could not see the parent
+conversation); the failure classification, a child declining the task, and the
+tool disappearing when the switch is turned off still rest on loopback evidence
+alone, and the remaining steps of `docs/e2e-checklist.md` §H have not been
+performed.
+
+**Added**
+
+- #235 Transcribe the `ctx.subagents` seam and stand up the provider skeleton.
+- #240 Run `start()` on the provider's full path, behind a registration switch.
+- #241 Register the `cherry_subagent` tool face.
+- #242 Add the “Experimental subagent” block to the settings page, off by default.
+- #243 Say it is experimental in the README pair and the release notes.
+- #264 Add `GET /cherry-remote/api/subagent/targets` as the settings page's candidate source.
+- #266 Add the `subagentTargets` module: the one rule from candidate state to drop-down options.
+- #267 Turn the panel's three target fields into named drop-downs.
+- #268 Say so, and disable the option, when the peer has no system workspace.
+- #270 Put the “DSH's own subagent, Cherry Studio child” framing into the panel, the plugin row and the READMEs.
+- #272 Scope a target value to the device it was read under, fixing “the next drop-down does not take effect”.
+
+**Changed**
+
+- #227 Keep every tool's parameter schema inside the subset the host actually enforces: eight tools' annotation-only keywords became description text, with the bounds still enforced by the parsers.
+- #236 Extract `runOnce` as the shared send-and-fold-receipt seam.
+
+**Fixed**
+
+- #238 Contain the two collectors, so a run result never turns into a rejection.
+- #247 Probe `ctx.subagents` through the unGATED lookup, so enabling the switch no longer throws during `apply`.
+- #249 A rejected receipt and a lost subscription are no longer reported as a finished run.
+- #252 Clearing the timeout box now really clears the field.
+
+**Documentation and tests**
+
+- #225 Record the 0.2.3 machine-verifiable results in the e2e checklist.
+- #226 State why the demotion's latency gain cannot be measured on this machine.
+- #244 Pin the two receipt echoes and delete an unreachable route guard.
+- #245 Keep the registry fixture in one place.
+- #253 Say why the STICKY soft-terminal pin cannot be tested today.
+- #255 Make the 0.3.0 release notes and the README pair truthful, and add §H to the e2e checklist.
+- #274 Record the 0.3.0 real-desktop walk results in the e2e checklist (§H steps 1–3).
 
 ## v0.2.3 (2026-11-05)
 
