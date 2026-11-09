@@ -17,6 +17,68 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.3.1 (2026-11-09)
+
+**中文**
+
+本版把 0.3.0 留下的两处缺口补上：`routes` 可以在设置页**按行编辑**（每条 = 目录前缀 + 可空的
+设备与工作区），`cwdMode` 只接受 `isolated`——写 `shared` 会被拒绝并说明原因，而在此之前它能
+通过校验、保存成功，却没有任何代码读它。同批把 0.3.0 的真机走查记录补进
+`docs/e2e-checklist.md`：§H-3 补齐通过（桌面端真的新建了会话、标题取自任务、子侧看不到父对话），
+§H-5 部分通过（子拒绝作为一次正常完成回来），§H-4（失败分类）仍只有环回证据，勾选框保持未勾。
+桌面端兼容范围不变（**2.1.4 – 2.1.10**），协议版本未动，工具数量仍是 15，配置形状未变。
+
+关于版本号：`routes` 编辑严格说属于新增能力，按本文件约定的「minor 承载新能力」更该发 0.4.0。
+并入补丁号的理由是它只补完 0.3.0 已声明的能力——`routes` 的解析、校验与保存从 0.3.0 起就存在，
+缺的只是界面入口，协议与配置形状都没有变化。
+
+**新增**
+
+- #302 设置页的 `routes` 改为按行编辑：增删行、三个字段可填，留空的设备或工作区沿用上面的目标。
+
+**修复**
+
+- #300 `cwdMode: shared` 改为拒绝并给出原因；它此前能通过校验并保存，但没有任何代码读取它。
+
+**文档与测试**
+
+- #304 补记 0.3.0 的真机走查：§H-3 通过、§H-5 部分通过、§H-4 仍未走查。
+
+**English**
+
+This release closes the two gaps 0.3.0 left open. `routes` is now **edited row by row**
+on the settings page — each row is a directory prefix plus an optional device and
+workspace — and `cwdMode` accepts only `isolated`: writing `shared` is refused with a
+sentence saying why, where it previously validated, saved, and then did nothing because
+no code read it. The same batch records the 0.3.0 walk on the shipped package in
+`docs/e2e-checklist.md`: §H-3 is now complete (a real desktop session was created, titled
+from the task, with no view of the parent conversation), §H-5 is partial (a refusal comes
+back as a normal completion), and §H-4 (failure classification) still has loopback
+evidence only — its box stays unticked. The desktop range is unchanged
+(**2.1.4 – 2.1.10**), no protocol version moved, there are still 15 tools, and the config
+shape is unchanged.
+
+On the version number: the `routes` editor is arguably a new capability, and this file's
+own convention would make that a 0.4.0 minor. It ships as a patch because it only
+completes a capability 0.3.0 already declared — `routes` has been parsed, validated and
+saved since 0.3.0, and only the editing surface was missing; neither the protocol nor the
+config shape changed.
+
+**Added**
+
+- #302 `routes` is edited row by row on the settings page: add and remove rows, fill the
+  three fields, and a blank device or workspace falls back to the target above.
+
+**Fixed**
+
+- #300 `cwdMode: shared` is refused with a reason; it previously validated and saved while
+  nothing read it.
+
+**Docs and tests**
+
+- #304 record the 0.3.0 walk on the shipped package: §H-3 passes, §H-5 partial, §H-4 still
+  unwalked.
+
 ## v0.3.0 (2026-11-09)
 
 **中文**
