@@ -682,6 +682,42 @@ describe('pairing wizard', () => {
 // ② Device cards — five-state light + four actions
 // ---------------------------------------------------------------------------
 
+describe('#287 the page leads with what is CONNECTED', () => {
+  it('①a the device list comes before the pairing wizard', async () => {
+    // What an operator opens this page to check is what is paired right now.
+    // The list used to sit under the wizard, the scope panel and the experiment,
+    // so answering that question meant scrolling past three sections that are
+    // about CHANGING something.
+    await renderWithDevice()
+    const devices = screen.getByRole('heading', { name: '已配对设备' })
+    const wizard = screen.getByRole('heading', { name: '配对向导' })
+    expect(
+      devices.compareDocumentPosition(wizard) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+    // Not merely "before the wizard" — the FIRST panel on the page.
+    expect(document.querySelector('section.cherry-panel')?.getAttribute('aria-labelledby')).toBe(
+      'cherry-devices-title',
+    )
+  })
+
+  it('①b a failed device read keeps its alert beside the list', async () => {
+    // The alert explains THIS read, so it has to travel with the section when
+    // the section moves. Asserting only the heading order would leave the alert
+    // free to drift back down beside the wizard.
+    const harness = installFetch([
+      ['GET', '/cherry-remote/api/devices', jsonResponse(500, { error: 'boom', message: 'read failed' })],
+    ])
+    render(
+      createElement(App, { eventSourceFactory: harness.eventSourceFactory, codeLifetimeMs: 60_000 }),
+    )
+    const alert = await screen.findByRole('alert')
+    const devices = screen.getByRole('heading', { name: '已配对设备' })
+    expect(
+      alert.compareDocumentPosition(devices) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+})
+
 describe('device card status light', () => {
   const states = [
     ['connected', '已连接'],

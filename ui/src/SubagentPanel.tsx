@@ -798,16 +798,16 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
               therefore comes FIRST, the heading names the document being
               judged, and the problems stay visible: they are the reason the
               restart is worth doing. */}
-          <h4>
-            {data.pendingRestart
-              ? t('subagent.status.heading.pending')
-              : t('subagent.status.heading')}
-          </h4>
           {data.pendingRestart && (
             <p className="cherry-notice" role="status">
               {t('subagent.pendingRestart')}
             </p>
           )}
+          <h4>
+            {data.pendingRestart
+              ? t('subagent.status.heading.pending')
+              : t('subagent.status.heading')}
+          </h4>
           <StatusBlock status={data.status} />
           <p className="cherry-hint">
             {data.source === 'file' ? t('subagent.source.file') : t('subagent.source.config')}
@@ -837,212 +837,218 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                 {t('subagent.enabled')}
               </label>
 
-              <TargetSelect
-                label={t('subagent.device')}
-                field={deviceField}
-                labels={targetLabels}
-                disabled={readOnly}
-                onChange={(value) => {
-                  if (value === MANUAL_TARGET_VALUE) {
-                    setManual('device')
-                    return
-                  }
-                  setManual(undefined)
-                  // ONLY the device moves here. The two downstream values stop
-                  // APPLYING, because their scopes still name the old device —
-                  // and a value scoped to a device the operator returns to starts
-                  // applying again (#271).
-                  setDraft({ ...draft, device: value })
-                  setCommittedDevice(value.trim())
-                }}
-              />
-              {manual === 'device' && (
-                <label className="cherry-subagent-field">
-                  {t('subagent.deviceManual')}
-                  <input
-                    type="text"
-                    value={draft.device}
-                    disabled={readOnly}
-                    onChange={(event) => setDraft({ ...draft, device: event.target.value })}
-                    // Committed on the way OUT, not per keystroke: every
-                    // keystroke would otherwise be a real walk of the peer.
-                    onBlur={(event) => setCommittedDevice(event.target.value.trim())}
-                    onKeyDown={(event) => {
-                      if (event.key === 'Enter') setCommittedDevice(event.currentTarget.value.trim())
-                    }}
-                  />
-                </label>
-              )}
-              <p className="cherry-hint">{t('subagent.deviceHint')}</p>
-              {agentInvalidated && (
-                <p className="cherry-hint">{t('subagent.targets.reselectAgent')}</p>
-              )}
-              {/* The system workspace has NO id — it is the protocol's
-                  `{ kind: 'system' }` branch and never appears in `items` — so
-                  it stays a RADIO, not a list entry (#263). */}
-              {systemWorkspace === false && (
-                <p className="cherry-hint">{t('subagent.workspace.systemUnavailable')}</p>
-              )}
-              {systemWorkspace === false && draft.workspace === 'system' && (
-                // Shown, never rewritten: the operator chose this, and a page
-                // that quietly changed it would be editing a document nobody
-                // asked it to edit.
-                <p className="cherry-hint">{t('subagent.workspace.systemConflict')}</p>
-              )}
-
-              <TargetSelect
-                label={t('subagent.agentId')}
-                field={agentField}
-                labels={targetLabels}
-                disabled={readOnly}
-                onChange={(value) => {
-                  if (value === MANUAL_TARGET_VALUE) {
-                    setManual('agent')
-                    return
-                  }
-                  setManual(undefined)
-                  // The pick is scoped to the device it came from (#271). NOT a
-                  // clear of the workspace: the scope comparison below already
-                  // makes the old workspace stop applying, and it comes back if
-                  // the operator puts this agent back.
-                  setDraft({ ...draft, agentId: value, agentScope: draft.device.trim() })
-                }}
-              />
-              {manual === 'agent' && (
-                <label className="cherry-subagent-field">
-                  {t('subagent.agentIdManual')}
-                  <input
-                    type="text"
-                    value={draft.agentId}
-                    disabled={readOnly}
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        agentId: event.target.value,
-                        agentScope: draft.device.trim(),
-                      })
-                    }
-                  />
-                </label>
-              )}
-              {agentProblem !== undefined && (
-                <p className="cherry-hint">{targetProblemText(t, agentProblem)}</p>
-              )}
-              {agentProblem === undefined && draft.device.trim() === '' && (
-                <p className="cherry-hint">{t('subagent.targets.pickDevice')}</p>
-              )}
-              {agentProblem === undefined && draft.device.trim() !== '' && agentCandidates.kind === 'loading' && (
-                <p className="cherry-hint">{t('subagent.targets.loading')}</p>
-              )}
-              {agentProblem === undefined && draft.device.trim() !== '' && agentCandidates.kind === 'ready' && agentCandidates.items.length === 0 && (
-                <p className="cherry-hint">{t('subagent.targets.empty')}</p>
-              )}
-              {truncatedLists !== undefined && truncatedLists.length > 0 && (
-                <p className="cherry-hint">
-                  {t('subagent.targets.truncated', { lists: truncatedLists.join(t('list.separator')) })}
-                </p>
-              )}
-
-              <fieldset className="cherry-scope-options">
-                <legend>{t('subagent.workspace.legend')}</legend>
-                <label className="cherry-subagent-check">
-                  <input
-                    type="radio"
-                    name="subagent-workspace"
-                    checked={draft.workspace === 'registry'}
-                    disabled={readOnly}
-                    onChange={() => setDraft({ ...draft, workspace: 'registry' })}
-                  />
-                  {t('subagent.workspace.registry')}
-                </label>
-                <label className="cherry-subagent-check">
-                  <input
-                    type="radio"
-                    name="subagent-workspace"
-                    checked={draft.workspace === 'system'}
-                    // Disabled only on a KNOWN absence (#263). A failed read
-                    // leaves it usable, because "we could not ask" is not "the
-                    // peer has none".
-                    disabled={readOnly || systemWorkspace === false}
-                    onChange={() => setDraft({ ...draft, workspace: 'system' })}
-                  />
-                  {t('subagent.workspace.system')}
-                </label>
-              </fieldset>
-              {draft.workspace === 'registry' && (
+              {/* #287: while the switch is OFF the section shows only the
+                  switch. Rendering-only — the draft keeps every value, so
+                  turning it back on restores exactly what was there. */}
+              {draft.enabled && (
                 <>
-                  <TargetSelect
-                    label={t('subagent.workspaceId')}
-                    field={workspaceField}
-                    labels={targetLabels}
-                    disabled={readOnly}
-                    onChange={(value) => {
-                      if (value === MANUAL_TARGET_VALUE) {
-                        setManual('workspace')
-                        return
+                <TargetSelect
+                  label={t('subagent.device')}
+                  field={deviceField}
+                  labels={targetLabels}
+                  disabled={readOnly}
+                  onChange={(value) => {
+                    if (value === MANUAL_TARGET_VALUE) {
+                      setManual('device')
+                      return
+                    }
+                    setManual(undefined)
+                    // ONLY the device moves here. The two downstream values stop
+                    // APPLYING, because their scopes still name the old device —
+                    // and a value scoped to a device the operator returns to starts
+                    // applying again (#271).
+                    setDraft({ ...draft, device: value })
+                    setCommittedDevice(value.trim())
+                  }}
+                />
+                {manual === 'device' && (
+                  <label className="cherry-subagent-field">
+                    {t('subagent.deviceManual')}
+                    <input
+                      type="text"
+                      value={draft.device}
+                      disabled={readOnly}
+                      onChange={(event) => setDraft({ ...draft, device: event.target.value })}
+                      // Committed on the way OUT, not per keystroke: every
+                      // keystroke would otherwise be a real walk of the peer.
+                      onBlur={(event) => setCommittedDevice(event.target.value.trim())}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') setCommittedDevice(event.currentTarget.value.trim())
+                      }}
+                    />
+                  </label>
+                )}
+                <p className="cherry-hint">{t('subagent.deviceHint')}</p>
+                {agentInvalidated && (
+                  <p className="cherry-hint">{t('subagent.targets.reselectAgent')}</p>
+                )}
+                {/* The system workspace has NO id — it is the protocol's
+                    `{ kind: 'system' }` branch and never appears in `items` — so
+                    it stays a RADIO, not a list entry (#263). */}
+                {systemWorkspace === false && (
+                  <p className="cherry-hint">{t('subagent.workspace.systemUnavailable')}</p>
+                )}
+                {systemWorkspace === false && draft.workspace === 'system' && (
+                  // Shown, never rewritten: the operator chose this, and a page
+                  // that quietly changed it would be editing a document nobody
+                  // asked it to edit.
+                  <p className="cherry-hint">{t('subagent.workspace.systemConflict')}</p>
+                )}
+
+                <TargetSelect
+                  label={t('subagent.agentId')}
+                  field={agentField}
+                  labels={targetLabels}
+                  disabled={readOnly}
+                  onChange={(value) => {
+                    if (value === MANUAL_TARGET_VALUE) {
+                      setManual('agent')
+                      return
+                    }
+                    setManual(undefined)
+                    // The pick is scoped to the device it came from (#271). NOT a
+                    // clear of the workspace: the scope comparison below already
+                    // makes the old workspace stop applying, and it comes back if
+                    // the operator puts this agent back.
+                    setDraft({ ...draft, agentId: value, agentScope: draft.device.trim() })
+                  }}
+                />
+                {manual === 'agent' && (
+                  <label className="cherry-subagent-field">
+                    {t('subagent.agentIdManual')}
+                    <input
+                      type="text"
+                      value={draft.agentId}
+                      disabled={readOnly}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          agentId: event.target.value,
+                          agentScope: draft.device.trim(),
+                        })
                       }
-                      setManual(undefined)
-                      setDraft({
-                        ...draft,
-                        workspaceId: value,
-                        workspaceScope: workspaceScopeOf(draft.device.trim(), draft.agentId.trim()),
-                      })
-                    }}
-                  />
-                  {manual === 'workspace' && (
-                    <label className="cherry-subagent-field">
-                      {t('subagent.workspaceIdManual')}
-                      <input
-                        type="text"
-                        value={draft.workspaceId}
-                        disabled={readOnly}
-                        onChange={(event) =>
-                          setDraft({
-                            ...draft,
-                            workspaceId: event.target.value,
-                            workspaceScope: workspaceScopeOf(draft.device.trim(), draft.agentId.trim()),
-                          })
+                    />
+                  </label>
+                )}
+                {agentProblem !== undefined && (
+                  <p className="cherry-hint">{targetProblemText(t, agentProblem)}</p>
+                )}
+                {agentProblem === undefined && draft.device.trim() === '' && (
+                  <p className="cherry-hint">{t('subagent.targets.pickDevice')}</p>
+                )}
+                {agentProblem === undefined && draft.device.trim() !== '' && agentCandidates.kind === 'loading' && (
+                  <p className="cherry-hint">{t('subagent.targets.loading')}</p>
+                )}
+                {agentProblem === undefined && draft.device.trim() !== '' && agentCandidates.kind === 'ready' && agentCandidates.items.length === 0 && (
+                  <p className="cherry-hint">{t('subagent.targets.empty')}</p>
+                )}
+                {truncatedLists !== undefined && truncatedLists.length > 0 && (
+                  <p className="cherry-hint">
+                    {t('subagent.targets.truncated', { lists: truncatedLists.join(t('list.separator')) })}
+                  </p>
+                )}
+
+                <fieldset className="cherry-scope-options">
+                  <legend>{t('subagent.workspace.legend')}</legend>
+                  <label className="cherry-subagent-check">
+                    <input
+                      type="radio"
+                      name="subagent-workspace"
+                      checked={draft.workspace === 'registry'}
+                      disabled={readOnly}
+                      onChange={() => setDraft({ ...draft, workspace: 'registry' })}
+                    />
+                    {t('subagent.workspace.registry')}
+                  </label>
+                  <label className="cherry-subagent-check">
+                    <input
+                      type="radio"
+                      name="subagent-workspace"
+                      checked={draft.workspace === 'system'}
+                      // Disabled only on a KNOWN absence (#263). A failed read
+                      // leaves it usable, because "we could not ask" is not "the
+                      // peer has none".
+                      disabled={readOnly || systemWorkspace === false}
+                      onChange={() => setDraft({ ...draft, workspace: 'system' })}
+                    />
+                    {t('subagent.workspace.system')}
+                  </label>
+                </fieldset>
+                {draft.workspace === 'registry' && (
+                  <>
+                    <TargetSelect
+                      label={t('subagent.workspaceId')}
+                      field={workspaceField}
+                      labels={targetLabels}
+                      disabled={readOnly}
+                      onChange={(value) => {
+                        if (value === MANUAL_TARGET_VALUE) {
+                          setManual('workspace')
+                          return
                         }
-                      />
-                    </label>
-                  )}
-                  {workspaceInvalidated && (
-                    <p className="cherry-hint">{t('subagent.targets.reselectWorkspace')}</p>
-                  )}
-                  {workspaceProblem !== undefined && (
-                    <p className="cherry-hint">{targetProblemText(t, workspaceProblem)}</p>
-                  )}
+                        setManual(undefined)
+                        setDraft({
+                          ...draft,
+                          workspaceId: value,
+                          workspaceScope: workspaceScopeOf(draft.device.trim(), draft.agentId.trim()),
+                        })
+                      }}
+                    />
+                    {manual === 'workspace' && (
+                      <label className="cherry-subagent-field">
+                        {t('subagent.workspaceIdManual')}
+                        <input
+                          type="text"
+                          value={draft.workspaceId}
+                          disabled={readOnly}
+                          onChange={(event) =>
+                            setDraft({
+                              ...draft,
+                              workspaceId: event.target.value,
+                              workspaceScope: workspaceScopeOf(draft.device.trim(), draft.agentId.trim()),
+                            })
+                          }
+                        />
+                      </label>
+                    )}
+                    {workspaceInvalidated && (
+                      <p className="cherry-hint">{t('subagent.targets.reselectWorkspace')}</p>
+                    )}
+                    {workspaceProblem !== undefined && (
+                      <p className="cherry-hint">{targetProblemText(t, workspaceProblem)}</p>
+                    )}
+                  </>
+                )}
+
+                <label className="cherry-subagent-field">
+                  {t('subagent.timeoutMs')}
+                  <input
+                    type="number"
+                    value={draft.timeoutMs}
+                    disabled={readOnly}
+                    onChange={(event) => setDraft({ ...draft, timeoutMs: event.target.value })}
+                  />
+                </label>
+                <p className="cherry-hint">{t('subagent.timeoutHint')}</p>
+
+                {/* Read-only on purpose: the field is validated and stored, but
+                    nothing reads it yet (D1), so a control that looked like it
+                    changed behaviour would be the fake switch again. */}
+                <p className="cherry-hint cherry-mono">
+                  {t('subagent.cwdMode', { value: data.subagent.cwdMode ?? 'isolated' })}
+                </p>
+
+                {/* Read-only for a DIFFERENT reason than `cwdMode`: `routes` is
+                    live (`matchRoute` picks the device and workspace from it),
+                    but the page has no editor for a per-directory table, and a
+                    bad entry is named in a problem (`routes[0].cwdPrefix`) the
+                    operator would otherwise never see. JSON, not a pretty table:
+                    it shows exactly the stored value. */}
+                <p className="cherry-hint cherry-mono">
+                  {t('subagent.routes', { value: JSON.stringify(data.subagent.routes ?? []) })}
+                </p>
                 </>
               )}
-
-              <label className="cherry-subagent-field">
-                {t('subagent.timeoutMs')}
-                <input
-                  type="number"
-                  value={draft.timeoutMs}
-                  disabled={readOnly}
-                  onChange={(event) => setDraft({ ...draft, timeoutMs: event.target.value })}
-                />
-              </label>
-              <p className="cherry-hint">{t('subagent.timeoutHint')}</p>
-
-              {/* Read-only on purpose: the field is validated and stored, but
-                  nothing reads it yet (D1), so a control that looked like it
-                  changed behaviour would be the fake switch again. */}
-              <p className="cherry-hint cherry-mono">
-                {t('subagent.cwdMode', { value: data.subagent.cwdMode ?? 'isolated' })}
-              </p>
-
-              {/* Read-only for a DIFFERENT reason than `cwdMode`: `routes` is
-                  live (`matchRoute` picks the device and workspace from it),
-                  but the page has no editor for a per-directory table, and a
-                  bad entry is named in a problem (`routes[0].cwdPrefix`) the
-                  operator would otherwise never see. JSON, not a pretty table:
-                  it shows exactly the stored value. */}
-              <p className="cherry-hint cherry-mono">
-                {t('subagent.routes', { value: JSON.stringify(data.subagent.routes ?? []) })}
-              </p>
-
               <div className="cherry-scope-save">
                 <button type="button" disabled={busy || readOnly} onClick={() => void save()}>
                   {t('subagent.save')}

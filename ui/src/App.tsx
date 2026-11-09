@@ -229,26 +229,9 @@ export function App({
         </p>
       )}
 
-      <PairingWizard
-        subscribed={subscribed}
-        progress={progress}
-        {...(codeLifetimeMs === undefined ? {} : { codeLifetimeMs })}
-        {...(runLifetimeMs === undefined ? {} : { runLifetimeMs })}
-        onRunStart={startRun}
-        onSettled={onSettled}
-      />
-
-      {/* Above the device list: the scope decides which workspaces the tools
-          appear in, which is the setting an operator comes here to change. */}
-      <ToolScopePanel {...(scopeClient === undefined ? {} : { client: scopeClient })} />
-
-      {/* The experiment: OFF by default, labelled as experimental where the
-          operator turns it on, never only after it works (#233). */}
-      <SubagentPanel
-        {...(subagentClient === undefined ? {} : { client: subagentClient })}
-        devices={sorted}
-      />
-
+      {/* FIRST, because it answers the question the page is opened for: what
+          is paired right now. Everything below this section is about CHANGING
+          that state (#287). */}
       <section className="cherry-panel" aria-labelledby="cherry-devices-title">
         <h3 id="cherry-devices-title">{t('app.devices.heading')}</h3>
         {/* Three states, not two: the list is EMPTY only once a read said so.
@@ -273,6 +256,26 @@ export function App({
           ))}
         </ul>
       </section>
+
+      <PairingWizard
+        subscribed={subscribed}
+        progress={progress}
+        {...(codeLifetimeMs === undefined ? {} : { codeLifetimeMs })}
+        {...(runLifetimeMs === undefined ? {} : { runLifetimeMs })}
+        onRunStart={startRun}
+        onSettled={onSettled}
+      />
+
+      {/* The scope decides which workspaces the tools appear in, which is the
+          setting an operator comes here to change. */}
+      <ToolScopePanel {...(scopeClient === undefined ? {} : { client: scopeClient })} />
+
+      {/* The experiment: OFF by default, labelled as experimental where the
+          operator turns it on, never only after it works (#233). */}
+      <SubagentPanel
+        {...(subagentClient === undefined ? {} : { client: subagentClient })}
+        devices={sorted}
+      />
     </div>
   )
 }

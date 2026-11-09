@@ -155,6 +155,78 @@ const DEVICES: DeviceSummary[] = [
 ]
 
 // ---------------------------------------------------------------------------
+// ⑨ #287: while the experiment is OFF, the section is only the switch
+// ---------------------------------------------------------------------------
+
+describe('⑨ #287 the section collapses to the switch while it is off', () => {
+  it('⑨a an OFF document renders the switch and the save button, and no target fields', async () => {
+    // A default-off feature that fills half the page while off is noise: the
+    // three drop-downs, the timeout and the workspace radio describe a
+    // configuration the operator has not asked for.
+    renderPanel(stubClient())
+    await screen.findByText('未启用（默认关闭）。')
+    expect(screen.getByLabelText('启用子智能体（默认关闭）')).toBeDefined()
+    expect(screen.getByRole('button', { name: '保存子智能体配置' })).toBeDefined()
+    expect(screen.queryByLabelText('目标设备')).toBeNull()
+    expect(screen.queryByLabelText('目标 agent')).toBeNull()
+    expect(screen.queryByText('工作区', { selector: 'legend' })).toBeNull()
+  })
+
+  it('⑨b checking the switch brings the fields back, with the stored values untouched', async () => {
+    // Collapsing is RENDERING ONLY: the draft keeps what was there, so turning
+    // the experiment back on never means re-entering the target.
+    const client = stubClient({
+      ...DISABLED,
+      subagent: { revision: 4, enabled: false, device: 'desk-1', agentId: 'agent-7', workspaceId: 'ws-1' },
+    })
+    renderPanel(client, DEVICES)
+    await screen.findByText('未启用（默认关闭）。')
+    fireEvent.click(screen.getByLabelText('启用子智能体（默认关闭）'))
+
+    const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
+    expect(device.value).toBe('desk-1')
+    expect((screen.getByLabelText('目标 agent') as HTMLSelectElement).value).toBe('agent-7')
+  })
+
+  it('⑨c a restart owed while OFF still says so — the collapse must not swallow the only actionable line', async () => {
+    // Turning the experiment OFF also needs a restart. If collapsing hid the
+    // notice, the operator would be told nothing at the one moment the notice
+    // is the whole point.
+    renderPanel(
+      stubClient({
+        subagent: { revision: 2, enabled: false },
+        source: 'file',
+        status: { state: 'ready', reason: { code: 'ready', providerName: 'cherry', toolName: 'cherry_subagent' } },
+        pendingRestart: true,
+      }),
+    )
+    // The exact sentence AND its class: `/重启/` alone is satisfied by the
+    // always-rendered `subagent.defaultOff` line, which also says 重启 — a
+    // reviewer proved a mutation that hides the real notice stays green
+    // against that matcher.
+    const notice = await screen.findByText('已保存，但当前装配仍在用旧配置：重启 DSH 后生效。')
+    expect(notice.className).toBe('cherry-notice')
+    expect(screen.queryByLabelText('目标设备')).toBeNull()
+  })
+  it('⑨d ON → OFF → ON keeps every target — the round trip, not just the way in', async () => {
+    // ⑨b only walks OFF → ON. A mutation that CLEARS the draft when the switch
+    // is turned off survives that case, because its fixture starts from an OFF
+    // document with nothing to clear. This is the direction where a clear would
+    // actually be observable.
+    renderPanel(stubClient(READY), DEVICES)
+    const toggle = (await screen.findByLabelText('启用子智能体（默认关闭）')) as HTMLInputElement
+    expect(toggle.checked).toBe(true)
+
+    fireEvent.click(toggle)
+    expect(screen.queryByLabelText('目标设备')).toBeNull()
+    fireEvent.click(screen.getByLabelText('启用子智能体（默认关闭）'))
+
+    expect((await screen.findByLabelText('目标设备') as HTMLSelectElement).value).toBe('desk-1')
+    expect((screen.getByLabelText('目标 agent') as HTMLSelectElement).value).toBe('agent-7')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // ① the hard requirement, and the default
 // ---------------------------------------------------------------------------
 
@@ -831,9 +903,13 @@ describe('⑦ the three target fields are drop-downs with names', () => {
   })
 
   it('⑦f `unsupported` disables the drop-downs with the rest of the form', async () => {
-    const client = stubClient(
-      withStatus('unsupported', { code: 'unsupported' }),
-    )
+    // An ENABLED document, deliberately: #287 collapses the configuration while
+    // the switch is off, so an OFF document has no drop-downs to disable. The
+    // claim here is about `readOnly`, and it needs a form to be read-only.
+    const client = stubClient({
+      ...withStatus('unsupported', { code: 'unsupported' }),
+      subagent: { revision: 3, enabled: true, device: 'desk-1', agentId: 'agent-7', workspaceId: 'ws-1' },
+    })
     renderPanel(client, DEVICES)
     const device = (await screen.findByLabelText('目标设备')) as HTMLSelectElement
     const agent = (await screen.findByLabelText('目标 agent')) as HTMLSelectElement
