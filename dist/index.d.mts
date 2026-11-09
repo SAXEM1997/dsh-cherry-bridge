@@ -432,4 +432,16 @@ export declare function resolveDataDir(config?: CherryBridgeConfig, env?: NodeJS
  */
 export declare function noteError(entry: DiagnosticsError): void;
 export declare function apply(ctx: CherryBridgeContext, config?: CherryBridgeConfig): void;
+/**
+ * Settles when the CURRENT apply's identity bootstrap has finished, whatever the
+ * outcome — a failure is reported through `state.identityError` and through the
+ * diagnostics entry `apply` already records, never as a rejection here.
+ *
+ * Prefer this to watching for `identity.key` on disk. The file is written by
+ * `persistIdentity` BEFORE `state.identity` is assigned, so a watcher can wake
+ * on the file and still be told "the device identity is still loading; retry in
+ * a moment" by the next tool call — the race that made `toolsManage` ③k flake
+ * (#269). This promise settles after the assignment.
+ */
+export declare function whenIdentityReady(): Promise<void>;
 //#endregion

@@ -15,7 +15,7 @@ import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
-import { applyAssembly } from '../helpers/applyAssembly.js'
+import { applyAssembly, settleIdentity } from '../helpers/applyAssembly.js'
 import { SCOPE_DOC_VERSION } from '../../src/toolScope.js'
 
 /**
@@ -1054,15 +1054,6 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
    * must wait for the same precondition, or it would be asserting about a race
    * no user can hit.
    */
-  async function waitForIdentity(dataDir: string): Promise<void> {
-    await vi.waitFor(
-      () => {
-        expect(existsSync(join(dataDir, 'identity.key'))).toBe(true)
-      },
-      5_000,
-    )
-  }
-
   /**
    * Builds the assembly's pool for `dev-A` and waits until the link is up.
    *
@@ -1146,7 +1137,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 
     // `apply` starts the identity load and returns; the test owns the async
     // work it triggered, so it settles it before the data dir goes away.
-    await waitForIdentity(dataDir)
+    await settleIdentity()
   })
 
   it('③b does not DOUBLE-register on a repeated apply: the registry still holds one of each', async () => {
@@ -1169,7 +1160,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     // The second pass REBOUND the names rather than merely adding to them: none
     // of the first pass's definition objects survives.
     expect(ctx.tools.definitions.some((definition) => firstPass.includes(definition))).toBe(false)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
   })
 
   it('③c registers tools against the assembly\'s OWN store and pool', async () => {
@@ -1180,7 +1171,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     // Behavioural proof that the tool deps ARE the assembly's: `cherry_devices`
     // answers from the assembly's archive, and reaching a live record through it
@@ -1224,7 +1215,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     })
     await applyAssembly(ctx as never, { dataDir, rateBudgetPerSecond: 1 })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     // Build the pool and wait for the link before timing: the measurement is
     // the pacing between two BUSINESS RPCs, not the dial.
@@ -1250,7 +1241,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     await applyAssembly(ctx as never, { dataDir })
 
     const stream = await openStream(ctx)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     const pair = ctx.tools.definitions.find((definition) => definition.name === 'cherry_pair')!
     const outcome = (await pair.execute({
@@ -1275,7 +1266,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     await applyAssembly(ctx as never, { dataDir })
     const fakeInfo = await makeFake()
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     const stream = await openStream(ctx)
     await connectPool(ctx, fakeInfo)
@@ -1313,7 +1304,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     await connectPool(ctx, fakeInfo)
 
@@ -1359,7 +1350,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     const read = ctx.tools.definitions.find((definition) => definition.name === 'cherry_read')!
@@ -1411,7 +1402,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     const read = ctx.tools.definitions.find((definition) => definition.name === 'cherry_read')!
@@ -1442,7 +1433,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     // discarded config (or the wrong key) would leave the drop unreported.
     await applyAssembly(ctx as never, { dataDir, perSessionCacheBytes: 64 })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     const read = ctx.tools.definitions.find((definition) => definition.name === 'cherry_read')!
@@ -1483,7 +1474,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     dirs.push(dataDir)
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     const pair = ctx.tools.definitions.find((definition) => definition.name === 'cherry_pair')!
     const payload = payloadFor(fakeInfo)
@@ -1582,7 +1573,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
 
     /** Every DeviceConnection the assembly constructed, in order. */
     const built: DeviceConnection[] = []
@@ -1673,7 +1664,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     // Two sessions subscribed, so the recovery loop has more than one to walk.
@@ -1742,7 +1733,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     const wait = ctx.tools.definitions.find((definition) => definition.name === 'cherry_wait')!
@@ -1807,7 +1798,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     const wait = ctx.tools.definitions.find((definition) => definition.name === 'cherry_wait')!
@@ -1853,7 +1844,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 
     expect(() => index.apply(ctx as never, { dataDir })).not.toThrow()
     expect(consoleWarn).toHaveBeenCalled()
-    await waitForIdentity(dataDir)
+    await settleIdentity()
   })
 
   // -------------------------------------------------------------------------
@@ -1893,7 +1884,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     // A `cherry_read` of a distinct id is the cheapest way to join the
@@ -1980,7 +1971,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     // The subscription layer TOLERATES every schema-valid notification (it warns
@@ -2025,7 +2016,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     await connectPool(ctx, fakeInfo)
 
     // One live subscription to recover: the cheapest join is a `cherry_read`.
@@ -2077,7 +2068,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     const file = join(dataDir, 'devices.json')
 
     // Before: the archive knows only the address the pairing recorded.
@@ -2115,7 +2106,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     const file = join(dataDir, 'devices.json')
     const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
 
@@ -2179,7 +2170,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       desktopIdentity: fakeInfo.desktopIdentity,
       forgottenHosts: ['192.168.1.8'],
     })
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     const file = join(dataDir, 'devices.json')
     const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
 
@@ -2284,8 +2275,31 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     index.apply(assemblyCtx() as never, { dataDir })
     expect(existsSync(join(dataDir, 'identity.key'))).toBe(false)
 
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     expect(existsSync(join(dataDir, 'identity.key'))).toBe(true)
+  }, 15_000)
+
+  it('③af whenIdentityReady settles AFTER the identity is READABLE, not when the file appears (#269)', async () => {
+    // `persistIdentity` writes identity.key BEFORE `state.identity` is assigned,
+    // so a watcher that wakes on the file can still be told "the device identity
+    // is still loading; retry in a moment" by the very next tool call. That is
+    // how ③k failed once in twenty isolated runs. The settle point has to be the
+    // promise, and pairing is the shortest path that reads the identity.
+    const index = await import('../../src/index.js')
+    const fakeInfo = await makeFake({ pairingDecision: 'approved', pairingGetPendingPolls: 1 })
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+
+    const ctx = assemblyCtx()
+    index.apply(ctx as never, { dataDir })
+    await index.whenIdentityReady()
+
+    const pair = ctx.tools.definitions.find((definition) => definition.name === 'cherry_pair')!
+    const outcome = (await pair.execute({ payload: payloadFor(fakeInfo), name: 'Desk Alpha' })) as Record<
+      string,
+      unknown
+    >
+    expect(outcome['status']).toBe('approved')
   }, 15_000)
 
   it('③ab unwraps a bracketed IPv6 literal and refuses an over-long host, like the PATCH path', async () => {
@@ -2296,7 +2310,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
-    await waitForIdentity(dataDir)
+    await settleIdentity()
     const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
 
     // The archive stores BARE hosts (the PATCH path unwraps the brackets). A

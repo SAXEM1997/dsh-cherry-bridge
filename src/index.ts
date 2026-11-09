@@ -367,6 +367,18 @@ interface AssemblyState {
    */
   identityError: unknown
   /**
+   * The identity bootstrap THIS apply started, as a promise that always
+   * resolves (both arms are handled where it is created).
+   *
+   * `identity.key` appearing on disk is NOT the same event as `identity`
+   * becoming readable: `persistIdentity` writes the file first, and the
+   * assignment runs a microtask later. Anything that waits for the FILE can
+   * still find `requireIdentity()` reporting "still loading; retry in a
+   * moment" — the race behind #269's toolsManage ③k instance. This is the
+   * settle point that actually corresponds to `identity` being set.
+   */
+  identityReady: Promise<void>
+  /**
    * The current apply's resolved config. Held on the state (rather than closed
    * over) because the pool helpers are module functions the HTTP face and the
    * tool face both call: a re-apply must move BOTH faces onto the new config.
@@ -455,6 +467,7 @@ const state: AssemblyState = {
   }),
   identity: undefined,
   identityError: undefined,
+  identityReady: Promise.resolve(),
   rateBudgetPerSecond: DEFAULT_RATE_BUDGET_PER_SECOND,
   perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
   wsTls: undefined,
@@ -1181,7 +1194,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   state.subagents = subagents
   state.disposers.push(subagents.mount(ctx))
 
-  void loadOrCreateIdentity(dataDir).then(
+  state.identityReady = loadOrCreateIdentity(dataDir).then(
     (identity) => {
       state.identity = identity.key
       // A later successful load (a re-apply after the operator fixed the data
@@ -1198,4 +1211,19 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
       })
     },
   )
+}
+
+/**
+ * Settles when the CURRENT apply's identity bootstrap has finished, whatever the
+ * outcome — a failure is reported through `state.identityError` and through the
+ * diagnostics entry `apply` already records, never as a rejection here.
+ *
+ * Prefer this to watching for `identity.key` on disk. The file is written by
+ * `persistIdentity` BEFORE `state.identity` is assigned, so a watcher can wake
+ * on the file and still be told "the device identity is still loading; retry in
+ * a moment" by the next tool call — the race that made `toolsManage` ③k flake
+ * (#269). This promise settles after the assignment.
+ */
+export function whenIdentityReady(): Promise<void> {
+  return state.identityReady
 }

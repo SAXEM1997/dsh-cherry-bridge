@@ -25,7 +25,7 @@ import type { ScopeHostContext } from '../../src/toolScopeHost.js'
 import { FakeToolHost } from '../helpers/fakeToolHost.js'
 import type { FakeCapability, FakeRestrictCall } from '../helpers/fakeToolHost.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
-import { waitForIdentityFile } from '../helpers/applyAssembly.js'
+import { settleIdentity } from '../helpers/applyAssembly.js'
 
 const dirs: string[] = []
 let warn: ReturnType<typeof vi.fn>
@@ -573,7 +573,7 @@ describe('T4 ⑧ the assembly point: apply() mounts the host', () => {
 
     try {
       expect(() => index.apply(fixture.ctx as never, { dataDir: dir })).not.toThrow()
-      await waitForIdentityFile(dir)
+      await settleIdentity()
 
       // The registration is the ONLY externally visible proof that the host was
       // instantiated AND mounted: nothing else reaches the tool registry.
@@ -604,7 +604,7 @@ describe('T4 ⑧ the assembly point: apply() mounts the host', () => {
 
     try {
       expect(() => index.apply(fixture.ctx as never, { dataDir: dir })).not.toThrow()
-      await waitForIdentityFile(dir)
+      await settleIdentity()
       expect(fixture.definitions).toEqual([])
       expect(fixture.injectedEffects).toHaveLength(0)
       expect(fixture.effects).toHaveLength(1)
