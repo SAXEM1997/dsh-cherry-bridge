@@ -222,6 +222,7 @@ describe('② the status is rendered from CODES, and the two failures differ', (
             { code: 'exclusive', field: 'workspaceId', other: 'workspaceKind' },
             { code: 'route-cwd-prefix', field: 'routes[0].cwdPrefix' },
             { code: 'route-cwd-prefix-root', field: 'routes[1].cwdPrefix' },
+            { code: 'route-cwd-prefix-relative', field: 'routes[2].cwdPrefix' },
           ],
         }),
       ),
@@ -236,6 +237,7 @@ describe('② the status is rendered from CODES, and the two failures differ', (
       'workspaceId 与 workspaceKind 只能二选一',
       'routes[0].cwdPrefix 必须是非空字符串',
       'routes[1].cwdPrefix 不能是根目录 /（它只能命中根目录本身，命不中任何子目录；要「所有目录」就别写 routes）',
+      'routes[2].cwdPrefix 必须是绝对路径（委派的工作目录总是绝对路径，相对前缀匹配不到任何地方）',
     ]) {
       expect(screen.getByText(sentence)).toBeDefined()
     }
@@ -446,6 +448,7 @@ describe('④ the page is bilingual, including the codes', () => {
             // a zh-only case leaves the English half free to drift, and the
             // page's two languages are supposed to say the same thing.
             { code: 'route-cwd-prefix-root', field: 'routes[0].cwdPrefix' },
+            { code: 'route-cwd-prefix-relative', field: 'routes[1].cwdPrefix' },
           ],
         }),
       ),
@@ -459,6 +462,11 @@ describe('④ the page is bilingual, including the codes', () => {
     expect(
       screen.getByText(
         'routes[0].cwdPrefix must not be the root / (it only matches the root itself, never a directory below it; leave routes out if you mean every directory)',
+      ),
+    ).toBeDefined()
+    expect(
+      screen.getByText(
+        'routes[1].cwdPrefix must be an absolute path (a delegation’s working directory always is, so a relative prefix matches nowhere)',
       ),
     ).toBeDefined()
     // And the hard requirement travels with the language.

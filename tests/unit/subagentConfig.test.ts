@@ -321,6 +321,39 @@ describe('resolution: routes are the delegation target table (SUB-10..14)', () =
     }
   })
 
+  it('#279 a RELATIVE prefix is refused: every delegation cwd is absolute, so it can never match', () => {
+    // The same class as the root prefix beside it. `matchRoute` normalizes both
+    // sides and compares at a segment boundary, and `cwd` is always an absolute
+    // path, so a relative prefix claims nothing — while the parser used to accept
+    // it, leaving the operator with a route the page lists and nothing uses.
+    for (const cwdPrefix of ['.', './x', 'foo', 'foo/', '../sibling']) {
+      const resolved = resolveSubagentConfig({ ...COMPLETE, routes: [{ cwdPrefix }] })
+      if (resolved.kind !== 'invalid') throw new Error(`expected invalid for ${cwdPrefix}`)
+      expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix-relative', field: 'routes[0].cwdPrefix' }])
+    }
+  })
+
+  it('#279 the field names the route the operator actually wrote', () => {
+    // The guard sits inside the per-route loop, so a table with an absolute
+    // first entry and a relative second one must point at index 1 — the message
+    // is the only thing the operator has to find the offending line.
+    const resolved = resolveSubagentConfig({
+      ...COMPLETE,
+      routes: [{ cwdPrefix: '/workspace/dsh' }, { cwdPrefix: 'foo' }],
+    })
+    if (resolved.kind !== 'invalid') throw new Error('expected invalid')
+    expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix-relative', field: 'routes[1].cwdPrefix' }])
+  })
+
+  it('#279 an ABSOLUTE prefix is still accepted, trailing slash and all', () => {
+    // The guard must not swallow the ordinary case: a trailing slash normalizes
+    // away, and a dotted directory name is still absolute.
+    for (const cwdPrefix of ['/workspace/dsh', '/workspace/dsh/', '/.hidden', '/a']) {
+      const resolved = resolveSubagentConfig({ ...COMPLETE, routes: [{ cwdPrefix }] })
+      expect(resolved.kind).toBe('ready')
+    }
+  })
+
   it('a route entry that is not an object is refused by index', () => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, routes: ['/w/dsh'] })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')

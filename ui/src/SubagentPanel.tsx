@@ -133,6 +133,8 @@ function problemText(t: T, problem: SubagentProblem): string {
       return t('subagent.problem.route-cwd-prefix', { field: problem.field })
     case 'route-cwd-prefix-root':
       return t('subagent.problem.route-cwd-prefix-root', { field: problem.field })
+    case 'route-cwd-prefix-relative':
+      return t('subagent.problem.route-cwd-prefix-relative', { field: problem.field })
     case 'out-of-range':
       return t('subagent.problem.out-of-range', {
         field: problem.field,

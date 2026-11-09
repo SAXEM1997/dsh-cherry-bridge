@@ -38,7 +38,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { normalize, sep } from 'node:path'
+import { isAbsolute, normalize, sep } from 'node:path'
 import {
   CHERRY_SUBAGENT_PROVIDER_DEFAULT,
   MESSAGE_TEXT_MAX_CHARS,
@@ -833,7 +833,12 @@ export type SubagentProblem =
       readonly received: ReceivedShape
     }
   | {
-      readonly code: 'empty' | 'missing' | 'route-cwd-prefix' | 'route-cwd-prefix-root'
+      readonly code:
+        | 'empty'
+        | 'missing'
+        | 'route-cwd-prefix'
+        | 'route-cwd-prefix-root'
+        | 'route-cwd-prefix-relative'
       readonly field: string
     }
   | {
@@ -983,6 +988,22 @@ function routesOf(raw: Record<string, unknown>, problems: SubagentProblem[]): Ch
     // `routes` out, and the default target applies.
     if (normalizeRoutePath(prefix).endsWith(sep)) {
       problems.push({ code: 'route-cwd-prefix-root', field: `${at}.cwdPrefix` })
+      return
+    }
+    // A RELATIVE prefix is the same dead route by another spelling (#279): the
+    // routing key is `request.cwd`, which is always absolute, so `'.'`, `'./x'`
+    // or `'foo'` claims nothing. Judged with `node:path`'s own `isAbsolute`,
+    // which is the platform's — the same platform `normalize` and `sep` come
+    // from, so the three agree by construction.
+    //
+    // NOT normalized first, unlike the root check above: on this platform
+    // (`posix`) normalizing cannot change whether a path is absolute, so the
+    // wrapper would be a call no input can tell apart from the plain one. On
+    // `win32` it is worse than useless — `normalizeRoutePath('C:\\')` is `'C:'`,
+    // which `isAbsolute` reads as relative — so the plain call is the correct
+    // one on both platforms and the wrapper was never right here.
+    if (!isAbsolute(prefix)) {
+      problems.push({ code: 'route-cwd-prefix-relative', field: `${at}.cwdPrefix` })
       return
     }
     const device = optionalText(record, 'device', problems, `${at}.device`)
