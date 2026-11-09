@@ -239,6 +239,24 @@ function StatusBlock({ status }: { status: SubagentStatus }): ReturnType<typeof 
 }
 
 /** The editable half of the document. */
+/** One editable route row: the three strings the boxes hold. */
+interface RouteDraft {
+  cwdPrefix: string
+  device: string
+  workspaceId: string
+}
+
+/**
+ * A row the operator added and never filled in.
+ *
+ * "Add" is one click from "save", so an all-blank row is an abandoned click
+ * rather than a route. Sending it would fail validation and blame the operator
+ * for a row they never meant to create.
+ */
+function isBlankRoute(route: RouteDraft): boolean {
+  return route.cwdPrefix.trim() === '' && route.device.trim() === '' && route.workspaceId.trim() === ''
+}
+
 interface Draft {
   enabled: boolean
   device: string
@@ -246,6 +264,14 @@ interface Draft {
   workspace: 'registry' | 'system'
   workspaceId: string
   timeoutMs: string
+  /**
+   * The per-directory route table (#303).
+   *
+   * Text, not the parsed values: the boxes must be able to hold a half-typed
+   * path, and a row the operator just added is all blanks. `bodyOf` does the
+   * trimming and the "blank means omit" translation.
+   */
+  routes: RouteDraft[]
   /**
    * The DEVICE `agentId` was read or chosen under (#271).
    *
@@ -284,6 +310,11 @@ function draftOf(config: SubagentConfig): Draft {
     workspace: config.workspaceKind === 'system' ? 'system' : 'registry',
     workspaceId: config.workspaceId ?? '',
     timeoutMs: config.timeoutMs === undefined ? '' : String(config.timeoutMs),
+    routes: (config.routes ?? []).map((route) => ({
+      cwdPrefix: route.cwdPrefix,
+      device: route.device ?? '',
+      workspaceId: route.workspaceId ?? '',
+    })),
     // The stored values were read TOGETHER, so they scope each other. Seeding
     // these from the document is what makes an untouched form send the values
     // back unchanged.
@@ -325,6 +356,19 @@ function bodyOf(draft: Draft, stored: SubagentConfig & { revision: number }): Su
     ...(draft.timeoutMs.trim() === '' || !Number.isFinite(timeout)
       ? { timeoutMs: undefined }
       : { timeoutMs: timeout }),
+    // ALWAYS written, never omitted on a full removal: `...stored` still carries
+    // the old array, so leaving the key out would silently keep every route the
+    // operator just deleted — the trap `timeoutMs` above already paid for.
+    //
+    // A blank half is OMITTED rather than sent as `''`: an empty `device` is a
+    // device selector that matches nothing, and the resolver would refuse every
+    // delegation under that prefix. Absent means "fall back to the target above",
+    // which is what a blank box says.
+    routes: draft.routes.filter((route) => !isBlankRoute(route)).map((route) => ({
+      cwdPrefix: route.cwdPrefix.trim(),
+      ...(route.device.trim() === '' ? {} : { device: route.device.trim() }),
+      ...(route.workspaceId.trim() === '' ? {} : { workspaceId: route.workspaceId.trim() }),
+    })),
     expectedRevision: stored.revision,
   }
 }
@@ -657,6 +701,30 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
   /** The lists are only as good as the key they answered for. */
   const truncatedLists =
     agentAnswer !== undefined && agentAnswer.device === device ? agentAnswer.truncated : undefined
+
+  /**
+   * Route table edits (#303). Index-keyed because the rows ARE positional: a
+   * route's meaning is its place in the precedence order (the FIRST matching
+   * prefix wins), so moving a row up is a real edit, and a key that followed the
+   * value would make the boxes jump between rows.
+   */
+  const editRoute = (index: number, patch: Partial<RouteDraft>): void => {
+    if (draft === undefined) return
+    setDraft({
+      ...draft,
+      routes: draft.routes.map((route, at) => (at === index ? { ...route, ...patch } : route)),
+    })
+  }
+
+  const addRoute = (): void => {
+    if (draft === undefined) return
+    setDraft({ ...draft, routes: [...draft.routes, { cwdPrefix: '', device: '', workspaceId: '' }] })
+  }
+
+  const removeRoute = (index: number): void => {
+    if (draft === undefined) return
+    setDraft({ ...draft, routes: draft.routes.filter((_, at) => at !== index) })
+  }
 
   const save = async (): Promise<void> => {
     // `effective` is undefined exactly when `draft` is, so this one check covers
@@ -1040,15 +1108,69 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
                   {t('subagent.cwdMode', { value: data.subagent.cwdMode ?? 'isolated' })}
                 </p>
 
-                {/* Read-only for a DIFFERENT reason than `cwdMode`: `routes` is
-                    live (`matchRoute` picks the device and workspace from it),
-                    but the page has no editor for a per-directory table, and a
-                    bad entry is named in a problem (`routes[0].cwdPrefix`) the
-                    operator would otherwise never see. JSON, not a pretty table:
-                    it shows exactly the stored value. */}
-                <p className="cherry-hint cherry-mono">
-                  {t('subagent.routes', { value: JSON.stringify(data.subagent.routes ?? []) })}
-                </p>
+                {/* Editable since #303: `routes` is live (`matchRoute` picks the
+                    device and workspace from it), and a table the operator cannot
+                    fill in left the only way to use it as hand-editing JSON.
+                    Validation is NOT duplicated here — the resolver owns the
+                    rules, and a second copy of "absolute, non-root, non-empty"
+                    would drift (#280). A bad entry comes back named by its exact
+                    path (`routes[0].cwdPrefix`) in the status block above. */}
+                <fieldset className="cherry-subagent-routes">
+                  <legend>{t('subagent.routes.title')}</legend>
+                  <p className="cherry-hint">{t('subagent.routes.hint')}</p>
+                  {draft.routes.length === 0 ? (
+                    <p className="cherry-hint">{t('subagent.routes.empty')}</p>
+                  ) : (
+                    draft.routes.map((route, index) => (
+                      <div className="cherry-subagent-route" key={index}>
+                        <label className="cherry-subagent-field">
+                          <span>{t('subagent.routes.cwdPrefix')}</span>
+                          <input
+                            type="text"
+                            className="cherry-subagent-select cherry-mono"
+                            aria-label={t('subagent.routes.cwdPrefixLabel', { index: index + 1 })}
+                            value={route.cwdPrefix}
+                            readOnly={readOnly}
+                            onChange={(event) => editRoute(index, { cwdPrefix: event.target.value })}
+                          />
+                        </label>
+                        <label className="cherry-subagent-field">
+                          <span>{t('subagent.routes.device')}</span>
+                          <input
+                            type="text"
+                            className="cherry-subagent-select cherry-mono"
+                            aria-label={t('subagent.routes.deviceLabel', { index: index + 1 })}
+                            value={route.device}
+                            readOnly={readOnly}
+                            onChange={(event) => editRoute(index, { device: event.target.value })}
+                          />
+                        </label>
+                        <label className="cherry-subagent-field">
+                          <span>{t('subagent.routes.workspaceId')}</span>
+                          <input
+                            type="text"
+                            className="cherry-subagent-select cherry-mono"
+                            aria-label={t('subagent.routes.workspaceIdLabel', { index: index + 1 })}
+                            value={route.workspaceId}
+                            readOnly={readOnly}
+                            onChange={(event) => editRoute(index, { workspaceId: event.target.value })}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          className="cherry-subagent-route-remove"
+                          disabled={readOnly}
+                          onClick={() => removeRoute(index)}
+                        >
+                          {t('subagent.routes.remove', { index: index + 1 })}
+                        </button>
+                      </div>
+                    ))
+                  )}
+                  <button type="button" disabled={readOnly} onClick={() => addRoute()}>
+                    {t('subagent.routes.add')}
+                  </button>
+                </fieldset>
                 </>
               )}
               <div className="cherry-scope-save">

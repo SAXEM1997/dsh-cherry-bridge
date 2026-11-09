@@ -348,5 +348,15 @@
 }
 .cherry-subagent-form { display: flex; flex-direction: column; gap: 8px; }
 .cherry-subagent-field { display: flex; flex-direction: column; gap: 2px; }
+/* The route table (#302): a fieldset whose rows stack, each row a grid of
+   prefix/device/workspace plus a remove button. `min-width: 0` on the grid
+   children is what stops a long absolute path from blowing the panel wider than
+   the settings column. */
+.cherry-subagent-routes { border: 1px solid rgba(128, 128, 128, 0.25); border-radius: 6px; padding: 8px 10px; margin: 8px 0; }
+.cherry-subagent-routes legend { padding: 0 4px; font-weight: 600; }
+.cherry-subagent-route { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 8px; align-items: end; margin: 6px 0; min-width: 0; }
+.cherry-subagent-route > * { min-width: 0; }
+.cherry-subagent-route-remove { align-self: end; }
+
 .cherry-subagent-check { display: flex; align-items: center; gap: 6px; }
 .cherry-subagent-problems { margin: 4px 0 0; padding-left: 20px; }

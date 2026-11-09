@@ -179,9 +179,10 @@ be in `prompt`.
 
 The settings page edits `enabled` / `device` / `agentId` / workspace /
 `timeoutMs` (30 minutes by default, `0` means no bound). `providerName`,
-`toolName`, `routes` and `maxInteractionAbandons` are only carried through —
-`routes` is shown read-only (it overrides the device and workspace per directory
-prefix), the rest need the config file. `cwdMode` accepts **only `isolated`**:
+`routes` is edited row by row on the page (each row is a directory prefix plus an
+optional device and workspace; the first match from the top wins), while
+`providerName`, `toolName` and `maxInteractionAbandons` are only carried through
+and need the config file. `cwdMode` accepts **only `isolated`**:
 `shared` would require DSH and Cherry Studio to share one filesystem, which the
 plugin can neither provide nor verify, so `shared` is refused with a sentence
 saying why.

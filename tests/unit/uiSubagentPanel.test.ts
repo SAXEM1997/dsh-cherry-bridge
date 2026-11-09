@@ -356,21 +356,21 @@ describe('② the status is rendered from CODES, and the two failures differ', (
     ).toBeDefined()
   })
 
-  it('②e shows the stored routes read-only, because a problem can name one this form cannot edit', async () => {
+  it('②e a stored route is EDITABLE here, so a problem naming one can be fixed on this page', async () => {
+    // Was read-only until #303, and the case existed to prove the stored table
+    // was visible at all (a `routes[0].cwdPrefix` problem has to be reachable).
+    // Visibility is no longer the question — the boxes now hold the values — so
+    // what is pinned is that they are not merely displayed: `readOnly` would
+    // satisfy every visibility assertion while leaving the operator stuck.
     renderPanel(
       stubClient({
         ...READY,
         subagent: { ...READY.subagent, routes: [{ cwdPrefix: '/repo/a', device: 'desk-9' }] },
       }),
     )
-    // `routesOf` validates every entry and pushes `routes[0].cwdPrefix`-style
-    // problems, so a bad route has to be visible HERE or nowhere: the page has
-    // no editor for it, and `bodyOf` carries the stored value through untouched.
-    // It is not a declaration: `matchRoute` picks the device and workspace for
-    // a subdirectory from exactly this table.
-    await screen.findByText(
-      'routes：[{"cwdPrefix":"/repo/a","device":"desk-9"}]（按子目录前缀覆盖设备与工作区；本页只展示，不编辑）',
-    )
+    const prefix = (await screen.findByLabelText('第 1 条目录前缀')) as HTMLInputElement
+    expect(prefix.value).toBe('/repo/a')
+    expect(prefix.readOnly).toBe(false)
   })
 })
 
@@ -990,5 +990,82 @@ describe('⑧ the system workspace radio tells the truth about the peer', () => 
     fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
     await waitFor(() => expect(client.puts).toHaveLength(1))
     expect(client.puts[0]!.workspaceKind).toBe('system')
+  })
+})
+
+describe('⑩ #303 routes are edited as a table, not as raw JSON', () => {
+  const WITH_ROUTES: SubagentResponse = {
+    ...READY,
+    subagent: {
+      ...READY.subagent,
+      routes: [
+        { cwdPrefix: '/workspace/api', device: 'desk-9' },
+        { cwdPrefix: '/workspace/web', workspaceId: 'ws-9' },
+      ],
+    },
+  }
+
+  it('⑩a renders one row per stored route, with its own three boxes', async () => {
+    renderPanel(stubClient(WITH_ROUTES))
+    // The values are in boxes the operator can edit, not in a JSON blob.
+    expect((await screen.findByLabelText('第 1 条目录前缀') as HTMLInputElement).value).toBe('/workspace/api')
+    expect((screen.getByLabelText('第 1 条设备（可空）') as HTMLInputElement).value).toBe('desk-9')
+    expect((screen.getByLabelText('第 1 条工作区 id（可空）') as HTMLInputElement).value).toBe('')
+    expect((screen.getByLabelText('第 2 条目录前缀') as HTMLInputElement).value).toBe('/workspace/web')
+    expect((screen.getByLabelText('第 2 条设备（可空）') as HTMLInputElement).value).toBe('')
+    expect((screen.getByLabelText('第 2 条工作区 id（可空）') as HTMLInputElement).value).toBe('ws-9')
+  })
+
+  it('⑩b an added row reaches the save body, with blank halves OMITTED', async () => {
+    const client = stubClient(WITH_ROUTES)
+    renderPanel(client)
+    fireEvent.click(await screen.findByRole('button', { name: '添加一条路由' }))
+    fireEvent.change(screen.getByLabelText('第 3 条目录前缀'), { target: { value: '  /workspace/ml  ' } })
+    fireEvent.change(screen.getByLabelText('第 3 条设备（可空）'), { target: { value: '  ' } })
+    fireEvent.change(screen.getByLabelText('第 3 条工作区 id（可空）'), { target: { value: ' ws-7 ' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    // Trimmed, and a blank half is ABSENT rather than empty: an empty string
+    // would be stored as "override to nothing" and refuse every delegation there.
+    expect(client.puts[0]!.routes).toEqual([
+      { cwdPrefix: '/workspace/api', device: 'desk-9' },
+      { cwdPrefix: '/workspace/web', workspaceId: 'ws-9' },
+      { cwdPrefix: '/workspace/ml', workspaceId: 'ws-7' },
+    ])
+  })
+
+  it('⑩c the remove button drops that row and keeps the others in order', async () => {
+    const client = stubClient(WITH_ROUTES)
+    renderPanel(client)
+    fireEvent.click(await screen.findByRole('button', { name: '删除第 1 条' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.routes).toEqual([{ cwdPrefix: '/workspace/web', workspaceId: 'ws-9' }])
+  })
+
+  it('⑩d adding a row and saving without filling it writes NOTHING (#303)', async () => {
+    // "Add" is one click away from "save"; an all-blank row is an abandoned
+    // click, not a route. Sending it would fail validation and blame the operator
+    // for a row they never meant to create.
+    const client = stubClient(WITH_ROUTES)
+    renderPanel(client)
+    fireEvent.click(await screen.findByRole('button', { name: '添加一条路由' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.routes).toHaveLength(2)
+  })
+
+  it('⑩e removing the LAST row clears the field instead of leaving it alone', async () => {
+    // The trap `timeoutMs` already paid for: `...stored` still carries the old
+    // array, so omitting the key on a full removal would silently keep every
+    // route the operator just deleted.
+    const client = stubClient(
+      { ...READY, subagent: { ...READY.subagent, routes: [{ cwdPrefix: '/only', device: 'desk-9' }] } },
+    )
+    renderPanel(client)
+    fireEvent.click(await screen.findByRole('button', { name: '删除第 1 条' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存子智能体配置' }))
+    await waitFor(() => expect(client.puts).toHaveLength(1))
+    expect(client.puts[0]!.routes).toEqual([])
   })
 })
