@@ -2212,13 +2212,6 @@ function defineCherryTool(definition: {
 }
 
 /**
- * The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
- * family: the six READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9), and
- * two MANAGEMENT ones (Task 10), plus the registration framework they all
- * share. Kept as one class (rather than per-face closures) so the per-session
- * and per-device state the later faces add has an obvious home.
- */
-/**
  * A wait that OUR side stopped.
  *
  * Deliberately not one of the peer's four terminal statuses: the run did not
@@ -2244,6 +2237,19 @@ export class RunAbortedError extends Error {
     this.executionId = executionId
   }
 }
+/**
+ * The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
+ * family THIS CLASS defines: the six READ-ONLY tools (Task 8), six INTERACTIVE
+ * ones (Task 9), and
+ * two MANAGEMENT ones (Task 10), plus the registration framework they all
+ * share. Kept as one class (rather than per-face closures) so the per-session
+ * and per-device state the later faces add has an obvious home.
+ *
+ * FOURTEEN is the count for THIS CLASS, not for the plugin: `cherry_subagent`
+ * is the fifteenth governed name and is defined in `subagentTool.ts`, outside
+ * this class. Raising this number because the plugin gained a tool would make
+ * the sentence describe a list the code below does not build.
+ */
 
 export class CherryToolEngine {
   readonly #deps: CherryToolsDeps
@@ -2631,7 +2637,7 @@ export class CherryToolEngine {
    * The settings page's candidate source (#260): the agents on a device, and —
    * when `agentId` names one — that agent's workspaces.
    *
-   * WHY IT IS A METHOD HERE AND NOT A FIFTEENTH TOOL. The page needs exactly the
+   * WHY IT IS A METHOD HERE AND NOT A TOOL OF ITS OWN. The page needs exactly the
    * two capabilities the read tools already have: the shared device resolution
    * (`#resolve`, including the `connecting` wait and the quarantine precedence)
    * and the page-aggregating walk (`#aggregate`). Both are private to this
@@ -4896,10 +4902,12 @@ export class CherryToolEngine {
 
     const resolved = await this.#linkOr(deviceId)
     if (resolved.link === undefined) {
-      // The verdict is the TOOL vocabulary (`ambiguous-device`, `device-not-found`,
+      // The verdict is the TOOL vocabulary (`ambiguous-device`,
       // `archive-quarantined`), and it is quoted rather than re-worded: an
       // operator chasing a delegation failure should see the same words the
-      // device tools use for the same condition.
+      // device tools use for the same condition. A device the archive does
+      // not hold at all never reaches here: `#requireConnection` refuses it
+      // first, with its own message.
       throw new Error(
         `cherry subagent: the target device is unavailable (${String(resolved.verdict.error)})`,
       )

@@ -83,7 +83,7 @@ export type SubagentStatusReason =
       readonly problem: SubagentToolProblem
     }
 
-/** What the settings page and the diagnostics report show for this subsystem. */
+/** What the settings page shows for this subsystem. */
 export interface SubagentSubsystemStatus {
   readonly state: 'pending' | 'unsupported' | 'failed' | 'ready'
   /**
@@ -102,7 +102,6 @@ export interface SubagentsService {
    * this file stays free of `@deepseek-ai/*` types.
    */
   startActivation?(spec: CherryActivationSpec): Promise<CherryActivation>
-  list?(): readonly { readonly name: string }[]
 }
 
 /**
@@ -217,7 +216,7 @@ const INJECT_KEYS = ['subagents'] as const
 export interface SubagentHost {
   /** Mount, and return the disposer that releases the registration. */
   mount(ctx: SubagentHostContext): () => void
-  /** The current state, for the settings page and the diagnostics report. */
+  /** The current state, for the settings page. */
   status(): SubagentSubsystemStatus
 }
 

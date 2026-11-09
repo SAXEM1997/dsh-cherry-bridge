@@ -7,7 +7,7 @@ import { writeFileAtomicSync } from './atomicFile.js'
  * order, the atomic write, the `degraded` note set and the write-side guard
  * rails (spec §6.1 first half; B9/B14/B16 storage side).
  *
- * The document answers one question — which workspaces see the 14 `cherry_*`
+ * The document answers one question — which workspaces see the 15 `cherry_*`
  * tools — and everything here serves making that answer fail-closed without
  * ever silently inventing one. Three rules carry that:
  *

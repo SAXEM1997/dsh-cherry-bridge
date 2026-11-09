@@ -251,11 +251,11 @@ describe('cherry_subagent execute', () => {
   it('④f propagates a refused activation instead of inventing an id', async () => {
     const tool = build({
       startActivation: async () => {
-        throw new Error('cherry subagent: the target device is unavailable (device-not-found)')
+        throw new Error('cherry subagent: the target device is unavailable (not-found)')
       },
     })
     // A refusal here is fail-BEFORE-return, so the seam's contract says reject:
     // swallowing it would tell the model a child exists when none does.
-    await expect(tool.execute(ARGS, exec())).rejects.toThrow(/device-not-found/)
+    await expect(tool.execute(ARGS, exec())).rejects.toThrow(/not-found/)
   })
 })

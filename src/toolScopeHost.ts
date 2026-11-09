@@ -441,15 +441,15 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
    * and no second (B18):
    *
    *   visible under the CURRENT document and judgement ⇒ the EMPTY set
-   *   not visible ⇒ CHERRY_TOOL_NAMES ∩ the no-argument `schemas()`
+   *   not visible ⇒ the governed `names` ∩ the observed global set
    *   not visible, view unreadable ⇒ `undefined` (no target could be computed)
    *
    * `judgement()` is the per-agent cache; a MISS falls back to
    * `scope.resolveNow(agent)` — the same §4 rules answered from the CURRENT
    * generation WITHOUT awaiting anything. `rebuild()` is fed by the currently
    * live agents alone, so a brand-new agent id can never be pre-judged; without
-   * that fallback the first install would deny all 14 names and the tools would
-   * appear only once the asynchronous round converged — B13's 「第一轮就有工具」
+   * that fallback the first install would deny every governed name and the tools
+   * would appear only once the asynchronous round converged — B13's 「第一轮就有工具」
    * is exactly the other direction. Only when there is NO usable generation
    * either (a read never taken, failed, or empty) does the expression collapse
    * to `isVisible(doc, undefined)`: under `global` that is true (a miss releases

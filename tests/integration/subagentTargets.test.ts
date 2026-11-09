@@ -20,7 +20,7 @@ import type { FakeAgentRecord, FakeCherryOptions, FakeWorkspaceRecord } from '..
  * offer the device's agents and workspaces as DROPDOWNS instead of asking an
  * operator to copy ids out of the model tool's output. It therefore needs the
  * same two capabilities the read tools have — the shared device resolution and
- * the page-aggregating walk — WITHOUT registering a fifteenth tool, so it is a
+ * the page-aggregating walk — WITHOUT registering a tool of its own, so it is a
  * public method on the engine and is driven here directly.
  *
  * WHAT THE RIG IS. A real `DeviceConnection` (real Noise XX, real hello, real
