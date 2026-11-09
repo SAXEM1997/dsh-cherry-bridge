@@ -1,0 +1,87 @@
+# Every gate this repository has was, until now, run by hand on one machine.
+# Two of them are exactly the kind that should not depend on whose laptop it is:
+# a contract test asserts the lockfile resolves to registry.npmjs.org (a local
+# mirror rewrites it silently), and `artifactFreshness` compares the committed
+# artifacts against a fresh build.
+#
+# This workflow is a SIGNAL, not a gate. It is deliberately NOT a required
+# check on `main` yet — the suite has a known load-dependent flake (#269), and
+# a required check that goes red for reasons nobody can attribute blocks every
+# PR. The unblock conditions are recorded on that issue.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A force-push supersedes the run it interrupted; there is nothing to learn
+# from a result about a commit that no longer exists.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci`, never `npm install`: the lockfile is committed and a contract
+      # assertion pins its resolved hosts, so an install that rewrites it must
+      # fail loudly rather than pass quietly.
+      - run: npm ci
+
+      # Both type projects. `tsconfig.json` is the server (nodenext), and
+      # `tsconfig.ui.json` holds every test that imports `ui/**`; a test
+      # imported by the wrong project fails here, not in the suite.
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # `artifactFreshness` already rebuilds into a temp dir and byte-compares
+      # against `git show HEAD:`. This is the coarser second arm: build IN PLACE
+      # and let git say whether the committed bytes are the ones this source
+      # produces. It names the file in the log instead of hiding it inside a
+      # test assertion.
+      - run: npm run build && npm run build:client
+
+      - name: committed artifacts match this source
+        run: git diff --exit-code -- dist lib
+
+      # The publish surface: `files` in package.json decides what ships, and a
+      # directory listed by mistake (the whole `docs/`) shows up here.
+      - run: npm pack --dry-run
+
+  # `engines.node` says `>=22.18.0`. `node-version: 22` resolves to the newest
+  # 22.x, so without this job the declared floor is never executed and a patch
+  # that reaches for a newer API passes CI while failing for everyone on the
+  # floor.
+  #
+  # Pinned to the exact floor rather than folded into a matrix: this job's
+  # name is what a branch-protection rule would reference, and a matrix renames
+  # it to `test (22.18.0)`.
+  node-floor:
+    name: node-floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.18.0'
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
