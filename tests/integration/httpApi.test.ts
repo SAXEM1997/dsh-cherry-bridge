@@ -20,6 +20,7 @@ import { DeviceUnavailableError, TransportLostError } from '../../src/connection
 import type { SubagentTargetsOutcome } from '../../src/tools.js'
 import { LOG_TEXT_MAX } from '../../src/text.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
+import { applyAssembly, waitForIdentityFile } from '../helpers/applyAssembly.js'
 
 /**
  * Task 11 integration suite: the same-origin HTTP face + SSE stream, driven
@@ -2780,7 +2781,7 @@ describe('plugin assembly (index.ts apply)', () => {
     const index = await import('../../src/index.js')
     const ctx = assemblyCtx()
 
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     expect(ctx.server.routes.has(PREFIX)).toBe(true)
     // The identity load is async by design (apply must stay synchronous), so
@@ -2802,7 +2803,7 @@ describe('plugin assembly (index.ts apply)', () => {
     // that differs from what the assembly resolved.
     const index = await import('../../src/index.js')
     const ctx = assemblyCtx()
-    index.apply(ctx as never, {
+    await applyAssembly(ctx as never, {
       dataDir,
       subagent: { enabled: true, device: 'desk-1', agentId: 'agent-7', workspaceId: 'ws-1' },
     })
@@ -2847,7 +2848,7 @@ describe('plugin assembly (index.ts apply)', () => {
     // only way the store the engine reads holds a device.
     new DeviceStore(join(dataDir, 'devices.json')).upsert(record())
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     const answered = await call('/subagent/targets?device=no-such-device', {}, ctx.server)
 
@@ -2859,7 +2860,7 @@ describe('plugin assembly (index.ts apply)', () => {
   it('does not adopt connections from a previous apply against another archive', async () => {
     const index = await import('../../src/index.js')
     const first = assemblyCtx()
-    index.apply(first as never, { dataDir })
+    await applyAssembly(first as never, { dataDir })
 
     // A second apply with a fresh data dir must start from an empty pool, so a
     // device id present only in the OLD archive cannot be served from a stale
@@ -2868,6 +2869,7 @@ describe('plugin assembly (index.ts apply)', () => {
     try {
       const second = assemblyCtx()
       expect(() => index.apply(second as never, { dataDir: secondDir })).not.toThrow()
+      await waitForIdentityFile(secondDir)
       expect(second.server.routes.has(PREFIX)).toBe(true)
       // The first plugin's route seat was replaced by its own teardown path.
       expect(first.effects).toHaveLength(1)
@@ -2886,7 +2888,7 @@ describe('plugin assembly (index.ts apply)', () => {
     const index = await import('../../src/index.js')
     const { DeviceConnection } = await import('../../src/connection.js')
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     const store = new DeviceStore(join(dataDir, 'devices.json'))
     store.upsert(record({ hosts: ['127.0.0.1'], port: 1111 }))
@@ -2931,7 +2933,7 @@ describe('plugin assembly (index.ts apply)', () => {
     const index = await import('../../src/index.js')
     const { DeviceConnection } = await import('../../src/connection.js')
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     const store = new DeviceStore(join(dataDir, 'devices.json'))
     store.upsert(record())
@@ -2990,7 +2992,7 @@ describe('plugin assembly (index.ts apply)', () => {
     const index = await import('../../src/index.js')
     const { DeviceConnection } = await import('../../src/connection.js')
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     const store = new DeviceStore(join(dataDir, 'devices.json'))
     store.upsert(record())

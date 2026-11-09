@@ -15,6 +15,7 @@ import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
+import { applyAssembly } from '../helpers/applyAssembly.js'
 import { SCOPE_DOC_VERSION } from '../../src/toolScope.js'
 
 /**
@@ -821,7 +822,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       expect(ctx.subagents.registered.map((entry) => entry.name)).toEqual(['cherry'])
       rmSync(dataDir, { recursive: true, force: true })
     })
@@ -830,7 +831,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       expect(ctx.subagents.registered).toHaveLength(1)
       // The ROOT effect is the plugin's own teardown (`ctx.effect`), and it
       // drains every subsystem disposer — this is the path a host unload takes.
@@ -845,7 +846,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       expect(ctx.subagents.registered).toHaveLength(1)
       expect(ctx.injectedEffects.length).toBeGreaterThan(0)
       for (const teardown of ctx.injectedEffects.splice(0)) teardown()
@@ -860,7 +861,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       const names = ctx.tools.definitions.map((definition) => definition.name)
       expect(names).toContain('cherry_subagent')
       // Registered BESIDE the fourteen, not instead of one: the assembly's own
@@ -873,7 +874,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       expect(ctx.tools.definitions.some((definition) => definition.name === 'cherry_subagent')).toBe(true)
       for (const teardown of ctx.effects) await teardown()
       expect(ctx.tools.definitions).toEqual([])
@@ -888,7 +889,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: { ...SUBAGENT, enabled: false } })
+      await applyAssembly(ctx as never, { dataDir, subagent: { ...SUBAGENT, enabled: false } })
       const names = ctx.tools.definitions.map((definition) => definition.name)
       expect(names).not.toContain('cherry_subagent')
       expect(names).toHaveLength(14)
@@ -927,7 +928,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx(false, 'restrict')
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir })
+      await applyAssembly(ctx as never, { dataDir })
       const response = new FakeResponse()
       await ctx.server.dispatch(
         new FakeRequest(`${PREFIX}/scope`, { host: HOST }) as never,
@@ -949,7 +950,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx(false, 'restrict')
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
       expect(typeof when).toBe('function')
       // No scope document ⇒ `selected` with an empty list (the D3 default), and
@@ -970,7 +971,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         join(dataDir, 'scope.json'),
         `${JSON.stringify({ version: SCOPE_DOC_VERSION, revision: 1, mode: 'global', workspaceIds: [] }, null, 2)}\n`,
       )
-      index.apply(ctx as never, { dataDir, subagent: SUBAGENT })
+      await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
       expect(when!({ agent: { id: 'any-agent' } })).toBe(true)
       rmSync(dataDir, { recursive: true, force: true })
@@ -1000,7 +1001,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         },
       ])
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir, subagent: { ...SUBAGENT, toolName: 'custom_delegate' } })
+      await applyAssembly(ctx as never, { dataDir, subagent: { ...SUBAGENT, toolName: 'custom_delegate' } })
       // The first synchronous round runs before the subagent host has registered
       // the fifteenth name, so a `PUT /scope` — which calls `refresh()` inline —
       // is what makes the deny set observably complete.
@@ -1027,7 +1028,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx()
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
-      index.apply(ctx as never, { dataDir })
+      await applyAssembly(ctx as never, { dataDir })
       expect(ctx.subagents.registered).toEqual([])
       rmSync(dataDir, { recursive: true, force: true })
     })
@@ -1123,7 +1124,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     dirs.push(dataDir)
     const ctx = assemblyCtx()
 
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     expect(ctx.tools.definitions.map((definition) => definition.name)).toEqual([
       'cherry_devices',
@@ -1154,13 +1155,13 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     dirs.push(dataDir)
     const ctx = assemblyCtx()
 
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     const firstPass = [...ctx.tools.definitions]
 
     // A second apply (a reload) must not stack a second registration: the host
     // registry would then hold two definitions per name, and every tool call
     // would be ambiguous.
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     const names = ctx.tools.definitions.map((definition) => definition.name)
     expect(names).toHaveLength(14)
@@ -1177,7 +1178,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
 
@@ -1221,7 +1222,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         ],
       },
     })
-    index.apply(ctx as never, { dataDir, rateBudgetPerSecond: 1 })
+    await applyAssembly(ctx as never, { dataDir, rateBudgetPerSecond: 1 })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
 
@@ -1246,7 +1247,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
 
     const stream = await openStream(ctx)
     await waitForIdentity(dataDir)
@@ -1271,7 +1272,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     const fakeInfo = await makeFake()
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
@@ -1310,7 +1311,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
 
@@ -1356,7 +1357,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1408,7 +1409,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1439,7 +1440,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const ctx = assemblyCtx()
     // A deliberately tiny budget: the default 2 MiB would never trip, so a
     // discarded config (or the wrong key) would leave the drop unreported.
-    index.apply(ctx as never, { dataDir, perSessionCacheBytes: 64 })
+    await applyAssembly(ctx as never, { dataDir, perSessionCacheBytes: 64 })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1481,7 +1482,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     await waitForIdentity(dataDir)
 
     const pair = ctx.tools.definitions.find((definition) => definition.name === 'cherry_pair')!
@@ -1579,7 +1580,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
 
@@ -1670,7 +1671,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1739,7 +1740,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1804,7 +1805,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1824,7 +1825,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 
     // A RE-APPLY drains the previous pool; the parked waiter belongs to the
     // pool being drained and must be rejected with it.
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     // Peer-side proof again: the re-apply released the live subscription rather
     // than merely dropping the assembly's reference to it.
     await vi.waitFor(
@@ -1890,7 +1891,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -1977,7 +1978,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -2022,7 +2023,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     await connectPool(ctx, fakeInfo)
@@ -2074,7 +2075,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     const file = join(dataDir, 'devices.json')
@@ -2112,7 +2113,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     const file = join(dataDir, 'devices.json')
@@ -2167,7 +2168,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     // Seeded ALREADY forgotten, so the connect below proves the suppression and
     // the remember is the only thing that changes the outcome.
     new DeviceStore(join(dataDir, 'devices.json')).upsert({
@@ -2207,7 +2208,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
 
@@ -2246,13 +2247,54 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     expect(fakeInfo.fake.socketCount).toBe(0)
   })
 
+  it('③ad applyAssembly settles the identity bootstrap, so an immediate teardown cannot race it (#269)', async () => {
+    // The teardown shape that used to flake in a full-suite run: remove the data
+    // directory the moment the apply call returns. `apply` starts
+    // `loadOrCreateIdentity` without awaiting it, and on a fresh directory that
+    // promise calls `mkdir(dataDir, { recursive: true })` before writing — so a
+    // teardown that gets there first sees the directory RECREATED under it and
+    // the final `rmdir` fails with ENOTEMPTY. `applyAssembly` waits for the
+    // write, which is the same event, not a sleep.
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    await applyAssembly(assemblyCtx() as never, { dataDir })
+    // SYNCHRONOUS removal on purpose: an async `rm` would race the write the
+    // same way the bug does, so the test would inherit the flakiness instead of
+    // pinning the fix. `rmSync` cannot interleave with a pending microtask, so
+    // the window is exact: whatever is still in flight lands afterwards.
+    rmSync(dataDir, { recursive: true, force: true })
+
+    // Watch the window the write used to land in. One check would race the same
+    // way the bug does; twenty over 200 ms cover it.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      expect(existsSync(dataDir)).toBe(false)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }, 15_000)
+
+  it('③ae index.apply starts the identity bootstrap WITHOUT waiting for it (#269)', async () => {
+    // The production fact ③ad compensates for, pinned so it cannot change
+    // silently: `apply` is synchronous by host contract, so `identity.key`
+    // cannot exist at the instant it returns. If this ever fails because apply
+    // started settling the bootstrap itself, that is a real improvement — ③ad
+    // and the helper then become redundant and should be revisited.
+    const index = await import('../../src/index.js')
+    const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
+    dirs.push(dataDir)
+
+    index.apply(assemblyCtx() as never, { dataDir })
+    expect(existsSync(join(dataDir, 'identity.key'))).toBe(false)
+
+    await waitForIdentity(dataDir)
+    expect(existsSync(join(dataDir, 'identity.key'))).toBe(true)
+  }, 15_000)
+
   it('③ab unwraps a bracketed IPv6 literal and refuses an over-long host, like the PATCH path', async () => {
     const index = await import('../../src/index.js')
     const fakeInfo = await makeFake()
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
     const ctx = assemblyCtx()
-    index.apply(ctx as never, { dataDir })
+    await applyAssembly(ctx as never, { dataDir })
     seedConnectedDevice(dataDir, fakeInfo)
     await waitForIdentity(dataDir)
     const devices = ctx.tools.definitions.find((definition) => definition.name === 'cherry_devices')!
