@@ -1,0 +1,152 @@
+# The release path has three steps that fail SILENTLY when skipped (AGENTS.md
+# → Release): the staged publish plus the web approval, bumping BOTH README
+# install pins BEFORE staging, and re-attaching the tarball to the GitHub
+# release under the version-independent name the plugin catalog probes.
+#
+# Locally, publishing needs `npx npm@11` because the npm bundled with Node 22
+# has no `stage` command. On a runner we simply pick a Node whose npm has it.
+#
+# Two modes, because the npm approval happens in a browser BETWEEN them:
+#
+#   stage  — gate, then `npm stage publish`; prints the stage id to approve
+#   attach — after approval: download the PUBLISHED tarball, prove it matches
+#            the registry's shasum, attach it as dsh-cherry-bridge.tgz
+#
+# Running `attach` before approving is refused on purpose: an unapproved stage
+# leaves `latest` where it was, silently, and the asset would then advertise a
+# version nobody can install.
+
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'stage = gate + staged publish; attach = put the published tarball on the GitHub release'
+        type: choice
+        options: [stage, attach]
+        default: stage
+      dist_tag:
+        description: 'npm dist-tag (stage mode only)'
+        required: false
+        default: latest
+      dry_run:
+        description: 'stage mode: run every gate, then stop without publishing'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  stage:
+    name: stage
+    if: ${{ inputs.mode == 'stage' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # `npm stage` needs npm >= 11; Node 22.18 ships npm 10.
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - run: npm ci
+
+      # Silent failure #2: npm serves the README captured in the tarball, so a
+      # pin bumped after the publish is stale on the npm page forever. Both
+      # files, both spec forms — four pins, because a language switch that only
+      # half updates is the same bug with a smaller blast radius.
+      - name: the README install pins name the version being published
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          echo "publishing $VERSION"
+          for f in README.md README.en.md; do
+            grep -q "dsh-cherry-bridge@$VERSION" "$f" \
+              || { echo "::error file=$f::missing the @$VERSION install pin"; exit 1; }
+            grep -q "#v$VERSION" "$f" \
+              || { echo "::error file=$f::missing the #v$VERSION install pin"; exit 1; }
+          done
+
+      # `prepublishOnly` IS the gate: typecheck, the full suite, both builds and
+      # `npm pack --dry-run`. It runs again inside `npm stage publish` below —
+      # that costs a few minutes on a job that runs a handful of times a year,
+      # and it means no step here depends on `stage` forwarding publish flags.
+      - run: npm run prepublishOnly
+
+      - name: committed artifacts match this source
+        run: git diff --exit-code -- dist lib
+
+      - name: stage the publish
+        if: ${{ !inputs.dry_run }}
+        run: npm stage publish --tag "${{ inputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: approve it on npmjs.com
+        run: |
+          echo "Staged. Open https://www.npmjs.com/ → Packages → Staged Packages"
+          echo "and approve it with 2FA. Then re-run this workflow with mode=attach."
+          echo "Check with: npm view dsh-cherry-bridge dist-tags"
+
+  attach:
+    name: attach
+    if: ${{ inputs.mode == 'attach' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # Uploading a release asset.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: take the published tarball, byte for byte
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+
+          # Refuse to attach before the staged publish was approved.
+          LATEST=$(npm view dsh-cherry-bridge dist-tags.latest)
+          [ "$LATEST" = "$VERSION" ] \
+            || { echo "::error::dist-tags.latest is $LATEST, not $VERSION — approve the stage first"; exit 1; }
+
+          # Download the PUBLISHED bytes rather than rebuilding: a rebuild is a
+          # hope that the tarball is reproducible, this is the artefact itself.
+          npm pack "dsh-cherry-bridge@$VERSION"
+          mv "dsh-cherry-bridge-$VERSION.tgz" dsh-cherry-bridge.tgz
+
+          EXPECTED=$(npm view "dsh-cherry-bridge@$VERSION" dist.shasum)
+          ACTUAL=$(sha1sum dsh-cherry-bridge.tgz | cut -d' ' -f1)
+          [ "$ACTUAL" = "$EXPECTED" ] \
+            || { echo "::error::sha1 $ACTUAL != registry $EXPECTED"; exit 1; }
+          echo "sha1 $ACTUAL"
+
+      - name: attach under the version-independent name
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          # Silent failure #3: the catalog entry points at
+          # releases/latest/download/dsh-cherry-bridge.tgz — NOT at a name with
+          # the version in it. The release itself (body = the CHANGELOG section)
+          # is the maintainer's, so a missing one is an error, not something to
+          # invent here.
+          gh release view "v$VERSION" >/dev/null 2>&1 \
+            || { echo "::error::create the GitHub release v$VERSION first, body = the CHANGELOG section"; exit 1; }
+          gh release upload "v$VERSION" dsh-cherry-bridge.tgz --clobber
+
+      - name: the catalog's URL answers 200
+        run: |
+          set -euo pipefail
+          URL=https://github.com/SAXEM1997/dsh-cherry-bridge/releases/latest/download/dsh-cherry-bridge.tgz
+          CODE=$(curl -sL -o /dev/null -w '%{http_code}' "$URL")
+          [ "$CODE" = "200" ] || { echo "::error::$URL answered $CODE"; exit 1; }
+          echo "$URL → 200"
