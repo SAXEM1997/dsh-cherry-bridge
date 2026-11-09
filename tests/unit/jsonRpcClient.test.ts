@@ -12,6 +12,7 @@ import {
 } from '@cherrystudio/remote-transport'
 import { toRemoteSocket } from '../../src/rpc/wsAdapter.js'
 import {
+  failureReason,
   isChannelClosedError,
   JsonRpcClient,
   JsonRpcRequestError,
@@ -919,5 +920,53 @@ describe('JsonRpcClient', () => {
     // And a request made later still fails fast with the same face.
     await expect(client.request('agent.agents.list', {})).rejects.toThrow(/^JSON-RPC channel closed$/)
     expect(write).toHaveBeenCalledTimes(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// failureReason — the ONE judgement of "did the peer give a reason" (#265)
+// ---------------------------------------------------------------------------
+
+describe('failureReason reads the peer’s discriminator, and only a real one (#265)', () => {
+  const withData = (data: unknown): JsonRpcRequestError =>
+    new JsonRpcRequestError(1000, 'peer refused', data)
+
+  it('⑬a answers the string a peer put in `data.reason`', () => {
+    expect(failureReason(withData({ reason: 'RATE_LIMITED' }))).toBe('RATE_LIMITED')
+  })
+
+  it('⑬b answers undefined for anything that is not a peer request error', () => {
+    // The function is applied to whatever a catch block caught, so every other
+    // shape has to answer "no reason" rather than throw or guess.
+    expect(failureReason(new Error('local'))).toBeUndefined()
+    expect(failureReason(undefined)).toBeUndefined()
+    expect(failureReason('RATE_LIMITED')).toBeUndefined()
+    expect(failureReason(new RequestTimeoutError('agent.agents.list', 1_000, false))).toBeUndefined()
+    // A LOOK-ALIKE is not the peer's error class. Something local that happens to
+    // carry `data.reason` must not be read as a peer classification: the
+    // discriminator is only meaningful for the error the peer's answer produced.
+    expect(failureReason({ data: { reason: 'RATE_LIMITED' } })).toBeUndefined()
+  })
+
+  it('⑬c a `reason` that is not a STRING is not a reason', () => {
+    // `JsonRpcRequestError.data` is `unknown`, so this is the judgement the
+    // whole rule consists of. A number, an object or null in that slot would
+    // otherwise be handed back as if the peer had classified the failure, and
+    // every caller compares it against a string enum — silently never matching.
+    expect(failureReason(withData({ reason: 42 }))).toBeUndefined()
+    expect(failureReason(withData({ reason: { code: 'RATE_LIMITED' } }))).toBeUndefined()
+    expect(failureReason(withData({ reason: null }))).toBeUndefined()
+    expect(failureReason(withData({ reason: ['RATE_LIMITED'] }))).toBeUndefined()
+  })
+
+  it('⑬d `data` that is not an object carries no reason', () => {
+    expect(failureReason(withData(undefined))).toBeUndefined()
+    expect(failureReason(withData(null))).toBeUndefined()
+    expect(failureReason(withData('RATE_LIMITED'))).toBeUndefined()
+    // An ARRAY is an object to `typeof`, and it answers "no reason" too — not
+    // because a guard excludes it (a JSON array cannot carry a `reason` key, so
+    // such a guard would be unreachable) but because the field is simply absent.
+    expect(failureReason(withData([]))).toBeUndefined()
+    expect(failureReason(withData(['RATE_LIMITED']))).toBeUndefined()
   })
 })

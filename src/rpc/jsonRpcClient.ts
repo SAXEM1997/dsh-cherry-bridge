@@ -140,6 +140,36 @@ export class JsonRpcRequestError extends Error {
 }
 
 /**
+ * The peer's own failure discriminator, or `undefined` when it gave none.
+ *
+ * `JsonRpcRequestError.data` is `unknown`, so this function IS the definition of
+ * "the peer classified this failure": the data must be a plain object and
+ * `reason` must be a string. Every caller compares the answer against a string
+ * enum (`RATE_LIMITED`, `RESOURCE_EXHAUSTED`, …), so a number or an object in
+ * that slot would silently never match — which is why this is a judgement rather
+ * than a field access, and why it lives HERE (#265): it is a property of the
+ * error class, not of any one consumer.
+ *
+ * There were FIVE copies of this rule before — `tools.ts`, `subscriptions.ts`,
+ * an inline one in `httpApi.ts`, and `rpcReason` in both `connection.ts` and
+ * `pairing.ts` — and they had already drifted: some excluded arrays from "plain
+ * object" and others did not, which is exactly the kind of difference that makes
+ * two faces classify one peer error differently without either of them failing.
+ *
+ * No `Array.isArray` guard: `data` is what a peer put on the wire, and a JSON
+ * array cannot carry a `reason` key, so such a check could never answer
+ * differently from the plain one — an unreachable guard reads as though there is
+ * an input that reaches it.
+ */
+export function failureReason(error: unknown): string | undefined {
+  if (!(error instanceof JsonRpcRequestError)) return undefined
+  const data: unknown = error.data
+  if (typeof data !== 'object' || data === null) return undefined
+  const reason = (data as Record<string, unknown>)['reason']
+  return typeof reason === 'string' ? reason : undefined
+}
+
+/**
  * Per-request options. Shared by this client and by the connection facade, which
  * forwards them after its own lifecycle handling (`#businessRequest`).
  */

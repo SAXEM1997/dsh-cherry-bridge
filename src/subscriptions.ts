@@ -1,4 +1,4 @@
-import { JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import { failureReason, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcClient } from './rpc/jsonRpcClient.js'
 import { DEFAULT_PER_SESSION_CACHE_BYTES } from './defaults.js'
 import { failureText } from './text.js'
@@ -228,12 +228,6 @@ function positive(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
 }
 
-/** The peer's failure discriminator, or undefined for a non-protocol error. */
-function failureReason(error: unknown): string | undefined {
-  if (!(error instanceof JsonRpcRequestError)) return undefined
-  const data = error.data as { reason?: unknown } | undefined
-  return data !== null && typeof data === 'object' && typeof data.reason === 'string' ? data.reason : undefined
-}
 
 /** UTF-8 byte length of one buffered event, as JSON (what the peer actually sends). */
 function eventBytes(event: AgentEvent): number {

@@ -14,9 +14,8 @@ import { resolveSubagentConfig, sameSubagentResolution } from './subagent.js'
 import type { SubagentConfigResolution } from './subagent.js'
 import type { SubagentConfigDocument, StoredSubagentConfig } from './subagentConfigStore.js'
 import type { SubagentSubsystemStatus } from './subagentHost.js'
-import { failureReason } from './tools.js'
 import type { SubagentTargetsListing, SubagentTargetsOutcome } from './tools.js'
-import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
+import { failureReason, JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { failureText } from './text.js'
 
 /**

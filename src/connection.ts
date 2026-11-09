@@ -4,7 +4,7 @@ import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-t
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
 import { directEndpointUrl, advertisedEndpointSchema } from '@cherrystudio/remote-protocol'
 import type { DirectEndpoint } from '@cherrystudio/remote-protocol'
-import { isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import { failureReason, isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcRequestOptions } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { digestIdentity } from './diagnostics.js'
@@ -665,14 +665,6 @@ interface AuthResult {
 interface RefreshResult {
   accessToken: string
   expiresAt: string
-}
-
-function rpcReason(error: unknown): string | undefined {
-  if (error instanceof JsonRpcRequestError) {
-    const data = error.data as { reason?: unknown } | undefined
-    if (data !== null && typeof data === 'object' && typeof data.reason === 'string') return data.reason
-  }
-  return undefined
 }
 
 function isPeerIdentityMismatch(error: unknown): boolean {
@@ -1460,7 +1452,7 @@ export class DeviceConnection {
         protocolVersions: [...this.#helloProtocolVersions],
       })
     } catch (error) {
-      if (rpcReason(error) === 'INVALID_CONNECTION_STATE') throw new ProtocolVersionError(String(error))
+      if (failureReason(error) === 'INVALID_CONNECTION_STATE') throw new ProtocolVersionError(String(error))
       throw error instanceof Error ? error : new Error(String(error))
     }
 
@@ -1491,7 +1483,7 @@ export class DeviceConnection {
     try {
       auth = await this.#authenticate(link)
     } catch (error) {
-      const reason = rpcReason(error)
+      const reason = failureReason(error)
       if (reason === 'GRANT_REVOKED' || reason === 'UNAUTHENTICATED') throw new AuthRejectedError(reason)
       throw error instanceof Error ? error : new Error(String(error))
     }
@@ -1635,7 +1627,7 @@ export class DeviceConnection {
     try {
       return await this.#houseCall<AuthResult>(link, 'connection.authenticate', params(stored !== undefined))
     } catch (error) {
-      const reason = rpcReason(error)
+      const reason = failureReason(error)
       if (
         stored !== undefined &&
         (reason === 'TOKEN_EXPIRED' || reason === 'UNAUTHENTICATED')
