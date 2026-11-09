@@ -206,6 +206,26 @@ describe('a failed run reports the peer’s own classification (#231)', () => {
     expect(JSON.stringify(answer)).not.toContain('sk-live-should-never-surface')
   })
 
+  it('①e a failed run the peer did NOT classify still carries a reason (#259)', async () => {
+    // The fixture falls back to `{ reason: 'INTERNAL', message: 'Run failed' }`
+    // when a `failed` terminal carries no `executionError`, and NOTHING exercised
+    // that fallback: every failing fixture supplied its own classification. A
+    // caller branching on "did the peer say why" then has no way to tell the two
+    // apart, so the fallback is part of the contract the fixture models.
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], runTerminalStatus: 'failed' },
+    })
+    const answer = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'do the thing',
+      timeoutMs: 5_000,
+    })) as Record<string, unknown>
+
+    expect(answer['status']).toBe('failed')
+    expect(answer['executionError']).toEqual({ reason: 'INTERNAL', message: 'Run failed' })
+  })
+
   it('①b a COMPLETED run carries no `executionError` at all', async () => {
     // Absence, not a placeholder: a `{reason: undefined}` or an empty object
     // would make "the peer said why" indistinguishable from "the peer did not",
@@ -418,7 +438,7 @@ describe('a settled run whose history could not be read is not a silent child (S
 
 describe('a delegation has no human to ask (SUB-30..32)', () => {
   it('③a every card is DENIED and the run carries on to its terminal', async () => {
-    const rig = await makeRig(completing('finished anyway', { pushInteractionOnRun: INTERACTION, denyKeepsRunAlive: true }))
+    const rig = await makeRig(completing('finished anyway', { pushInteractionOnRun: INTERACTION }))
     const outcome = await delegate(rig)
     expect(outcome.status).toBe('completed')
     expect(outcome.text).toBe('finished anyway')
@@ -438,7 +458,6 @@ describe('a delegation has no human to ask (SUB-30..32)', () => {
     const rig = await makeRig(
       completing('never gets here', {
         pushInteractionOnRun: INTERACTION,
-        denyKeepsRunAlive: true,
         interactionSpamOnRun: { count: 20, record: INTERACTION },
       }),
     )
