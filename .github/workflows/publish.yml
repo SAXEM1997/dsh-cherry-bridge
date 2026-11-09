@@ -143,10 +143,23 @@ jobs:
             || { echo "::error::create the GitHub release v$VERSION first, body = the CHANGELOG section"; exit 1; }
           gh release upload "v$VERSION" dsh-cherry-bridge.tgz --clobber
 
+      # Retried, because a freshly uploaded asset is not instantly downloadable:
+      # 0.3.0 answered 504 for about three minutes after the upload, while the
+      # 0.2.3 asset on the same repo answered 200 and an unrelated public asset
+      # also 504'd. A single curl turns that propagation delay into a red
+      # release run for a release that is in fact complete.
       - name: the catalog's URL answers 200
         run: |
           set -euo pipefail
           URL=https://github.com/SAXEM1997/dsh-cherry-bridge/releases/latest/download/dsh-cherry-bridge.tgz
-          CODE=$(curl -sL -o /dev/null -w '%{http_code}' "$URL")
-          [ "$CODE" = "200" ] || { echo "::error::$URL answered $CODE"; exit 1; }
-          echo "$URL → 200"
+          for attempt in 1 2 3 4 5 6; do
+            CODE=$(curl -sL -o /dev/null -w '%{http_code}' "$URL" || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "$URL → 200 (attempt $attempt)"
+              exit 0
+            fi
+            echo "attempt $attempt → $CODE"
+            sleep 20
+          done
+          echo "::error::$URL never answered 200"
+          exit 1
