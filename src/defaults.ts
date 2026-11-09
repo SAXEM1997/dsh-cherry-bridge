@@ -210,11 +210,17 @@ export const MAX_RESUME_TOKEN_CHARS = 4_096
 /**
  * The provider name a Cherry delegation is registered under.
  *
- * These four values are **numbers and words that also appear in the copy**: the
- * README pair, the tool description and the settings page all quote them, and a
- * reader has no way to tell a stale sentence from a changed default. They live
- * here, once, and `tests/unit/subagentConfig.test.ts` pins them — the same
- * discipline issue #219 applied to the parameter descriptions.
+ * These four values are **numbers and words a reader can meet in the copy**: the
+ * README pair names the `providerName` / tool fields and quotes the 30-minute
+ * timeout, the settings page shows the tool name and, once mounted, the
+ * provider name in its status line. They live here, once, and
+ * `tests/unit/subagentConfig.test.ts` pins them — the same discipline issue #219
+ * applied to the parameter descriptions.
+ *
+ * `DEFAULT_MAX_INTERACTION_ABANDONS` is the exception, and it is called out
+ * rather than quietly included: no copy quotes it and the page has no control
+ * for it, so changing it is not a documentation change. Anyone adding that
+ * control has to add the sentence too.
  */
 export const CHERRY_SUBAGENT_PROVIDER_DEFAULT = 'cherry'
 

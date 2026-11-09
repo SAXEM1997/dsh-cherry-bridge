@@ -5851,7 +5851,7 @@ function matchRoute(routes, cwd) {
 *   when it is longer than the peer's own body ceiling.
 */
 function textPrompt(prompt) {
-	if (prompt.length === 0) throw new Error("cherry subagent: the one-shot task must contain only text blocks");
+	if (prompt.length === 0) throw new Error("cherry subagent: the one-shot task must not be empty");
 	const texts = [];
 	for (const block of prompt) {
 		if (block.type !== "text" || typeof block.text !== "string") throw new Error("cherry subagent: the one-shot task must contain only text blocks");
@@ -7443,13 +7443,6 @@ function defineCherryTool(definition) {
 	};
 }
 /**
-* The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
-* family: the six READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9), and
-* two MANAGEMENT ones (Task 10), plus the registration framework they all
-* share. Kept as one class (rather than per-face closures) so the per-session
-* and per-device state the later faces add has an obvious home.
-*/
-/**
 * A wait that OUR side stopped.
 *
 * Deliberately not one of the peer's four terminal statuses: the run did not
@@ -7474,6 +7467,19 @@ var RunAbortedError = class extends Error {
 		this.executionId = executionId;
 	}
 };
+/**
+* The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
+* family THIS CLASS defines: the six READ-ONLY tools (Task 8), six INTERACTIVE
+* ones (Task 9), and
+* two MANAGEMENT ones (Task 10), plus the registration framework they all
+* share. Kept as one class (rather than per-face closures) so the per-session
+* and per-device state the later faces add has an obvious home.
+*
+* FOURTEEN is the count for THIS CLASS, not for the plugin: `cherry_subagent`
+* is the fifteenth governed name and is defined in `subagentTool.ts`, outside
+* this class. Raising this number because the plugin gained a tool would make
+* the sentence describe a list the code below does not build.
+*/
 var CherryToolEngine = class {
 	#deps;
 	/**
@@ -7800,7 +7806,7 @@ var CherryToolEngine = class {
 	* The settings page's candidate source (#260): the agents on a device, and —
 	* when `agentId` names one — that agent's workspaces.
 	*
-	* WHY IT IS A METHOD HERE AND NOT A FIFTEENTH TOOL. The page needs exactly the
+	* WHY IT IS A METHOD HERE AND NOT A TOOL OF ITS OWN. The page needs exactly the
 	* two capabilities the read tools already have: the shared device resolution
 	* (`#resolve`, including the `connecting` wait and the quarantine precedence)
 	* and the page-aggregating walk (`#aggregate`). Both are private to this
@@ -12458,15 +12464,15 @@ function createToolScopeHost(deps) {
 	* and no second (B18):
 	*
 	*   visible under the CURRENT document and judgement ⇒ the EMPTY set
-	*   not visible ⇒ CHERRY_TOOL_NAMES ∩ the no-argument `schemas()`
+	*   not visible ⇒ the governed `names` ∩ the observed global set
 	*   not visible, view unreadable ⇒ `undefined` (no target could be computed)
 	*
 	* `judgement()` is the per-agent cache; a MISS falls back to
 	* `scope.resolveNow(agent)` — the same §4 rules answered from the CURRENT
 	* generation WITHOUT awaiting anything. `rebuild()` is fed by the currently
 	* live agents alone, so a brand-new agent id can never be pre-judged; without
-	* that fallback the first install would deny all 14 names and the tools would
-	* appear only once the asynchronous round converged — B13's 「第一轮就有工具」
+	* that fallback the first install would deny every governed name and the tools
+	* would appear only once the asynchronous round converged — B13's 「第一轮就有工具」
 	* is exactly the other direction. Only when there is NO usable generation
 	* either (a read never taken, failed, or empty) does the expression collapse
 	* to `isVisible(doc, undefined)`: under `global` that is true (a miss releases

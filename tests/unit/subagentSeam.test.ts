@@ -694,8 +694,12 @@ describe('#229 textPrompt refuses anything the seam cannot carry', () => {
     expect(() => textPrompt([{ type: 'image', source: 'x' } as never])).toThrow(/text/)
   })
 
-  it('rejects an empty prompt', () => {
-    expect(() => textPrompt([])).toThrow()
+  it('rejects an empty prompt with its OWN sentence, not the block complaint', () => {
+    // An empty task is not a task carrying a non-text block. Both used to say
+    // "must contain only text blocks", which sends the operator looking for a
+    // block they never wrote.
+    expect(() => textPrompt([])).toThrow(/must not be empty/)
+    expect(() => textPrompt([])).not.toThrow(/only text blocks/)
   })
 
   it('rejects a prompt that is only whitespace', () => {
@@ -836,12 +840,12 @@ describe('#231 the provider maps the runner’s answer onto the seam', () => {
     // the seam's "fail after returning means settle through result" applies. The
     // runner's message is the only account of why, so it becomes the diagnostic.
     const { deps } = runnerStub(async () => {
-      throw new Error('cherry subagent: the target device is unavailable (device-not-found)')
+      throw new Error('cherry subagent: the target device is unavailable (not-found)')
     })
     const run = await createCherryProvider(deps).start(providerRequest())
     const result = await run.result
     expect(result.stopReason).toBe('error')
-    expect(result.diagnostic).toContain('device-not-found')
+    expect(result.diagnostic).toContain('not-found')
   })
 
   it('⑥e a `completed` result carries NO diagnostic, whatever the runner said', async () => {

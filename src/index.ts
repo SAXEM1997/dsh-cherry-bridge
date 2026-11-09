@@ -323,8 +323,8 @@ interface AssemblyState {
    * The EXPERIMENTAL subagent subsystem for this apply, when one was mounted.
    *
    * Held on the state rather than returned because the settings page reaches it
-   * through the HTTP face (#233) and the diagnostics report reads its state; a
-   * re-apply replaces it, so a panel never reads a previous assembly's verdict.
+   * through the HTTP face (#233); a re-apply replaces it, so a panel never reads
+   * a previous assembly's verdict.
    */
   subagents?: SubagentHost
   /**

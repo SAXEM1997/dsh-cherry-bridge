@@ -493,7 +493,10 @@ export function matchRoute(
  */
 export function textPrompt(prompt: readonly SubagentContentBlock[]): string {
   if (prompt.length === 0) {
-    throw new Error('cherry subagent: the one-shot task must contain only text blocks')
+    // A different sentence from the block check below: an EMPTY task is not a
+    // task carrying a non-text block, and the operator who sent nothing needs to
+    // hear that, not a complaint about a block they never wrote.
+    throw new Error('cherry subagent: the one-shot task must not be empty')
   }
   const texts: string[] = []
   for (const block of prompt) {
