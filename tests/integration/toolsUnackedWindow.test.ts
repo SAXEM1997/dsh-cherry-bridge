@@ -482,13 +482,23 @@ describe('#212: the peer’s un-acked delivery window cannot stall a wait', () =
     }
     await vi.waitFor(() => expect(rig.fake.ackCalls.length).toBe(1), 3_000)
 
+    // The ack TRIGGER is the peer's window, while `unackedBytes` counts what
+    // this layer has handed to the subscriber so far. Those are two different
+    // clocks, and under CPU contention they drift far enough apart that the
+    // byte assertion below measured the drift instead of the invariant: a
+    // contended run read 174 740 where a quiet one reads 261 764 (#269). Wait
+    // for delivery to reach the window, then assert the invariant itself.
+    await vi.waitFor(() => {
+      expect(rig.subscriptions().deliveryOf('s-1')?.deliveredBytes ?? 0).toBeGreaterThan(250_000)
+    }, 5_000)
+
     const ledger = rig.subscriptions().deliveryOf('s-1')
     expect(ledger?.acks).toBe(0)
-    // Still essentially the whole stream un-acked: a refusal must not move the
-    // byte side either (the number is the layer's own, slightly under the
-    // peer's window because the peer counts what it SENT).
-    expect(ledger?.unackedBytes).toBeGreaterThan(200_000)
-    expect(ledger?.deliveredBytes).toBeGreaterThanOrEqual(ledger?.unackedBytes ?? 0)
+    // Still the whole stream un-acked, stated exactly and without a clock:
+    // nothing was acked, so everything delivered must still be un-acked. A
+    // refusal that freed any budget breaks this equality whatever the timing.
+    expect(ledger?.unackedBytes).toBe(ledger?.deliveredBytes)
+    expect(ledger?.unackedBytes).toBeGreaterThan(250_000)
   })
 
   it('①h the ledger belongs to the CURRENT subscription: a re-subscribe resets it', async () => {
