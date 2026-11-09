@@ -40,6 +40,7 @@ import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions, FakeInteractionRecord, FakeMessageRecord } from '../loopback/fakeCherry.js'
 import { makeDualPeer, testTlsCaPem, type DualPeer } from '../helpers/tls/dualPeer.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
+import { applyAssembly } from '../helpers/applyAssembly.js'
 
 /**
  * Task 13 — the CONTRACT suite.
@@ -1955,7 +1956,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     const server = makeServer()
     const dir = tempDir('cherry-assembly-')
     const ctx = assemblyCtx(server)
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: dir })
 
     try {
       const store = new DeviceStore(join(dir, 'devices.json'))
@@ -2005,7 +2006,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     const server = makeServer()
     const ctx = assemblyCtx(server)
     const first = tempDir('cherry-reapply-1-')
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: first })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: first })
 
     // Record one error the way the assembly does when a device drops.
     index.noteError({
@@ -2020,7 +2021,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
 
     // A re-apply is a FRESH assembly: the previous run's error summaries and
     // connection count describe a pool that no longer exists.
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-reapply-2-') })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-reapply-2-') })
 
     const after = await getDiagnostics(server)
     const report = after.body as {
@@ -2045,7 +2046,7 @@ describe('③ the real plugin assembly serves /diagnostics', () => {
     const index = await import('../../src/index.js')
     const server = makeServer()
     const ctx = assemblyCtx(server)
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-cursor-') })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: tempDir('cherry-cursor-') })
 
     try {
       const empty = await getDiagnostics(server)
@@ -2310,7 +2311,7 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     // is the ONLY thing that changes the dial's verdict. `ca`-only is the
     // private-CA production shape (no `rejectUnauthorized: false` crutch): a
     // bag that drops `ca` must NOT connect.
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: { ca: testTlsCaPem } })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: { ca: testTlsCaPem } })
 
     try {
       // Written AFTER `apply` (the assembly creates its store handle there),
@@ -2340,7 +2341,7 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     const dir = tempDir('cherry-wstls-control-')
     const server = makeServer()
     const ctx = assemblyCtx(server)
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: dir })
 
     try {
       seedWssDevice(dir, peer)
@@ -2375,7 +2376,7 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     const ctx = assemblyCtx(server)
     // `ca`-only, no `rejectUnauthorized: false` crutch: the pairing dial must
     // carry the CA itself (a bag that drops `ca` must NOT pair).
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: { ca: testTlsCaPem } })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: dir, wsTls: { ca: testTlsCaPem } })
 
     try {
       await waitForPath(join(dir, 'identity.key'))
@@ -2415,7 +2416,7 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     const dir = tempDir('cherry-wstls-pair-control-')
     const server = makeServer()
     const ctx = assemblyCtx(server)
-    index.apply(ctx as unknown as CherryHttpContext, { dataDir: dir })
+    await applyAssembly(ctx as unknown as CherryHttpContext, { dataDir: dir })
 
     try {
       await waitForPath(join(dir, 'identity.key'))
@@ -2448,7 +2449,7 @@ describe('③w the assembly forwards wsTls to BOTH dial sites (issue #133)', () 
     const sentinel = '-----BEGIN CERTIFICATE-----WS-TLS-PEM-SENTINEL-----END CERTIFICATE-----'
     const server = makeServer()
     const ctx = assemblyCtx(server)
-    index.apply(ctx as unknown as CherryHttpContext, {
+    await applyAssembly(ctx as unknown as CherryHttpContext, {
       dataDir: tempDir('cherry-wstls-secret-'),
       wsTls: { ca: sentinel },
     })
