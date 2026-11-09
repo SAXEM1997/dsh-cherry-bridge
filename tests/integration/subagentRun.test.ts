@@ -456,6 +456,80 @@ describe('a delegation has no human to ask (SUB-30..32)', () => {
   })
 })
 
+describe('a receipt `interrupted` is not a run that ended (#250)', () => {
+  /** The receipt whose outcome is undetermined, with a child left running. */
+  const INTERRUPTED = (): FakeCherryOptions =>
+    // A short delay, not a long one: the run has to still be ALIVE when the
+    // cancel arrives, and the cancel's own drive then reports `cancelled` after
+    // the same delay — which is what the test waits for.
+    completing('never observed', { sendOutcome: 'interrupted', runDelayMs: 300 })
+
+  it('⑦a the verdict is an UNDETERMINED COMMAND, never "the run ended"', async () => {
+    // `interrupted` is the one word BOTH dimensions spell: an execution terminal
+    // (the run stopped) and a command receipt (the outcome is undecided). The
+    // fold's fallback called the second one "the run ended interrupted" — a run
+    // terminal it never observed, and the wording that teaches a parent to
+    // report a healthy child as broken.
+    const rig = await makeRig(INTERRUPTED())
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).not.toContain('the run ended')
+    expect(outcome.diagnostic).toMatch(/undetermined/i)
+    // The recovery route, with the VALUE: this diagnostic is the only channel a
+    // delegation's parent has — its outcome carries no `commandId` — so naming
+    // the field without the id would be advice the caller cannot take.
+    const sent = rig.fake.commandCallsFor('agent.messages.send')[0]?.['commandId']
+    expect(typeof sent).toBe('string')
+    expect(outcome.diagnostic).toContain(String(sent))
+  })
+
+  it('⑦b the child may be alive, so it is CANCELLED — and named correctly', async () => {
+    const rig = await makeRig(INTERRUPTED())
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    // Pinned as the WORK, not as the wire call: the fake refuses a cancel whose
+    // `expectedExecutionId` is not its own active execution, so a `cancelled`
+    // update for THIS run is the peer saying "you stopped the right child".
+    const started = rig.fake.executionUpdates.find((update) => update.status === 'running')?.executionId
+    expect(started).toBeDefined()
+    // The peer only accepts a cancel naming its OWN active execution, so this
+    // update is the peer saying "you stopped the child I started" — not merely
+    // that a cancel frame went out.
+    await vi.waitFor(() => {
+      const cancelled = rig.fake.executionUpdates.filter((update) => update.status === 'cancelled')
+      expect(cancelled.map((update) => update.executionId)).toEqual([started])
+    })
+  })
+
+  it('⑦d the peer’s own classification rides along when the receipt carries one', async () => {
+    // A legal interrupted receipt MAY carry `error` (contract ⑤'s case is a full
+    // command ledger). Dropping it would leave the parent with "interrupted" and
+    // no way to tell a full ledger from a lost link — the same information the
+    // rejected branch keeps.
+    const rig = await makeRig(
+      completing('never observed', {
+        sendOutcome: 'interrupted',
+        runDelayMs: 300,
+        sendInterruptedError: { reason: 'RESOURCE_EXHAUSTED', message: 'Receipt ledger is full' },
+      }),
+    )
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('RESOURCE_EXHAUSTED')
+    expect(outcome.diagnostic).toContain('Receipt ledger is full')
+  })
+
+  it('⑦c a genuine run-terminal `interrupted` still takes the terminal branch', async () => {
+    // Green before AND after this change: it is the guard against over-reach.
+    // Its red comes from the mutation that makes the shape test claim both
+    // dimensions, not from the old implementation.
+    const rig = await makeRig(completing('cut short', { runTerminalStatus: 'interrupted' }))
+    const outcome = await delegate(rig)
+    expect(outcome.status).toBe('error')
+    expect(outcome.diagnostic).toContain('the run ended interrupted')
+  })
+})
+
 describe('the deadline is the delegation’s own (SUB-40..42)', () => {
   it('④a the timeout cancels the run and reports an ERROR — never `cancelled`', async () => {
     // The race this pins: cancelling makes the peer push a `cancelled` terminal,

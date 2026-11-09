@@ -2332,6 +2332,33 @@ describe('final review: the receipt status enum', () => {
     expect(result.status).toBe('rejected')
     expect(result.error?.reason).toBe('CONFLICT')
   })
+
+  it('R4c: an INTERRUPTED receipt short-circuits too, and does NOT cancel the run (#250)', async () => {
+    // The receipt says the command's OUTCOME IS UNDETERMINED, so the wait has
+    // nothing to settle on and hands the receipt back — same short-circuit as a
+    // refusal, different meaning.
+    //
+    // The cancel is deliberately NOT here. A delegation cancels, because nobody
+    // will read its child; a `cherry_send` caller gets the receipt and can read
+    // the session with `cherry_read`, so killing the run for them is a decision
+    // this issue did not make. Pinned as an absence because the cancel lives one
+    // call up, in the delegation runner, and "helpfully" moving it into the
+    // shared path would otherwise pass every test.
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], sendOutcome: 'interrupted', runDelayMs: 300 },
+    })
+
+    const result = (await rig.call('cherry_send', {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: 'cut off',
+      timeoutMs: 5_000,
+    })) as { status: string; commandId?: string; method?: string }
+
+    expect(result.status).toBe('interrupted')
+    expect(result.method).toBe('agent.messages.send')
+    expect(rig.fake.commandCallsFor('agent.executions.cancel')).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------

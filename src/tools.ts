@@ -1528,6 +1528,20 @@ interface ObservationCarry {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Which dimension an answer came from, for the one status both dimensions spell.
+ *
+ * `interrupted` is an EXECUTION terminal (the run stopped) and a COMMAND
+ * RECEIPT (the command's outcome is undecided, so no run may exist at all). The
+ * status alone cannot say which, and the two need opposite sentences, so the
+ * SHAPE decides: `method` names the command that was interrupted, and no
+ * execution answer carries one — a run terminal answers with `session` / `text`
+ * / `cursor` instead (#250).
+ */
+function isCommandReceipt(answer: Record<string, unknown>): boolean {
+  return typeof answer['method'] === 'string'
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -4987,8 +5001,17 @@ export class CherryToolEngine {
     // `awaiting-interaction` arrives here only through the ceiling (which has
     // already cancelled) or through a card with no id (unreachable), the four
     // terminal statuses have ended the run, and a rejected RECEIPT never started
-    // one. A receipt `interrupted` — the command's outcome is undetermined, so
-    // its run MAY be alive — is the one case this does not cover (issue #250).
+    // one.
+    //
+    // A receipt `interrupted` joins them (#250) — the command's outcome is
+    // undetermined, so its run MAY be alive. It is the RECEIPT shape
+    // specifically: a run-terminal `interrupted` has already stopped, and a
+    // cancel would name a run the peer no longer has.
+    //
+    // Deliberately NOT in `#runOnce`, which the tool face shares: a
+    // `cherry_send` caller gets the receipt back and can read the session with
+    // `cherry_read`, so cancelling its run for it is a decision this issue did
+    // not make. R4c pins that absence.
     if (answer['status'] === 'timeout' || answer['status'] === 'subscription-lost') {
       await this.#cancelRun(
         connection,
@@ -4996,6 +5019,11 @@ export class CherryToolEngine {
         sessionId,
         optionalString(answer['executionId']) ?? observedExecutionId,
       ).catch(() => {})
+    }
+    if (answer['status'] === 'interrupted' && isCommandReceipt(answer)) {
+      await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer['executionId'])).catch(
+        () => {},
+      )
     }
     return this.#foldDelegation(answer, {
       ceilingHit,
@@ -5098,6 +5126,36 @@ export class CherryToolEngine {
         diagnostic:
           `the delegation could not observe the run${reason === undefined ? '' : ` (${reason})`}. ` +
           `The child may still be running. ${SUBSCRIPTION_LOST_GUIDANCE}`,
+      }
+    }
+    // #250: `interrupted` is the one status BOTH dimensions spell, so the shape
+    // decides which sentence is true. A RECEIPT says the command's outcome is
+    // undetermined — no run may exist, and one that does may still be running —
+    // which is not "the run ended". Reached here only for the receipt shape;
+    // a run-terminal `interrupted` falls through to the branch below, where the
+    // execution's own vocabulary is correct.
+    if (status === 'interrupted' && isCommandReceipt(answer)) {
+      const receiptError = isRecord(answer['error']) ? answer['error'] : undefined
+      const reason = receiptError === undefined ? undefined : optionalString(receiptError['reason'])
+      const message = receiptError === undefined ? undefined : optionalString(receiptError['message'])
+      // The peer's own classification rides along when it sent one, exactly as
+      // the rejected branch carries it: it is the only thing that says whether
+      // the interruption was a full ledger or a lost link.
+      const because = reason === undefined ? '' : ` (${reason}${message === undefined ? '' : `: ${message}`})`
+      // The ID is interpolated, not just named: this diagnostic is the ONLY
+      // channel a delegation's parent has (its outcome carries no `commandId`),
+      // so "retry with the same commandId" without the value would be advice the
+      // caller cannot take.
+      const command = optionalString(answer['commandId'])
+      return {
+        status: 'error',
+        text: '',
+        diagnostic:
+          `the peer interrupted the delegation command${because}: its OUTCOME IS UNDETERMINED, so no child ` +
+          'may have been started and one that was may still be running. The command was not replayed; ' +
+          `its recorded receipt can be read back with the same \`commandId\`${
+            command === undefined ? '' : ` (\`${command}\`)`
+          }.`,
       }
     }
     // `failed` / `interrupted` / `cancelled`, and anything the peer invents.

@@ -6913,6 +6913,19 @@ const DEFAULT_WAIT_POLL_MS = 25;
 * without a next step is a dead end for the caller.
 */
 const SUBSCRIPTION_LOST_GUIDANCE = "the session's event subscription was lost mid-wait and could not be re-established; the run's outcome is unknowable from this wait. Read the session with cherry_read (it does not need a subscription), or call cherry_wait again to rebuild the subscription from a fresh baseline";
+/**
+* Which dimension an answer came from, for the one status both dimensions spell.
+*
+* `interrupted` is an EXECUTION terminal (the run stopped) and a COMMAND
+* RECEIPT (the command's outcome is undecided, so no run may exist at all). The
+* status alone cannot say which, and the two need opposite sentences, so the
+* SHAPE decides: `method` names the command that was interrupted, and no
+* execution answer carries one — a run terminal answers with `session` / `text`
+* / `cursor` instead (#250).
+*/
+function isCommandReceipt(answer) {
+	return typeof answer["method"] === "string";
+}
 function isRecord$1(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -9187,6 +9200,7 @@ var CherryToolEngine = class {
 			};
 		}
 		if (answer["status"] === "timeout" || answer["status"] === "subscription-lost") await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer["executionId"]) ?? observedExecutionId).catch(() => {});
+		if (answer["status"] === "interrupted" && isCommandReceipt(answer)) await this.#cancelRun(connection, record.deviceId, sessionId, optionalString(answer["executionId"])).catch(() => {});
 		return this.#foldDelegation(answer, {
 			ceilingHit,
 			maxInteractionAbandons: input.maxInteractionAbandons,
@@ -9255,6 +9269,18 @@ var CherryToolEngine = class {
 				status: "error",
 				text: "",
 				diagnostic: `the delegation could not observe the run${reason === void 0 ? "" : ` (${reason})`}. The child may still be running. ${SUBSCRIPTION_LOST_GUIDANCE}`
+			};
+		}
+		if (status === "interrupted" && isCommandReceipt(answer)) {
+			const receiptError = isRecord$1(answer["error"]) ? answer["error"] : void 0;
+			const reason = receiptError === void 0 ? void 0 : optionalString(receiptError["reason"]);
+			const message = receiptError === void 0 ? void 0 : optionalString(receiptError["message"]);
+			const because = reason === void 0 ? "" : ` (${reason}${message === void 0 ? "" : `: ${message}`})`;
+			const command = optionalString(answer["commandId"]);
+			return {
+				status: "error",
+				text: "",
+				diagnostic: `the peer interrupted the delegation command${because}: its OUTCOME IS UNDETERMINED, so no child may have been started and one that was may still be running. The command was not replayed; its recorded receipt can be read back with the same \`commandId\`${command === void 0 ? "" : ` (\`${command}\`)`}.`
 			};
 		}
 		const error = isRecord$1(answer["executionError"]) ? answer["executionError"] : void 0;
