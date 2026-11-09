@@ -309,6 +309,8 @@ const zh: Dict = {
   'subagent.problem.enum': '{field} 只接受 {allowed}（收到 {received}）',
   'subagent.problem.exclusive': '{field} 与 {other} 只能二选一',
   'subagent.problem.route-cwd-prefix': '{field} 必须是非空字符串',
+  'subagent.problem.route-cwd-prefix-root':
+    '{field} 不能是根目录 /（它只能命中根目录本身，命不中任何子目录；要「所有目录」就别写 routes）',
   'shape.string': '字符串',
   'shape.number': '数字',
   'shape.boolean': '布尔值',
@@ -575,6 +577,8 @@ const en: Dict = {
   'subagent.problem.enum': '{field} accepts only {allowed} (got {received})',
   'subagent.problem.exclusive': '{field} and {other} are mutually exclusive',
   'subagent.problem.route-cwd-prefix': '{field} must be a non-empty string',
+  'subagent.problem.route-cwd-prefix-root':
+    '{field} must not be the root / (it only matches the root itself, never a directory below it; leave routes out if you mean every directory)',
   'shape.string': 'a string',
   'shape.number': 'a number',
   'shape.boolean': 'a boolean',

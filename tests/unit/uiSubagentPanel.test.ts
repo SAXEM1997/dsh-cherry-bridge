@@ -221,6 +221,7 @@ describe('② the status is rendered from CODES, and the two failures differ', (
             { code: 'enum', field: 'cwdMode', allowed: ['isolated', 'shared'], received: 'number' },
             { code: 'exclusive', field: 'workspaceId', other: 'workspaceKind' },
             { code: 'route-cwd-prefix', field: 'routes[0].cwdPrefix' },
+            { code: 'route-cwd-prefix-root', field: 'routes[1].cwdPrefix' },
           ],
         }),
       ),
@@ -234,6 +235,7 @@ describe('② the status is rendered from CODES, and the two failures differ', (
       'cwdMode 只接受 isolated、shared（收到 数字）',
       'workspaceId 与 workspaceKind 只能二选一',
       'routes[0].cwdPrefix 必须是非空字符串',
+      'routes[1].cwdPrefix 不能是根目录 /（它只能命中根目录本身，命不中任何子目录；要「所有目录」就别写 routes）',
     ]) {
       expect(screen.getByText(sentence)).toBeDefined()
     }
@@ -438,7 +440,13 @@ describe('④ the page is bilingual, including the codes', () => {
           // translated shape from an untranslated one. (The standards review
           // caught the original `null` here, where deleting SHAPE_KEYS left this
           // case green.)
-          problems: [{ code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'string' }],
+          problems: [
+            { code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'string' },
+            // A code whose sentence is a whole clause, not a token substitution:
+            // a zh-only case leaves the English half free to drift, and the
+            // page's two languages are supposed to say the same thing.
+            { code: 'route-cwd-prefix-root', field: 'routes[0].cwdPrefix' },
+          ],
         }),
       ),
     )
@@ -447,6 +455,11 @@ describe('④ the page is bilingual, including the codes', () => {
     // result ever lands inside an English sentence.
     expect(
       screen.getByText('timeoutMs must be an integer between 0 and 2147483647 (got a string)'),
+    ).toBeDefined()
+    expect(
+      screen.getByText(
+        'routes[0].cwdPrefix must not be the root / (it only matches the root itself, never a directory below it; leave routes out if you mean every directory)',
+      ),
     ).toBeDefined()
     // And the hard requirement travels with the language.
     expect(screen.getByText('Experimental')).toBeDefined()

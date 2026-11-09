@@ -354,7 +354,7 @@ export type SubagentProblem =
       field: string
       received: ReceivedShape
     }
-  | { code: 'empty' | 'missing' | 'route-cwd-prefix'; field: string }
+  | { code: 'empty' | 'missing' | 'route-cwd-prefix' | 'route-cwd-prefix-root'; field: string }
   | { code: 'out-of-range'; field: string; min: number; max: number; received: ReceivedShape }
   | { code: 'enum'; field: string; allowed: string[]; received: ReceivedShape }
   | { code: 'exclusive'; field: string; other: string }

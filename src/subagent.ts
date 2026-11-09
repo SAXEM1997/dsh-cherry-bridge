@@ -832,7 +832,10 @@ export type SubagentProblem =
       readonly field: string
       readonly received: ReceivedShape
     }
-  | { readonly code: 'empty' | 'missing' | 'route-cwd-prefix'; readonly field: string }
+  | {
+      readonly code: 'empty' | 'missing' | 'route-cwd-prefix' | 'route-cwd-prefix-root'
+      readonly field: string
+    }
   | {
       readonly code: 'out-of-range'
       readonly field: string
@@ -969,6 +972,17 @@ function routesOf(raw: Record<string, unknown>, problems: SubagentProblem[]): Ch
     const prefix = typeof record['cwdPrefix'] === 'string' ? record['cwdPrefix'].trim() : ''
     if (prefix.length === 0) {
       problems.push({ code: 'route-cwd-prefix', field: `${at}.cwdPrefix` })
+      return
+    }
+    // A ROOT prefix is the same kind of dead route, for a different reason
+    // (#257): `matchRoute` compares at a segment boundary, so `/` asks for `//`
+    // and matches the root itself and nothing below it. It is not a harmless
+    // no-op either — `matchRoute`
+    // takes the FIRST declared match, so a root route that did match would
+    // shadow every route after it. "Every directory" already has a form: leave
+    // `routes` out, and the default target applies.
+    if (normalizeRoutePath(prefix).endsWith(sep)) {
+      problems.push({ code: 'route-cwd-prefix-root', field: `${at}.cwdPrefix` })
       return
     }
     const device = optionalText(record, 'device', problems, `${at}.device`)

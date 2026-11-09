@@ -298,6 +298,29 @@ describe('resolution: routes are the delegation target table (SUB-10..14)', () =
     expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix', field: 'routes[0].cwdPrefix' }])
   })
 
+  it('#257 the ROOT prefix is refused: it matches nothing, and "every directory" is what omitting routes means', () => {
+    // `matchRoute` compares at a segment boundary, so a prefix of `/` asks for
+    // `//`: it matches the root itself and NOTHING below it — a route the
+    // operator wrote to cover everything, listed on the page, that never fires.
+    // Worse, `matchRoute` takes
+    // the FIRST declared match, so a root route that DID match would silently
+    // shadow every route after it. Refusing it is the only place the operator
+    // finds out, and the sentence can point at the form that already means this.
+    const resolved = resolveSubagentConfig({ ...COMPLETE, routes: [{ cwdPrefix: '/' }] })
+    if (resolved.kind !== 'invalid') throw new Error('expected invalid')
+    expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix-root', field: 'routes[0].cwdPrefix' }])
+  })
+
+  it('#257 every spelling that normalizes to the root is refused too', () => {
+    // `//`, `///` and `/.` all normalize to `/`. Refusing only the literal one
+    // would leave three ways to write the same dead route.
+    for (const cwdPrefix of ['//', '///', '/.']) {
+      const resolved = resolveSubagentConfig({ ...COMPLETE, routes: [{ cwdPrefix }] })
+      if (resolved.kind !== 'invalid') throw new Error(`expected invalid for ${cwdPrefix}`)
+      expect(resolved.problems).toEqual([{ code: 'route-cwd-prefix-root', field: 'routes[0].cwdPrefix' }])
+    }
+  })
+
   it('a route entry that is not an object is refused by index', () => {
     const resolved = resolveSubagentConfig({ ...COMPLETE, routes: ['/w/dsh'] })
     if (resolved.kind !== 'invalid') throw new Error('expected invalid')
