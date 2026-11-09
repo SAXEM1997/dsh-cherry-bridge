@@ -46,13 +46,13 @@ flowchart TB
 
 ```bash
 # From npm (recommended, pinned)
-npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.3.0
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.3.1
 
 # Install the latest npm release
 npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge
 
 # From GitHub source (same commit as the npm release)
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.3.0
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.3.1
 ```
 
 The package ships `cordis.patch.yml` (`package.json`'s `dsh.bundle.patch` points
