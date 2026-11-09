@@ -55,6 +55,7 @@
     "tests/unit/i18nParity.test.ts",
     "tests/unit/uiSubagentPanel.test.ts",
     "tests/unit/subagentTargets.test.ts",
+    "tests/unit/subagentProblemContract.test.ts",
     "tests/integration/clientBundle.test.ts"
   ]
 }

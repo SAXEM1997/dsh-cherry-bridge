@@ -350,22 +350,33 @@ export type ReceivedShape =
  */
 export type SubagentProblem =
   | {
-      code: 'not-string' | 'not-boolean' | 'not-array' | 'not-object'
-      field: string
-      received: ReceivedShape
+      readonly code: 'not-string' | 'not-boolean' | 'not-array' | 'not-object'
+      readonly field: string
+      readonly received: ReceivedShape
     }
   | {
-      code:
+      readonly code:
         | 'empty'
         | 'missing'
         | 'route-cwd-prefix'
         | 'route-cwd-prefix-root'
         | 'route-cwd-prefix-relative'
-      field: string
+      readonly field: string
     }
-  | { code: 'out-of-range'; field: string; min: number; max: number; received: ReceivedShape }
-  | { code: 'enum'; field: string; allowed: string[]; received: ReceivedShape }
-  | { code: 'exclusive'; field: string; other: string }
+  | {
+      readonly code: 'out-of-range'
+      readonly field: string
+      readonly min: number
+      readonly max: number
+      readonly received: ReceivedShape
+    }
+  | {
+      readonly code: 'enum'
+      readonly field: string
+      readonly allowed: readonly string[]
+      readonly received: ReceivedShape
+    }
+  | { readonly code: 'exclusive'; readonly field: string; readonly other: string }
 
 /** Why the provider is registered but the model-facing tool is not. */
 export type SubagentToolProblem =
