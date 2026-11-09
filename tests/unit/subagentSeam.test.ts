@@ -646,6 +646,21 @@ describe('#229 matchRoute picks the first declared prefix at a path boundary', (
     expect(matchRoute([{ cwdPrefix: '.' }], '/workspace/dsh')).toBeUndefined()
   })
 
+  it('#257 a ROOT prefix matches the root itself and nothing below it', () => {
+    // The fact behind the refusal beside it: `/` is not "no path at all", it is
+    // "the root, and only the root" — `target === prefix` fires when the cwd IS
+    // `/`, while every path below it needs `//`. The page's sentence says exactly
+    // this, so it has to stay true.
+    //
+    // The config parser refuses a root `cwdPrefix` upstream
+    // (`route-cwd-prefix-root`), so this input cannot arrive through
+    // configuration; it is asserted here because `matchRoute` is exported.
+    const routes: CherrySubagentRoute[] = [{ cwdPrefix: '/', workspaceId: 'root' }]
+    expect(matchRoute(routes, '/')?.workspaceId).toBe('root')
+    expect(matchRoute(routes, '/workspace/dsh')).toBeUndefined()
+    expect(matchRoute(routes, '/workspace')).toBeUndefined()
+  })
+
   it('normalizes both sides before comparing, and stays case-sensitive (SUB-14)', () => {
     const routes: CherrySubagentRoute[] = [{ cwdPrefix: '/workspace/dsh/', workspaceId: 'dsh' }]
     // Trailing slash on the prefix, `..` in the cwd, redundant separators.

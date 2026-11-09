@@ -6092,6 +6092,13 @@ function routesOf(raw, problems) {
 			});
 			return;
 		}
+		if (normalizeRoutePath(prefix).endsWith(sep)) {
+			problems.push({
+				code: "route-cwd-prefix-root",
+				field: `${at}.cwdPrefix`
+			});
+			return;
+		}
 		const device = optionalText(record, "device", problems, `${at}.device`);
 		const workspaceId = optionalText(record, "workspaceId", problems, `${at}.workspaceId`);
 		routes.push({
