@@ -11794,6 +11794,11 @@ function newestAssistantMessage(messages) {
 * `revision` (the profile cannot carry an `expectedRevision`), so {@link read}
 * drops it rather than let it pose as a baseline.
 *
+* **A damaged file is not an absent one** (#258). Only ENOENT seeds: a file that
+* exists and cannot be read or parsed is fail-CLOSED — an empty document, which
+* resolves to `disabled` — because falling back to the seed would let a broken
+* document re-enable an experiment the operator had turned off.
+*
 * ## The resolver stays the only validator
 *
 * `save` checks the LOCK and the body's shape, and nothing else. Every field
@@ -11831,30 +11836,43 @@ function createSubagentConfigDocument(parts) {
 			text = readFileSync(parts.file, "utf8");
 		} catch (error) {
 			const code = error instanceof Error && "code" in error ? String(error.code) : "";
-			if (code !== "ENOENT") log(`[cherry-remote] 读取子智能体配置失败（${code || "unknown"}）`);
-			return;
+			if (code === "ENOENT") return { kind: "absent" };
+			log(`[cherry-remote] 读取子智能体配置失败（${code || "unknown"}）；按未启用处理`);
+			return { kind: "damaged" };
 		}
 		let parsed;
 		try {
 			parsed = JSON.parse(text);
 		} catch {
-			log("[cherry-remote] 子智能体配置不是合法 JSON；按未配置处理，保存会覆盖它");
-			return;
+			log("[cherry-remote] 子智能体配置文件损坏（不是合法 JSON）；按未启用处理，保存会覆盖它");
+			return { kind: "damaged" };
 		}
 		if (!isRecord(parsed)) {
-			log("[cherry-remote] 子智能体配置不是对象；按未配置处理，保存会覆盖它");
-			return;
+			log("[cherry-remote] 子智能体配置文件损坏（不是对象）；按未启用处理，保存会覆盖它");
+			return { kind: "damaged" };
 		}
 		return {
-			document: parsed,
-			revision: revisionOf(parsed),
-			source: "file"
+			kind: "ok",
+			stored: {
+				document: parsed,
+				revision: revisionOf(parsed),
+				source: "file"
+			}
 		};
 	};
-	const read = () => readFile() ?? {
-		document: parts.seed,
-		revision: 0,
-		source: "config"
+	const read = () => {
+		const found = readFile();
+		if (found.kind === "ok") return found.stored;
+		if (found.kind === "absent") return {
+			document: parts.seed,
+			revision: 0,
+			source: "config"
+		};
+		return {
+			document: {},
+			revision: 0,
+			source: "file"
+		};
 	};
 	return {
 		read,

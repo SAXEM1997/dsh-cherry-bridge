@@ -194,16 +194,31 @@ describe('saving: a field the caller omits stays omitted (#251)', () => {
 })
 
 describe('reading: a damaged file is reported, and stays fixable', () => {
-  it('④a invalid JSON falls back to the seed, warns, and a save overwrites it', () => {
-    const fixtureUnderTest = fixture({ enabled: false })
+  // #258: the fallback used to be the profile SEED, so a file that stopped
+  // parsing re-enabled the experiment from a YAML value the operator had
+  // already overridden. Every case here seeds `enabled: true` on purpose — the
+  // old cases seeded `false`, which is why they passed against the bug.
+  const DANGEROUS_SEED = { enabled: true, device: 'desk-9', agentId: 'agent-9', workspaceId: 'ws-9' }
+
+  it('④a invalid JSON is NOT the seed: the document is empty, so the switch is off', () => {
+    const fixtureUnderTest = fixture(DANGEROUS_SEED)
     try {
       writeFileSync(fixtureUnderTest.file, '{not json')
       expect(fixtureUnderTest.document.read()).toEqual({
-        document: { enabled: false },
+        document: {},
         revision: 0,
-        source: 'config',
+        source: 'file',
       })
-      expect(fixtureUnderTest.logs.join('\n')).toContain('不是合法 JSON')
+      // The acceptance criterion is the RESOLUTION, not the shape: the whole
+      // point is that the experiment cannot come back on by itself.
+      expect(resolveSubagentConfig(fixtureUnderTest.document.read().document).kind).toBe('disabled')
+      const logged = fixtureUnderTest.logs.join('\n')
+      expect(logged).toContain('文件损坏')
+      // The WORD matters: the old line said "按未配置处理" while falling back to
+      // the seed, so it described the opposite of what it did. Asserting only
+      // that some warning happened would let the lie come back.
+      expect(logged).toContain('按未启用处理')
+      expect(logged).not.toContain('按未配置处理')
       // The lock restarts at 0, which is what makes the damage repairable from
       // the page: refusing writes would need a hand-edited 0600 file.
       expect(fixtureUnderTest.document.save(ENABLED, 0).ok).toBe(true)
@@ -214,19 +229,52 @@ describe('reading: a damaged file is reported, and stays fixable', () => {
   })
 
   it('④b a JSON array or scalar is the same damage, not a config', () => {
-    const fixtureUnderTest = fixture(undefined)
+    const fixtureUnderTest = fixture(DANGEROUS_SEED)
     try {
       for (const text of ['[]', '"enabled"', 'null', '3']) {
         writeFileSync(fixtureUnderTest.file, text)
         expect(fixtureUnderTest.document.read()).toEqual({
-          document: undefined,
+          document: {},
           revision: 0,
-          source: 'config',
+          source: 'file',
         })
       }
-      expect(fixtureUnderTest.logs.join('\n')).toContain('不是对象')
+      const logged = fixtureUnderTest.logs.join('\n')
+      expect(logged).toContain('文件损坏')
+      // The same word rule as ④a: this is a different log SITE, so it needs its
+      // own assertion or a revert here would stay green.
+      expect(logged).toContain('按未启用处理')
+      expect(logged).not.toContain('按未配置处理')
     } finally {
       fixtureUnderTest.dispose()
+    }
+  })
+
+  it('④c a file that cannot be READ is damaged too, not absent', () => {
+    // ENOENT means "the page has never saved", which is the only case that may
+    // fall back to the seed. A path that exists but cannot be read is a fault:
+    // treating it as absent would re-enable the experiment from the seed just
+    // as surely as a parse error does. A directory is the portable way to make
+    // `readFileSync` fail with something other than ENOENT (EISDIR).
+    const dir = mkdtempSync(join(tmpdir(), 'cherry-subagent-config-dir-'))
+    try {
+      const logs: string[] = []
+      const document = createSubagentConfigDocument({
+        file: dir,
+        seed: DANGEROUS_SEED,
+        log: (message) => logs.push(message),
+      })
+      expect(document.read()).toEqual({ document: {}, revision: 0, source: 'file' })
+      expect(resolveSubagentConfig(document.read().document).kind).toBe('disabled')
+      const logged = logs.join('\n')
+      expect(logged).toContain('读取子智能体配置失败')
+      expect(logged).toContain('按未启用处理')
+      // NOT the parse arm's promise: the path is unusable, so the next save
+      // fails the same way the read did. A repair the operator cannot perform
+      // from the page must not be advertised as one click away.
+      expect(logged).not.toContain('保存会覆盖')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })
