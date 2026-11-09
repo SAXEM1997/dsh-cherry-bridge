@@ -196,7 +196,7 @@ checks is all three:
 | --- | --- | --- |
 | npm registry | `plugin add dsh-cherry-bridge@X.Y.Z` | the staged publish + the web approval (1) |
 | GitHub release asset | `releases/latest/download/dsh-cherry-bridge.tgz` | the same tarball, renamed, attached to the release (3) |
-| plugin catalog | that fixed URL, probed nightly at 02:23 UTC | nothing per version — the merged entry follows `repository` |
+| plugin catalog | that fixed URL, probed nightly at 02:23 UTC | nothing per version for `version`; a hand-written `description` needs a PR |
 
 **Three release steps fail silently when skipped.**
 
@@ -224,10 +224,18 @@ checks is all three:
    `dsh-cherry-bridge-X.Y.Z.tgz`). Verify that URL answers 200 and that its sha1
    equals the npm tarball's: without the asset the download URL 404s for every
    catalog user (0.1.5 did exactly that).
-   **This package has no catalog entry yet** — `data/plugins/SAXEM1997__dsh-cherry-bridge.yml`
-   was never submitted (checked 2026-11-06: a `cherry-bridge` search over that
-   repository returns 0 files). Creating it is a separate PR to that repository,
-   and it must not land before the release whose asset it advertises.
+   **The entry exists** — `data/plugins/SAXEM1997__dsh-cherry-bridge.yml` in
+   `awesome-dsh-plugin/awesome-dsh-plugin`, added 2026-10-18. The market plugin
+   (`dshmarket`) reads `https://awesome-dsh-plugin.com/plugins.json`, generated
+   from that repository, so a merged entry is what a one-click install resolves
+   to. Two of its fields move on their own and two do not: `version` is NOT in
+   the YAML — `scripts/probe-npm.mjs` records it in `data/npm-map.json` from the
+   packument, so it follows the npm publish; `description.en` / `description.zh`
+   are hand-written, so a release that changes what the plugin IS (a new tool, a
+   new capability) needs a PR there too. 0.3.0 shipped while the catalog still
+   said "14 cherry_* tools" until #13557 refreshed it. Edit the UPSTREAM
+   repository through a PR: `SAXEM1997/awesome-dsh-plugin` is a stale fork
+   (last commit 2026-09-18) and editing it changes nothing a user sees.
 
 **Retry discipline.** Re-read the published state before retrying (the stage
 id, `dist-tags`, the asset URL) — the silent failures above look like success
