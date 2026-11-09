@@ -17,7 +17,7 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
-## v0.3.0 (2026-11-06)
+## v0.3.0 (2026-11-09)
 
 **中文**
 
@@ -44,6 +44,7 @@ DSH 官方 `subagent` 的委派（与 Claude Code / Codex 的子智能体同一�
 - #268 对端没有系统工作区时，设置页当场说明并禁用该选项。
 - #270 把「仿 DSH 官方 subagent」的定位写进面板说明、插件行与 README 开头。
 - #272 目标值按「读取它的设备」判定是否仍然适用，修掉「下一个下拉选了不生效」。
+- #288 设置页把「已配对设备」提到页首；实验性区块未开启时只留开关。
 
 **变更**
 
@@ -59,6 +60,7 @@ DSH 官方 `subagent` 的委派（与 Claude Code / Codex 的子智能体同一�
 - #276 配置文件损坏时按「未启用」处理，不再回落到 profile 种子把实验功能悄悄打开。
 - #277 回执维度的 `interrupted` 不再被说成「运行结束」，且会把可能还活着的子运行取消。
 - #278 根目录前缀 `/` 的路由改为当场判为无效并说明，不再是一条永不生效的配置。
+- #282 相对路径前缀的路由同样当场判为无效——委派的工作目录总是绝对路径，它匹配不到任何地方。
 
 **文档与测试**
 
@@ -69,6 +71,11 @@ DSH 官方 `subagent` 的委派（与 Claude Code / Codex 的子智能体同一�
 - #253 说明 STICKY 软终态那条钉为什么当前测不到。
 - #255 0.3.0 发布说明与 README 一对如实化，e2e 清单补上 §H 走查。
 - #274 e2e 清单记录 0.3.0 的真机走查结果（§H 步骤 1–3）。
+- #283 五份 `failureReason` 实现并回 `JsonRpcRequestError` 旁，只留一处规则。
+- #284 十一条与代码不符的注释和报错文案对齐（含我自己引入的一处错上错）。
+- #285 给 `SubagentProblem` 两端 union 加上类型级契约测试，并补齐被它查出的 `readonly` 漂移。
+- #286 环回夹具的两个默认臂：一个钉住，另一个证明模型本身就是错的并删掉（拒绝审批不会终止运行）。
+- #290 加 GitHub Actions 门禁流水线与分阶段发布流水线。
 
 ---
 
@@ -106,6 +113,7 @@ performed.
 - #268 Say so, and disable the option, when the peer has no system workspace.
 - #270 Put the “DSH's own subagent, Cherry Studio child” framing into the panel, the plugin row and the READMEs.
 - #272 Scope a target value to the device it was read under, fixing “the next drop-down does not take effect”.
+- #288 Lead the settings page with the paired devices, and collapse the experimental block to its switch while it is off.
 
 **Changed**
 
@@ -121,6 +129,7 @@ performed.
 - #276 A damaged config document is treated as "not enabled" instead of falling back to the profile seed and quietly turning the experiment on.
 - #277 A receipt-level `interrupted` is no longer reported as a finished run, and the child that may still be alive is cancelled.
 - #278 A route whose prefix is the root `/` is rejected as invalid instead of being accepted as configuration that can never fire.
+- #282 A relative route prefix is rejected the same way: a delegated working directory is always absolute, so it can never match.
 
 **Documentation and tests**
 
@@ -131,6 +140,11 @@ performed.
 - #253 Say why the STICKY soft-terminal pin cannot be tested today.
 - #255 Make the 0.3.0 release notes and the README pair truthful, and add §H to the e2e checklist.
 - #274 Record the 0.3.0 real-desktop walk results in the e2e checklist (§H steps 1–3).
+- #283 Fold the five `failureReason` implementations back beside `JsonRpcRequestError`, leaving one rule.
+- #284 Align eleven comments and messages that no longer matched the code, including one wrong "fix" of my own.
+- #285 Add a type-level contract test for the two `SubagentProblem` unions, and align the `readonly` drift it found.
+- #286 The loopback fake's two default arms: one pinned, the other proved to model behaviour the peer does not have and deleted (denying an approval does not end the run).
+- #290 Add the GitHub Actions gate and the staged-publish workflow.
 
 ## v0.2.3 (2026-11-05)
 
