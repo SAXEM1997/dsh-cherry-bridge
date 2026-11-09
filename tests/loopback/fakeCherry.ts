@@ -485,8 +485,21 @@ export interface FakeAgentOptions {
    * present and the lifecycle follows on the event stream. It is neither
    * `applied` nor a refusal — a client that treats it as terminal under an
    * implicit `wait: true` hands back a non-terminal answer.
+   *
+   * `'interrupted'` answers the receipt whose OUTCOME IS UNDETERMINED (#250):
+   * the command was cut off before the peer could say whether its run started.
+   * A run MAY therefore be alive, so the fake drives one and names it in the
+   * receipt — the shape a client must cancel rather than walk away from.
    */
-  sendOutcome?: 'applied' | 'accepted' | 'busy' | 'target-unavailable' | 'resource-exhausted'
+  sendOutcome?: 'applied' | 'accepted' | 'busy' | 'target-unavailable' | 'resource-exhausted' | 'interrupted'
+  /**
+   * The classification an `'interrupted'` receipt carries, when the peer sent
+   * one (the contract suite's `commandReceiptSchema` case uses
+   * `RESOURCE_EXHAUSTED` / "Receipt ledger is full"). Omitted by default: an
+   * interrupted receipt is schema-legal WITHOUT `error`, and the client must
+   * still say something useful.
+   */
+  sendInterruptedError?: { reason: string; message: string }
   /**
    * Enforce the `expectedIdleRevision` admission gate on `agent.messages.send`
    * (DEFAULT `true`, matching the real `agentHandlers.ts`).
@@ -3647,6 +3660,36 @@ export class FakeCherry {
         reason: 'RESOURCE_EXHAUSTED',
         message: 'Command receipt ledger is full',
       })
+    }
+
+    if (outcome === 'interrupted') {
+      // #250: the peer was cut off before it could say whether this command's
+      // run started. It DID start one here, and names it, because the failure
+      // that matters is the caller walking away from a live child.
+      const interruptedExecutionId = `exec-${randomUUID().slice(0, 8)}`
+      const interruptedMessageId =
+        this.#agent().runMessageId ?? this.#agent().terminalMessage?.messageId ?? 'msg-1'
+      this.#activeExecutionId = interruptedExecutionId
+      // The run REALLY started before the command was cut off, so the peer's own
+      // stream says so — synchronously, before the receipt is answered, because
+      // that ordering is the whole point: a caller that walks away leaves a
+      // child the event stream has already announced.
+      this.#emitExecutionUpdated(sessionId, interruptedExecutionId, 'running', interruptedMessageId)
+      void this.#driveRun(
+        sessionId,
+        interruptedExecutionId,
+        this.#agent().runTerminalStatus ?? 'completed',
+        interruptedMessageId,
+      )
+      const interruptedError = this.#agent().sendInterruptedError
+      return {
+        commandId: params['commandId'],
+        method: 'agent.messages.send',
+        status: 'interrupted',
+        admittedAt: new Date().toISOString(),
+        executionId: interruptedExecutionId,
+        ...(interruptedError === undefined ? {} : { error: interruptedError }),
+      }
     }
 
     const refusal = this.#sendAdmissionRefusal(session, params)
