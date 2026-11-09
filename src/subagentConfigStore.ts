@@ -14,6 +14,11 @@
  * `revision` (the profile cannot carry an `expectedRevision`), so {@link read}
  * drops it rather than let it pose as a baseline.
  *
+ * **A damaged file is not an absent one** (#258). Only ENOENT seeds: a file that
+ * exists and cannot be read or parsed is fail-CLOSED — an empty document, which
+ * resolves to `disabled` — because falling back to the seed would let a broken
+ * document re-enable an experiment the operator had turned off.
+ *
  * ## The resolver stays the only validator
  *
  * `save` checks the LOCK and the body's shape, and nothing else. Every field
@@ -56,6 +61,12 @@ export type SubagentConfigSaveResult =
       readonly message: string
     }
 
+/** What one look at the file found. `absent` is the only state that seeds. */
+type FileRead =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'damaged' }
+  | { readonly kind: 'ok'; readonly stored: StoredSubagentConfig }
+
 /** The document's face: read it, or read-modify-write it. */
 export interface SubagentConfigDocument {
   read(): StoredSubagentConfig
@@ -89,31 +100,55 @@ export function createSubagentConfigDocument(parts: {
 }): SubagentConfigDocument {
   const log = parts.log ?? ((): void => {})
 
-  const readFile = (): StoredSubagentConfig | undefined => {
+  const readFile = (): FileRead => {
     let text: string
     try {
       text = readFileSync(parts.file, 'utf8')
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? String((error as { code: unknown }).code) : ''
       // ENOENT is the ordinary "the page has never saved" state, not a fault.
-      if (code !== 'ENOENT') log(`[cherry-remote] 读取子智能体配置失败（${code || 'unknown'}）`)
-      return undefined
+      if (code === 'ENOENT') return { kind: 'absent' }
+      // Anything else is the file being there and unusable — the same class as
+      // a parse error, and just as capable of handing the experiment back to
+      // the seed if it were called absent (#258).
+      // No "保存会覆盖它" here, unlike the parse arm: the path itself is
+      // unusable, so a save cannot repair it — `writeFileAtomicSync` renames
+      // onto that path and fails the same way the read did. Promising a repair
+      // the next click cannot deliver is the same class of lie as the one this
+      // issue is about.
+      log(`[cherry-remote] 读取子智能体配置失败（${code || 'unknown'}）；按未启用处理`)
+      return { kind: 'damaged' }
     }
     let parsed: unknown
     try {
       parsed = JSON.parse(text)
     } catch {
-      log('[cherry-remote] 子智能体配置不是合法 JSON；按未配置处理，保存会覆盖它')
-      return undefined
+      log('[cherry-remote] 子智能体配置文件损坏（不是合法 JSON）；按未启用处理，保存会覆盖它')
+      return { kind: 'damaged' }
     }
     if (!isRecord(parsed)) {
-      log('[cherry-remote] 子智能体配置不是对象；按未配置处理，保存会覆盖它')
-      return undefined
+      log('[cherry-remote] 子智能体配置文件损坏（不是对象）；按未启用处理，保存会覆盖它')
+      return { kind: 'damaged' }
     }
-    return { document: parsed, revision: revisionOf(parsed), source: 'file' }
+    return { kind: 'ok', stored: { document: parsed, revision: revisionOf(parsed), source: 'file' } }
   }
 
-  const read = (): StoredSubagentConfig => readFile() ?? { document: parts.seed, revision: 0, source: 'config' }
+  const read = (): StoredSubagentConfig => {
+    const found = readFile()
+    if (found.kind === 'ok') return found.stored
+    if (found.kind === 'absent') return { document: parts.seed, revision: 0, source: 'config' }
+    // #258: fail CLOSED. A damaged file used to fall through to the seed, so a
+    // document the operator had saved `enabled: false` into could come back as
+    // `enabled: true` from a YAML value they had already overridden — the one
+    // direction the "off by default" promise cannot afford. An EMPTY document
+    // resolves to `disabled`, and `revision: 0` still lets the page save over
+    // the damage, so the fault is reported and repairable rather than fatal.
+    //
+    // `source: 'file'` because the file IS what won: it exists, it is the
+    // authority, and its content is unusable. Calling it `config` would blame
+    // the profile for a document the profile never held.
+    return { document: {}, revision: 0, source: 'file' }
+  }
 
   return {
     read,
