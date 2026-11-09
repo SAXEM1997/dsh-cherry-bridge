@@ -53,6 +53,18 @@ what loads it.
   **full** suite (`npm test`) runs **once, by the integrator before merge**.
   `artifactFreshness` is the exception: it matters when source comments or
   build config changed.
+- **`npm run test:fast` is the daily lane, `npm test` is the gate.** The fast
+  lane runs `tests/unit` + `tests/contract` — 42 files, 757 tests, ~30 s — and
+  covers pure logic, every contract invariant, and `artifactFreshness`. It does
+  NOT cover `tests/integration` (28 files, ~700 tests, ~120 s), which is where
+  sockets, timers and the loopback peer live; a change that touches
+  `src/connection.ts`, `src/rpc/**`, the fake peer, or anything timing-related
+  has to go through the full suite before merge, not the fast one.
+- **The suite runs on `max(2, cores - 1)` workers, set in `vitest.config.ts`.**
+  vitest's default is `cores - 1`, which on a two-core box is a single worker —
+  the whole suite queueing behind itself (~300 s instead of ~150 s). Do not
+  reach for `--no-isolate` to go faster: it was measured at 125 s and it FAILS
+  five tests across files that share module state.
 - **No source change without its artifact.** `src/`/`ui/` edits and their
   rebuilt `dist/`/`lib/` go in the **same commit** (see [Build facts](#build-facts)).
 - **Scope discipline.** Change what the issue names. Adjacent discoveries go
