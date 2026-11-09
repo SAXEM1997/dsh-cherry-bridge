@@ -147,7 +147,7 @@ schema 已允许 `interrupted`，所以客户端**必须**处理，但当前服�
 - [ ] `cherry_interactions` 列出待答项（已答项被客户端过滤掉）；**资格以 `agent.interactions.list` 为准**——即使一张 `interaction.updated` 都没收到，列出的卡仍可 `cherry_respond` 成功（实时流只是加速器，不是资格依据）。
 - [ ] 批准（approve）→ 回执 `applied`，随后 `cherry_wait` 恢复等待到真实终态。
 - [ ] 提问卡缺键回答 → 回执 `rejected` + `CONFLICT`，**无部分提交**；对提问卡 approve → `CONFLICT`（"Question requires answers"）。
-- [ ] 拒绝（deny）→ 回执 `applied`，运行以 `cancelled` 收束。
+- [ ] 拒绝（deny）→ 回执 `applied`。**运行是否继续要实测**：源码 `AiStreamManager.resolveToolApproval` 对拒绝发出 `tool-output-denied` 而流不中断，`agentJournal` 只把 `paused`（用户中止）映射成 `cancelled`，所以预期是**继续**到真实终态；若真机上观察到 `cancelled`，说明这条源码路径不覆盖该卡种，请记下来。
 - [ ] `cherry_cancel` 带 `expectedExecutionId` 成功取消活跃执行。
 
 ### D. 断连恢复

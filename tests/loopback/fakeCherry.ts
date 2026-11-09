@@ -599,17 +599,6 @@ export interface FakeAgentOptions {
    */
   pushInteractionOnRun?: FakeInteractionRecord
   /**
-   * Whether a DENIED interaction lets the run continue.
-   *
-   * The default models the peer that abandons the work on a refusal
-   * (`#settleInteraction` resumes a denied run as `cancelled`). A delegation
-   * denies EVERY card and expects the run to carry on (SUB-30), which that
-   * default cannot express — so this knob is the other peer: the tool call is
-   * refused, the agent keeps going and reaches its configured terminal. Unset
-   * leaves every existing fixture byte-identical.
-   */
-  denyKeepsRunAlive?: boolean
-  /**
    * Keep a run parked on a FRESH interaction after each answer, `count` times.
    *
    * `pushInteractionOnRun` pushes exactly one card and the run settles once it is
@@ -3945,11 +3934,15 @@ export class FakeCherry {
       }
     }
 
-    // A DENIED interaction ends the run as cancelled (the work is abandoned)
-    // unless the fixture models a peer that carries on; an APPROVED/answered one
-    // proceeds to its configured terminal.
-    const denied = status === 'denied' && this.#agent().denyKeepsRunAlive !== true
-    const status2 = denied ? 'cancelled' : parked.status
+    // A DENIED card does NOT end the run. The real peer answers a refusal with a
+    // `tool-output-denied` chunk and leaves the stream live
+    // (`AiStreamManager.resolveToolApproval`), and its journal maps `cancelled`
+    // only from `paused` — a user abort (`agentJournal.ts`). This fixture used to
+    // model the opposite by default, behind a `denyKeepsRunAlive` knob that only
+    // two cases set; nothing depended on the other branch, and the branch itself
+    // described behaviour the peer does not have. Removed rather than pinned
+    // (#259).
+    const status2 = parked.status
     this.#emitExecutionUpdated(parked.sessionId, parked.executionId, status2, parked.messageId)
     if (status2 !== 'running' && status2 !== 'finalizing' && status2 !== 'awaiting-approval') {
       this.#activeExecutionId = undefined
