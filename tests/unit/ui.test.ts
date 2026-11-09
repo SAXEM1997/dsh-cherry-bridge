@@ -545,9 +545,15 @@ describe('pairing wizard', () => {
     // POST clears it) and the submit button stays disabled with no cancel
     // control — the page can only recover by a reload. The run deadline is the
     // exit for exactly that case.
+    // 1 s, not the 80 ms the neighbouring cases use. This case asserts a
+    // NEGATIVE — that the deadline has NOT fired yet — so its lifetime has to be
+    // far outside the time it takes to reach that line. At 80 ms a contended
+    // machine (12 copies of this file on two cores) blew through the deadline
+    // first and the button was already enabled: 'expected false to be true',
+    // 14 of 24 runs (#269). The positive half waits for the alarm explicitly.
     const harness = await renderWithDevice(
       [['POST', '/cherry-remote/api/pair', jsonResponse(202, { claimId: 'claim-silent' })]],
-      { runLifetimeMs: 80 },
+      { runLifetimeMs: 1_000 },
     )
 
     submitPayload()
@@ -560,10 +566,13 @@ describe('pairing wizard', () => {
     // The run is in 'waiting': nothing but a terminal frame can settle it.
     expect((screen.getByRole('button', { name: '开始配对' }) as HTMLButtonElement).disabled).toBe(true)
 
-    await waitFor(() => {
-      const alerts = screen.getAllByRole('alert').map((node) => node.textContent ?? '')
-      expect(alerts.some((text) => text.includes('没有等到配对结果'))).toBe(true)
-    })
+    await waitFor(
+      () => {
+        const alerts = screen.getAllByRole('alert').map((node) => node.textContent ?? '')
+        expect(alerts.some((text) => text.includes('没有等到配对结果'))).toBe(true)
+      },
+      { timeout: 5_000 },
+    )
 
     // The form works again, the in-flight narration is gone, and the transient
     // code went with it (a code left on screen beside a dead run invites
