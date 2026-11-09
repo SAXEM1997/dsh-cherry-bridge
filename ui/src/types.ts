@@ -361,6 +361,7 @@ export type SubagentProblem =
         | 'route-cwd-prefix'
         | 'route-cwd-prefix-root'
         | 'route-cwd-prefix-relative'
+        | 'cwd-mode-unimplemented'
       readonly field: string
     }
   | {
