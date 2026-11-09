@@ -842,6 +842,7 @@ export type SubagentProblem =
         | 'route-cwd-prefix'
         | 'route-cwd-prefix-root'
         | 'route-cwd-prefix-relative'
+        | 'cwd-mode-unimplemented'
       readonly field: string
     }
   | {
@@ -1070,12 +1071,19 @@ export function resolveSubagentConfig(raw: unknown): SubagentConfigResolution {
       received: shapeName(workspaceKind),
     })
   }
+  // `shared` gets its OWN refusal, ahead of the enum arm, so `allowed` can keep
+  // telling the truth about what is accepted. Nothing consumes `cwdMode`
+  // (`grep -rn cwdMode src/ | grep -v subagent.ts` is empty), so accepting
+  // `shared` meant validating, saving and then doing nothing while the user
+  // believed the child ran in this directory (#299).
   const cwdModeValue = record['cwdMode']
-  if (cwdModeValue !== undefined && cwdModeValue !== 'isolated' && cwdModeValue !== 'shared') {
+  if (cwdModeValue === 'shared') {
+    problems.push({ code: 'cwd-mode-unimplemented', field: 'cwdMode' })
+  } else if (cwdModeValue !== undefined && cwdModeValue !== 'isolated') {
     problems.push({
       code: 'enum',
       field: 'cwdMode',
-      allowed: ['isolated', 'shared'],
+      allowed: ['isolated'],
       received: shapeName(cwdModeValue),
     })
   }

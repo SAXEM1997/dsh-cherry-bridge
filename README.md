@@ -156,8 +156,10 @@ subagent:
 的一切都得写进 `prompt`。
 
 设置页编辑 `enabled` / `device` / `agentId` / 工作区 / `timeoutMs`（默认 30 分钟，`0` 表示不限）；
-`providerName`、`toolName`、`cwdMode`、`routes`、`maxInteractionAbandons` 只透传——`routes` 只读展示
-（它按子目录前缀覆盖设备与工作区），其余几个要改就走配置文件。
+`providerName`、`toolName`、`routes`、`maxInteractionAbandons` 只透传——`routes` 只读展示
+（它按子目录前缀覆盖设备与工作区），其余几个要改就走配置文件。`cwdMode` **只接受 `isolated`**：
+`shared` 需要 DSH 与 Cherry Studio 真的共用同一个文件系统，插件既提供不了也验证不了，写 `shared`
+会被拒绝并说明原因。
 
 已知限制：
 

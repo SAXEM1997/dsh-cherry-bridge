@@ -313,6 +313,8 @@ const zh: Dict = {
     '{field} 不能是根目录 /（它只能命中根目录本身，命不中任何子目录；要「所有目录」就别写 routes）',
   'subagent.problem.route-cwd-prefix-relative':
     '{field} 必须是绝对路径（委派的工作目录总是绝对路径，相对前缀匹配不到任何地方）',
+  'subagent.problem.cwd-mode-unimplemented':
+    '{field} 本期只接受 isolated。shared 需要 DSH 与 Cherry Studio 真的共用同一个文件系统，插件既提供不了也验证不了，所以直接拒绝——子运行始终在它自己的工作区里',
   'shape.string': '字符串',
   'shape.number': '数字',
   'shape.boolean': '布尔值',
@@ -583,6 +585,8 @@ const en: Dict = {
     '{field} must not be the root / (it only matches the root itself, never a directory below it; leave routes out if you mean every directory)',
   'subagent.problem.route-cwd-prefix-relative':
     '{field} must be an absolute path (a delegation’s working directory always is, so a relative prefix matches nowhere)',
+  'subagent.problem.cwd-mode-unimplemented':
+    '{field} accepts only isolated for now. shared would require DSH and Cherry Studio to share one filesystem, which the plugin can neither provide nor verify, so it is refused outright — a child always runs in its own workspace',
   'shape.string': 'a string',
   'shape.number': 'a number',
   'shape.boolean': 'a boolean',

@@ -6173,10 +6173,14 @@ function resolveSubagentConfig(raw) {
 		received: shapeName(workspaceKind)
 	});
 	const cwdModeValue = record["cwdMode"];
-	if (cwdModeValue !== void 0 && cwdModeValue !== "isolated" && cwdModeValue !== "shared") problems.push({
+	if (cwdModeValue === "shared") problems.push({
+		code: "cwd-mode-unimplemented",
+		field: "cwdMode"
+	});
+	else if (cwdModeValue !== void 0 && cwdModeValue !== "isolated") problems.push({
 		code: "enum",
 		field: "cwdMode",
-		allowed: ["isolated", "shared"],
+		allowed: ["isolated"],
 		received: shapeName(cwdModeValue)
 	});
 	const timeoutMs = optionalInteger(record, "timeoutMs", problems, {

@@ -69,7 +69,7 @@ const READY: SubagentResponse = {
     device: 'desk-1',
     agentId: 'agent-7',
     workspaceId: 'ws-1',
-    cwdMode: 'shared',
+    cwdMode: 'isolated',
     timeoutMs: 1_800_000,
     revision: 4,
   },
@@ -290,11 +290,12 @@ describe('② the status is rendered from CODES, and the two failures differ', (
           problems: [
             { code: 'missing', field: 'device' },
             { code: 'out-of-range', field: 'timeoutMs', min: 0, max: 2_147_483_647, received: 'string' },
-            { code: 'enum', field: 'cwdMode', allowed: ['isolated', 'shared'], received: 'number' },
+            { code: 'enum', field: 'cwdMode', allowed: ['isolated'], received: 'number' },
             { code: 'exclusive', field: 'workspaceId', other: 'workspaceKind' },
             { code: 'route-cwd-prefix', field: 'routes[0].cwdPrefix' },
             { code: 'route-cwd-prefix-root', field: 'routes[1].cwdPrefix' },
             { code: 'route-cwd-prefix-relative', field: 'routes[2].cwdPrefix' },
+            { code: 'cwd-mode-unimplemented', field: 'cwdMode' },
           ],
         }),
       ),
@@ -305,11 +306,12 @@ describe('② the status is rendered from CODES, and the two failures differ', (
     for (const sentence of [
       '缺少 device',
       'timeoutMs 必须是 0 到 2147483647 之间的整数（收到 字符串）',
-      'cwdMode 只接受 isolated、shared（收到 数字）',
+      'cwdMode 只接受 isolated（收到 数字）',
       'workspaceId 与 workspaceKind 只能二选一',
       'routes[0].cwdPrefix 必须是非空字符串',
       'routes[1].cwdPrefix 不能是根目录 /（它只能命中根目录本身，命不中任何子目录；要「所有目录」就别写 routes）',
       'routes[2].cwdPrefix 必须是绝对路径（委派的工作目录总是绝对路径，相对前缀匹配不到任何地方）',
+      'cwdMode 本期只接受 isolated。shared 需要 DSH 与 Cherry Studio 真的共用同一个文件系统，插件既提供不了也验证不了，所以直接拒绝——子运行始终在它自己的工作区里',
     ]) {
       expect(screen.getByText(sentence)).toBeDefined()
     }
@@ -404,8 +406,9 @@ describe('③ a save is a read-modify-write, locked on what was read', () => {
     // device id.
     expect(body.device).toBe('desk-2')
     // `cwdMode` has no control on this page — dropping it would make a save
-    // delete configuration the operator never saw.
-    expect(body.cwdMode).toBe('shared')
+    // delete configuration the operator never saw. (`isolated` is the only value
+    // the resolver accepts now, #299; the pass-through still has to survive.)
+    expect(body.cwdMode).toBe('isolated')
     // `routes` picks the device and workspace for a directory, and it has no
     // control here either: a save that sent only the rendered half would
     // re-route every delegated directory, silently.

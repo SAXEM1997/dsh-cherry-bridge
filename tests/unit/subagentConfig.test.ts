@@ -227,7 +227,9 @@ describe('resolution: the remaining scalars are validated where they are read', 
     [
       'cwdMode',
       'elsewhere',
-      { code: 'enum', field: 'cwdMode', allowed: ['isolated', 'shared'], received: 'string' },
+      // `allowed` lists what is ACCEPTED, so it narrowed to the one value that
+      // survives. `shared` has its own code now (#299) and never reaches here.
+      { code: 'enum', field: 'cwdMode', allowed: ['isolated'], received: 'string' },
     ],
     // The OTHER enum, and the one whose accepted set is a single value. It had no
     // case at all: `workspaceKind: 'system'` exercised the `exclusive` arm
@@ -272,10 +274,23 @@ describe('resolution: the remaining scalars are validated where they are read', 
     expect(resolved.problems).toEqual([problem])
   })
 
-  it('`cwdMode: shared` is accepted — it is a declaration, not a behaviour switch (D1)', () => {
+  it('`cwdMode: shared` is REFUSED — nothing consumes it, and the filesystems are not shared (#299)', () => {
+    // The old case asserted the opposite ("a declaration, not a behaviour
+    // switch"), which is exactly the trap: `grep -rn cwdMode src/ | grep -v
+    // subagent.ts` is empty, so `shared` validated, saved, and did nothing.
+    // `shared` claims the two sides see one filesystem; we can neither provide
+    // nor verify that, so the honest answer is a refusal that says so.
     const resolved = resolveSubagentConfig({ ...COMPLETE, cwdMode: 'shared' })
+    if (resolved.kind !== 'invalid') throw new Error('expected invalid')
+    expect(resolved.problems).toEqual([{ code: 'cwd-mode-unimplemented', field: 'cwdMode' }])
+  })
+
+  it('`cwdMode: isolated` stays accepted — it describes what actually happens (#299)', () => {
+    // The over-reach guard: a refusal that also rejected `isolated` would pass
+    // the case above while breaking every existing config.
+    const resolved = resolveSubagentConfig({ ...COMPLETE, cwdMode: 'isolated' })
     if (resolved.kind !== 'ready') throw new Error('expected ready')
-    expect(resolved.config.cwdMode).toBe('shared')
+    expect(resolved.config.cwdMode).toBe('isolated')
   })
 })
 
