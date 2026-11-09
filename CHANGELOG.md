@@ -56,6 +56,9 @@ DSH 官方 `subagent` 的委派（与 Claude Code / Codex 的子智能体同一�
 - #247 `ctx.subagents` 探针改用 unGATED 查找，打开开关不再让 `apply` 抛错。
 - #249 被拒绝的回执与丢失的订阅都不再报成「运行结束」。
 - #252 清空超时框现在真的清掉字段。
+- #276 配置文件损坏时按「未启用」处理，不再回落到 profile 种子把实验功能悄悄打开。
+- #277 回执维度的 `interrupted` 不再被说成「运行结束」，且会把可能还活着的子运行取消。
+- #278 根目录前缀 `/` 的路由改为当场判为无效并说明，不再是一条永不生效的配置。
 
 **文档与测试**
 
@@ -115,6 +118,9 @@ performed.
 - #247 Probe `ctx.subagents` through the unGATED lookup, so enabling the switch no longer throws during `apply`.
 - #249 A rejected receipt and a lost subscription are no longer reported as a finished run.
 - #252 Clearing the timeout box now really clears the field.
+- #276 A damaged config document is treated as "not enabled" instead of falling back to the profile seed and quietly turning the experiment on.
+- #277 A receipt-level `interrupted` is no longer reported as a finished run, and the child that may still be alive is cancelled.
+- #278 A route whose prefix is the root `/` is rejected as invalid instead of being accepted as configuration that can never fire.
 
 **Documentation and tests**
 
