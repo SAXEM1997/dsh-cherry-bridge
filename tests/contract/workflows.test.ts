@@ -53,6 +53,13 @@ describe('the workflows keep the guards that make a silent failure loud', () => 
     expect(text).toMatch(/git diff --exit-code -- dist lib/)
   })
 
+  it('①e the catalog URL check retries, so propagation delay is not a red release', () => {
+    // 0.3.0's attach run failed on a single `curl` that answered 504 for about
+    // three minutes after the upload — the release was complete and correct.
+    const text = readFileSync(PUBLISH, 'utf8')
+    expect(text).toContain('for attempt in')
+  })
+
   it('①d publish.yml refuses to attach before the stage was approved', () => {
     // An unapproved stage is SILENT: `dist-tags` simply does not move. Without
     // this gate the workflow would happily attach a tarball for a version
