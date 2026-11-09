@@ -58,6 +58,7 @@
   ],
   "scripts": {
     "test": "vitest run",
+    "test:fast": "vitest run tests/unit tests/contract",
     "build": "tsdown",
     "build:client": "vite build --mode client --config ui/vite.config.ts",
     "dev:ui": "vite --config ui/vite.config.ts",
