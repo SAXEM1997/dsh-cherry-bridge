@@ -8,7 +8,7 @@ import { directEndpointUrl, pairingQrSchema } from '@cherrystudio/remote-protoco
 import type { WsDialOptions } from './connection.js'
 import type { DeviceRecord } from './deviceStore.js'
 import type { DeviceStore } from './deviceStore.js'
-import { JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
+import { failureReason, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
 import { boundedJoin, clipText } from './text.js'
 
@@ -627,14 +627,6 @@ function destroy(temp: TempChannel): void {
   temp.controller.abort()
 }
 
-function rpcReason(error: unknown): string | undefined {
-  if (error instanceof JsonRpcRequestError) {
-    const data = error.data as { reason?: unknown } | undefined
-    if (data !== null && typeof data === 'object' && typeof data.reason === 'string') return data.reason
-  }
-  return undefined
-}
-
 interface ClaimResult {
   claimId: string
   verificationCode: string
@@ -985,7 +977,7 @@ function recordFrom(
  */
 function asPairingError(error: unknown, stage: 'hello' | 'claim' | 'poll'): PairingError {
   if (error instanceof PairingError) return error
-  const reason = rpcReason(error)
+  const reason = failureReason(error)
   if (reason !== undefined) {
     return new PairingError('rejected', `the desktop refused the pairing ${stage} (${reason})`)
   }

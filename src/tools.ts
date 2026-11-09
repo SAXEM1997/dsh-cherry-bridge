@@ -17,7 +17,7 @@ import {
   MAX_RESUME_TOKEN_CHARS,
   PARTS_LIST_PAGE_CLAMP,
 } from './defaults.js'
-import { JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
+import { failureReason, JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { ContentReadGate } from './contentGate.js'
 import { truncateErrorMessage } from './diagnostics.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
@@ -1568,22 +1568,6 @@ function executionErrorOf(payload: Record<string, unknown>): { reason: string; m
   return message === undefined ? { reason } : { reason, message }
 }
 
-/**
- * The peer's failure discriminator, or undefined for a non-protocol error.
- *
- * EXPORTED for the HTTP face's candidate seam (#260), which classifies the same
- * `JsonRpcRequestError` into `peer-refused` + `reason`. It had grown a second
- * copy there, and two copies of "where the peer puts its reason" is exactly the
- * kind of rule that drifts. (It is ALSO duplicated in `subscriptions.ts`; that
- * pair predates this and is tracked separately, because this module is the one
- * the HTTP face may import without a cycle.)
- */
-export function failureReason(error: unknown): string | undefined {
-  if (!(error instanceof JsonRpcRequestError)) return undefined
-  const data = error.data
-  if (isRecord(data) && typeof data['reason'] === 'string') return data['reason']
-  return undefined
-}
 
 /**
  * The phrase this hint leaves behind, so applying it twice reads once.

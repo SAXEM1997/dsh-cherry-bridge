@@ -1077,6 +1077,35 @@ var JsonRpcRequestError = class extends Error {
 		Object.setPrototypeOf(this, new.target.prototype);
 	}
 };
+/**
+* The peer's own failure discriminator, or `undefined` when it gave none.
+*
+* `JsonRpcRequestError.data` is `unknown`, so this function IS the definition of
+* "the peer classified this failure": the data must be a plain object and
+* `reason` must be a string. Every caller compares the answer against a string
+* enum (`RATE_LIMITED`, `RESOURCE_EXHAUSTED`, …), so a number or an object in
+* that slot would silently never match — which is why this is a judgement rather
+* than a field access, and why it lives HERE (#265): it is a property of the
+* error class, not of any one consumer.
+*
+* There were FIVE copies of this rule before — `tools.ts`, `subscriptions.ts`,
+* an inline one in `httpApi.ts`, and `rpcReason` in both `connection.ts` and
+* `pairing.ts` — and they had already drifted: some excluded arrays from "plain
+* object" and others did not, which is exactly the kind of difference that makes
+* two faces classify one peer error differently without either of them failing.
+*
+* No `Array.isArray` guard: `data` is what a peer put on the wire, and a JSON
+* array cannot carry a `reason` key, so such a check could never answer
+* differently from the plain one — an unreachable guard reads as though there is
+* an input that reaches it.
+*/
+function failureReason(error) {
+	if (!(error instanceof JsonRpcRequestError)) return void 0;
+	const data = error.data;
+	if (typeof data !== "object" || data === null) return void 0;
+	const reason = data["reason"];
+	return typeof reason === "string" ? reason : void 0;
+}
 /** Serialises a frame for the channel; the channel itself carries objects. */
 function encodeFrame(value) {
 	return JSON.parse(JSON.stringify(value));
@@ -3246,12 +3275,6 @@ function isAllHostsUnreachable(error) {
 function isPerHostFailure(error) {
 	return !(error instanceof IdentityMismatchError || error instanceof ProtocolVersionError || error instanceof AuthRejectedError || error instanceof CancelledError);
 }
-function rpcReason$1(error) {
-	if (error instanceof JsonRpcRequestError) {
-		const data = error.data;
-		if (data !== null && typeof data === "object" && typeof data.reason === "string") return data.reason;
-	}
-}
 function isPeerIdentityMismatch(error) {
 	if (!(error instanceof Error)) return false;
 	if (error.name === "UnexpectedPeerError") return true;
@@ -3816,7 +3839,7 @@ var DeviceConnection = class {
 		try {
 			hello = await this.#houseCall(link, "connection.hello", { protocolVersions: [...this.#helloProtocolVersions] });
 		} catch (error) {
-			if (rpcReason$1(error) === "INVALID_CONNECTION_STATE") throw new ProtocolVersionError(String(error));
+			if (failureReason(error) === "INVALID_CONNECTION_STATE") throw new ProtocolVersionError(String(error));
 			throw error instanceof Error ? error : new Error(String(error));
 		}
 		const unackedBytes = positive$2(hello.limits?.["unackedBytes"]);
@@ -3833,7 +3856,7 @@ var DeviceConnection = class {
 		try {
 			auth = await this.#authenticate(link);
 		} catch (error) {
-			const reason = rpcReason$1(error);
+			const reason = failureReason(error);
 			if (reason === "GRANT_REVOKED" || reason === "UNAUTHENTICATED") throw new AuthRejectedError(reason);
 			throw error instanceof Error ? error : new Error(String(error));
 		}
@@ -3919,7 +3942,7 @@ var DeviceConnection = class {
 		try {
 			return await this.#houseCall(link, "connection.authenticate", params(stored !== void 0));
 		} catch (error) {
-			const reason = rpcReason$1(error);
+			const reason = failureReason(error);
 			if (stored !== void 0 && (reason === "TOKEN_EXPIRED" || reason === "UNAUTHENTICATED")) return await this.#houseCall(link, "connection.authenticate", params(false));
 			throw error;
 		}
@@ -4611,12 +4634,6 @@ function destroy(temp) {
 	} catch {}
 	temp.controller.abort();
 }
-function rpcReason(error) {
-	if (error instanceof JsonRpcRequestError) {
-		const data = error.data;
-		if (data !== null && typeof data === "object" && typeof data.reason === "string") return data.reason;
-	}
-}
 /**
 * Renders the progress line's host list under {@link STAGE_HOSTS_CHARS} (the
 * invariant lives on that constant). A truncated list names the first host,
@@ -4793,7 +4810,7 @@ function recordFrom(payload, approved, deviceName, winner) {
 */
 function asPairingError(error, stage) {
 	if (error instanceof PairingError) return error;
-	const reason = rpcReason(error);
+	const reason = failureReason(error);
 	if (reason !== void 0) return new PairingError("rejected", `the desktop refused the pairing ${stage} (${reason})`);
 	return new PairingError("unreachable", failureSegment(`pairing ${stage} failed`, error instanceof Error ? error.message : String(error)));
 }
@@ -4855,12 +4872,6 @@ const AUTO_ACK_RETRY_MS = 3e3;
 const AUTO_ACK_RETRY_MAX_MS = 3e4;
 function positive$1(value, fallback) {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
-}
-/** The peer's failure discriminator, or undefined for a non-protocol error. */
-function failureReason$1(error) {
-	if (!(error instanceof JsonRpcRequestError)) return void 0;
-	const data = error.data;
-	return data !== null && typeof data === "object" && typeof data.reason === "string" ? data.reason : void 0;
 }
 /** UTF-8 byte length of one buffered event, as JSON (what the peer actually sends). */
 function eventBytes(event) {
@@ -5206,7 +5217,7 @@ var SessionSubscriptions = class {
 			await this.#runCheckpointChain(sessionId, descriptor, attemptsLeft);
 			return;
 		} catch (error) {
-			if (failureReason$1(error) === "RESOURCE_EXHAUSTED" && attemptsLeft > 1) {
+			if (failureReason(error) === "RESOURCE_EXHAUSTED" && attemptsLeft > 1) {
 				if (!await this.#evictLru(sessionId)) throw error;
 				attemptsLeft -= 1;
 				continue;
@@ -5313,7 +5324,7 @@ var SessionSubscriptions = class {
 			this.#installCheckpoint(sessionId, descriptor, items);
 			return;
 		} catch (error) {
-			if (!(failureReason$1(error) === "CHECKPOINT_EXPIRED" || Date.now() > leaseDeadline) || attemptsLeft <= 1) throw error;
+			if (!(failureReason(error) === "CHECKPOINT_EXPIRED" || Date.now() > leaseDeadline) || attemptsLeft <= 1) throw error;
 			await this.#closeSubscription(descriptor.subscriptionId);
 			await this.#subscribeChain(sessionId, void 0, attemptsLeft - 1);
 			return;
@@ -6966,21 +6977,6 @@ function executionErrorOf(payload) {
 		reason,
 		message
 	};
-}
-/**
-* The peer's failure discriminator, or undefined for a non-protocol error.
-*
-* EXPORTED for the HTTP face's candidate seam (#260), which classifies the same
-* `JsonRpcRequestError` into `peer-refused` + `reason`. It had grown a second
-* copy there, and two copies of "where the peer puts its reason" is exactly the
-* kind of rule that drifts. (It is ALSO duplicated in `subscriptions.ts`; that
-* pair predates this and is tracked separately, because this module is the one
-* the HTTP face may import without a cycle.)
-*/
-function failureReason(error) {
-	if (!(error instanceof JsonRpcRequestError)) return void 0;
-	const data = error.data;
-	if (isRecord$1(data) && typeof data["reason"] === "string") return data["reason"];
 }
 /**
 * The phrase this hint leaves behind, so applying it twice reads once.
