@@ -1,24 +1,27 @@
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
-
 /**
  * Applies the plugin and SETTLES the identity bootstrap `apply` starts.
  *
  * `apply` is synchronous by host contract, so it cannot await
- * `loadOrCreateIdentity`. On a fresh data directory that promise generates an
- * Ed25519 key and writes `identity.key` roughly **12 ms after `apply`
- * returns** (measured; the delay is `createDeviceIdentity()`).
+ * `loadOrCreateIdentity`. That leaves two windows a test can fall into, and both
+ * of them were live flake instances in #269:
  *
- * A test that removes its data directory inside that window races the write:
- * `generateIdentity` calls `mkdir(dataDir, { recursive: true })` and then
- * writes, so the directory is RECREATED after `rm` has walked it, and `rm`'s
- * final `rmdir` fails with `ENOTEMPTY`. That is issue #269 — the flake that
- * only ever appeared in a full-suite run, where the 12 ms stretches under load.
+ *  1. **The write is still in flight when the test tears down.** On a fresh data
+ *     directory the bootstrap generates an Ed25519 key (~12 ms) and only then
+ *     calls `mkdir(dataDir, { recursive: true })` and writes `identity.key`.
+ *     A teardown that removes the directory inside that window gets the
+ *     directory RECREATED under it and the final `rmdir` fails `ENOTEMPTY`
+ *     (`toolsManage` ③aa).
+ *  2. **The file exists but the identity is not readable yet.** `persistIdentity`
+ *     writes `identity.key` BEFORE `state.identity` is assigned, so a watcher
+ *     that wakes on the file can still be answered "the device identity is still
+ *     loading; retry in a moment" by the next tool call (`toolsManage` ③k).
  *
- * Every test that applies the assembly against a directory it later removes
- * must go through here (or call `waitForIdentityFile`). Waiting for the file is
- * the honest settlement of the promise the test started — it is the same write,
- * not a sleep.
+ * Both are the same mistake — waiting for the wrong event. `whenIdentityReady()`
+ * is the right one: it settles after the assignment, so there is nothing left in
+ * flight and nothing left unreadable.
+ *
+ * Every test that applies the assembly against a directory it later removes, or
+ * that calls a tool needing the identity, must go through here.
  */
 export async function applyAssembly(
   ctx: unknown,
@@ -26,22 +29,15 @@ export async function applyAssembly(
 ): Promise<void> {
   const index = await import('../../src/index.js')
   index.apply(ctx as never, config)
-  await waitForIdentityFile(config.dataDir)
+  await index.whenIdentityReady()
 }
 
 /**
- * Waits until `dataDir/identity.key` exists — the observable end of the
- * bootstrap `apply` starts. Used directly by the cases that must keep a
- * synchronous `expect(() => index.apply(…)).not.toThrow()` assertion around the
- * call and settle afterwards.
+ * Waits for the identity bootstrap to settle. Used directly by the cases that
+ * must keep a synchronous `expect(() => index.apply(…)).not.toThrow()` around
+ * the call and settle afterwards.
  */
-export async function waitForIdentityFile(dataDir: string, timeoutMs = 5_000): Promise<void> {
-  const path = join(dataDir, 'identity.key')
-  const deadline = Date.now() + timeoutMs
-  while (!existsSync(path)) {
-    if (Date.now() > deadline) {
-      throw new Error(`identity.key did not appear in ${dataDir} within ${timeoutMs} ms`)
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
+export async function settleIdentity(): Promise<void> {
+  const index = await import('../../src/index.js')
+  await index.whenIdentityReady()
 }

@@ -20,7 +20,7 @@ import { DeviceUnavailableError, TransportLostError } from '../../src/connection
 import type { SubagentTargetsOutcome } from '../../src/tools.js'
 import { LOG_TEXT_MAX } from '../../src/text.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
-import { applyAssembly, waitForIdentityFile } from '../helpers/applyAssembly.js'
+import { applyAssembly, settleIdentity } from '../helpers/applyAssembly.js'
 
 /**
  * Task 11 integration suite: the same-origin HTTP face + SSE stream, driven
@@ -2869,7 +2869,7 @@ describe('plugin assembly (index.ts apply)', () => {
     try {
       const second = assemblyCtx()
       expect(() => index.apply(second as never, { dataDir: secondDir })).not.toThrow()
-      await waitForIdentityFile(secondDir)
+      await settleIdentity()
       expect(second.server.routes.has(PREFIX)).toBe(true)
       // The first plugin's route seat was replaced by its own teardown path.
       expect(first.effects).toHaveLength(1)

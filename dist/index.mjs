@@ -14544,6 +14544,7 @@ const state = {
 	}),
 	identity: void 0,
 	identityError: void 0,
+	identityReady: Promise.resolve(),
 	rateBudgetPerSecond: 32,
 	perSessionCacheBytes: DEFAULT_PER_SESSION_CACHE_BYTES,
 	wsTls: void 0,
@@ -14977,7 +14978,7 @@ function apply(ctx, config = {}) {
 	});
 	state.subagents = subagents;
 	state.disposers.push(subagents.mount(ctx));
-	loadOrCreateIdentity(dataDir).then((identity) => {
+	state.identityReady = loadOrCreateIdentity(dataDir).then((identity) => {
 		state.identity = identity.key;
 		state.identityError = void 0;
 	}, (error) => {
@@ -14990,5 +14991,19 @@ function apply(ctx, config = {}) {
 		});
 	});
 }
+/**
+* Settles when the CURRENT apply's identity bootstrap has finished, whatever the
+* outcome — a failure is reported through `state.identityError` and through the
+* diagnostics entry `apply` already records, never as a rejection here.
+*
+* Prefer this to watching for `identity.key` on disk. The file is written by
+* `persistIdentity` BEFORE `state.identity` is assigned, so a watcher can wake
+* on the file and still be told "the device identity is still loading; retry in
+* a moment" by the next tool call — the race that made `toolsManage` ③k flake
+* (#269). This promise settles after the assignment.
+*/
+function whenIdentityReady() {
+	return state.identityReady;
+}
 //#endregion
-export { DEFAULT_CONTENT_READ_BUDGET_PER_SECOND, DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND, apply, inject, name, noteError, resolveBridgeConfig, resolveDataDir };
+export { DEFAULT_CONTENT_READ_BUDGET_PER_SECOND, DEFAULT_PER_SESSION_CACHE_BYTES, DEFAULT_RATE_BUDGET_PER_SECOND, apply, inject, name, noteError, resolveBridgeConfig, resolveDataDir, whenIdentityReady };
