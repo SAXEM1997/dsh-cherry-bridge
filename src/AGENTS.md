@@ -278,8 +278,8 @@ this beside the cache).
 
 The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
 timeout and idle faces) runs AFTER the caller's wait window, so the window
-cannot bound it. It once had no time bound: a read whose link dies waits up to
-`transportRetryWaitMs` (5 s), so under a flapping link each of ~30 requests
+cannot bound it. It once had no time bound: since #12 a read whose link dies
+waits `transportRetryWaitMs` (5 s), so under a flapping link each of ~30 requests
 could absorb it — a 1 s window answering ~150 s later (#3, #21).
 
 - **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
