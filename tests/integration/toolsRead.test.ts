@@ -3685,6 +3685,8 @@ describe('issue #307: the image budget degrades per part', () => {
     )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
 
     const part = result.messages[0]!.parts[0]!
+    // The PART reports the peer's spelling; only the saved image is normalised.
+    expect(part.mediaType).toBe('IMAGE/PNG')
     expect(part.image).toMatchObject({ mediaType: 'image/png', bytes: 64 })
     expect(rig.fake.methodCount('agent.content.read')).toBe(1)
     expect(attachments.saved).toHaveLength(1)

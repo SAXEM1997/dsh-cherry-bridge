@@ -3775,8 +3775,9 @@ export class CherryToolEngine {
           includeImages: {
             type: 'boolean',
             description:
-              'When true, fetch uploaded `file` images (PNG/JPEG/WebP/GIF, as accepted by this ' +
-              'deployment) and return them as image blocks beside the snapshot. Requires the calling ' +
+              'When true, fetch uploaded `file` images of a type this deployment accepts and return ' +
+              'them as image blocks beside the snapshot (the part keeps the peer\'s media-type ' +
+              'spelling; `image.mediaType` is normalised). Requires the calling ' +
               'model route to declare image input; a route without it is refused before any content ' +
               'is read. Desktop-local pasted images (legacy `data` parts) carry no bytes and stay ' +
               'metadata-only. At most a per-call image count/byte budget is read; a part over it keeps ' +

@@ -627,13 +627,13 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   `source`/`context` are withheld.
 - Attachments — `kind: 'file'`, and legacy `kind: 'data'` named `file` whose
   `{mediaType, filename}` is JSON in `content.text` — report `name`/`mediaType`
-  (`byteLength` from a ref only), no `unavailable` (bytes not fetched by
-  default), and `content` **empty** unless the record has a key we skip (then
-  raw text, lossless). `includeImages` is the ONE exception: an accepted `file`
-  image is fetched, verified and saved via `saveImage` under a 4-image / 8 MiB
-  budget (`imagesOmitted: 'cap'` when over); the route must declare `image`
-  input, and `includeImages` without an attachments service answers
-  `unsupported`. Legacy `data` never qualifies (no contentId).
+  (`byteLength` from a ref only), no `unavailable` unless `includeImages`
+  asked and the store refused that image, and `content` **empty** unless the
+  record has a key we skip. `includeImages` is the exception: an accepted
+  `file` image is fetched, verified and saved via `saveImage` under our
+  4-image / 8 MiB per-call cap (`imagesOmitted: 'cap'` when over); the route
+  must declare `image` input, and `includeImages` without an attachments
+  service answers `unsupported`. Legacy `data` never qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
 
