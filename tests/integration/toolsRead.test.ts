@@ -3692,4 +3692,57 @@ describe('issue #307: the image budget degrades per part', () => {
     expect(attachments.saved).toHaveLength(1)
     expect(attachments.saved[0]!.mediaType).toBe('image/png')
   })
+
+  it('⑱m a REVISION_EXPIRED retry restarts the per-call image budget (#310)', async () => {
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            {
+              sessionId: 's-1',
+              agentId: 'agent-1',
+              workspaceId: 'ws-1',
+              title: 'Images',
+              historyRevision: '1000',
+            },
+          ],
+          messages: [
+            {
+              messageId: 'm-2',
+              revision: '1002',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: 'B'.repeat(128), name: 'second.png', mediaType: 'image/png' }],
+            },
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: 'A'.repeat(128), name: 'first.png', mediaType: 'image/png' }],
+            },
+          ],
+        },
+      },
+      { engine: { readImagesPerCall: 2 }, attachments: attachments.service, llm: fakeLlm() },
+    )
+    // The FIRST attempt reads m-2's image, then finds m-1's parts stale. The
+    // retry re-projects both messages; the budget must start over with it.
+    rig.fake.failPartsListAfter(1, { reason: 'REVISION_EXPIRED', message: 'Message revision expired' })
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    expect(rig.fake.methodCount('agent.parts.list')).toBe(3)
+    // One slice in the abandoned attempt + one per image in the retry.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(3)
+    const parts = result.messages.flatMap((message) => message.parts)
+    expect(parts.filter((part) => part['image'] !== undefined)).toHaveLength(2)
+    expect(parts.some((part) => part['imagesOmitted'] === 'cap')).toBe(false)
+  })
 })
