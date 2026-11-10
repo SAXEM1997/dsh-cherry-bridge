@@ -13,10 +13,12 @@ import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
 import { cherryScopeToolNames, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
 import type {
+  AttachmentServiceLike,
   CherryFsLike,
   CherryToolsContext,
   CherryToolsDeps,
   CherryWorkingDirectoryLike,
+  LlmServiceLike,
 } from './tools.js'
 import { ToolScopeState } from './toolScope.js'
 import { CherryToolEngine } from './tools.js'
@@ -967,6 +969,13 @@ function assemblyDeps(ctx: CherryBridgeContext): CherryHttpDeps & CherryToolsDep
      * states to report yet; the engine joins when it first resolves one.
      */
     watchDeviceState: (deviceId, cb) => state.connections.get(deviceId)?.onState(cb),
+    // The host's optional services, resolved LAZILY on every call (#307): the
+    // deps object is built before the composition mounts them, and a captured
+    // instance would be the one from before the mount. Absent is a legitimate
+    // deployment (no durable image store), which `cherry_read` reports as the
+    // structured `unsupported` verdict — never an assembly failure.
+    attachments: () => ctx.get?.('attachments') as AttachmentServiceLike | undefined,
+    llm: () => ctx.get?.('llm') as LlmServiceLike | undefined,
     // Both channels return a DETACHER: the listener sets live on this assembly,
     // not on the SSE hub that subscribes to them, so a hub cannot remove its
     // callbacks unless the seam hands it the means to. Without this, every

@@ -338,9 +338,18 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
 - [ ] **上游版本核验**（桌面端为 2.1.4–2.1.10 或已比对过的更新版本；依据见
       src/AGENTS.md「Protocol basis」）：
       - [ ] 桌面端**升级后无需重新配对**：设备档案直接连上，`desktopIdentity` 未变。
-      - [ ] 桌面端为 2.1.5+ 且会话里有**来自手机上传的附件**时：该 part 为 `kind:"file"`
-            并带 `name`/`mediaType`/`byteLength`，`content` 为空，且**没有**任何
-            `agent.content.read` 调用（一次都不该有——那些字节是文件，不是文本）。
+      - [ ] 桌面端为 2.1.5+ 且会话里有**来自手机上传的附件**时：默认读取下该 part 为
+            `kind:"file"` 并带 `name`/`mediaType`/`byteLength`，`content` 为空，且
+            **没有**任何 `agent.content.read` 调用（一次都不该有——那些字节是文件，不是文本）。
+      - [ ] 同一张上传图，`cherry_read` 带 `includeImages: true` 且**当前模型路由声明了
+            image 输入**时：`agent.content.read` 按 24 KiB 分片取完，sha256 校验通过，
+            附件 part 出现 `image: {attachmentId, mediaType, bytes, width, height, name?}`，
+            工具结果在快照文本块之后带一个 image block；`attachments.saveImage` 落盘一次。
+      - [ ] 同一张上传图，`includeImages: true` 但**模型路由只声明文本输入**时：调用在
+            任何 `agent.content.read` / `agent.sessions.get` 之前被拒绝，错误说明模型
+            不支持 image 输入。
+      - [ ] 桌面端本地粘贴的图（旧式 `data` part）在 `includeImages: true` 下仍只回
+            元数据，`agent.content.read` 为 0（协议没有 `contentId`，取不到字节）。
       - [ ] 桌面端为 2.1.7+ 且会话里有**未上传的附件**（如粘贴的图片）时：该 part 为
             `kind:"data"` 且 `name:"file"`，元数据以 JSON 形式放在 `content.text` 里
             （`{"mediaType":…,"filename":…}`）→ 读取报告 `name`（来自 `filename`，

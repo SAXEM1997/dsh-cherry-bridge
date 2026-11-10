@@ -17,6 +17,8 @@ import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.
 import { LastCandidateHostError, QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
 import {
   DEVICE_SETTLE_WAIT_MS,
+  DEFAULT_READ_IMAGE_BYTES_PER_CALL,
+  DEFAULT_READ_IMAGES_PER_CALL,
   INTERACTIONS_LIST_PAGE_CLAMP,
   LIST_PAGE_CLAMP,
   MAX_RESUME_TOKEN_CHARS,
@@ -70,11 +72,26 @@ export interface ToolParametersSchema {
   additionalProperties?: boolean
 }
 
-/** A content block the host turns into model-facing tool output. */
-export interface ToolContentBlock {
-  type: 'text'
-  text: string
+/** A durable image reference, as the host's `ImageAttachmentRef` carries it. */
+export interface ToolImageAttachment {
+  attachmentId: string
+  mediaType: string
+  bytes: number
+  width: number
+  height: number
+  name?: string
 }
+
+/** A content block the host turns into model-facing tool output. */
+export type ToolContentBlock =
+  | {
+      type: 'text'
+      text: string
+    }
+  | {
+      type: 'image'
+      attachment: ToolImageAttachment
+    }
 
 /**
  * The filesystem slice `cherry_send` needs to upload local files (issue #306).
@@ -491,6 +508,21 @@ export interface CherryReadPart {
   name?: string
   mediaType?: string
   byteLength?: string
+  /**
+   * The IMAGE ITSELF, once `includeImages` fetched the peer's bytes, verified
+   * their digest and committed them to the host's attachment store. Present
+   * only for an eligible `kind: 'file'` image part; every other attachment keeps
+   * the metadata-only face above. {@link #readRender} emits the matching image
+   * block beside the snapshot.
+   */
+  image?: ToolImageAttachment
+  /**
+   * Why this attachment's IMAGE was not read even though `includeImages` asked
+   * for it. `'cap'` means the per-call image count or byte budget (or the
+   * deployment's own image limits) had no room left. The part keeps its
+   * metadata; the loss is per part, never a failed read.
+   */
+  imagesOmitted?: 'cap'
 }
 
 /**
@@ -1423,6 +1455,33 @@ const SUBSCRIPTION_LOST_GUIDANCE =
 // Dependency surface
 // ---------------------------------------------------------------------------
 
+/**
+ * The host's durable attachment store, narrowed to what `cherry_read` needs to
+ * turn peer bytes into an `ImageBlock` (#307).
+ *
+ * A structural type, like every other host seam in this file: the plugin takes
+ * no `@deepseek-ai/*` runtime dependency, and the host's own
+ * `AttachmentStore.saveImage` is the only member reached.
+ */
+export interface AttachmentServiceLike {
+  readonly imageLimits: {
+    readonly maxImageBytes: number
+    readonly maxImagesPerMessage: number
+    readonly maxMessageImageBytes: number
+    readonly mediaTypes: readonly string[]
+  }
+  saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<ToolImageAttachment>
+}
+
+/** The host LLM service's one method the calling route's image gate reads. */
+export interface LlmServiceLike {
+  resolveModelInfo(
+    provider: string,
+    model: string,
+    signal?: AbortSignal,
+  ): Promise<{ inputModalities?: readonly string[] }>
+}
+
 /** Everything the tool face needs from the assembly. */
 export interface CherryToolsDeps {
   store: DeviceStore
@@ -1499,6 +1558,16 @@ export interface CherryToolsDeps {
    * resolves exactly as `read_image` resolves it (issue #306). Lazy.
    */
   workingDirectory?: () => CherryWorkingDirectoryLike | undefined
+  /**
+   * The host's attachment service, read LAZILY (#307): the deps object is built
+   * before the composition mounts its services, so a captured instance would be
+   * the one from before the mount. Absent makes `includeImages` answer the
+   * structured `unsupported` verdict instead of failing assembly — the rest of
+   * the read face keeps working in a deployment without an image store.
+   */
+  attachments?: () => AttachmentServiceLike | undefined
+  /** The host LLM service, read lazily for the same reason (route gate only). */
+  llm?: () => LlmServiceLike | undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -1704,6 +1773,23 @@ class ContentIntegrityError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'ContentIntegrityError'
+  }
+}
+
+/**
+ * The byte ceiling of ONE read was crossed (#307).
+ *
+ * A plain `Error` for the text face — the degradable class — but its own type so
+ * the IMAGE face can tell "this image does not fit the per-call budget" (the
+ * part keeps its metadata with `imagesOmitted: 'cap'`) from a peer that would
+ * not serve the bytes (`unavailable`). The two look identical on the wire; only
+ * the caller's budget differs, and swallowing that distinction would make a cap
+ * stop read as a failure.
+ */
+class ContentByteCapError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ContentByteCapError'
   }
 }
 
@@ -2086,6 +2172,23 @@ function uploadFailureCode(error: unknown): string | undefined {
   return isRecord(error) && typeof error['code'] === 'string' ? error['code'] : undefined
 }
 
+/** The route gate's refusal when no provider/model pair can be read. */
+const IMAGE_ROUTE_UNRESOLVED =
+  'cannot read images from this session: the current model route could not be resolved'
+
+/**
+ * A `{ref}`'s DECLARED byte length when it is a finite number, else `undefined`.
+ *
+ * The declaration is the peer's own claim and is only ever used to bound a walk
+ * (or to refuse one before it starts); the bytes actually read are the honest
+ * measure. One helper, so the text pre-flight and the verified walk cannot drift
+ * apart on what "usable" means.
+ */
+function declaredRefBytes(ref: Record<string, unknown>): number | undefined {
+  const value = Number(ref['byteLength'])
+  return Number.isFinite(value) ? value : undefined
+}
+
 /** One text block: the tool result the model reads. */
 function textBlock(text: string): ToolContentBlock[] {
   return [{ type: 'text', text }]
@@ -2097,6 +2200,49 @@ const FREE_OUTPUT_SCHEMA: Record<string, unknown> = { type: 'object', additional
 /** A generous, honest renderer: the model gets the whole aggregated value as JSON. */
 function jsonRender(_args: unknown, value: unknown): ToolContentBlock[] {
   return textBlock(JSON.stringify(value, null, 2))
+}
+
+/**
+ * `cherry_read`'s renderer: the snapshot as ONE text block (the established
+ * shape every caller and test already reads), then one image block per part
+ * that carries `image` (#307).
+ *
+ * The snapshot's JSON stays INTACT — including each part's `image` metadata —
+ * so a consumer that only reads text loses nothing, and the model additionally
+ * receives the pixels beside it. Images follow newest-message-first part order,
+ * the same order the walk projects them in.
+ */
+function readRender(_args: unknown, value: unknown): ToolContentBlock[] {
+  const blocks: ToolContentBlock[] = textBlock(JSON.stringify(value, null, 2))
+  if (!isRecord(value) || !Array.isArray(value['messages'])) return blocks
+  for (const message of value['messages']) {
+    if (!isRecord(message) || !Array.isArray(message['parts'])) continue
+    for (const part of message['parts']) {
+      if (!isRecord(part) || !isRecord(part['image'])) continue
+      const image = part['image']
+      if (
+        typeof image['attachmentId'] !== 'string' ||
+        typeof image['mediaType'] !== 'string' ||
+        typeof image['bytes'] !== 'number' ||
+        typeof image['width'] !== 'number' ||
+        typeof image['height'] !== 'number'
+      ) {
+        continue
+      }
+      blocks.push({
+        type: 'image',
+        attachment: {
+          attachmentId: image['attachmentId'],
+          mediaType: image['mediaType'],
+          bytes: image['bytes'],
+          width: image['width'],
+          height: image['height'],
+          ...(typeof image['name'] === 'string' ? { name: image['name'] } : {}),
+        },
+      })
+    }
+  }
+  return blocks
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,6 +2336,48 @@ export interface CherryToolEngineOptions {
    * costs round trips.
    */
   contentReadSliceBytes?: number
+  /**
+   * Per-call image ATTACHMENT budget for `cherry_read(includeImages: true)`
+   * (#307): at most this many images, and at most this many bytes, are fetched
+   * and stored. Omitted uses {@link DEFAULT_READ_IMAGES_PER_CALL} /
+   * {@link DEFAULT_READ_IMAGE_BYTES_PER_CALL}; the deployment's
+   * `attachments.imageLimits` tightens whichever is smaller.
+   *
+   * Injectable so a loopback test can reach the cap with a handful of bytes
+   * instead of allocating eight megabytes.
+   */
+  readImagesPerCall?: number
+  readImageBytesPerCall?: number
+}
+
+/**
+ * The per-CALL image budget `cherry_read(includeImages: true)` spends (#307).
+ *
+ * ONE instance per read, shared by every message and part in it, so the cap is
+ * a call-level statement rather than a per-message one. The walk is
+ * newest-message-first, so the budget reaches the newest pictures first.
+ */
+interface ReadImageBudget {
+  readonly attachments: AttachmentServiceLike
+  readonly maxImages: number
+  readonly maxBytes: number
+  /** The deployment's per-image ceiling (`imageLimits.maxImageBytes`). */
+  readonly maxImageBytes: number
+  images: number
+  bytes: number
+}
+
+/**
+ * The two optional knobs `#projectMessage` / `#projectPart` share.
+ *
+ * A single object rather than two trailing parameters: the read face passes the
+ * image budget and every wait face passes a deadline, and a positional `raw,
+ * undefined, images` left a hole where a future third knob would silently land
+ * in the wrong one.
+ */
+interface ProjectionOptions {
+  readonly deadline?: AssemblyDeadline
+  readonly images?: ReadImageBudget
 }
 
 /**
@@ -2345,12 +2533,18 @@ function defineCherryTool(definition: {
   description: string
   parameters: Record<string, unknown>
   execute(args: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>
+  /**
+   * Present only for a tool whose result carries something JSON cannot: the
+   * image blocks `cherry_read` appends beside its snapshot (#307). Omitted
+   * keeps the canonical JSON renderer.
+   */
+  render?(args: unknown, value: unknown): ToolContentBlock[]
 }): CherryToolDefinition {
   return {
     name: definition.name,
     description: definition.description,
     parameters: definition.parameters as unknown as ToolParametersSchema,
-    output: { schema: FREE_OUTPUT_SCHEMA, render: jsonRender },
+    output: { schema: FREE_OUTPUT_SCHEMA, render: definition.render ?? jsonRender },
     execute: definition.execute,
   }
 }
@@ -2476,6 +2670,9 @@ export class CherryToolEngine {
    * reach a walk's second slice, see `CherryToolEngineOptions`).
    */
   readonly #contentReadSliceBytes: number
+  /** Per-call image count/byte budget for `cherry_read(includeImages: true)`. */
+  readonly #readImagesPerCall: number
+  readonly #readImageBytesPerCall: number
   /**
    * The parts pages already walked, keyed `<deviceId>\0<messageId>`.
    *
@@ -2620,6 +2817,14 @@ export class CherryToolEngine {
     this.#contentReadSliceBytes = Math.max(
       1,
       Math.floor(options.contentReadSliceBytes ?? CONTENT_READ_MAX_BYTES),
+    )
+    this.#readImagesPerCall = Math.max(
+      0,
+      Math.floor(options.readImagesPerCall ?? DEFAULT_READ_IMAGES_PER_CALL),
+    )
+    this.#readImageBytesPerCall = Math.max(
+      0,
+      Math.floor(options.readImageBytesPerCall ?? DEFAULT_READ_IMAGE_BYTES_PER_CALL),
     )
   }
 
@@ -3654,11 +3859,18 @@ export class CherryToolEngine {
         'revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a ' +
         'quiet session costs no `agent.parts.list` RPC; externalized content is still fetched ' +
         'and sha256-verified on every read, so unverified bytes are never served from memory. An ' +
-        'attachment is reported as METADATA, never as its bytes: a `kind: "file"` part, or a ' +
+        'attachment is reported as METADATA by default, never as its bytes: a `kind: "file"` part, or a ' +
         'legacy `data` part named `file` (the metadata as JSON in `content.text`), comes back as ' +
-        '`name`/`mediaType` (plus `byteLength` for the `file` kind) with `content` emptied — or ' +
-        'kept verbatim when that record carries a key this projection does not report. The bytes ' +
-        'are deliberately not fetched into a text channel. Messages come NEWEST-first, so the ' +
+        '`name`/`mediaType` (plus `byteLength` for the `file` kind) — with that metadata text ' +
+        'emptied, or kept verbatim when the record carries a key this projection does not report. ' +
+        'With `includeImages: true`, an ' +
+        'uploaded `file` image is ALSO fetched through `agent.content.read`, sha256-verified, saved ' +
+        'to the host attachment store and rendered as an image block beside this snapshot; that path ' +
+        'requires the calling model route to declare image input and is refused before any content ' +
+        'is read when it does not. A legacy `data` attachment (a desktop-local paste) carries no ' +
+        'contentId, so its bytes are unreachable and it stays metadata-only. Non-image file parts ' +
+        'likewise keep their metadata. A part whose image was skipped for the per-call cap keeps its ' +
+        'metadata plus `imagesOmitted: "cap"`. Messages come NEWEST-first, so the ' +
         'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
         'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
         'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A ' +
@@ -3704,17 +3916,48 @@ export class CherryToolEngine {
               'Omit it to read from the newest message. A token this tool did not emit is refused locally, ' +
               `and ${MAX_RESUME_TOKEN_CHARS} characters is the ceiling.`,
           },
+          includeImages: {
+            type: 'boolean',
+            description:
+              'When true, fetch uploaded `file` images of a type this deployment accepts and return ' +
+              'them as image blocks beside the snapshot (the part keeps the peer\'s media-type ' +
+              'spelling; `image.mediaType` is normalised). Requires the calling ' +
+              'model route to declare image input; a route without it is refused before any content ' +
+              'is read. Desktop-local pasted images (legacy `data` parts) carry no bytes and stay ' +
+              'metadata-only. At most a per-call image count/byte budget is read; a part over it keeps ' +
+              'its metadata with `imagesOmitted: "cap"`. Defaults to false.',
+          },
         },
         required: ['device', 'sessionId'],
         additionalProperties: false,
       },
-      execute: async (args) => {
+      execute: async (args, exec) => {
         // BEFORE any device work: a token is judged here, so a bad argument
         // never dials a device and never reaches the peer with an unvetted
         // cursor. The real desktop SILENTLY falls back to the newest page for
         // a malformed cursor, which would present the newest page again as
         // "continued history" — the refusal has to be ours.
         const resume = parseMessageResume(args['messagesResumeCursor'])
+        // The image gate is also BEFORE device work: a deployment with no image
+        // store cannot produce the blocks the caller asked for, and a route that
+        // does not accept images would refuse them one content read later. Both
+        // are stated here, where no dial and no `agent.content.read` has run.
+        const includeImages = args['includeImages'] === true
+        let images: ReadImageBudget | undefined
+        if (includeImages) {
+          const attachments = this.#deps.attachments?.()
+          if (attachments === undefined) {
+            return {
+              error: 'unsupported',
+              message:
+                'this deployment has no host attachment service, so cherry_read cannot turn uploaded ' +
+                'images into image blocks; call cherry_read without includeImages to read the text ' +
+                'snapshot, whose attachment parts stay metadata-only',
+            }
+          }
+          images = this.#imageBudget(attachments)
+          await this.#assertImageCapableRoute(exec)
+        }
         const resolved = await this.#linkOr(requiredString(args, 'device'))
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
@@ -3726,8 +3969,9 @@ export class CherryToolEngine {
         // send/wait tools use. A live subscription is left exactly as it is.
         await this.#ensureSubscription(record.deviceId, sessionId)
 
-        return this.#readRound(connection, sessionId, limit, true, resume)
+        return this.#readRound(connection, sessionId, limit, true, resume, images)
       },
+      render: readRender,
     })
   }
 
@@ -3748,15 +3992,16 @@ export class CherryToolEngine {
     limit: number,
     retryOnExpiry: boolean,
     resume?: MessageResume,
+    images?: ReadImageBudget,
   ): Promise<CherryReadSnapshot> {
     try {
-      return await this.#readOnce(connection, sessionId, limit, resume)
+      return await this.#readOnce(connection, sessionId, limit, resume, images)
     } catch (error) {
       if (retryOnExpiry && failureReason(error) === 'REVISION_EXPIRED') {
         console.warn(
           `[cherry-remote] session ${sessionId} history revision expired; re-pulling the baseline and retrying once`,
         )
-        return this.#readRound(connection, sessionId, limit, false, resume)
+        return this.#readRound(connection, sessionId, limit, false, resume, images)
       }
       throw error
     }
@@ -3799,7 +4044,17 @@ export class CherryToolEngine {
     sessionId: string,
     limit: number,
     resume?: MessageResume,
+    images?: ReadImageBudget,
   ): Promise<CherryReadSnapshot> {
+    // A REVISION_EXPIRED retry re-runs this WHOLE round (#readRound), and the
+    // images the abandoned attempt already committed are re-projected by it —
+    // so the per-call budget restarts too. Without this an image read before
+    // the expiry would be charged twice, and a later image could be omitted
+    // for a budget the caller never actually spent.
+    if (images !== undefined) {
+      images.images = 0
+      images.bytes = 0
+    }
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
       string,
       unknown
@@ -3846,7 +4101,12 @@ export class CherryToolEngine {
     let projectedBytes = 0
     let outOfBudget = false
     for (const raw of page.items) {
-      const message = await this.#projectMessage(connection, sessionId, raw)
+      const message = await this.#projectMessage(
+        connection,
+        sessionId,
+        raw,
+        images === undefined ? {} : { images },
+      )
       messages.push(message)
       projectedBytes += JSON.stringify(message).length
       // AFTER the message is complete — the budget trims what comes NEXT, never
@@ -3937,7 +4197,7 @@ export class CherryToolEngine {
     connection: DeviceConnection,
     sessionId: string,
     raw: Record<string, unknown>,
-    deadline?: AssemblyDeadline,
+    options: ProjectionOptions = {},
   ): Promise<CherryReadMessage> {
     const messageId = messageIdOf(raw)
     const revision = String(raw['revision'] ?? '')
@@ -3970,7 +4230,7 @@ export class CherryToolEngine {
           // message could outlive the whole answer. A deadline stop returns the
           // parts read so far and marks the message `incomplete`
           // (`partsTruncated: 'deadline'`), never a silently short list.
-          deadline,
+          deadline: options.deadline,
         },
       )
       // The REFUSAL list lives in the store (`#rememberPartsPage`), the one
@@ -3982,7 +4242,7 @@ export class CherryToolEngine {
 
     const parts: CherryReadPart[] = []
     for (const part of page.items) {
-      parts.push(await this.#projectPart(connection, sessionId, part, deadline))
+      parts.push(await this.#projectPart(connection, sessionId, part, options))
     }
     const partsTruncated = page.truncated ? (page.truncationReason ?? 'safety-bound') : undefined
     // The message-level completeness verdict is set HERE, the one projection
@@ -4029,7 +4289,7 @@ export class CherryToolEngine {
     connection: DeviceConnection,
     sessionId: string,
     raw: Record<string, unknown>,
-    deadline?: AssemblyDeadline,
+    options: ProjectionOptions = {},
   ): Promise<CherryReadPart> {
     const partId = String(raw['partId'] ?? '')
     const revision = String(raw['revision'] ?? '')
@@ -4039,21 +4299,42 @@ export class CherryToolEngine {
     // A FILE PART IS NEVER RESOLVED AS TEXT, whatever shape its reference
     // takes. Cherry ≥ 2.1.5 projects an uploaded attachment as
     // `{kind: 'file', name, ref}` — a TOP-LEVEL `ref`, no `content` at all —
-    // and `agent.content.read` really will serve those bytes. They are FILE
-    // bytes: this projection hands text to a model, so resolving them would
-    // decode binary as UTF-8 and pull megabytes into the context window. The
-    // honest face is the file's METADATA with an empty body.
+    // and `agent.content.read` really will serve those bytes. Decoding them as
+    // UTF-8 would mangle binary and pull megabytes into the context window, so
+    // the DEFAULT face is the file's metadata with an empty body.
+    //
+    // `includeImages` (#307) opens exactly ONE exception: an image accepted by
+    // the deployment is fetched as BYTES, verified, and committed to the host
+    // attachment store as an `image` block. Every other file part — and every
+    // legacy `data` attachment, whose local paste has no contentId at all —
+    // keeps the metadata-only face.
     //
     // (`{ref}` nested under `content` on a `file` part is not the real peer's
     // shape, but it is schema-legal — `partSchema`'s file variant is a loose
     // object — and the same rule is the safe one for it.)
     if (kind === 'file') {
+      const face = this.#attachmentFace(kind, raw, content)
+      const projected =
+        options.images === undefined
+          ? undefined
+          : await this.#projectImagePart(
+              connection,
+              sessionId,
+              raw,
+              content,
+              face,
+              options.images,
+              options.deadline,
+            )
       return {
         partId,
         kind,
         revision,
         content: '',
-        ...this.#attachmentFace(kind, raw, content),
+        ...face,
+        ...(projected?.image === undefined ? {} : { image: projected.image }),
+        ...(projected?.omitted === true ? { imagesOmitted: 'cap' as const } : {}),
+        ...(projected?.unavailable === undefined ? {} : { unavailable: projected.unavailable }),
         ...(typeof raw['state'] === 'string' ? { state: raw['state'] } : {}),
         ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
         ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
@@ -4091,8 +4372,8 @@ export class CherryToolEngine {
         // the ref's declared size.
         const refusal = this.#externalizedRefusal(content['ref'])
         if (refusal !== undefined) throw refusal
-        releaseSlot = await this.#contentGate.acquire(deadline?.instant)
-        text = await this.#readExternalized(connection, sessionId, content['ref'], deadline)
+        releaseSlot = await this.#contentGate.acquire(options.deadline?.instant)
+        text = await this.#readExternalized(connection, sessionId, content['ref'], options.deadline)
       } catch (error) {
         // An INTEGRITY failure is not degradable: see `#degradableReadFailure`.
         if (!this.#degradableReadFailure(error)) throw error
@@ -4132,6 +4413,159 @@ export class CherryToolEngine {
       ...(typeof raw['state'] === 'string' ? { state: raw['state'] } : {}),
       ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
       ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
+    }
+  }
+
+  /**
+   * The per-CALL image budget for one `cherry_read(includeImages: true)`
+   * (#307).
+   *
+   * The deployment's own `imageLimits` can only TIGHTEN the engine defaults: a
+   * host that accepts two images per message must not be asked for four, and a
+   * host with a 1 MiB message budget must not be handed 8. `maxImageBytes` is
+   * kept separately because it is a PER-IMAGE refusal (a single picture the
+   * store would reject), while `maxBytes` is the call-wide sum.
+   */
+  #imageBudget(attachments: AttachmentServiceLike): ReadImageBudget {
+    const limits = attachments.imageLimits
+    const floor = (value: number): number =>
+      Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+    return {
+      attachments,
+      maxImages: Math.min(this.#readImagesPerCall, floor(limits.maxImagesPerMessage)),
+      maxBytes: Math.min(this.#readImageBytesPerCall, floor(limits.maxMessageImageBytes)),
+      maxImageBytes: floor(limits.maxImageBytes),
+      images: 0,
+      bytes: 0,
+    }
+  }
+
+  /**
+   * Prove the CALLING ROUTE accepts image input before a single image byte is
+   * fetched (#307).
+   *
+   * Deliberately the same gate `read_image` applies: the session's latest routed
+   * provider/model is read from the request header first and the agent options
+   * second, then the host's `llm.resolveModelInfo` must declare `image` among
+   * the input modalities. A text-only route is refused HERE, before any
+   * `agent.content.read`, so the caller is never charged for bytes it could not
+   * display — and never handed a silent "no image" answer for a route that
+   * would have refused it.
+   *
+   * `exec` is optional on the host contract (a nested/PTC dispatch may arrive
+   * without an agent); that case cannot resolve a route and is refused with the
+   * same guidance as a missing provider/model.
+   */
+  async #assertImageCapableRoute(exec: CherryToolExec | undefined): Promise<void> {
+    const agent = exec?.agent
+    if (!isRecord(agent)) throw new Error(IMAGE_ROUTE_UNRESOLVED)
+    const options = isRecord(agent['options']) ? agent['options'] : {}
+    const session = isRecord(agent['session']) ? agent['session'] : {}
+    let header: unknown
+    if (typeof session['requestHeader'] === 'function') {
+      header = (session['requestHeader'] as () => unknown)()
+    }
+    const config = isRecord(header) && isRecord(header['config']) ? header['config'] : {}
+    const provider = optionalString(config['provider']) ?? optionalString(options['provider'])
+    const model = optionalString(config['model']) ?? optionalString(options['model'])
+    const llm = this.#deps.llm?.()
+    if (provider === undefined || model === undefined || llm === undefined) {
+      throw new Error(IMAGE_ROUTE_UNRESOLVED)
+    }
+    const active = await llm.resolveModelInfo(provider, model, exec?.signal)
+    if (active.inputModalities === undefined || !active.inputModalities.includes('image')) {
+      throw new Error(
+        `cannot read images from this session: model "${model}" does not declare image input; ` +
+          'switch to an image-capable model to read images',
+      )
+    }
+  }
+
+  /**
+   * One `kind: 'file'` part's IMAGE, under the call's budget (#307).
+   *
+   * Three outcomes, none of which fails the read by itself:
+   *
+   *  - `image` — the peer's bytes were fetched through the verified walk, their
+   *    sha256 matched, and the host attachment store committed them.
+   *  - `omitted: true` — the call's image count/byte budget (or the deployment's
+   *    own per-image/message limits) had no room. The part keeps its metadata
+   *    and says `imagesOmitted: 'cap'`.
+   *  - `unavailable` — the store refused the image (`AttachmentError`), or the
+   *    peer could not serve the bytes (the degradable class). Same treatment as
+   *    a failed text ref: the part stays, the loss is named.
+   *
+   * An INTEGRITY failure still throws: unverified bytes are never handed to the
+   * attachment store, let alone to the model.
+   *
+   * Returns `{}` for a part this face does not own — a non-image, a media type
+   * the deployment does not accept, or a `file` record with no ref.
+   */
+  async #projectImagePart(
+    connection: DeviceConnection,
+    sessionId: string,
+    raw: Record<string, unknown>,
+    content: Record<string, unknown>,
+    face: { name?: string; mediaType?: string },
+    images: ReadImageBudget,
+    deadline?: AssemblyDeadline,
+  ): Promise<{ image?: ToolImageAttachment; omitted?: true; unavailable?: string }> {
+    const ref = isRecord(raw['ref']) ? raw['ref'] : isRecord(content['ref']) ? content['ref'] : undefined
+    // MIME types are CASE-INSENSITIVE (RFC 2045): a peer that spells the type
+    // `IMAGE/PNG` means the same thing, and the deployment's accepted list is
+    // lowercase. Normalise ONCE, here, and hand the store the normalised value
+    // so a host that validates its own limits does not reject it later.
+    const mediaType = face.mediaType?.toLowerCase()
+    if (ref === undefined || mediaType === undefined) return {}
+    if (!mediaType.startsWith('image/')) return {}
+    if (!images.attachments.imageLimits.mediaTypes.includes(mediaType)) return {}
+
+    const declared = declaredRefBytes(ref)
+    if (images.images >= images.maxImages) return { omitted: true }
+    if (declared !== undefined) {
+      // A single picture above the store's per-image ceiling can never be
+      // accepted; spending a content walk on it would turn a deterministic
+      // refusal into a slower one.
+      if (declared > images.maxImageBytes) return { omitted: true }
+      if (images.bytes + declared > images.maxBytes) return { omitted: true }
+    }
+    const remaining = images.maxBytes - images.bytes
+    if (remaining <= 0) return { omitted: true }
+
+    // ONE PROCESS-WIDE SLOT, exactly like a text ref (issue #39): the walk's
+    // transient peak is the same whether the bytes end in text or in an image.
+    let releaseSlot: (() => void) | undefined
+    try {
+      releaseSlot = await this.#contentGate.acquire(deadline?.instant)
+      const bytes = await this.#readVerifiedBytes(connection, sessionId, ref, remaining, deadline)
+      const saved = await images.attachments.saveImage({
+        data: bytes,
+        mediaType,
+        ...(face.name === undefined ? {} : { name: face.name }),
+      })
+      // Count what the WIRE cost, not what the store kept: a normalizing store
+      // may shrink the image, and the per-call budget exists to bound fetching.
+      images.images += 1
+      images.bytes += bytes.length
+      return {
+        image: {
+          attachmentId: saved.attachmentId,
+          mediaType: saved.mediaType,
+          bytes: saved.bytes,
+          width: saved.width,
+          height: saved.height,
+          ...(saved.name === undefined ? {} : { name: saved.name }),
+        },
+      }
+    } catch (error) {
+      if (error instanceof ContentByteCapError) return { omitted: true }
+      // An `AttachmentError` from `saveImage` lands in this same arm: it carries
+      // no `failureReason`, so the part keeps its metadata and names the store's
+      // own message. An INTEGRITY failure still throws above this catch's reach.
+      if (!this.#degradableReadFailure(error)) throw error
+      return { unavailable: unavailableReason(error) }
+    } finally {
+      releaseSlot?.()
     }
   }
 
@@ -4309,8 +4743,10 @@ export class CherryToolEngine {
    *
    * The projection calls it BEFORE queueing for a content-read slot (issue #39
    * review, finding 2), so an unreadable ref never waits for capacity it cannot
-   * use and never reports the gate's deadline as its reason; the walk calls it
-   * again so the invariant holds for any caller that reaches it directly.
+   * use and never reports the gate's deadline as its reason. The walk itself
+   * re-checks the same bound against the budget it was handed
+   * ({@link CherryToolEngine.#readVerifiedBytes}), which is the arm the image
+   * face relies on for its per-call byte budget.
    *
    * A plain Error on purpose: this is the DEGRADABLE class (see
    * {@link CherryToolEngine.#degradableReadFailure}), so one oversized ref
@@ -4318,8 +4754,8 @@ export class CherryToolEngine {
    */
   #externalizedRefusal(ref: Record<string, unknown>): Error | undefined {
     const contentId = String(ref['contentId'] ?? '')
-    const declaredBytes = Number(ref['byteLength'])
-    if (!Number.isFinite(declaredBytes) || declaredBytes <= this.#externalizedByteCap) return undefined
+    const declaredBytes = declaredRefBytes(ref)
+    if (declaredBytes === undefined || declaredBytes <= this.#externalizedByteCap) return undefined
     return new Error(
       `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${this.#externalizedByteCap}-byte limit ` +
         'for externalized content; not read',
@@ -4327,23 +4763,19 @@ export class CherryToolEngine {
   }
 
   /**
-   * Paginate `agent.content.read` over one `{ref}` and verify its sha256.
+   * Paginate `agent.content.read` over one `{ref}`, verify its sha256, and
+   * decode the certified bytes as legal UTF-8.
    *
-   * The digest is checked against BOTH its sources (the ref's declaration and
-   * the slices' own reports), which must agree when both are present, and the
-   * certified bytes must then decode as legal UTF-8 — a digest certifies bytes,
-   * not text.
-   *
-   * THE MEMORY CONTRACT (issue #7). {@link MAX_EXTERNALIZED_BYTES} caps ONE
-   * ref, and this walk holds its content at roughly 3x that cap at its peak:
-   * the decoded slice buffers, the single concatenation the digest and the
-   * decoder both need, and the decoded string handed back. Three copies is the
-   * price of never hashing or decoding a buffer that the caller could mutate,
-   * and it is paid ONE REF AT A TIME by this engine's walks — messages and
-   * parts are projected sequentially, so an aggregate's own peak is one ref's.
-   * It is NOT a process-wide bound: independent reads (separate tool calls)
-   * in flight together multiply the peak by their count. A global gate or
-   * budget is a separate concern, deliberately outside this walk.
+   * The decode is the TEXT face's rule, not the walk's: a digest certifies
+   * bytes, not text, and a lenient decode would rewrite every illegal sequence
+   * to U+FFFD and hand the model substitution characters as though they were
+   * the part's content. So it is FATAL — content that is not legal UTF-8 fails
+   * like any other unreadable content (degradable, per part) rather than being
+   * silently mangled. The decoder also applies the standard encoding rule of
+   * DROPPING a leading U+FEFF — what the official reducer's decode does too,
+   * and what keeps an invisible zero-width character out of the model's
+   * context. The image face (#307) deliberately stops at the bytes and never
+   * reaches this decode.
    */
   async #readExternalized(
     connection: DeviceConnection,
@@ -4351,26 +4783,71 @@ export class CherryToolEngine {
     ref: Record<string, unknown>,
     deadline?: AssemblyDeadline,
   ): Promise<string> {
+    // The caller's pre-flight (see `#externalizedRefusal`) has already refused
+    // a declared size above this cap before a gate slot was taken; the walk
+    // checks it again so the invariant holds for any caller that reaches it
+    // directly.
+    const bytes = await this.#readVerifiedBytes(
+      connection,
+      sessionId,
+      ref,
+      this.#externalizedByteCap,
+      deadline,
+    )
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      throw new Error(
+        `agent.content.read for ${String(ref['contentId'] ?? '')} returned bytes that are not valid UTF-8; not decoded`,
+      )
+    }
+  }
+
+  /**
+   * Paginate `agent.content.read` over one `{ref}` and verify its sha256,
+   * returning the CERTIFIED BYTES — no decode (#307 factors this out of the
+   * text walk so the image face can reuse it).
+   *
+   * `byteCap` is the budget THIS read may spend. The text face passes
+   * {@link MAX_EXTERNALIZED_BYTES}; the image face passes what remains of the
+   * per-call image byte budget, and maps a {@link ContentByteCapError} to
+   * `imagesOmitted: 'cap'` rather than to a failed part.
+   *
+   * THE MEMORY CONTRACT (issue #7). {@link MAX_EXTERNALIZED_BYTES} caps ONE
+   * ref, and this walk holds its content at roughly 3x that cap at its peak:
+   * the decoded slice buffers and the single concatenation the digest needs.
+   * Three copies is the price of never hashing a buffer that the caller could
+   * mutate, and it is paid ONE REF AT A TIME by this engine's walks — messages
+   * and parts are projected sequentially, so an aggregate's own peak is one
+   * ref's. It is NOT a process-wide bound: independent reads (separate tool
+   * calls) in flight together multiply the peak by their count. A global gate
+   * or budget is a separate concern, deliberately outside this walk.
+   */
+  async #readVerifiedBytes(
+    connection: DeviceConnection,
+    sessionId: string,
+    ref: Record<string, unknown>,
+    byteCap: number,
+    deadline?: AssemblyDeadline,
+  ): Promise<Buffer> {
     const contentId = String(ref['contentId'] ?? '')
     const revision = String(ref['revision'] ?? '')
     const declaredSha = typeof ref['sha256'] === 'string' ? ref['sha256'] : undefined
     // The advertised byte length bounds the walk honestly: the peer declares it
     // on the ref, so a read that needs more slices than the content can hold is
     // a peer fault, not a reason to return a partial (and unverifiable) value.
-    const declaredBytes = Number(ref['byteLength'])
-    // The declared length bounds the walk honestly, but only up to the absolute
-    // cap: past it the walk is refused BEFORE any round trip (see
-    // MAX_EXTERNALIZED_BYTES). This is the degradable class — a plain Error, so
-    // the part is marked unavailable instead of failing the read.
-    //
-    // Checked here AND at the caller's pre-flight (one implementation,
-    // `#externalizedRefusal`): the caller needs it before taking a gate slot,
-    // and this keeps the walk safe for any future caller.
-    const refusal = this.#externalizedRefusal(ref)
-    if (refusal !== undefined) throw refusal
-    const maxSlices = Number.isSafeInteger(declaredBytes)
-      ? Math.max(1, Math.ceil(declaredBytes / this.#contentReadSliceBytes))
-      : DEFAULT_CONTENT_SLICE_BOUND
+    const declaredBytes = declaredRefBytes(ref)
+    // The declared length bounds the walk honestly up to the caller's budget:
+    // past it the walk is refused BEFORE any round trip.
+    if (declaredBytes !== undefined && declaredBytes > byteCap) {
+      throw new ContentByteCapError(
+        `{ref} ${contentId} declares ${declaredBytes} bytes, above the ${byteCap}-byte limit for this read; not read`,
+      )
+    }
+    const maxSlices =
+      declaredBytes !== undefined && Number.isSafeInteger(declaredBytes)
+        ? Math.max(1, Math.ceil(Math.min(declaredBytes, byteCap) / this.#contentReadSliceBytes))
+        : DEFAULT_CONTENT_SLICE_BOUND
 
     let offset = '0'
     let sha: string | undefined
@@ -4410,11 +4887,11 @@ export class CherryToolEngine {
       // it just to measure it is the memory exposure the cap exists to bound.
       // ceil(len/4)*3 is the exact byte count for unpadded base64 and errs high
       // by at most the padding — the safe direction for a ceiling.
-      const cap = this.#externalizedByteCap
+      const cap = byteCap
       if (read + Math.ceil(data.length / 4) * 3 > cap + 2) {
-        throw new Error(
+        throw new ContentByteCapError(
           `agent.content.read for ${contentId} exceeded the ${cap}-byte limit ` +
-            'for externalized content; not read',
+            'for this read; not read',
         )
       }
       const chunk = Buffer.from(data, 'base64')
@@ -4443,9 +4920,9 @@ export class CherryToolEngine {
       // more than the cap, and a peer may simply serve more than it declared.
       // Bytes actually read are the only honest measure here.
       if (read > cap) {
-        throw new Error(
+        throw new ContentByteCapError(
           `agent.content.read for ${contentId} exceeded the ${cap}-byte limit ` +
-            'for externalized content; not read',
+            'for this read; not read',
         )
       }
       if (typeof slice['sha256'] === 'string') sha = slice['sha256']
@@ -4510,23 +4987,9 @@ export class CherryToolEngine {
         `agent.content.read for ${contentId} failed its sha256 check (expected ${expected}, got ${actual})`,
       )
     }
-    // A MATCHING DIGEST CERTIFIES THE BYTES, NOT THEIR LEGALITY. The sha256 says
-    // these are the bytes the content is made of; it says nothing about whether
-    // those bytes ARE text. A lenient decode would rewrite every illegal
-    // sequence to U+FFFD and hand the model substitution characters as though
-    // they were the part's content — so the decode is FATAL, and content that
-    // is not legal UTF-8 fails like any other unreadable content (degradable,
-    // per part) rather than being silently mangled. The decoder also applies
-    // the standard encoding rule of DROPPING a leading U+FEFF — what the
-    // official reducer's decode does too, and what keeps an invisible zero-width
-    // character out of the model's context.
-    try {
-      return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))
-    } catch {
-      throw new Error(
-        `agent.content.read for ${contentId} returned bytes that are not valid UTF-8; not decoded`,
-      )
-    }
+    // Certified bytes, undecoded: the TEXT wrapper above owns the UTF-8 rule,
+    // and the image face must never run it (binary is the whole point).
+    return Buffer.concat(chunks)
   }
 
   // -------------------------------------------------------------------------
@@ -8368,7 +8831,12 @@ export class CherryToolEngine {
         stop = 'deadline'
         break
       }
-      const message = await this.#projectMessage(connection, sessionId, raw, deadline)
+      const message = await this.#projectMessage(
+        connection,
+        sessionId,
+        raw,
+        deadline === undefined ? {} : { deadline },
+      )
       messages.push(message)
       projectedBytes += JSON.stringify(message).length
       // Checked AFTER the message is complete: the budget trims what comes
