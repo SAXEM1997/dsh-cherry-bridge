@@ -139,7 +139,6 @@ interface PreparedSendAttachment extends SendAttachmentRequest {
   read(offset: number, length: number, signal: AbortSignal | undefined): Promise<Uint8Array>
 }
 
-/** A staged upload: what `agent.uploads.prepare`…`complete` produced. */
 /** The caller-facing echo of one uploaded file (#306), also remembered for replay (#311). */
 interface SendAttachmentEcho {
   filename: string
@@ -148,6 +147,7 @@ interface SendAttachmentEcho {
   uploadId: string
 }
 
+/** A staged upload: what `agent.uploads.prepare`…`complete` produced. */
 interface UploadedSendAttachment extends PreparedSendAttachment {
   readonly uploadId: string
   readonly writerEpoch: string
@@ -5422,10 +5422,14 @@ export class CherryToolEngine {
             wait: args['wait'] !== false,
             timeoutMs: waitTimeout(args['timeoutMs']),
             attachments: send.echo.map((file) => ({ uploadId: file.uploadId })),
-            ...(remembered.body['selectionId'] === undefined
-              ? {}
-              : { selectionId: String(remembered.body['selectionId']) }),
+            ...(typeof remembered.body['selectionId'] === 'string'
+              ? { selectionId: remembered.body['selectionId'] }
+              : {}),
           })
+          // A replay of a REJECTED send returns the refusal alone: the first
+          // send's branch cancelled its staged uploads and suppressed the echo,
+          // so advertising those ids here would attach freed records to a run.
+          if (replayed['status'] === 'rejected') return replayed
           return { ...replayed, attachments: send.echo }
         }
 

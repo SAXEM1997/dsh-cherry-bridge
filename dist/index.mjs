@@ -9622,18 +9622,20 @@ var CherryToolEngine = class {
 					if (remembered.method !== SEND_METHOD) throw commandBodyDiffers();
 					const send = remembered.send;
 					if (send === void 0 || !sameSendAttachmentRequests(send.requests, parsed.value) || remembered.body["sessionId"] !== sessionId || remembered.body["text"] !== text) throw commandBodyDiffers();
+					const replayed = await this.#runOnce({
+						connection,
+						deviceId: record.deviceId,
+						sessionId,
+						text,
+						commandId: callerCommandId,
+						wait: args["wait"] !== false,
+						timeoutMs: waitTimeout(args["timeoutMs"]),
+						attachments: send.echo.map((file) => ({ uploadId: file.uploadId })),
+						...typeof remembered.body["selectionId"] === "string" ? { selectionId: remembered.body["selectionId"] } : {}
+					});
+					if (replayed["status"] === "rejected") return replayed;
 					return {
-						...await this.#runOnce({
-							connection,
-							deviceId: record.deviceId,
-							sessionId,
-							text,
-							commandId: callerCommandId,
-							wait: args["wait"] !== false,
-							timeoutMs: waitTimeout(args["timeoutMs"]),
-							attachments: send.echo.map((file) => ({ uploadId: file.uploadId })),
-							...remembered.body["selectionId"] === void 0 ? {} : { selectionId: String(remembered.body["selectionId"]) }
-						}),
+						...replayed,
 						attachments: send.echo
 					};
 				}
