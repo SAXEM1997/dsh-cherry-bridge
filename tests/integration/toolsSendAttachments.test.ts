@@ -7,8 +7,9 @@ import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { registerCherryTools } from '../../src/tools.js'
+import { registerCherryToolsWithEngine } from '../../src/tools.js'
 import type {
+  CherryToolEngine,
   CherryFsLike,
   CherryFsTargetLike,
   CherryToolDefinition,
@@ -20,6 +21,8 @@ import { FakeCherry } from '../loopback/fakeCherry.js'
 
 interface Rig {
   fake: FakeCherry
+  /** The real engine, so a test can drive its command-memory seam (#321). */
+  engine: CherryToolEngine
   call(name: string, args?: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>
   stop(): Promise<void>
 }
@@ -129,10 +132,11 @@ async function makeRig(options: {
     fs: () => options.fs ?? memoryFs(files),
     workingDirectory: () => ({ ensure: async () => tmp }),
   }
-  registerCherryTools(ctx, deps, {})
+  const registered = registerCherryToolsWithEngine(ctx, deps, {})
   await connection.connect()
   const rig: Rig = {
     fake,
+    engine: registered.engine!,
     call: async (name, args = {}, exec) => {
       const definition = ctx.definitions.find((entry) => entry.name === name)
       if (definition === undefined) throw new Error(`tool ${name} is not registered`)
@@ -695,5 +699,36 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
     // Refused LOCALLY: the peer never sees a second send under this id.
     expect(rig.fake.methodCount('agent.messages.send')).toBe(1)
+  })
+
+  it('㉖a an evicted command entry re-uploads, and the peer rejects the new body', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files })
+    const args = {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: '',
+      wait: false,
+      commandId: 'cmd-1',
+      attachments: [{ path: '/work/a.txt' }],
+    }
+    await rig.call('cherry_send', args, exec())
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+
+    // The engine's own FIFO: one entry per id, 128 per device. The first send
+    // was the OLDEST entry, so filling the bound evicts it.
+    for (let index = 0; index < 128; index += 1) {
+      rig.engine.rememberCommandBodyForTest('dev-A', `filler-${index}`)
+    }
+    expect(rig.engine.rememberedCommandIds('dev-A')).not.toContain('cmd-1')
+
+    // With no memory, the retry uploads again (fresh uploadIds), so its body
+    // differs from the ledger's and the PEER decides: an idempotency conflict,
+    // not a silent replay and not a second successful send.
+    await expect(rig.call('cherry_send', args, exec())).rejects.toThrow(
+      /^Command body differs from the recorded command/,
+    )
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(2)
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(2)
   })
 })
