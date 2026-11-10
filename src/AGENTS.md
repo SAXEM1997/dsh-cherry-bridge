@@ -129,16 +129,17 @@ These are load-bearing; the code comments are the long version.
 
 ### Uploads: binary chunks on the same channel
 
-hello `agentUploadsVersion:1` becomes `limits.uploads`; ABSENT refuses
-attachments (`unsupported`) before any upload.
+hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
 
-- `prepare` → 1 MiB `{kind:'upload'}` records (window 2), each acked by an
-  `uploads.ack` notification; `complete` carries the sha256; `get`
-  polls to `ready`; any later failure cancels.
+- `prepare` → 1 MiB `{kind:'upload'}` records (window 2), each acked by
+  `uploads.ack`; `complete` carries sha256; `get` polls to ready; a later
+  failure cancels.
 - `present` is best-effort: `accepted:false` still sends the uploadIds, no
-  `selectionId`. `rejected` frees the staging records; `interrupted` keeps
-  them and the echo (the run may hold them). Blank text needs attachments.
-  Limits: 8 files, 1 GiB each, 2 GiB.
+  `selectionId`. `rejected` frees staging records; `interrupted` keeps them and
+  the echo. Blank text needs attachments. Limits: 8 files, 1 GiB
+  each, 2 GiB.
+- Upload failures are `upload-failed` + the peer's `reason`; no per-code
+  verdict (#312).
 
 ### The `connecting` window: waited out, then judged
 

@@ -562,4 +562,54 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(2)
     expect(second.attachments[0]!.uploadId).not.toBe(first.attachments[0]!.uploadId)
   })
+
+  // Issue #312: ONE verdict, `upload-failed`, with the peer's code preserved in
+  // `reason`. The four codes are not separate errors; these cases pin that the
+  // code is never dropped or rewritten on the way out.
+  async function refusedUpload(reason: string): Promise<Record<string, unknown>> {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files })
+    rig.fake.failNextUploadAck({ reason, message: `peer refused: ${reason}` })
+    return (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', attachments: [{ path: '/work/a.txt' }] },
+      exec(),
+    )) as Record<string, unknown>
+  }
+
+  it('㉔a a NOT_FOUND upload failure keeps the peer code in reason', async () => {
+    const verdict = await refusedUpload('NOT_FOUND')
+    expect(verdict['error']).toBe('upload-failed')
+    expect(verdict['reason']).toBe('NOT_FOUND')
+  })
+
+  it('㉔b a CHECKSUM_MISMATCH verification failure keeps the peer code in reason', async () => {
+    // This code cannot ride an upload ACK (the protocol's ack enum has no
+    // CHECKSUM_MISMATCH): the desktop reports it on `agent.uploads.get` after
+    // `complete`, which is the path this case drives.
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files })
+    rig.fake.failNextUploadVerification('CHECKSUM_MISMATCH')
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', attachments: [{ path: '/work/a.txt' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    expect(verdict['error']).toBe('upload-failed')
+    expect(verdict['reason']).toBe('CHECKSUM_MISMATCH')
+  })
+
+  it('㉔c a RESOURCE_EXHAUSTED upload failure keeps the peer code in reason', async () => {
+    const verdict = await refusedUpload('RESOURCE_EXHAUSTED')
+    expect(verdict['error']).toBe('upload-failed')
+    expect(verdict['reason']).toBe('RESOURCE_EXHAUSTED')
+  })
+
+  it('㉔d a GRANT_REVOKED upload failure keeps the peer code in reason', async () => {
+    const verdict = await refusedUpload('GRANT_REVOKED')
+    expect(verdict['error']).toBe('upload-failed')
+    expect(verdict['reason']).toBe('GRANT_REVOKED')
+  })
 })
