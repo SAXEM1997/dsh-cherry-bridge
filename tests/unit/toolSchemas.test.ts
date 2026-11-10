@@ -141,6 +141,19 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     })
   })
 
+  it('issue #307: cherry_read offers includeImages as an OPTIONAL boolean, and says what it reads', () => {
+    const definition = toolOf('cherry_read')
+    const includeImages = properties(definition)['includeImages']
+    expect(includeImages).toMatchObject({ type: 'boolean' })
+    expect(definition.parameters.required).toEqual(['device', 'sessionId'])
+    // The description is the model's only warning that this opt-in has a
+    // deployment/route gate and a per-call cap, so neither may silently vanish.
+    expect(String(includeImages?.['description'])).toMatch(/image input/i)
+    expect(String(includeImages?.['description'])).toMatch(/imagesOmitted/i)
+    expect(definition.description).toMatch(/includeImages: true/)
+    expect(definition.description).toMatch(/legacy `data` attachment/i)
+  })
+
   it('issue #103: the failure clause is conditional and claims only what is dropped', () => {
     // The wire `failure` is OPTIONAL even on a failed message (protocol
     // `messageSchema.failure` is `ZodOptional`), so an unconditional "carries

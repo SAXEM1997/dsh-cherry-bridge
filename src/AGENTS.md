@@ -214,9 +214,9 @@ this beside the cache).
   proxy). It excludes `{ref}` text (the multi-megabyte half) but INCLUDES
   inline text — up to the peer's 4,096-char `INLINE_TEXT_LIMIT` per part, so a
   few hundred fat inline parts can legitimately reach the 1 MiB entry cap.
-  `MESSAGE_CACHE_BYTES_PER_DEVICE` = 32 MiB. Two bounds judged INDEPENDENTLY:
-  an entry exceeding the entry cap **or** the device budget is refused — an
-  entry the device can never fit must not evict it wholesale to store itself.
+  `MESSAGE_CACHE_BYTES_PER_DEVICE` = 32 MiB. Two independent bounds: an entry
+  over either cap is refused — one the device can never fit must not evict it
+  wholesale to store itself.
 - **Eviction is FIFO** — `Map` order IS the policy (the same choice `#remember`
   documents). A **refresh keeps the key's insertion position** (a rewrite, not
   a use; delete-then-set would silently make it LRU). Room is made BEFORE a
@@ -278,10 +278,9 @@ this beside the cache).
 
 The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
 timeout and idle faces) runs AFTER the caller's wait window, so the window
-cannot bound it. It once had no time bound at all: since #12 a read whose link
-dies waits up to `transportRetryWaitMs` (5 s), so under a flapping link each of
-~30 requests could absorb that wait — a 1 s window answering ~150 s later, the
-shape #3 fixed with a message ceiling and a byte budget (issue #21).
+cannot bound it. It once had no time bound: since #12 a read whose link dies
+waits up to `transportRetryWaitMs` (5 s), so under a flapping link each of ~30
+requests absorbed it — a 1 s window answering ~150 s later (#3, #21).
 
 - **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
   clamp(window, WAIT_ANSWER_TAIL_FLOOR_MS, WAIT_ANSWER_TAIL_MS)` — one more
@@ -334,12 +333,10 @@ shape #3 fixed with a message ceiling and a byte budget (issue #21).
   `AssemblyDeadline` of its own, anchored at TOOL ENTRY with the caller's window.
   A spent budget FAILS the call with a guidance error: nothing was learned about
   the run, so a retry is the recovery, and the caller is never handed a verdict
-  the snapshot never produced. Before this it was the one wait-answer request
-  with no absolute bound, and a flapping link could put 5–10 s of reconnect +
-  replay behind a 500 ms window. The idle answer's HISTORY walk keeps its own
-  anchor AFTER the snapshot, deliberately: a snapshot that was slow but
-  succeeded must not leave the walk with nothing, so the two phases are bounded
-  separately (a pathological call can spend both).
+  the snapshot never produced. Before #51 a flapping link could spend 5–10 s
+  behind a 500 ms window. The idle HISTORY walk anchors AFTER the snapshot
+  deliberately: a slow-but-successful snapshot must not leave the walk with
+  nothing, so the phases are bounded separately.
 
 What this is NOT: a global `cherry_read`/list-tool budget — they take no
 deadline; their bounds are `limit`, the safety breaker and the byte budgets.
@@ -485,10 +482,9 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   that reaches it — the compensations are that a clause no probe reaches still
   slips through, and that over-refusal (naming less than the parser would take)
   is allowed by design, since it costs resumability rather than correctness.
-  The failure mode all of this prevents is the emitter minting a stop point the
-  same tool then refuses: the caller holds a token that can never be used, and
-  the refusal surfaces at the resume call instead of at the answer that produced
-  it. A refused remainder yields no token at all — `truncated` already says the
+  The failure mode this prevents: an emitted stop point the same tool refuses —
+  a useless token whose refusal surfaces at resume, not at the answer. A
+  refused remainder yields no token at all — `truncated` already says the
   walk was cut, and the remedy then follows the REASON rather than the absence:
   a `'limit'` stop answers to a wider `limit` only where the caller owns that
   ceiling (`cherry_read` and the four list tools — a WAIT answer's `'limit'` is
@@ -629,11 +625,15 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 - A failed message may carry `failure: {reasonCode, retryable, message}`
   (peer classification, retry-worthiness, bounded summary); only its
   `source`/`context` are withheld.
-- Attachments — `kind: 'file'`, and legacy `kind: 'data'` named `file` whose
+- Attachments — `kind: 'file'`, and legacy `data` named `file` whose
   `{mediaType, filename}` is JSON in `content.text` — report `name`/`mediaType`
-  (`byteLength` from a ref only), no `unavailable` (bytes not fetched), and
-  `content` **empty** unless the record has a key we skip (then raw text,
-  lossless).
+  (`byteLength` from a ref only), no `unavailable` unless `includeImages`
+  asked and the image could not be fetched or saved, and `content` **empty**
+  unless the record has a key we skip. `includeImages` is the exception: an accepted
+  `file` image is fetched, verified and saved via `saveImage` under our
+  4-image / 8 MiB per-call cap (`imagesOmitted: 'cap'` when over); the route
+  must declare `image` input, and `includeImages` without an attachments
+  service answers `unsupported`. Legacy `data` never qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
 
@@ -945,7 +945,7 @@ faces:
 | --- | --- |
 | 2.1.5 `connection.hello` adds `agentUploadsVersion` / `agentUploadChecksum` / `agentAttachmentSelections` and 5 `agentUpload*` limits | Additive: hello has no strict validation, limits are read by name |
 | 2.1.5 record framing adds a binary marker (first byte `1`) for upload chunks | Additive: JSON record encoding is unchanged; we neither send nor receive binary |
-| 2.1.5 attachments project as `{kind: 'file', name, ref}` | Metadata only — bytes are never fetched |
+| 2.1.5 attachments project as `{kind: 'file', name, ref}` | Default metadata-only; `includeImages` fetches accepted images (#307) |
 | 2.1.5 `agent.messages.send` requires non-empty trimmed `text` | `cherry_send` rejects blank text locally as `text-empty` |
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |

@@ -12,7 +12,12 @@ import {
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
 import { cherryScopeToolNames, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
-import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
+import type {
+  AttachmentServiceLike,
+  CherryToolsContext,
+  CherryToolsDeps,
+  LlmServiceLike,
+} from './tools.js'
 import { ToolScopeState } from './toolScope.js'
 import { CherryToolEngine } from './tools.js'
 import { resolveSubagentConfig } from './subagent.js'
@@ -843,7 +848,7 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /** One dep object, shared by both faces, so there is exactly ONE pool. */
-function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
+function assemblyDeps(ctx: CherryBridgeContext): CherryHttpDeps & CherryToolsDeps {
   return {
     store: state.store,
     // The scope document's authority and the recompute entry, read through the
@@ -948,6 +953,13 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
      * states to report yet; the engine joins when it first resolves one.
      */
     watchDeviceState: (deviceId, cb) => state.connections.get(deviceId)?.onState(cb),
+    // The host's optional services, resolved LAZILY on every call (#307): the
+    // deps object is built before the composition mounts them, and a captured
+    // instance would be the one from before the mount. Absent is a legitimate
+    // deployment (no durable image store), which `cherry_read` reports as the
+    // structured `unsupported` verdict — never an assembly failure.
+    attachments: () => ctx.get?.('attachments') as AttachmentServiceLike | undefined,
+    llm: () => ctx.get?.('llm') as LlmServiceLike | undefined,
     // Both channels return a DETACHER: the listener sets live on this assembly,
     // not on the SSE hub that subscribes to them, so a hub cannot remove its
     // callbacks unless the seam hands it the means to. Without this, every
@@ -1086,7 +1098,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
     log: (message) => console.warn(message),
   })
 
-  const deps = assemblyDeps()
+  const deps = assemblyDeps(ctx)
   // `registerHttpApi` owns the headless degradation (warn + skip) and the route
   // disposer. The TOOL registrations deliberately have no seat here: they are
   // gated on the scope subsystem's capability tri-state and belong to the host
