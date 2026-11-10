@@ -341,7 +341,7 @@ describe('DeviceConnection over a real loopback channel', () => {
     // The KNOWN limits are read BY NAME: the unknown entries neither displace
     // them nor leak into the (closed-shape) effective projection, which carries
     // exactly the keys this client understands — plus the advertised un-acked
-    // window, read since issue #212.
+    // window (issue #212) and the upload capability bit (issue #306).
     expect(connection.limits).toEqual({
       heartbeatMs: 25_000,
       subscriptions: 5,
@@ -350,6 +350,7 @@ describe('DeviceConnection over a real loopback channel', () => {
       // The fake advertises the window it ENFORCES (the desktop advertises its
       // whole map), so the un-acked window (issue #212) joins the projection.
       unackedBytes: 262_144,
+      uploads: 1,
     } satisfies EffectiveLimits)
 
     // The link is USABLE, not merely established: an authenticated business
