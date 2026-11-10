@@ -1121,6 +1121,9 @@ export class FakeCherry {
   #readCalls: Array<{ method: string; params: Record<string, unknown> }> = []
   /** One-shot read-face failures, consumed by the first matching call. */
   #readFailNext: Map<string, FakeFailure>
+  /** Parts-list calls served, and the one-shot refusal after N of them (#310). */
+  #partsListCalls = 0
+  #partsListFailureAfter: { count: number; failure: FakeFailure } | undefined
   /** One-shot hooks that fire AFTER the next successful read of a method. */
   #afterReadOnce = new Map<string, () => void>()
   /** One-shot hooks that fire AS a method's next frame arrives (see `beforeNextCall`). */
@@ -1862,6 +1865,11 @@ export class FakeCherry {
    */
   setContentDigest(contentId: string, revision: string, sha256: string): void {
     this.#contentDigests.set(`${contentId}:${revision}`, sha256)
+  }
+
+  /** Refuses the `agent.parts.list` after `count` successes, once (#310). */
+  failPartsListAfter(count: number, failure: FakeFailure): void {
+    this.#partsListFailureAfter = { count, failure }
   }
 
   /** The digest the peer currently advertises for one pinned content. */
@@ -3510,6 +3518,12 @@ export class FakeCherry {
 
   /** The real `listParts`: a stale `messageRevision` is REVISION_EXPIRED. */
   #handlePartsList(method: string, params: Record<string, unknown>): Record<string, unknown> {
+    const after = this.#partsListFailureAfter
+    if (after !== undefined && this.#partsListCalls >= after.count) {
+      this.#partsListFailureAfter = undefined
+      throw new FakeRpcError(after.failure)
+    }
+    this.#partsListCalls += 1
     this.#requireSession(params['sessionId'] as string)
     const messages = this.#agent().messages ?? []
     const message = messages.find((entry) => entry.messageId === params['messageId'])
