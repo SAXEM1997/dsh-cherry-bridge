@@ -468,4 +468,98 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(rig.fake.cancelledWithUploadsInFlight()).toBe(0)
     expect(rejections).toEqual([])
   })
+
+  it('㉓a a same-id attachment retry reuses the remembered uploads and echo', async () => {
+    const files = new Map([
+      ['/work/a.txt', Buffer.from('hello')],
+      ['/work/b.txt', Buffer.from('other')],
+    ])
+    const rig = await makeRig({ files })
+    const args = {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: '',
+      wait: false,
+      commandId: 'cmd-1',
+      attachments: [{ path: '/work/a.txt' }],
+    }
+
+    const first = (await rig.call('cherry_send', args, exec())) as {
+      commandId: string
+      attachments: Array<{ uploadId: string; filename: string; mediaType: string; byteLength: number }>
+    }
+    const retry = (await rig.call('cherry_send', args, exec())) as typeof first
+    // A replay rewrites the memory entry; a SECOND retry pins that the local
+    // source survives that rewrite instead of being dropped on the first one.
+    const retryAgain = (await rig.call('cherry_send', args, exec())) as typeof first
+
+    expect(retry.commandId).toBe('cmd-1')
+    // The echo is the ORIGINAL staging record, not a second upload's.
+    expect(retry.attachments).toEqual(first.attachments)
+    expect(retryAgain.attachments).toEqual(first.attachments)
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    expect(rig.fake.methodCount('agent.attachments.present')).toBe(1)
+  })
+
+  it('㉓b a different attachment under the same id is refused before any upload', async () => {
+    const files = new Map([
+      ['/work/a.txt', Buffer.from('hello')],
+      ['/work/b.txt', Buffer.from('other')],
+    ])
+    const rig = await makeRig({ files })
+    await rig.call(
+      'cherry_send',
+      {
+        device: 'dev-A',
+        sessionId: 's-1',
+        text: '',
+        wait: false,
+        commandId: 'cmd-1',
+        attachments: [{ path: '/work/a.txt' }],
+      },
+      exec(),
+    )
+
+    await expect(
+      rig.call(
+        'cherry_send',
+        {
+          device: 'dev-A',
+          sessionId: 's-1',
+          text: '',
+          wait: false,
+          commandId: 'cmd-1',
+          attachments: [{ path: '/work/b.txt' }],
+        },
+        exec(),
+      ),
+    ).rejects.toThrow(/^Command body differs from the recorded command/)
+    // The conflict is decided locally: no second prepare, no second send.
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(1)
+  })
+
+  it('㉓c a NEW commandId uploads again and gets fresh ids', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files })
+    const send = (commandId: string) =>
+      rig.call(
+        'cherry_send',
+        {
+          device: 'dev-A',
+          sessionId: 's-1',
+          text: '',
+          wait: false,
+          commandId,
+          attachments: [{ path: '/work/a.txt' }],
+        },
+        exec(),
+      ) as Promise<{ attachments: Array<{ uploadId: string }> }>
+
+    const first = await send('cmd-1')
+    const second = await send('cmd-2')
+
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(2)
+    expect(second.attachments[0]!.uploadId).not.toBe(first.attachments[0]!.uploadId)
+  })
 })

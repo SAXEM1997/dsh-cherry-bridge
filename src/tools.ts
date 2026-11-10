@@ -140,6 +140,14 @@ interface PreparedSendAttachment extends SendAttachmentRequest {
 }
 
 /** A staged upload: what `agent.uploads.prepare`…`complete` produced. */
+/** The caller-facing echo of one uploaded file (#306), also remembered for replay (#311). */
+interface SendAttachmentEcho {
+  filename: string
+  mediaType: string
+  byteLength: number
+  uploadId: string
+}
+
 interface UploadedSendAttachment extends PreparedSendAttachment {
   readonly uploadId: string
   readonly writerEpoch: string
@@ -1179,6 +1187,31 @@ interface RememberedCommand {
   method: string
   fingerprint: unknown
   body: Record<string, unknown>
+  /**
+   * `cherry_send` with attachments only (#311): the LOCAL inputs and the echo
+   * a same-id retry reuses. The wire body carries uploadIds, which a retry
+   * cannot reproduce by uploading again, so the tool must skip the upload and
+   * replay the remembered body's ids — this is what lets the retry compare the
+   * caller's paths instead of ids it has not minted yet.
+   */
+  send?: {
+    requests: readonly SendAttachmentRequest[]
+    echo: readonly SendAttachmentEcho[]
+  }
+}
+
+/** Whether two `attachments[]` arguments name the same local files, verbatim. */
+function sameSendAttachmentRequests(
+  a: readonly SendAttachmentRequest[],
+  b: readonly SendAttachmentRequest[],
+): boolean {
+  if (a.length !== b.length) return false
+  return a.every(
+    (item, index) =>
+      item.path === b[index]!.path &&
+      item.filename === b[index]!.filename &&
+      item.mediaType === b[index]!.mediaType,
+  )
 }
 
 /**
@@ -5358,6 +5391,44 @@ export class CherryToolEngine {
           })
         }
 
+        // A SAME-ID RETRY WITH ATTACHMENTS REUSES THE REMEMBERED WIRE BODY
+        // (issue #311): uploading again mints new uploadIds, so the body would
+        // differ from the one the peer's ledger holds and the original receipt
+        // could never be replayed. The caller's paths must be identical — a
+        // different local file under the same id is a body conflict, decided
+        // here with zero upload RPCs.
+        const callerCommandId = optionalString(args['commandId'])
+        const remembered =
+          callerCommandId === undefined
+            ? undefined
+            : this.#recallCommandBody(record.deviceId, callerCommandId)
+        if (remembered !== undefined) {
+          if (remembered.method !== SEND_METHOD) throw commandBodyDiffers()
+          const send = remembered.send
+          if (
+            send === undefined ||
+            !sameSendAttachmentRequests(send.requests, parsed.value) ||
+            remembered.body['sessionId'] !== sessionId ||
+            remembered.body['text'] !== text
+          ) {
+            throw commandBodyDiffers()
+          }
+          const replayed = await this.#runOnce({
+            connection,
+            deviceId: record.deviceId,
+            sessionId,
+            text,
+            commandId: callerCommandId,
+            wait: args['wait'] !== false,
+            timeoutMs: waitTimeout(args['timeoutMs']),
+            attachments: send.echo.map((file) => ({ uploadId: file.uploadId })),
+            ...(remembered.body['selectionId'] === undefined
+              ? {}
+              : { selectionId: String(remembered.body['selectionId']) }),
+          })
+          return { ...replayed, attachments: send.echo }
+        }
+
         // THE CAPABILITY IS CHECKED BEFORE THE FIRST UPLOAD RPC (issue #306):
         // a desktop through 2.1.4 has no `agent.uploads.*` handlers, so four
         // round trips would only produce four refusals. `limits.uploads` is the
@@ -5375,16 +5446,23 @@ export class CherryToolEngine {
         if (!Array.isArray(uploaded)) return uploaded
 
         const selectionId = await this.#presentSendAttachments(connection, sessionId, uploaded)
+        const echo = uploaded.map((file) => ({
+          filename: file.filename,
+          mediaType: file.mediaType,
+          byteLength: file.byteLength,
+          uploadId: file.uploadId,
+        }))
         const answer = await this.#runOnce({
           connection,
           deviceId: record.deviceId,
           sessionId,
           text,
-          commandId: optionalString(args['commandId']),
+          commandId: callerCommandId,
           wait: args['wait'] !== false,
           timeoutMs: waitTimeout(args['timeoutMs']),
           attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
           ...(selectionId === undefined ? {} : { selectionId }),
+          send: { requests: parsed.value, echo },
         })
         // A REJECTED send never consumed the staging records, and that receipt
         // is a final answer: free them instead of leaving the desktop holding
@@ -5402,15 +5480,7 @@ export class CherryToolEngine {
         }
         // The echo is the caller's handle on what was staged: no bytes and no
         // base64, just the ids the peer assigned (issue #306).
-        return {
-          ...answer,
-          attachments: uploaded.map((file) => ({
-            filename: file.filename,
-            mediaType: file.mediaType,
-            byteLength: file.byteLength,
-            uploadId: file.uploadId,
-          })),
-        }
+        return { ...answer, attachments: echo }
       },
     })
   }
@@ -5651,6 +5721,8 @@ export class CherryToolEngine {
     attachments?: readonly { uploadId: string }[]
     /** The presence selection the uploads were staged under, when present succeeded. */
     selectionId?: string
+    /** The LOCAL send inputs and echo, remembered for a same-id replay (#311). */
+    send?: { requests: readonly SendAttachmentRequest[]; echo: readonly SendAttachmentEcho[] }
     /** The wait window, measured from the send's own success. */
     timeoutMs: number
     /**
@@ -5682,6 +5754,7 @@ export class CherryToolEngine {
       text,
       ...(request.attachments === undefined ? {} : { attachments: request.attachments }),
       ...(request.selectionId === undefined ? {} : { selectionId: request.selectionId }),
+      ...(request.send === undefined ? {} : { send: request.send }),
     })
 
     if (!wait) {
@@ -6204,6 +6277,7 @@ export class CherryToolEngine {
       text: string
       attachments?: readonly { uploadId: string }[]
       selectionId?: string
+      send?: { requests: readonly SendAttachmentRequest[]; echo: readonly SendAttachmentEcho[] }
     },
   ): Promise<{ receipt: Record<string, unknown>; baselineSeq: number }> {
     const { commandId, text } = request
@@ -6274,6 +6348,10 @@ export class CherryToolEngine {
             ...(attachments.length === 0 ? {} : { attachments }),
             ...(selectionId === undefined ? {} : { selectionId }),
           },
+          // A replay rewrites the entry, so the local source survives it.
+          ...(request.send === undefined && remembered?.send === undefined
+            ? {}
+            : { send: request.send ?? remembered!.send! }),
         })
       }
       const receipt = await this.#command(connection, SEND_METHOD, {
