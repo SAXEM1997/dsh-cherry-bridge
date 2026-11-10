@@ -1241,6 +1241,10 @@ export class DeviceConnection {
     }
     const requestId = randomUUID()
     const ack = this.#waitUploadAck(requestId, uploadId, signal)
+    // Observe a rejection that lands while the write is still pending: the ack
+    // timer, an abort or a teardown can settle it before `ack.promise` is
+    // awaited below, and an unobserved rejection is process-fatal in Node.
+    ack.promise.catch(() => {})
     try {
       const chunk: UploadChunk = {
         kind: 'upload',

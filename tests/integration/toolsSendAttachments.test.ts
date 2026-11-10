@@ -78,12 +78,14 @@ async function makeRig(options: {
   uploads?: boolean
   fs?: CherryFsLike
   ackDelayMs?: number
+  presentAccepted?: boolean
   sendOutcome?: 'busy' | 'target-unavailable' | 'resource-exhausted' | 'interrupted'
 } = {}): Promise<Rig> {
   const uploads = options.uploads ?? true
   const fake = new FakeCherry({
     ...(uploads ? { hello: { capabilities: { agentUploadsVersion: 1 } } } : {}),
     ...(options.ackDelayMs === undefined ? {} : { uploadAckDelayMs: options.ackDelayMs }),
+    ...(options.presentAccepted === undefined ? {} : { presentAccepted: options.presentAccepted }),
     agent: {
       ...(options.sendOutcome === undefined ? {} : { sendOutcome: options.sendOutcome }),
       agents: [{ agentId: 'agent-1', name: 'Agent One' }],
@@ -319,7 +321,7 @@ describe('issue #306: cherry_send uploads local files', () => {
     // 2.5 MiB = three chunks; delayed acks make the window observable.
     const bytes = Buffer.alloc(2 * 1024 * 1024 + 512 * 1024, 3)
     const files = new Map([['/work/large.bin', bytes]])
-    const rig = await makeRig({ files, ackDelayMs: 25 })
+    const rig = await makeRig({ files, ackDelayMs: 100 })
     await rig.call(
       'cherry_send',
       { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/large.bin' }] },
@@ -397,5 +399,73 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(verdict).not.toHaveProperty('attachments')
     // The refusal never consumed the staging record: the tool frees it.
     expect(rig.fake.uploadCancelCount()).toBe(1)
+  })
+
+  it('㉒b an interrupted send keeps the staged uploads and the attachment echo', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files, sendOutcome: 'interrupted' })
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', attachments: [{ path: '/work/a.txt' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    expect(verdict['status']).toBe('interrupted')
+    // `interrupted` is the command's outcome being UNDETERMINED: the desktop
+    // may already have pinned the staging record to the run it started, so
+    // cancelling would free bytes a live child is using, and suppressing the
+    // echo would lose the only ids the caller can reconcile against.
+    expect(verdict['attachments']).toEqual([
+      { filename: 'a.txt', mediaType: 'application/octet-stream', byteLength: 5, uploadId: expect.any(String) },
+    ])
+    expect(rig.fake.uploadCancelCount()).toBe(0)
+  })
+
+  it('㉒c a declined present still sends the attachments, without a selectionId', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files, presentAccepted: false })
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/a.txt' }] },
+      exec(),
+    )) as { attachments: unknown[] }
+
+    expect(verdict.attachments).toHaveLength(1)
+    expect(rig.fake.presentedSelections()).toHaveLength(1)
+    const sent = rig.fake.commandCallsFor('agent.messages.send')[0]!
+    expect(sent['attachments']).toHaveLength(1)
+    expect(sent).not.toHaveProperty('selectionId')
+  })
+
+  it('㉒d a failed chunk drains the sibling writes before cancelling', async () => {
+    // THREE chunks, so a sibling is still in flight when the second ack fails.
+    const files = new Map([['/work/big.bin', Buffer.alloc(2_500_000, 7)]])
+    const rig = await makeRig({ files, ackDelayMs: 30 })
+    rig.fake.failEveryUploadAckAfter(1, { reason: 'INTERNAL', message: 'ack lost' })
+
+    const rejections: unknown[] = []
+    const observe = (reason: unknown): void => {
+      rejections.push(reason)
+    }
+    process.on('unhandledRejection', observe)
+    try {
+      const verdict = (await rig.call(
+        'cherry_send',
+        { device: 'dev-A', sessionId: 's-1', text: '', attachments: [{ path: '/work/big.bin' }] },
+        exec(),
+      )) as Record<string, unknown>
+      expect(verdict['error']).toBe('upload-failed')
+      expect(verdict['reason']).toBe('INTERNAL')
+      await new Promise((resolve) => setImmediate(resolve))
+    } finally {
+      process.off('unhandledRejection', observe)
+    }
+
+    // The drain settled the sibling BEFORE the cancel, and no rejection escaped.
+    expect(rig.fake.uploadCancelCount()).toBe(1)
+    expect(rig.fake.cancelledWithUploadsInFlight()).toBe(0)
+    expect(rejections).toEqual([])
   })
 })

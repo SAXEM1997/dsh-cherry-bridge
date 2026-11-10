@@ -129,15 +129,16 @@ These are load-bearing; the code comments are the long version.
 
 ### Uploads: binary chunks on the same channel
 
-`agentUploadsVersion: 1` in hello becomes `limits.uploads`; ABSENT refuses
-attachments (`unsupported`) before any upload RPC.
+hello `agentUploadsVersion:1` becomes `limits.uploads`; ABSENT refuses
+attachments (`unsupported`) before any upload.
 
 - `prepare` → 1 MiB `{kind:'upload'}` records (window 2), each acked by an
-  `agent.uploads.ack` notification; `complete` carries the measured sha256,
-  then `get` polls to `ready`; any failure after `prepare` cancels.
-- `present` is best-effort (`accepted:false` never blocks); the send carries
-  `attachments` + `selectionId`. Blank text needs attachments (`text-empty`
-  otherwise). Limits: 8 files, 1 GiB each, 2 GiB per message.
+  `uploads.ack` notification; `complete` carries the sha256; `get`
+  polls to `ready`; any later failure cancels.
+- `present` is best-effort: `accepted:false` still sends the uploadIds, no
+  `selectionId`. `rejected` frees the staging records; `interrupted` keeps
+  them and the echo (the run may hold them). Blank text needs attachments.
+  Limits: 8 files, 1 GiB each, 2 GiB.
 
 ### The `connecting` window: waited out, then judged
 

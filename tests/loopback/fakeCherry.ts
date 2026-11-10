@@ -130,6 +130,8 @@ export interface FakeCherryOptions {
    * is always 1, whatever the client's window is.
    */
   uploadAckDelayMs?: number
+  /** Answer `agent.attachments.present` with `{accepted: false}` (#306). */
+  presentAccepted?: boolean
   /**
    * The `connection.endpoints` face (issue #143), modelled on the desktop's
    * `RemoteConnection.ts` handler + `RemoteAccessService.getConnectionEndpoints`:
@@ -1156,11 +1158,13 @@ export class FakeCherry {
   /** Staged uploads by id (#306); `bytes` is the live staging file. */
   #uploads = new Map<string, FakeUpload>()
   #uploadCancelCount = 0
+  #cancelWithUploadsInFlight = 0
   #uploadAckFailure: FakeFailure | undefined
   #uploadAckSuccesses = 0
   #uploadInFlight = 0
   #maxUploadInFlight = 0
   #uploadAckFailAfter: { count: number; failure: FakeFailure } | undefined
+  #uploadAckFailEveryFrom: { count: number; failure: FakeFailure } | undefined
   #presented: Array<Record<string, unknown>> = []
   #presentFailure: FakeFailure | undefined
   /** Interactions the peer currently serves via `agent.interactions.list`. */
@@ -1489,6 +1493,11 @@ export class FakeCherry {
     return this.#uploadCancelCount
   }
 
+  /** Cancels that arrived while a chunk ack was still owed (#306 drain test). */
+  cancelledWithUploadsInFlight(): number {
+    return this.#cancelWithUploadsInFlight
+  }
+
   /** Every `agent.attachments.present` this peer received (#306). */
   presentedSelections(): readonly Record<string, unknown>[] {
     return this.#presented
@@ -1507,6 +1516,11 @@ export class FakeCherry {
    */
   failUploadAckAfter(count: number, failure: FakeFailure): void {
     this.#uploadAckFailAfter = { count, failure }
+  }
+
+  /** Refuses EVERY ack from the `count`-th success on (#306 drain test). */
+  failEveryUploadAckAfter(count: number, failure: FakeFailure): void {
+    this.#uploadAckFailEveryFrom = { count, failure }
   }
 
   /** Refuses the NEXT `agent.attachments.present` once (#306). */
@@ -2249,6 +2263,11 @@ export class FakeCherry {
       ack({ ok: false, error: { reason: 'CONFLICT', message: 'Invalid upload chunk or offset' } })
       return
     }
+    const persistent = this.#uploadAckFailEveryFrom
+    if (persistent !== undefined && this.#uploadAckSuccesses >= persistent.count) {
+      ack({ ok: false, error: persistent.failure })
+      return
+    }
     const failure = this.#uploadAckFailure
     if (failure !== undefined) {
       this.#uploadAckFailure = undefined
@@ -2338,6 +2357,7 @@ export class FakeCherry {
   }
 
   #handleUploadCancel(params: Record<string, unknown>): Record<string, unknown> {
+    if (this.#uploadInFlight > 0) this.#cancelWithUploadsInFlight += 1
     this.#uploadOf(String(params['uploadId'] ?? ''))
     this.#uploads.delete(String(params['uploadId'] ?? ''))
     this.#uploadCancelCount += 1
@@ -2351,7 +2371,7 @@ export class FakeCherry {
       throw new FakeRpcError(failure)
     }
     this.#presented.push(params)
-    return { accepted: true }
+    return { accepted: this.#options.presentAccepted ?? true }
   }
 
   #handleSocket(socket: WebSocket, identity: Uint8Array): void {

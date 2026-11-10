@@ -3723,6 +3723,7 @@ var DeviceConnection = class {
 		if (this.#state !== "connected" || link === void 0) throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		const requestId = randomUUID();
 		const ack = this.#waitUploadAck(requestId, uploadId, signal);
+		ack.promise.catch(() => {});
 		try {
 			const chunk = {
 				kind: "upload",
@@ -9397,7 +9398,7 @@ var CherryToolEngine = class {
 					attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
 					...selectionId === void 0 ? {} : { selectionId }
 				});
-				if (answer["status"] === "rejected" || answer["status"] === "interrupted") {
+				if (answer["status"] === "rejected") {
 					await this.#cancelUploads(connection, uploaded);
 					return answer;
 				}

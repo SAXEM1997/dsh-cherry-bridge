@@ -4923,11 +4923,17 @@ export class CherryToolEngine {
           attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
           ...(selectionId === undefined ? {} : { selectionId }),
         })
-        // A REFUSED send never consumed the staging records, and a receipt that
-        // says so is a final answer: free them instead of leaving the desktop
-        // holding bytes for 24 h. The echo is suppressed too — it would read as
-        // "these were attached" beside a rejection (issue #306 review).
-        if (answer['status'] === 'rejected' || answer['status'] === 'interrupted') {
+        // A REJECTED send never consumed the staging records, and that receipt
+        // is a final answer: free them instead of leaving the desktop holding
+        // bytes for 24 h. The echo is suppressed too — it would read as "these
+        // were attached" beside a rejection (issue #306 review).
+        //
+        // `interrupted` is NOT a refusal. The desktop raises it when `run()`
+        // threw, which includes throws AFTER `FileIntakeService` pinned the
+        // staging records to the run: the bytes may already belong to a live
+        // child, so cancelling could pull them, and the echo is the caller's
+        // only reconciliation handle (issue #309 review).
+        if (answer['status'] === 'rejected') {
           await this.#cancelUploads(connection, uploaded)
           return answer
         }
