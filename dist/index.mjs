@@ -8824,7 +8824,7 @@ var CherryToolEngine = class {
 	*/
 	async #projectImagePart(connection, sessionId, raw, content, face, images, deadline) {
 		const ref = isRecord$1(raw["ref"]) ? raw["ref"] : isRecord$1(content["ref"]) ? content["ref"] : void 0;
-		const mediaType = face.mediaType;
+		const mediaType = face.mediaType?.toLowerCase();
 		if (ref === void 0 || mediaType === void 0) return {};
 		if (!mediaType.startsWith("image/")) return {};
 		if (!images.attachments.imageLimits.mediaTypes.includes(mediaType)) return {};

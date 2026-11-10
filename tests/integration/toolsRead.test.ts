@@ -3617,4 +3617,77 @@ describe('issue #307: the image budget degrades per part', () => {
     // The message-level completeness flag follows the ordinary projection.
     expect(result.messages[0]!.incomplete).toBe(true)
   })
+
+  it('⑱k a media type the deployment does not accept stays metadata-only, with no content walk', async () => {
+    const attachments = fakeAttachments({ mediaTypes: ['image/png'] })
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: 'A'.repeat(64), name: 'vector.svg', mediaType: 'image/svg+xml' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const part = result.messages[0]!.parts[0]!
+    expect(part).toMatchObject({ name: 'vector.svg', mediaType: 'image/svg+xml' })
+    expect(part).not.toHaveProperty('image')
+    expect(part).not.toHaveProperty('imagesOmitted')
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+    expect(attachments.saved).toHaveLength(0)
+  })
+
+  it('⑱l an UPPERCASE image media type is still read, normalised for the store', async () => {
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: 'A'.repeat(64), name: 'photo.png', mediaType: 'IMAGE/PNG' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const part = result.messages[0]!.parts[0]!
+    expect(part.image).toMatchObject({ mediaType: 'image/png', bytes: 64 })
+    expect(rig.fake.methodCount('agent.content.read')).toBe(1)
+    expect(attachments.saved).toHaveLength(1)
+    expect(attachments.saved[0]!.mediaType).toBe('image/png')
+  })
 })

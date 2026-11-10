@@ -630,10 +630,10 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   (`byteLength` from a ref only), no `unavailable` (bytes not fetched by
   default), and `content` **empty** unless the record has a key we skip (then
   raw text, lossless). `includeImages` is the ONE exception: an accepted `file`
-  image is fetched, sha256-verified and committed via `saveImage` under a
-  4-image / 8 MiB per-call budget (`imagesOmitted: 'cap'` when over); the route
-  must declare `image` input, and no attachments service answers `unsupported`.
-  Legacy `data` parts never qualify (no contentId).
+  image is fetched, verified and saved via `saveImage` under a 4-image / 8 MiB
+  budget (`imagesOmitted: 'cap'` when over); the route must declare `image`
+  input, and `includeImages` without an attachments service answers
+  `unsupported`. Legacy `data` never qualifies (no contentId).
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
 

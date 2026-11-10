@@ -4366,7 +4366,11 @@ export class CherryToolEngine {
     deadline?: AssemblyDeadline,
   ): Promise<{ image?: ToolImageAttachment; omitted?: true; unavailable?: string }> {
     const ref = isRecord(raw['ref']) ? raw['ref'] : isRecord(content['ref']) ? content['ref'] : undefined
-    const mediaType = face.mediaType
+    // MIME types are CASE-INSENSITIVE (RFC 2045): a peer that spells the type
+    // `IMAGE/PNG` means the same thing, and the deployment's accepted list is
+    // lowercase. Normalise ONCE, here, and hand the store the normalised value
+    // so a host that validates its own limits does not reject it later.
+    const mediaType = face.mediaType?.toLowerCase()
     if (ref === undefined || mediaType === undefined) return {}
     if (!mediaType.startsWith('image/')) return {}
     if (!images.attachments.imageLimits.mediaTypes.includes(mediaType)) return {}
