@@ -127,6 +127,19 @@ These are load-bearing; the code comments are the long version.
   the original receipt. Only the same id with a *different* body is an
   idempotency conflict.
 
+### Uploads: binary chunks on the same channel
+
+hello `agentUploadsVersion:1` becomes `limits.uploads`; ABSENT refuses
+attachments (`unsupported`) before any upload.
+
+- `prepare` → 1 MiB `{kind:'upload'}` records (window 2), each acked by an
+  `uploads.ack` notification; `complete` carries the sha256; `get`
+  polls to `ready`; any later failure cancels.
+- `present` is best-effort: `accepted:false` still sends the uploadIds, no
+  `selectionId`. `rejected` frees the staging records; `interrupted` keeps
+  them and the echo (the run may hold them). Blank text needs attachments.
+  Limits: 8 files, 1 GiB each, 2 GiB.
+
 ### The `connecting` window: waited out, then judged
 
 - The pool builds a `DeviceConnection` on **first touch** and dials it at once
@@ -684,19 +697,14 @@ host's mark in the same write: an explicit operator list is intent to dial, and
 Forgetting the LAST candidate is refused (`LastCandidateHostError`) and writes
 nothing — a record with nothing to dial answers `offline` until a re-pair or a
 PATCH writes a fresh `hosts` list.
-`forgottenHosts` is optional and versionless on purpose: absence means "nothing
-forgotten", an older build ignores the key instead of refusing the archive, and
-no migration (or `schemaVersion` 5) was needed. TWO consequences of that
-compatibility are stated, not implied: a RE-PAIR replaces the record wholesale,
-so it clears every mark (a fresh pairing is a fresh decision — the QR's own
-candidates may reintroduce the address), and a DOWNGRADE can produce the overlap
-the write paths refuse, because the older build preserves the key but cannot
-honour it — the READ path repairs that one state
-(`reconcileForgottenMarks`: keeps the dial list, drops the mark, warns), since
-refusing it would brick every device tool until a 0600 file was hand-edited,
-while `upsert`/`forgetEndpoints`/`rememberEndpoints` stay strict. Both write
-actions EVICT the pooled connection ON A CHANGE, exactly like a PATCH's address
-maintenance, because a `DeviceConnection` captures its record at construction.
+`forgottenHosts` is optional and versionless: absence means "nothing forgotten",
+an older build ignores the key, and no migration was needed. TWO consequences:
+a RE-PAIR replaces the record wholesale and clears every mark, and a DOWNGRADE
+can produce the overlap the write paths refuse — the READ path repairs it
+(`reconcileForgottenMarks`: keeps the dial list, drops the mark, warns), while
+`upsert`/`forgetEndpoints`/`rememberEndpoints` stay strict. Both write actions
+EVICT the pooled connection ON A CHANGE, because a `DeviceConnection` captures
+its record at construction.
 `GET /devices` reports `forgottenHosts` beside the address maps, and since issue
 #204 the settings page shows the marks with a 恢复 each, plus a 忘记 beside every
 dialed host: both ride the two POST routes in the table, call the SAME store
@@ -716,9 +724,8 @@ reconnect.
 `desktopIdentity` is decoded at PARSE time with the transport's own
 `peerIdFromString`: a pin that does not DECODE is `invalid-payload` before any
 socket; a decodable non-Ed25519 pin still fails post-open (`channel:`).
-ONE aggregate `dialBudgetMs` deadline (30 s) bounds the walk; unreached
-candidates are named. Claim/poll re-anchors a FRESH 120 s race guard at the
-claim (not the invitation's birth); peer `expired` is the real bound.
+ONE 30 s `dialBudgetMs` bounds the walk; unreached candidates are named. Claim
+re-anchors a fresh 120 s guard; peer `expired` is the real bound.
 A failed PRE-OPEN dial is prefixed `timeout:` or `websocket:` (the `ws` code is kept); a POST-OPEN channel failure IN THE DIAL is `channel:` (a CLAIM failure rides an established channel and is not tagged).
 Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
 (keeping its port) and `FAILURE_SEGMENT_MAX` = 240 caps the whole
@@ -750,8 +757,8 @@ selector, `cherry_pair` does not.
   `isVisible(doc, workspaceId)`, read per step). That is the gate that survives a
   host without `tools.restrict`, where the scope subsystem registers nothing and
   installs no deny layer; `restrict` + `guard` stay as the belt.
-- A save re-installs or releases the restriction layer for **every live agent**
-  and takes effect on the **next turn** — no restart, no new session.
+- A save re-installs the restriction layer for **every live agent** and takes
+  effect on the **next turn** — no restart, no new session.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - Capability missing is never papered over: `pending` is a neutral wait,
@@ -860,11 +867,9 @@ the error message).
 - **Never emitted**: `accessToken`, `tokenExpiresAt`, `invitationSecret`, the
   raw pinned `desktopIdentity`, message text and part text.
 - The report is built field by field, so a later credential is excluded **by
-  construction**, not by a deny-list. `limits` is re-projected from its four
-  keys: a whitelist inside the whitelist.
+  construction**; `limits` is re-projected from its known keys.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
-  RPC requests (those belong to the transport). Counters and the error ring are
-  zeroed on every `apply`: they describe **only** the current assembly.
+  RPC requests; counters and the error ring are zeroed on every `apply`.
 
 ### Logging: levels, identifiers, and what never appears
 
@@ -944,9 +949,9 @@ faces:
 | Upstream change | Impact |
 | --- | --- |
 | 2.1.5 `connection.hello` adds `agentUploadsVersion` / `agentUploadChecksum` / `agentAttachmentSelections` and 5 `agentUpload*` limits | Additive: hello has no strict validation, limits are read by name |
-| 2.1.5 record framing adds a binary marker (first byte `1`) for upload chunks | Additive: JSON record encoding is unchanged; we neither send nor receive binary |
+| 2.1.5 record framing adds a binary marker (first byte `1`) for upload chunks | Additive: JSON records unchanged; upload chunks are the one binary frame |
 | 2.1.5 attachments project as `{kind: 'file', name, ref}` | Default metadata-only; `includeImages` fetches accepted images (#307) |
-| 2.1.5 `agent.messages.send` requires non-empty trimmed `text` | `cherry_send` rejects blank text locally as `text-empty` |
+| 2.1.5 `agent.messages.send` requires non-empty trimmed `text` | `cherry_send` rejects blank text WITHOUT attachments as `text-empty` |
 | `agent.content.read` relaxed to 512/s | Our 32/s shared budget is unchanged; the content tier exists for throughput, not for the ceiling |
 | 2.1.5 keychain-less Linux stores the identity as plaintext 0600; identity is never regenerated | Upgrades need **no re-pairing** |
 | 2.1.7 raises the shared allowance to 256/s and refuses an over-budget request (`RATE_LIMITED` + `retryAfterMs`) instead of closing 1011 | No schema change; our 32/s default already sits far below it |

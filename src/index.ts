@@ -14,8 +14,10 @@ import { SessionSubscriptions } from './subscriptions.js'
 import { cherryScopeToolNames, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
 import type {
   AttachmentServiceLike,
+  CherryFsLike,
   CherryToolsContext,
   CherryToolsDeps,
+  CherryWorkingDirectoryLike,
   LlmServiceLike,
 } from './tools.js'
 import { ToolScopeState } from './toolScope.js'
@@ -848,6 +850,12 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /** One dep object, shared by both faces, so there is exactly ONE pool. */
+/** Looks up an OPTIONAL host service without making it an injection gate. */
+function hostService<T>(ctx: CherryBridgeContext, name: string): T | undefined {
+  const get = (ctx as { get?: (service: string) => unknown }).get
+  return get?.call(ctx, name) as T | undefined
+}
+
 function assemblyDeps(ctx: CherryBridgeContext): CherryHttpDeps & CherryToolsDeps {
   return {
     store: state.store,
@@ -894,6 +902,14 @@ function assemblyDeps(ctx: CherryBridgeContext): CherryHttpDeps & CherryToolsDep
         return engine.listTargets(device, agentId)
       },
     },
+    /**
+     * The host filesystem / working directory, used ONLY by `cherry_send`'s
+     * attachment upload (issue #306). Resolved lazily: this object is built
+     * before every host service has mounted, and a test rig that never uploads
+     * never touches either service.
+     */
+    fs: () => hostService<CherryFsLike>(ctx, 'fs'),
+    workingDirectory: () => hostService<CherryWorkingDirectoryLike>(ctx, 'workingDirectory'),
     /**
      * The pairing seam, shared by `cherry_pair` and `POST /pair`.
      *

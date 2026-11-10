@@ -1,11 +1,11 @@
 import { homedir, hostname } from "node:os";
-import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, normalize, sep } from "node:path";
 import { chmodSync, closeSync, copyFileSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { RemoteSocketStream, connectSecureChannel, createDeviceIdentity, deviceIdentityId } from "@cherrystudio/remote-transport";
 import { createHash, randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
-import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema, remoteLimits } from "@cherrystudio/remote-protocol";
+import { advertisedEndpointSchema, directEndpointUrl, jsonRpcNotificationSchema, jsonRpcRequestSchema, jsonRpcResponseSchema, pairingQrSchema, remoteFailureSchema, remoteLimits, uploadAckSchema, uploadTransferLimits } from "@cherrystudio/remote-protocol";
 import { peerIdFromString } from "@libp2p/peer-id";
 /**
 * Adds the candidate addresses a peer ADVERTISED that this record does not
@@ -2826,6 +2826,12 @@ const DEFAULT_CONTENT_READ_BUDGET_PER_SECOND = 256;
 * refusal is a verdict on that arrival, and commands are never replayed.
 */
 const RATE_LIMIT_MAX_WAIT_MS = 1e3;
+/** The peer's per-file upload ceiling (`agentUploadLimits.fileBytes`). */
+const MAX_SEND_ATTACHMENT_BYTES = 1024 ** 3;
+/** The peer's per-message attachment ceiling (`agentUploadLimits.messageBytes`). */
+const MAX_SEND_MESSAGE_BYTES = 2 * 1024 ** 3;
+/** How long one 1 MiB chunk waits for its `agent.uploads.ack` (issue #306). */
+const DEFAULT_UPLOAD_ACK_TIMEOUT_MS = 6e4;
 /** 2 MiB of event text cached per session (spec §3.5). */
 const DEFAULT_PER_SESSION_CACHE_BYTES = 2097152;
 /**
@@ -2975,6 +2981,17 @@ var RpcDeadlineExceededError = class extends Error {
 		this.device = device;
 		this.method = method;
 		Object.setPrototypeOf(this, new.target.prototype);
+	}
+};
+/**
+* The peer does not speak the upload surface (issue #306): its hello carried no
+* `agentUploadsVersion`. Thrown BEFORE `agent.uploads.prepare`, so an old
+* desktop receives zero upload requests.
+*/
+var UploadUnsupportedError = class extends Error {
+	constructor(deviceId) {
+		super(`device ${deviceId} does not advertise the upload capability (agentUploadsVersion)`);
+		this.name = "UploadUnsupportedError";
 	}
 };
 /**
@@ -3470,6 +3487,15 @@ var DeviceConnection = class {
 	#link;
 	#refreshFirstFailureAt;
 	#pendingPings = /* @__PURE__ */ new Set();
+	/**
+	* Upload-chunk acknowledgements in flight, keyed by the chunk's own
+	* `requestId` (issue #306). The apes of the upload window live here rather
+	* than in a per-call listener: ONE notification handler is attached for the
+	* connection's lifetime, and a waiter registers itself before its chunk is
+	* written, so an ack that arrives while `channel.write` is still resolving is
+	* never lost.
+	*/
+	#uploadAcks = /* @__PURE__ */ new Map();
 	#token;
 	#tokenExpiresAt;
 	/**
@@ -3510,6 +3536,7 @@ var DeviceConnection = class {
 		this.#helloProtocolVersions = opts.helloProtocolVersions ?? this.#protocolVersions;
 		this.#transportRetryWaitMs = opts.transportRetryWaitMs ?? 5e3;
 		this.#onAdvertisedEndpoints = opts.onAdvertisedEndpoints;
+		this.rpc.onNotification((method, params) => this.#onUploadNotification(method, params));
 	}
 	/**
 	* The business RPC surface: rate-smoothed and gated on `connected`. Typed
@@ -3621,6 +3648,179 @@ var DeviceConnection = class {
 			this.#settleWaiters.add(onState);
 			if (this.#state !== "connecting") finish(this.#state);
 		});
+	}
+	/**
+	* Streams ONE local file through the peer's upload surface (issue #306):
+	* `prepare` → 1 MiB binary chunks (window 2) → `complete` → poll `get` to
+	* `ready`. Returns the upload id the send will reference; the bytes are never
+	* retained by this class.
+	*
+	* The caller supplies `read`, so the connection stays filesystem-agnostic.
+	* The digest is computed HERE, from the exact bytes written, and handed to
+	* `complete` as `expectedSha256`: the peer's verification then compares two
+	* independent runs of the same hash rather than trusting a caller's claim.
+	*
+	* ANY failure after `prepare` cancels the upload before rethrowing. A failed
+	* `prepare` has nothing to cancel, and a cancelled upload is NOT_FOUND at the
+	* peer — both are correct: the staging area must not keep a half file.
+	*/
+	async uploadFile(input) {
+		if (this.#limits.uploads !== 1) throw new UploadUnsupportedError(this.record.deviceId);
+		if (this.#state !== "connected") throw new DeviceUnavailableError(this.record.deviceId, this.#state);
+		const { signal } = input;
+		const uploadId = randomUUID();
+		let staged = false;
+		const window = [];
+		try {
+			const prepared = await this.rpc.request("agent.uploads.prepare", {
+				uploadId,
+				filename: input.filename,
+				mediaType: input.mediaType,
+				checksumAlgorithm: "sha256",
+				byteLength: input.byteLength
+			});
+			staged = true;
+			const writerEpoch = String(prepared["writerEpoch"] ?? "0");
+			const hash = createHash("sha256");
+			let offset = 0;
+			while (offset < input.byteLength) {
+				signal?.throwIfAborted();
+				const length = Math.min(uploadTransferLimits.chunkBytes, input.byteLength - offset);
+				const bytes = await input.read(offset, length, signal);
+				if (bytes.length !== length) throw new Error(`upload read returned ${bytes.length} bytes at offset ${offset}, expected ${length}`);
+				hash.update(bytes);
+				const chunkOffset = offset;
+				window.push(this.#writeUploadChunk(uploadId, writerEpoch, chunkOffset, bytes, signal));
+				if (window.length >= uploadTransferLimits.window) await window.shift();
+				offset += length;
+			}
+			await Promise.all(window);
+			const sha256 = hash.digest("hex");
+			await this.rpc.request("agent.uploads.complete", {
+				uploadId,
+				writerEpoch,
+				expectedSha256: sha256
+			});
+			await this.#waitUploadReady(uploadId, input.pollMs ?? 50, signal);
+			return {
+				uploadId,
+				writerEpoch,
+				sha256,
+				byteLength: input.byteLength
+			};
+		} catch (error) {
+			await Promise.allSettled(window);
+			if (staged) try {
+				await this.rpc.request("agent.uploads.cancel", { uploadId });
+			} catch {}
+			throw error;
+		}
+	}
+	/** One chunk plus its ack. The waiter is registered BEFORE the write, so an
+	*  ack that arrives while `channel.write` is still settling cannot be lost. */
+	async #writeUploadChunk(uploadId, writerEpoch, offset, bytes, signal) {
+		const link = this.#link;
+		if (this.#state !== "connected" || link === void 0) throw new DeviceUnavailableError(this.record.deviceId, this.#state);
+		const requestId = randomUUID();
+		const ack = this.#waitUploadAck(requestId, uploadId, signal);
+		ack.promise.catch(() => {});
+		try {
+			const chunk = {
+				kind: "upload",
+				requestId,
+				uploadId,
+				writerEpoch,
+				offset: String(offset),
+				bytes
+			};
+			await link.channel.write(chunk);
+		} catch (error) {
+			ack.cancel(error instanceof Error ? error : new Error(String(error)));
+			throw error;
+		}
+		const committed = await ack.promise;
+		if (committed !== offset + bytes.length) throw new Error(`upload ack for ${uploadId} committed ${committed}, expected ${offset + bytes.length}`);
+	}
+	/** Registers one ack waiter. `cancel` is idempotent: the first settlement wins. */
+	#waitUploadAck(requestId, uploadId, signal) {
+		let settled = false;
+		let settleResolve = () => {};
+		let settleReject = () => {};
+		const promise = new Promise((resolve, reject) => {
+			settleResolve = resolve;
+			settleReject = reject;
+		});
+		let timer;
+		const cleanup = () => {
+			if (timer !== void 0) clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			this.#uploadAcks.delete(requestId);
+		};
+		const finish = (fn) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			fn();
+		};
+		const resolve = (committedOffset) => finish(() => settleResolve(committedOffset));
+		const reject = (error) => finish(() => settleReject(error));
+		const onAbort = () => {
+			reject(signal?.reason instanceof Error ? signal.reason : /* @__PURE__ */ new Error(`upload ${uploadId} aborted`));
+		};
+		timer = setTimeout(() => {
+			reject(/* @__PURE__ */ new Error(`upload ack for ${uploadId} timed out`));
+		}, DEFAULT_UPLOAD_ACK_TIMEOUT_MS);
+		if (signal?.aborted === true) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		if (!settled) this.#uploadAcks.set(requestId, {
+			uploadId,
+			resolve,
+			reject,
+			cleanup
+		});
+		return {
+			promise,
+			cancel: (error) => reject(error)
+		};
+	}
+	/** `agent.uploads.ack` arrives as a JSON-RPC notification, never as a reply. */
+	#onUploadNotification(method, params) {
+		if (method !== "agent.uploads.ack") return;
+		const parsed = uploadAckSchema.safeParse({
+			jsonrpc: "2.0",
+			method,
+			params
+		});
+		if (!parsed.success) return;
+		const ack = parsed.data.params;
+		const waiter = this.#uploadAcks.get(ack.requestId);
+		if (waiter === void 0) return;
+		if (ack.ok) {
+			if (ack.uploadId !== waiter.uploadId) {
+				waiter.reject(/* @__PURE__ */ new Error(`upload ack named ${ack.uploadId}, expected the chunk's own ${waiter.uploadId}`));
+				return;
+			}
+			waiter.resolve(Number(ack.committedOffset));
+		} else waiter.reject(Object.assign(new Error(ack.error.message), { code: ack.error.reason }));
+	}
+	/** Polls `agent.uploads.get` until the peer finishes verifying. */
+	async #waitUploadReady(uploadId, pollMs, signal) {
+		for (let attempt = 0; attempt < 120; attempt += 1) {
+			signal?.throwIfAborted();
+			const snapshot = await this.rpc.request("agent.uploads.get", { uploadId });
+			const state = String(snapshot["state"] ?? "");
+			if (state === "ready") return;
+			if (state === "failed") {
+				const code = String(snapshot["failureCode"] ?? "VERIFICATION_FAILED");
+				throw Object.assign(/* @__PURE__ */ new Error(`upload ${uploadId} failed verification (${code})`), { code });
+			}
+			await new Promise((resolve) => setTimeout(resolve, pollMs));
+		}
+		throw new Error(`upload ${uploadId} is still verifying after its poll budget; the peer may be stuck`);
+	}
+	/** Link teardown rejects every chunk waiter: no ack can arrive any more. */
+	#rejectUploadAcks(error) {
+		for (const waiter of [...this.#uploadAcks.values()]) waiter.reject(error);
 	}
 	/**
 	* Starts (or joins) the supervised lifecycle. Resolves once this cycle
@@ -3849,7 +4049,8 @@ var DeviceConnection = class {
 			pageItems: positive$2(hello.limits?.["pageItems"]) ?? FALLBACK_LIMITS.pageItems,
 			inFlightRequests: positive$2(hello.limits?.["inFlightRequests"]) ?? FALLBACK_LIMITS.inFlightRequests,
 			...unackedBytes === void 0 ? {} : { unackedBytes },
-			...typeof hello.agentMessageSummariesVersion === "number" ? { messageSummaries: hello.agentMessageSummariesVersion } : {}
+			...typeof hello.agentMessageSummariesVersion === "number" ? { messageSummaries: hello.agentMessageSummariesVersion } : {},
+			...typeof hello.agentUploadsVersion === "number" ? { uploads: hello.agentUploadsVersion } : {}
 		};
 		link.client.updateMaxInFlight(businessWindowFor(this.#limits.inFlightRequests));
 		let auth;
@@ -4018,6 +4219,7 @@ var DeviceConnection = class {
 	#teardownLink() {
 		const link = this.#link;
 		this.#link = void 0;
+		this.#rejectUploadAcks(/* @__PURE__ */ new Error(`device ${this.record.deviceId}: link lost during upload`));
 		this.#clearTimer("heartbeat");
 		this.#clearTimer("refresh");
 		this.#clearTimer("refreshRetry");
@@ -7323,6 +7525,73 @@ function requiredString(args, key) {
 	if (typeof value !== "string" || value === "") throw new Error(`cherry tools: "${key}" is required and must be a non-empty string`);
 	return value;
 }
+const SEND_IMAGE_MEDIA_TYPES = {
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".webp": "image/webp",
+	".gif": "image/gif"
+};
+/** Default media type by extension; the peer validates the final value. */
+function mediaTypeForFilename(filename) {
+	return SEND_IMAGE_MEDIA_TYPES[extname(filename).toLowerCase()] ?? "application/octet-stream";
+}
+/** Parses `attachments[]` before any filesystem or wire work. */
+function parseSendAttachments(value) {
+	if (value === void 0) return {
+		ok: true,
+		value: []
+	};
+	if (!Array.isArray(value)) return {
+		ok: false,
+		verdict: {
+			error: "attachments-invalid",
+			message: "`attachments` must be an array of objects."
+		}
+	};
+	const parsed = [];
+	for (let index = 0; index < value.length; index += 1) {
+		const item = value[index];
+		if (!isRecord$1(item)) return {
+			ok: false,
+			verdict: {
+				error: "attachments-invalid",
+				index,
+				message: `attachments[${index}] must be an object with a "path" string.`
+			}
+		};
+		const path = optionalString(item["path"]);
+		if (path === void 0 || path.trim().length === 0) return {
+			ok: false,
+			verdict: {
+				error: "attachments-invalid",
+				index,
+				message: `attachments[${index}].path must be a non-empty string.`
+			}
+		};
+		const filename = optionalString(item["filename"]);
+		const mediaType = optionalString(item["mediaType"]);
+		parsed.push({
+			path,
+			...filename === void 0 ? {} : { filename },
+			...mediaType === void 0 ? {} : { mediaType }
+		});
+	}
+	return {
+		ok: true,
+		value: parsed
+	};
+}
+/** Whether a remembered body's attachment list is exactly the caller's ids. */
+function sameAttachmentIds(value, ids) {
+	if (value === void 0) return ids.length === 0;
+	if (!Array.isArray(value) || value.length !== ids.length) return false;
+	return value.every((item, index) => isRecord$1(item) && item["uploadId"] === ids[index]);
+}
+/** A peer refusal's stable code, when it carried one. */
+function uploadFailureCode(error) {
+	return isRecord$1(error) && typeof error["code"] === "string" ? error["code"] : void 0;
+}
 /** The route gate's refusal when no provider/model pair can be read. */
 const IMAGE_ROUTE_UNRESOLVED = "cannot read images from this session: the current model route could not be resolved";
 /**
@@ -9258,7 +9527,7 @@ var CherryToolEngine = class {
 	#sendTool() {
 		return defineCherryTool({
 			name: "cherry_send",
-			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and, whenever a stop point can be named honestly, a `messagesResumeCursor` token marking where the unread history begins: hand it to `cherry_read` as `messagesResumeCursor` to read the older messages (re-waiting re-reads the newest window). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`. The reason `deadline` means the ANSWER's own assembly budget ran out (your window plus a bounded tail): the content read so far is still returned, and `cherry_read` continues past the stop-point token.",
+			description: "Send a message to a session and, by default, wait for the run to reach a terminal state (completed/failed/cancelled/interrupted), then aggregate the assistant text. A pending interaction ends the wait EARLY as a soft terminal (`awaiting-interaction`): answer it with cherry_interactions + cherry_respond, then resume with cherry_wait. `wait: false` returns the command receipt immediately. A timeout is NOT a failure — it returns the partial content and, whenever a stop point can be named honestly, a `messagesResumeCursor` token marking where the unread history begins: hand it to `cherry_read` as `messagesResumeCursor` to read the older messages (re-waiting re-reads the newest window). When content is cut, `messagesTruncated`/`messagesTruncationReason` report a MESSAGE-level cut: the OLDER messages were dropped, never part of a returned one — a returned message missing its own parts carries `incomplete`. The reason `deadline` means the ANSWER's own assembly budget ran out (your window plus a bounded tail): the content read so far is still returned, and `cherry_read` continues past the stop-point token. `attachments` uploads local files first and sends their ids with the message: text may then be blank (but is still capped at the same length). The peer must advertise the upload surface; an older desktop answers `unsupported` before any upload request.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -9272,7 +9541,30 @@ var CherryToolEngine = class {
 					},
 					text: {
 						type: "string",
-						description: `The message text, which must not be blank. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling).`
+						description: `The message text. At most ${TEXT_MAX_LENGTH} characters (the protocol ceiling). Optional when \`attachments\` is present; otherwise it must not be blank.`
+					},
+					attachments: {
+						type: "array",
+						description: `Local files to upload and attach to this message. Paths are resolved like \`read_image\` (the session working directory first), at most 8 per call and 2 GiB in total.`,
+						items: {
+							type: "object",
+							properties: {
+								path: {
+									type: "string",
+									description: "File path, resolved by the filesystem backend."
+								},
+								filename: {
+									type: "string",
+									description: "Name shown on the peer. Defaults to the basename of the resolved path."
+								},
+								mediaType: {
+									type: "string",
+									description: "MIME type. Defaults from the extension (PNG/JPEG/WebP/GIF), else application/octet-stream; the peer validates the final value."
+								}
+							},
+							required: ["path"],
+							additionalProperties: false
+						}
 					},
 					wait: {
 						type: "boolean",
@@ -9287,30 +9579,30 @@ var CherryToolEngine = class {
 						description: "Optional idempotency id. Omit to have one generated; REUSE the same id to retry a command whose outcome is unknown."
 					}
 				},
-				required: [
-					"device",
-					"sessionId",
-					"text"
-				],
+				required: ["device", "sessionId"],
 				additionalProperties: false
 			},
-			execute: async (args) => {
+			execute: async (args, exec) => {
 				const resolved = await this.#linkOr(requiredString(args, "device"));
 				if (resolved.link === void 0) return resolved.verdict;
 				const { connection, record } = resolved.link;
 				const sessionId = requiredString(args, "sessionId");
-				const text = requiredString(args, "text");
+				const text = optionalString(args["text"]) ?? "";
 				if (text.length > TEXT_MAX_LENGTH) return {
 					error: "text-too-long",
 					limit: TEXT_MAX_LENGTH,
 					length: text.length,
 					message: `the message is ${text.length} characters; the protocol caps a single send at ${TEXT_MAX_LENGTH}. Split it into several cherry_send calls.`
 				};
-				if (text.trim().length === 0) return {
+				const parsed = parseSendAttachments(args["attachments"]);
+				if (!parsed.ok) return parsed.verdict;
+				const files = await this.#resolveSendAttachments(parsed.value, exec);
+				if (!Array.isArray(files)) return files;
+				if (text.trim().length === 0 && files.length === 0) return {
 					error: "text-empty",
-					message: "the message text is empty (or whitespace only); the peer requires a non-blank body."
+					message: "the message text is empty (or whitespace only) and no attachments were given; the peer requires a non-blank body or at least one attachment."
 				};
-				return this.#runOnce({
+				if (files.length === 0) return this.#runOnce({
 					connection,
 					deviceId: record.deviceId,
 					sessionId,
@@ -9319,8 +9611,200 @@ var CherryToolEngine = class {
 					wait: args["wait"] !== false,
 					timeoutMs: waitTimeout(args["timeoutMs"])
 				});
+				if (connection.limits.uploads !== 1) return {
+					error: "unsupported",
+					message: "this desktop does not advertise the upload surface (agentUploadsVersion); it cannot receive attachments. Upgrade Cherry Studio to 2.1.5 or newer."
+				};
+				const uploaded = await this.#uploadSendAttachments(connection, files, exec);
+				if (!Array.isArray(uploaded)) return uploaded;
+				const selectionId = await this.#presentSendAttachments(connection, sessionId, uploaded);
+				const answer = await this.#runOnce({
+					connection,
+					deviceId: record.deviceId,
+					sessionId,
+					text,
+					commandId: optionalString(args["commandId"]),
+					wait: args["wait"] !== false,
+					timeoutMs: waitTimeout(args["timeoutMs"]),
+					attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
+					...selectionId === void 0 ? {} : { selectionId }
+				});
+				if (answer["status"] === "rejected") {
+					await this.#cancelUploads(connection, uploaded);
+					return answer;
+				}
+				return {
+					...answer,
+					attachments: uploaded.map((file) => ({
+						filename: file.filename,
+						mediaType: file.mediaType,
+						byteLength: file.byteLength,
+						uploadId: file.uploadId
+					}))
+				};
 			}
 		});
+	}
+	/**
+	* Resolves and validates every attachment against the LOCAL filesystem, before
+	* one upload request is sent (issue #306).
+	*
+	* The order is the tool's own budget first (count, per-file size, total size),
+	* then the filesystem: a caller that named nine files or a 2 GiB one must pay
+	* neither a stat nor a round trip for the tenth. A missing/unreadable file
+	* answers the same way — structured, and before `agent.uploads.prepare`.
+	*/
+	async #resolveSendAttachments(requests, exec) {
+		if (requests.length > 8) return {
+			error: "attachments-too-many",
+			limit: 8,
+			count: requests.length,
+			message: `at most 8 files may be attached to one message.`
+		};
+		if (requests.length === 0) return [];
+		let total = 0;
+		const fs = this.#deps.fs?.();
+		if (fs === void 0) return {
+			error: "unsupported",
+			message: "this deployment has no host filesystem service; attachments cannot be read."
+		};
+		const cwd = await this.#sendWorkingDirectory(exec);
+		const prepared = [];
+		for (const request of requests) {
+			let target;
+			let info;
+			try {
+				target = await fs.resolve(request.path, {
+					...cwd === void 0 ? {} : { cwd },
+					...exec?.signal === void 0 ? {} : { signal: exec.signal }
+				});
+				info = await fs.stat(target, exec?.signal);
+			} catch (error) {
+				return this.#attachmentUnreadable(request.path, error);
+			}
+			if (info === void 0) return {
+				error: "attachment-not-found",
+				path: request.path,
+				message: `cannot upload "${request.path}": not found.`
+			};
+			if (info.type !== "file") return {
+				error: "attachment-not-regular",
+				path: request.path,
+				message: `cannot upload "${request.path}": not a regular file.`
+			};
+			if (info.size > MAX_SEND_ATTACHMENT_BYTES) return this.#attachmentTooLarge(request.path, info.size);
+			total += info.size;
+			if (total > MAX_SEND_MESSAGE_BYTES) return {
+				error: "attachments-too-large",
+				limit: MAX_SEND_MESSAGE_BYTES,
+				totalBytes: total,
+				message: `the attachments total ${total} bytes; one message may carry at most ${MAX_SEND_MESSAGE_BYTES}.`
+			};
+			const filename = request.filename ?? basename(target.displayPath);
+			prepared.push({
+				...request,
+				target,
+				filename,
+				mediaType: request.mediaType ?? mediaTypeForFilename(filename),
+				byteLength: info.size,
+				read: (offset, length, signal) => fs.readByteRange(target, {
+					offset,
+					length
+				}, signal)
+			});
+		}
+		return prepared;
+	}
+	/** The calling session's working directory, or undefined when the host has none. */
+	async #sendWorkingDirectory(exec) {
+		const workingDirectory = this.#deps.workingDirectory?.();
+		if (workingDirectory === void 0 || exec?.agent === void 0) return void 0;
+		try {
+			return await workingDirectory.ensure(exec.agent, exec.signal);
+		} catch {
+			return;
+		}
+	}
+	#attachmentTooLarge(path, byteLength) {
+		return {
+			error: "attachment-too-large",
+			path,
+			byteLength,
+			limit: MAX_SEND_ATTACHMENT_BYTES,
+			message: `"${path}" is ${byteLength} bytes; one uploaded file may be at most ${MAX_SEND_ATTACHMENT_BYTES}.`
+		};
+	}
+	#attachmentUnreadable(path, error) {
+		return {
+			error: "attachment-unreadable",
+			path,
+			message: `cannot read "${path}": ${error instanceof Error ? error.message : String(error)}`
+		};
+	}
+	/**
+	* Uploads the prepared files ONE AT A TIME. Sequential on purpose: the peer's
+	* own window is two chunks per upload, and interleaving several uploads would
+	* multiply the bytes in flight without buying throughput on a LAN. A failure
+	* cancels the files already staged by THIS call, so a partially attached
+	* message cannot be sent by a later step.
+	*/
+	async #uploadSendAttachments(connection, files, exec) {
+		const uploaded = [];
+		for (const file of files) try {
+			const result = await connection.uploadFile({
+				filename: file.filename,
+				mediaType: file.mediaType,
+				byteLength: file.byteLength,
+				...exec?.signal === void 0 ? {} : { signal: exec.signal },
+				read: (offset, length, signal) => file.read(offset, length, signal)
+			});
+			uploaded.push({
+				...file,
+				...result
+			});
+		} catch (error) {
+			await this.#cancelUploads(connection, uploaded);
+			const code = uploadFailureCode(error);
+			return {
+				error: "upload-failed",
+				filename: file.filename,
+				...code === void 0 ? {} : { reason: code },
+				message: `uploading "${file.filename}" failed: ${error instanceof Error ? error.message : String(error)}`
+			};
+		}
+		return uploaded;
+	}
+	/** Best-effort cancellation of files staged by a failed call. */
+	async #cancelUploads(connection, uploaded) {
+		for (const file of uploaded) try {
+			await connection.rpc.request("agent.uploads.cancel", { uploadId: file.uploadId });
+		} catch {}
+	}
+	/**
+	* `agent.attachments.present` is BEST-EFFORT: it tells the peer what this
+	* selection is about to contain, and `accepted: false` (or a refusal) must not
+	* block the send — the attachments travel on `agent.messages.send` either way.
+	* Returns the selection id only when the call succeeded, so the send does not
+	* name a selection the peer never recorded.
+	*/
+	async #presentSendAttachments(connection, sessionId, uploaded) {
+		const selectionId = randomUUID();
+		try {
+			return (await connection.rpc.request("agent.attachments.present", {
+				selectionId,
+				sessionId,
+				sequence: "1",
+				items: uploaded.map((file) => ({
+					attachmentId: randomUUID(),
+					uploadId: file.uploadId,
+					filename: file.filename,
+					mediaType: file.mediaType,
+					byteLength: file.byteLength
+				}))
+			}))["accepted"] === false ? void 0 : selectionId;
+		} catch {
+			return;
+		}
 	}
 	/**
 	* ONE command's round trip against an ALREADY-EXISTING session: subscribe,
@@ -9351,7 +9835,9 @@ var CherryToolEngine = class {
 		const subscriptions = this.#deps.subs(deviceId);
 		const { receipt, baselineSeq } = await this.#admitSend(connection, subscriptions, deviceId, sessionId, {
 			commandId,
-			text
+			text,
+			...request.attachments === void 0 ? {} : { attachments: request.attachments },
+			...request.selectionId === void 0 ? {} : { selectionId: request.selectionId }
 		});
 		if (!wait) return receipt;
 		if (receipt["status"] === "rejected" || receipt["status"] === "interrupted") return receipt;
@@ -9644,25 +10130,32 @@ var CherryToolEngine = class {
 	*/
 	async #admitSend(connection, subscriptions, deviceId, sessionId, request) {
 		const { commandId, text } = request;
+		const attachments = request.attachments ?? [];
+		const attachmentIds = attachments.map((attachment) => attachment.uploadId);
+		const selectionId = request.selectionId;
 		const callerId = optionalString(commandId);
 		const attempt = async (commandId, revisionOverride) => {
 			const remembered = callerId === void 0 || commandId !== callerId ? void 0 : this.#recallCommandBody(deviceId, callerId);
 			if (remembered !== void 0 && remembered.method !== SEND_METHOD) throw commandBodyDiffers();
 			const rememberedBody = remembered?.body;
-			if (remembered !== void 0 && (rememberedBody?.["sessionId"] !== sessionId || rememberedBody["text"] !== text)) throw commandBodyDiffers();
+			if (remembered !== void 0 && (rememberedBody?.["sessionId"] !== sessionId || rememberedBody["text"] !== text || !sameAttachmentIds(rememberedBody?.["attachments"], attachmentIds) || rememberedBody?.["selectionId"] !== selectionId)) throw commandBodyDiffers();
 			const expectedIdleRevision = optionalString(rememberedBody?.["expectedIdleRevision"]) ?? revisionOverride ?? await this.#idleRevision(connection, subscriptions, deviceId, sessionId);
 			const baselineSeq = this.#newestSeq(subscriptions, sessionId);
 			if (callerId !== void 0) this.#rememberCommandBody(deviceId, callerId, {
 				method: SEND_METHOD,
 				fingerprint: {
 					sessionId,
-					text
+					text,
+					attachments: attachmentIds,
+					...selectionId === void 0 ? {} : { selectionId }
 				},
 				body: {
 					commandId,
 					sessionId,
 					text,
-					expectedIdleRevision
+					expectedIdleRevision,
+					...attachments.length === 0 ? {} : { attachments },
+					...selectionId === void 0 ? {} : { selectionId }
 				}
 			});
 			return {
@@ -9670,7 +10163,9 @@ var CherryToolEngine = class {
 					commandId,
 					sessionId,
 					text,
-					expectedIdleRevision
+					expectedIdleRevision,
+					...attachments.length === 0 ? {} : { attachments },
+					...selectionId === void 0 ? {} : { selectionId }
 				}),
 				baselineSeq
 			};
@@ -15016,6 +15511,10 @@ async function recoverSubscriptions(deviceId) {
 	}
 }
 /** One dep object, shared by both faces, so there is exactly ONE pool. */
+/** Looks up an OPTIONAL host service without making it an injection gate. */
+function hostService(ctx, name) {
+	return ctx.get?.call(ctx, name);
+}
 function assemblyDeps(ctx) {
 	return {
 		store: state.store,
@@ -15062,6 +15561,14 @@ function assemblyDeps(ctx) {
 				return engine.listTargets(device, agentId);
 			}
 		},
+		/**
+		* The host filesystem / working directory, used ONLY by `cherry_send`'s
+		* attachment upload (issue #306). Resolved lazily: this object is built
+		* before every host service has mounted, and a test rig that never uploads
+		* never touches either service.
+		*/
+		fs: () => hostService(ctx, "fs"),
+		workingDirectory: () => hostService(ctx, "workingDirectory"),
 		/**
 		* The pairing seam, shared by `cherry_pair` and `POST /pair`.
 		*

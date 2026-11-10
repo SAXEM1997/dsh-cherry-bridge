@@ -135,6 +135,10 @@ schema 已允许 `interrupted`，所以客户端**必须**处理，但当前服�
 
 - [ ] `cherry_sessions` / `cherry_agents` / `cherry_workspaces` 列出真实数据。
 - [ ] `cherry_send` 向真实会话发送文本，`wait: true` 收敛到终态并返回助手文本。
+- [ ] `cherry_send` 带 `attachments` 发一张本地图片到真实会话（`text` 可留空）。**期望**：
+      桌面聊天里出现该附件且能打开；结果回显 `{filename, mediaType, byteLength, uploadId}`。
+      再用一个 <2.1.5 的桌面（或模拟无 `agentUploadsVersion` 的 hello）重试：返回
+      `unsupported`，且没有 `agent.uploads.*` 请求。
 - [ ] 长回复（>4096 单元）经 `{ref}` 外置，聚合结果仍包含完整文本。
 - [ ] `cherry_read` 能按 messageId 读到该轮消息与 parts。
 - [ ] `wait: false` 立即返回命令回执，随后 `cherry_wait` / `cherry_events` 能续查到同一终态。

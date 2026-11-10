@@ -123,6 +123,26 @@ export const RATE_LIMIT_MAX_WAIT_MS = 1_000
  */
 export const DEVICE_SETTLE_WAIT_MS = 5_000
 
+/** Uploads accepted by ONE `cherry_send` call (issue #306). */
+export const MAX_SEND_ATTACHMENTS = 8
+
+/** The peer's per-file upload ceiling (`agentUploadLimits.fileBytes`). */
+export const MAX_SEND_ATTACHMENT_BYTES = 1024 ** 3
+
+/** The peer's per-message attachment ceiling (`agentUploadLimits.messageBytes`). */
+export const MAX_SEND_MESSAGE_BYTES = 2 * 1024 ** 3
+
+/** Media type for a file whose extension names no image format (issue #306). */
+export const DEFAULT_ATTACHMENT_MEDIA_TYPE = 'application/octet-stream'
+
+/** How long one 1 MiB chunk waits for its `agent.uploads.ack` (issue #306). */
+export const DEFAULT_UPLOAD_ACK_TIMEOUT_MS = 60_000
+
+/** `agent.uploads.get` polling while the peer verifies (issue #306). */
+export const DEFAULT_UPLOAD_READY_POLLS = 120
+
+/** Interval between `agent.uploads.get` polls (issue #306). */
+export const DEFAULT_UPLOAD_POLL_INTERVAL_MS = 50
 /**
  * How many uploaded IMAGES one `cherry_read(includeImages: true)` may attach,
  * and how many image BYTES it may fetch in total (#307).

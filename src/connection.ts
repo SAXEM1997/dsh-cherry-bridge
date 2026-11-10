@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
-import { directEndpointUrl, advertisedEndpointSchema } from '@cherrystudio/remote-protocol'
-import type { DirectEndpoint } from '@cherrystudio/remote-protocol'
+import { directEndpointUrl, advertisedEndpointSchema, uploadAckSchema, uploadTransferLimits } from '@cherrystudio/remote-protocol'
+import type { DirectEndpoint, UploadChunk } from '@cherrystudio/remote-protocol'
 import { failureReason, isChannelClosedError, JsonRpcClient, JsonRpcRequestError } from './rpc/jsonRpcClient.js'
 import type { JsonRpcRequestOptions } from './rpc/jsonRpcClient.js'
 import { toRemoteSocket } from './rpc/wsAdapter.js'
@@ -12,6 +12,9 @@ import {
   DEFAULT_CONTENT_READ_BUDGET_PER_SECOND,
   DEFAULT_RATE_BUDGET_PER_SECOND,
   DEFAULT_TRANSPORT_RETRY_WAIT_MS,
+  DEFAULT_UPLOAD_ACK_TIMEOUT_MS,
+  DEFAULT_UPLOAD_POLL_INTERVAL_MS,
+  DEFAULT_UPLOAD_READY_POLLS,
   RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
 import type { DeviceRecord } from './deviceStore.js'
@@ -66,6 +69,14 @@ export interface EffectiveLimits {
    * picked up on the reconnect that follows.
    */
   messageSummaries?: number
+  /**
+   * The peer's hello-advertised `agentUploadsVersion` (issue #306), stored
+   * beside the limits for the same reason as `messageSummaries`: absent through
+   * desktop 2.1.4, `1` from 2.1.5 on. ABSENT, never defaulted — a peer that
+   * does not advertise the upload surface must answer `unsupported` rather than
+   * receive four upload RPCs it will refuse.
+   */
+  uploads?: number
 }
 
 /**
@@ -242,6 +253,18 @@ export class RpcDeadlineExceededError extends Error {
     this.device = device
     this.method = method
     Object.setPrototypeOf(this, new.target.prototype)
+  }
+}
+
+/**
+ * The peer does not speak the upload surface (issue #306): its hello carried no
+ * `agentUploadsVersion`. Thrown BEFORE `agent.uploads.prepare`, so an old
+ * desktop receives zero upload requests.
+ */
+export class UploadUnsupportedError extends Error {
+  constructor(deviceId: string) {
+    super(`device ${deviceId} does not advertise the upload capability (agentUploadsVersion)`)
+    this.name = 'UploadUnsupportedError'
   }
 }
 
@@ -655,6 +678,8 @@ interface HelloResult {
   agentMessageSummariesVersion?: number
   /** The advertised-endpoints capability (issue #143), when advertised. */
   connectionEndpointsVersion?: number
+  /** The upload capability (issue #306), when advertised. */
+  agentUploadsVersion?: number
 }
 
 interface AuthResult {
@@ -811,6 +836,38 @@ interface LiveLink {
   epoch: number
 }
 
+/** One chunk's ack waiter (issue #306). */
+interface PendingUploadAck {
+  readonly uploadId: string
+  readonly resolve: (committedOffset: number) => void
+  readonly reject: (error: Error) => void
+  /** Removes the waiter, its timer and its abort listener. */
+  readonly cleanup: () => void
+}
+
+/** One local file handed to {@link DeviceConnection.uploadFile}. */
+export interface UploadFileInput {
+  readonly filename: string
+  readonly mediaType: string
+  readonly byteLength: number
+  /**
+   * Reads EXACTLY `length` bytes at `offset`. The caller owns the local
+   * filesystem; the connection owns the protocol, so it never learns a path.
+   */
+  read(offset: number, length: number, signal: AbortSignal | undefined): Promise<Uint8Array>
+  readonly signal?: AbortSignal
+  /** Delay between `agent.uploads.get` polls while the peer verifies. */
+  readonly pollMs?: number
+}
+
+/** What a successful upload yields. The bytes never leave the caller. */
+export interface UploadedFile {
+  readonly uploadId: string
+  readonly writerEpoch: string
+  readonly sha256: string
+  readonly byteLength: number
+}
+
 type TimerName = 'backoff' | 'heartbeat' | 'refresh' | 'refreshRetry'
 type Timer = ReturnType<typeof setTimeout>
 
@@ -886,6 +943,15 @@ export class DeviceConnection {
   #link: LiveLink | undefined
   #refreshFirstFailureAt: number | undefined
   #pendingPings = new Set<{ nonce: string; sentAt: number }>()
+  /**
+   * Upload-chunk acknowledgements in flight, keyed by the chunk's own
+   * `requestId` (issue #306). The apes of the upload window live here rather
+   * than in a per-call listener: ONE notification handler is attached for the
+   * connection's lifetime, and a waiter registers itself before its chunk is
+   * written, so an ack that arrives while `channel.write` is still resolving is
+   * never lost.
+   */
+  readonly #uploadAcks = new Map<string, PendingUploadAck>()
   #token: string | undefined
   #tokenExpiresAt: number | undefined
   /**
@@ -931,6 +997,10 @@ export class DeviceConnection {
     this.#helloProtocolVersions = opts.helloProtocolVersions ?? this.#protocolVersions
     this.#transportRetryWaitMs = opts.transportRetryWaitMs ?? DEFAULT_TRANSPORT_RETRY_WAIT_MS
     this.#onAdvertisedEndpoints = opts.onAdvertisedEndpoints
+    // ONE ack handler for the connection's lifetime: the registry re-attaches
+    // it to every new client, and a chunk waiter exists only for the few
+    // hundred milliseconds its own chunk is in flight.
+    this.rpc.onNotification((method, params) => this.#onUploadNotification(method, params))
   }
 
   /**
@@ -1075,6 +1145,223 @@ export class DeviceConnection {
       // it has to be observed by hand.
       if (this.#state !== 'connecting') finish(this.#state)
     })
+  }
+
+  /**
+   * Streams ONE local file through the peer's upload surface (issue #306):
+   * `prepare` → 1 MiB binary chunks (window 2) → `complete` → poll `get` to
+   * `ready`. Returns the upload id the send will reference; the bytes are never
+   * retained by this class.
+   *
+   * The caller supplies `read`, so the connection stays filesystem-agnostic.
+   * The digest is computed HERE, from the exact bytes written, and handed to
+   * `complete` as `expectedSha256`: the peer's verification then compares two
+   * independent runs of the same hash rather than trusting a caller's claim.
+   *
+   * ANY failure after `prepare` cancels the upload before rethrowing. A failed
+   * `prepare` has nothing to cancel, and a cancelled upload is NOT_FOUND at the
+   * peer — both are correct: the staging area must not keep a half file.
+   */
+  async uploadFile(input: UploadFileInput): Promise<UploadedFile> {
+    if (this.#limits.uploads !== 1) throw new UploadUnsupportedError(this.record.deviceId)
+    if (this.#state !== 'connected') throw new DeviceUnavailableError(this.record.deviceId, this.#state)
+    const { signal } = input
+    const uploadId = randomUUID()
+    let staged = false
+    // Declared OUTSIDE the try so the failure path can drain it: a chunk that
+    // is still in flight when a SIBLING fails would otherwise reject with no
+    // observer (link teardown rejects every waiter at once), which surfaces as
+    // a process-level unhandledRejection rather than the upload's own error.
+    const window: Promise<void>[] = []
+    try {
+      const prepared = await this.rpc.request<Record<string, unknown>>('agent.uploads.prepare', {
+        uploadId,
+        filename: input.filename,
+        mediaType: input.mediaType,
+        checksumAlgorithm: 'sha256',
+        byteLength: input.byteLength,
+      })
+      staged = true
+      const writerEpoch = String(prepared['writerEpoch'] ?? '0')
+      const hash = createHash('sha256')
+      let offset = 0
+      while (offset < input.byteLength) {
+        signal?.throwIfAborted()
+        const length = Math.min(uploadTransferLimits.chunkBytes, input.byteLength - offset)
+        const bytes = await input.read(offset, length, signal)
+        if (bytes.length !== length) {
+          throw new Error(
+            `upload read returned ${bytes.length} bytes at offset ${offset}, expected ${length}`,
+          )
+        }
+        hash.update(bytes)
+        const chunkOffset = offset
+        window.push(this.#writeUploadChunk(uploadId, writerEpoch, chunkOffset, bytes, signal))
+        if (window.length >= uploadTransferLimits.window) {
+          // `shift()` can only be undefined for an empty array, and the length
+          // was just checked; the non-null assertion is local to that fact.
+          await window.shift()!
+        }
+        offset += length
+      }
+      await Promise.all(window)
+      const sha256 = hash.digest('hex')
+      await this.rpc.request('agent.uploads.complete', { uploadId, writerEpoch, expectedSha256: sha256 })
+      await this.#waitUploadReady(uploadId, input.pollMs ?? DEFAULT_UPLOAD_POLL_INTERVAL_MS, signal)
+      return { uploadId, writerEpoch, sha256, byteLength: input.byteLength }
+    } catch (error) {
+      // Drain siblings BEFORE cancelling: their rejections are observed here,
+      // and a cancel resolves the staging record they may still be writing to.
+      await Promise.allSettled(window)
+      if (staged) {
+        // Best-effort: the staging record expires on its own, and a cancel
+        // failure must not replace the error that caused it.
+        try {
+          await this.rpc.request('agent.uploads.cancel', { uploadId })
+        } catch {
+          // Deliberately swallowed — see above.
+        }
+      }
+      throw error
+    }
+  }
+
+  /** One chunk plus its ack. The waiter is registered BEFORE the write, so an
+   *  ack that arrives while `channel.write` is still settling cannot be lost. */
+  async #writeUploadChunk(
+    uploadId: string,
+    writerEpoch: string,
+    offset: number,
+    bytes: Uint8Array,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const link = this.#link
+    if (this.#state !== 'connected' || link === undefined) {
+      throw new DeviceUnavailableError(this.record.deviceId, this.#state)
+    }
+    const requestId = randomUUID()
+    const ack = this.#waitUploadAck(requestId, uploadId, signal)
+    // Observe a rejection that lands while the write is still pending: the ack
+    // timer, an abort or a teardown can settle it before `ack.promise` is
+    // awaited below, and an unobserved rejection is process-fatal in Node.
+    ack.promise.catch(() => {})
+    try {
+      const chunk: UploadChunk = {
+        kind: 'upload',
+        requestId,
+        uploadId,
+        writerEpoch,
+        offset: String(offset),
+        bytes,
+      }
+      await link.channel.write(chunk)
+    } catch (error) {
+      ack.cancel(error instanceof Error ? error : new Error(String(error)))
+      throw error
+    }
+    const committed = await ack.promise
+    if (committed !== offset + bytes.length) {
+      throw new Error(
+        `upload ack for ${uploadId} committed ${committed}, expected ${offset + bytes.length}`,
+      )
+    }
+  }
+
+  /** Registers one ack waiter. `cancel` is idempotent: the first settlement wins. */
+  #waitUploadAck(
+    requestId: string,
+    uploadId: string,
+    signal: AbortSignal | undefined,
+  ): { promise: Promise<number>; cancel: (error: Error) => void } {
+    let settled = false
+    let settleResolve: (value: number) => void = () => {}
+    let settleReject: (error: Error) => void = () => {}
+    const promise = new Promise<number>((resolve, reject) => {
+      settleResolve = resolve
+      settleReject = reject
+    })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cleanup = (): void => {
+      if (timer !== undefined) clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+      this.#uploadAcks.delete(requestId)
+    }
+    const finish = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      fn()
+    }
+    const resolve = (committedOffset: number): void => finish(() => settleResolve(committedOffset))
+    const reject = (error: Error): void => finish(() => settleReject(error))
+    const onAbort = (): void => {
+      reject(
+        signal?.reason instanceof Error
+          ? signal.reason
+          : new Error(`upload ${uploadId} aborted`),
+      )
+    }
+    timer = setTimeout(() => {
+      reject(new Error(`upload ack for ${uploadId} timed out`))
+    }, DEFAULT_UPLOAD_ACK_TIMEOUT_MS)
+    if (signal?.aborted === true) {
+      onAbort()
+    } else {
+      signal?.addEventListener('abort', onAbort, { once: true })
+    }
+    if (!settled) this.#uploadAcks.set(requestId, { uploadId, resolve, reject, cleanup })
+    return { promise, cancel: (error) => reject(error) }
+  }
+
+  /** `agent.uploads.ack` arrives as a JSON-RPC notification, never as a reply. */
+  #onUploadNotification(method: string, params: unknown): void {
+    if (method !== 'agent.uploads.ack') return
+    const parsed = uploadAckSchema.safeParse({ jsonrpc: '2.0', method, params })
+    if (!parsed.success) return
+    const ack = parsed.data.params
+    const waiter = this.#uploadAcks.get(ack.requestId)
+    if (waiter === undefined) return
+    if (ack.ok) {
+      if (ack.uploadId !== waiter.uploadId) {
+        waiter.reject(
+          new Error(`upload ack named ${ack.uploadId}, expected the chunk's own ${waiter.uploadId}`),
+        )
+        return
+      }
+      waiter.resolve(Number(ack.committedOffset))
+    } else {
+      waiter.reject(
+        Object.assign(new Error(ack.error.message), { code: ack.error.reason }),
+      )
+    }
+  }
+
+  /** Polls `agent.uploads.get` until the peer finishes verifying. */
+  async #waitUploadReady(
+    uploadId: string,
+    pollMs: number,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    // The default poll interval times the poll bound is a six-second
+    // verification budget: a peer still 'verifying' past it is stuck, not slow,
+    // and the caller deserves a verdict rather than an unbounded hang.
+    for (let attempt = 0; attempt < DEFAULT_UPLOAD_READY_POLLS; attempt += 1) {
+      signal?.throwIfAborted()
+      const snapshot = await this.rpc.request<Record<string, unknown>>('agent.uploads.get', { uploadId })
+      const state = String(snapshot['state'] ?? '')
+      if (state === 'ready') return
+      if (state === 'failed') {
+        const code = String(snapshot['failureCode'] ?? 'VERIFICATION_FAILED')
+        throw Object.assign(new Error(`upload ${uploadId} failed verification (${code})`), { code })
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, pollMs))
+    }
+    throw new Error(`upload ${uploadId} is still verifying after its poll budget; the peer may be stuck`)
+  }
+
+  /** Link teardown rejects every chunk waiter: no ack can arrive any more. */
+  #rejectUploadAcks(error: Error): void {
+    for (const waiter of [...this.#uploadAcks.values()]) waiter.reject(error)
   }
 
   /**
@@ -1470,6 +1757,9 @@ export class DeviceConnection {
       ...(typeof hello.agentMessageSummariesVersion === 'number'
         ? { messageSummaries: hello.agentMessageSummariesVersion }
         : {}),
+      ...(typeof hello.agentUploadsVersion === 'number'
+        ? { uploads: hello.agentUploadsVersion }
+        : {}),
     }
 
     // Size the admission window from the peer's OWN concurrency budget now that
@@ -1740,6 +2030,9 @@ export class DeviceConnection {
   #teardownLink(): void {
     const link = this.#link
     this.#link = undefined
+    // No ack can arrive on a torn-down channel; parking an upload until its
+    // 60 s timer would turn a link loss into a minute-long hang.
+    this.#rejectUploadAcks(new Error(`device ${this.record.deviceId}: link lost during upload`))
     this.#clearTimer('heartbeat')
     this.#clearTimer('refresh')
     this.#clearTimer('refreshRetry')
