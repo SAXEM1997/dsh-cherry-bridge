@@ -499,6 +499,8 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(retryAgain.attachments).toEqual(first.attachments)
     expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
     expect(rig.fake.methodCount('agent.attachments.present')).toBe(1)
+    // The whole point of the replay: the peer still holds ONE command record.
+    expect(rig.fake.admittedCommands.size).toBe(1)
   })
 
   it('㉓b a different attachment under the same id is refused before any upload', async () => {
@@ -611,5 +613,87 @@ describe('issue #306: cherry_send uploads local files', () => {
     const verdict = await refusedUpload('GRANT_REVOKED')
     expect(verdict['error']).toBe('upload-failed')
     expect(verdict['reason']).toBe('GRANT_REVOKED')
+  })
+
+  it('㉕a a rejected send replay does not echo the uploads the first send cancelled', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files, sendOutcome: 'busy' })
+    const args = {
+      device: 'dev-A',
+      sessionId: 's-1',
+      text: '',
+      wait: false,
+      commandId: 'cmd-1',
+      attachments: [{ path: '/work/a.txt' }],
+    }
+
+    const first = (await rig.call('cherry_send', args, exec())) as Record<string, unknown>
+    const retry = (await rig.call('cherry_send', args, exec())) as Record<string, unknown>
+
+    expect(first['status']).toBe('rejected')
+    expect(first).not.toHaveProperty('attachments')
+    expect(retry['status']).toBe('rejected')
+    // The first branch freed these ids; advertising them beside a rejection
+    // would tell the caller they are attached to the run.
+    expect(retry).not.toHaveProperty('attachments')
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    // The replay must NOT cancel again: the first branch already did.
+    expect(rig.fake.uploadCancelCount()).toBe(1)
+  })
+
+  it('㉕b a text-only send cannot be retried as an attachment send under the same id', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files })
+    await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: 'hello', wait: false, commandId: 'cmd-1' },
+      exec(),
+    )
+
+    await expect(
+      rig.call(
+        'cherry_send',
+        {
+          device: 'dev-A',
+          sessionId: 's-1',
+          text: 'hello',
+          wait: false,
+          commandId: 'cmd-1',
+          attachments: [{ path: '/work/a.txt' }],
+        },
+        exec(),
+      ),
+    ).rejects.toThrow(/^Command body differs from the recorded command/)
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(0)
+  })
+
+  it('㉕c an attachment send cannot be retried as text-only under the same id', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    // A declined presence keeps `selectionId` out of the remembered body, so
+    // the ATTACHMENTS comparison is the only thing that can catch this retry.
+    const rig = await makeRig({ files, presentAccepted: false })
+    await rig.call(
+      'cherry_send',
+      {
+        device: 'dev-A',
+        sessionId: 's-1',
+        text: 'hello',
+        wait: false,
+        commandId: 'cmd-1',
+        attachments: [{ path: '/work/a.txt' }],
+      },
+      exec(),
+    )
+
+    await expect(
+      rig.call(
+        'cherry_send',
+        { device: 'dev-A', sessionId: 's-1', text: 'hello', wait: false, commandId: 'cmd-1' },
+        exec(),
+      ),
+    ).rejects.toThrow(/^Command body differs from the recorded command/)
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    // Refused LOCALLY: the peer never sees a second send under this id.
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(1)
   })
 })
