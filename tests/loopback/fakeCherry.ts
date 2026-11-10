@@ -9,7 +9,8 @@ import {
   RemoteSocketStream,
 } from '@cherrystudio/remote-transport'
 import type { SecureChannel } from '@cherrystudio/remote-transport'
-import { connectionMethods, pairingMethods, remoteLimits } from '@cherrystudio/remote-protocol'
+import { connectionMethods, isUploadChunk, pairingMethods, remoteLimits } from '@cherrystudio/remote-protocol'
+import type { UploadChunk } from '@cherrystudio/remote-protocol'
 import { agentAuthorizationSchema, agentMethods } from '@cherrystudio/remote-protocol/agent'
 import { configurationMethods } from '@cherrystudio/remote-protocol/configuration'
 import type { AgentCheckpointPage, AgentCursor } from '@cherrystudio/remote-protocol/agent'
@@ -25,6 +26,20 @@ export interface FakeFailure {
   retryAfterMs?: number
   /** Structured refusal payload (`data.details`), e.g. the byte budget's. */
   details?: Record<string, unknown>
+}
+
+/** One staged upload (#306). */
+interface FakeUpload {
+  readonly uploadId: string
+  readonly filename: string
+  readonly mediaType: string
+  readonly byteLength: number
+  readonly bytes: Buffer
+  readonly writerEpoch: string
+  offset: number
+  state: 'receiving' | 'ready' | 'failed'
+  sha256?: string
+  failureCode?: string
 }
 
 /** Configuration of the `connection.hello` reply (limits/heartbeat face). */
@@ -109,6 +124,12 @@ export interface FakeCherryOptions {
   /** Versions offered in the Noise-prelude negotiation (default [1]). */
   protocolVersions?: number[]
   hello?: FakeHelloOptions
+  /**
+   * Hold each upload ack this long before sending it (#306). Lets a test
+   * observe the client's chunk WINDOW: with immediate acks the in-flight count
+   * is always 1, whatever the client's window is.
+   */
+  uploadAckDelayMs?: number
   /**
    * The `connection.endpoints` face (issue #143), modelled on the desktop's
    * `RemoteConnection.ts` handler + `RemoteAccessService.getConnectionEndpoints`:
@@ -1132,6 +1153,16 @@ export class FakeCherry {
   #commands = new Map<string, FakeCommandRecord>()
   /** Every command-face request's params exactly as the peer received them. */
   #commandCalls: Array<{ method: string; params: Record<string, unknown> }> = []
+  /** Staged uploads by id (#306); `bytes` is the live staging file. */
+  #uploads = new Map<string, FakeUpload>()
+  #uploadCancelCount = 0
+  #uploadAckFailure: FakeFailure | undefined
+  #uploadAckSuccesses = 0
+  #uploadInFlight = 0
+  #maxUploadInFlight = 0
+  #uploadAckFailAfter: { count: number; failure: FakeFailure } | undefined
+  #presented: Array<Record<string, unknown>> = []
+  #presentFailure: FakeFailure | undefined
   /** Interactions the peer currently serves via `agent.interactions.list`. */
   #interactions: FakeInteractionRecord[]
   /** The execution id the peer reports as active for the session. */
@@ -1436,6 +1467,51 @@ export class FakeCherry {
   /** The params of every call to one command-face method, in arrival order. */
   commandCallsFor(method: string): readonly Record<string, unknown>[] {
     return this.#commandCalls.filter((entry) => entry.method === method).map((entry) => entry.params)
+  }
+
+  /** The bytes staged for an upload, for a sha256/offset assertion (#306). */
+  uploadedBytes(uploadId: string): Buffer | undefined {
+    return this.#uploads.get(uploadId)?.bytes
+  }
+
+  /** The largest number of upload chunks this peer ever held unanswered (#306). */
+  maxUploadInFlight(): number {
+    return this.#maxUploadInFlight
+  }
+
+  /** The sha256 the peer computed over the staged bytes (#306). */
+  uploadedSha256(uploadId: string): string | undefined {
+    return this.#uploads.get(uploadId)?.sha256
+  }
+
+  /** How many times the client cancelled a staged upload (#306). */
+  uploadCancelCount(): number {
+    return this.#uploadCancelCount
+  }
+
+  /** Every `agent.attachments.present` this peer received (#306). */
+  presentedSelections(): readonly Record<string, unknown>[] {
+    return this.#presented
+  }
+
+  /** Refuses the NEXT upload chunk's ack once (#306). */
+  failNextUploadAck(failure: FakeFailure): void {
+    this.#uploadAckFailure = failure
+  }
+
+  /**
+   * Refuses the ack of the chunk AFTER `count` successful chunk acks (#306).
+   * The global `failNextUploadAck` can only reach the FIRST chunk of a
+   * multi-file send, which cannot exercise "a later file failed, cancel the
+   * earlier one".
+   */
+  failUploadAckAfter(count: number, failure: FakeFailure): void {
+    this.#uploadAckFailAfter = { count, failure }
+  }
+
+  /** Refuses the NEXT `agent.attachments.present` once (#306). */
+  failNextPresent(failure: FakeFailure): void {
+    this.#presentFailure = failure
   }
 
   /** Every command receipt the peer admitted, keyed by commandId. */
@@ -2145,6 +2221,139 @@ export class FakeCherry {
     this.#pending = this.#pending.filter(({ socket }) => socket.readyState === WebSocket.OPEN)
   }
 
+  // -------------------------------------------------------------------------
+  // Uploads and attachment presence (#306)
+  // -------------------------------------------------------------------------
+
+  /** One binary chunk: validate offset continuity, stage the bytes, ack. */
+  #receiveUpload(chunk: UploadChunk): void {
+    const requestId = chunk.requestId
+    const upload = this.#uploads.get(chunk.uploadId)
+    this.#uploadInFlight += 1
+    if (this.#uploadInFlight > this.#maxUploadInFlight) this.#maxUploadInFlight = this.#uploadInFlight
+    const emit = (params: Record<string, unknown>): void => {
+      this.#uploadInFlight -= 1
+      this.#notifyNow('agent.uploads.ack', { requestId, ...params })
+    }
+    const delay = this.#options.uploadAckDelayMs
+    const ack = (params: Record<string, unknown>): void => {
+      if (delay === undefined || delay <= 0) emit(params)
+      else setTimeout(() => emit(params), delay)
+    }
+    if (upload === undefined) {
+      ack({ ok: false, error: { reason: 'NOT_FOUND', message: 'Upload not found' } })
+      return
+    }
+    const offset = Number(chunk.offset)
+    if (!Number.isSafeInteger(offset) || offset !== upload.offset || chunk.bytes.length === 0) {
+      ack({ ok: false, error: { reason: 'CONFLICT', message: 'Invalid upload chunk or offset' } })
+      return
+    }
+    const failure = this.#uploadAckFailure
+    if (failure !== undefined) {
+      this.#uploadAckFailure = undefined
+      ack({ ok: false, error: failure })
+      return
+    }
+    const after = this.#uploadAckFailAfter
+    if (after !== undefined && this.#uploadAckSuccesses >= after.count) {
+      this.#uploadAckFailAfter = undefined
+      ack({ ok: false, error: after.failure })
+      return
+    }
+    this.#uploadAckSuccesses += 1
+    chunk.bytes.forEach((byte, index) => {
+      upload.bytes[offset + index] = byte
+    })
+    upload.offset = offset + chunk.bytes.length
+    ack({
+      ok: true,
+      uploadId: chunk.uploadId,
+      writerEpoch: upload.writerEpoch,
+      committedOffset: String(upload.offset),
+    })
+  }
+
+  #uploadOf(uploadId: string): FakeUpload {
+    const upload = this.#uploads.get(uploadId)
+    if (upload === undefined) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Upload not found' })
+    }
+    return upload
+  }
+
+  #uploadSnapshot(upload: FakeUpload): Record<string, unknown> {
+    return {
+      uploadId: upload.uploadId,
+      state: upload.state,
+      committedOffset: String(upload.offset),
+      writerEpoch: upload.writerEpoch,
+      checksumAlgorithm: 'sha256',
+      ...(upload.sha256 === undefined ? {} : { sha256: upload.sha256 }),
+      ...(upload.failureCode === undefined ? {} : { failureCode: upload.failureCode }),
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    }
+  }
+
+  #uploadSnapshotOrThrow(uploadId: string): Record<string, unknown> {
+    return this.#uploadSnapshot(this.#uploadOf(uploadId))
+  }
+
+  #handleUploadPrepare(params: Record<string, unknown>): Record<string, unknown> {
+    const uploadId = String(params['uploadId'] ?? '')
+    const existing = this.#uploads.get(uploadId)
+    if (existing !== undefined) return this.#uploadSnapshot(existing)
+    const byteLength = Number(params['byteLength'])
+    if (!Number.isSafeInteger(byteLength) || byteLength < 0 || byteLength > 1024 ** 3) {
+      throw new FakeRpcError({ reason: 'INVALID_ARGUMENT', message: 'Invalid byteLength' })
+    }
+    const upload: FakeUpload = {
+      uploadId,
+      filename: String(params['filename'] ?? ''),
+      mediaType: String(params['mediaType'] ?? ''),
+      byteLength,
+      bytes: Buffer.alloc(byteLength),
+      writerEpoch: '0',
+      offset: 0,
+      state: 'receiving',
+    }
+    this.#uploads.set(uploadId, upload)
+    return this.#uploadSnapshot(upload)
+  }
+
+  #handleUploadComplete(params: Record<string, unknown>): Record<string, unknown> {
+    const upload = this.#uploadOf(String(params['uploadId'] ?? ''))
+    if (upload.offset !== upload.byteLength) {
+      throw new FakeRpcError({ reason: 'CONFLICT', message: 'Upload is incomplete' })
+    }
+    upload.sha256 = createHash('sha256').update(upload.bytes).digest('hex')
+    const expected = params['expectedSha256']
+    if (typeof expected === 'string' && expected !== upload.sha256) {
+      upload.state = 'failed'
+      upload.failureCode = 'CHECKSUM_MISMATCH'
+    } else {
+      upload.state = 'ready'
+    }
+    return this.#uploadSnapshot(upload)
+  }
+
+  #handleUploadCancel(params: Record<string, unknown>): Record<string, unknown> {
+    this.#uploadOf(String(params['uploadId'] ?? ''))
+    this.#uploads.delete(String(params['uploadId'] ?? ''))
+    this.#uploadCancelCount += 1
+    return { cancelled: true }
+  }
+
+  #handleAttachmentsPresent(params: Record<string, unknown>): Record<string, unknown> {
+    const failure = this.#presentFailure
+    if (failure !== undefined) {
+      this.#presentFailure = undefined
+      throw new FakeRpcError(failure)
+    }
+    this.#presented.push(params)
+    return { accepted: true }
+  }
+
   #handleSocket(socket: WebSocket, identity: Uint8Array): void {
     const controller = new AbortController()
     const stream = new RemoteSocketStream(toRemoteSocket(socket), componentLogger.forComponent('fake'), 'inbound')
@@ -2210,6 +2419,13 @@ export class FakeCherry {
     try {
       for (;;) {
         const frame = await live.channel.read()
+        // A binary upload chunk is NOT a JSON-RPC frame: it carries no method
+        // and no id, so the dispatch path cannot see it (#306). `channel.read`
+        // already decoded it from the transport's binary record form.
+        if (isUploadChunk(frame)) {
+          this.#receiveUpload(frame as UploadChunk)
+          continue
+        }
         if (typeof frame === 'object' && frame !== null) {
           // Dispatch without awaiting: a delayed handler must not stall the loop.
           void this.#dispatch(live, frame as Record<string, unknown>)
@@ -2385,6 +2601,16 @@ export class FakeCherry {
         return this.#handleAck(params)
       case 'agent.subscriptions.close':
         return this.#handleClose(params)
+      case 'agent.uploads.prepare':
+        return this.#handleUploadPrepare(params)
+      case 'agent.uploads.get':
+        return this.#uploadSnapshotOrThrow(String(params['uploadId'] ?? ''))
+      case 'agent.uploads.complete':
+        return this.#handleUploadComplete(params)
+      case 'agent.uploads.cancel':
+        return this.#handleUploadCancel(params)
+      case 'agent.attachments.present':
+        return this.#handleAttachmentsPresent(params)
       default:
         throw new FakeRpcError({ reason: 'NOT_FOUND', message: `unknown method ${method}` })
     }

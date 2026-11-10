@@ -123,6 +123,18 @@ export const RATE_LIMIT_MAX_WAIT_MS = 1_000
  */
 export const DEVICE_SETTLE_WAIT_MS = 5_000
 
+/** Uploads accepted by ONE `cherry_send` call (issue #306). */
+export const MAX_SEND_ATTACHMENTS = 8
+
+/** The peer's per-file upload ceiling (`agentUploadLimits.fileBytes`). */
+export const MAX_SEND_ATTACHMENT_BYTES = 1024 ** 3
+
+/** The peer's per-message attachment ceiling (`agentUploadLimits.messageBytes`). */
+export const MAX_SEND_MESSAGE_BYTES = 2 * 1024 ** 3
+
+/** Media type for a file whose extension names no image format (issue #306). */
+export const DEFAULT_ATTACHMENT_MEDIA_TYPE = 'application/octet-stream'
+
 /** 2 MiB of event text cached per session (spec §3.5). */
 export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 

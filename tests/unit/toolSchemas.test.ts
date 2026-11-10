@@ -250,15 +250,25 @@ describe('tool parameter schemas: the complete 14-tool registry (Task 10④)', (
     }
   })
 
-  it('cherry_send requires device/sessionId/text and caps text at the protocol ceiling of 32768', () => {
+  it('cherry_send requires device/sessionId, text optional, and declares typed attachments', () => {
     const definition = toolOf('cherry_send')
-    expect(definition.parameters.required).toEqual(['device', 'sessionId', 'text'])
+    expect(definition.parameters.required).toEqual(['device', 'sessionId'])
     // 32768 is the protocol's `agent.messages.send.text` ceiling. The tool still
     // refuses an over-long body BEFORE the wire (`text-too-long`), and the
     // number is stated in the description because the host's parameter subset
     // has no `maxLength` (issue #219; pinned by toolParameterSubset.test.ts
     // #219b).
     expect(properties(definition)['text']).toMatchObject({ type: 'string' })
+    // Attachments (issue #306): the path is the one required field; an item has
+    // no open-ended extras, so a typo like `fileName` is a schema error rather
+    // than silently ignored.
+    const attachments = properties(definition)['attachments']!
+    expect(attachments['type']).toBe('array')
+    expect(attachments['items']).toMatchObject({
+      type: 'object',
+      required: ['path'],
+      additionalProperties: false,
+    })
   })
 
   it('cherry_cancel REQUIRES expectedExecutionId: a cancel without a target is unrunnable', () => {

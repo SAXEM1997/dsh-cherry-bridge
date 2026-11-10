@@ -12,7 +12,12 @@ import {
 import { pairWithPayload } from './pairing.js'
 import { SessionSubscriptions } from './subscriptions.js'
 import { cherryScopeToolNames, registerCherryTools, registerCherryToolsWithEngine } from './tools.js'
-import type { CherryToolsContext, CherryToolsDeps } from './tools.js'
+import type {
+  CherryFsLike,
+  CherryToolsContext,
+  CherryToolsDeps,
+  CherryWorkingDirectoryLike,
+} from './tools.js'
 import { ToolScopeState } from './toolScope.js'
 import { CherryToolEngine } from './tools.js'
 import { resolveSubagentConfig } from './subagent.js'
@@ -843,7 +848,13 @@ async function recoverSubscriptions(deviceId: string): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /** One dep object, shared by both faces, so there is exactly ONE pool. */
-function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
+/** Looks up an OPTIONAL host service without making it an injection gate. */
+function hostService<T>(ctx: CherryBridgeContext, name: string): T | undefined {
+  const get = (ctx as { get?: (service: string) => unknown }).get
+  return get?.call(ctx, name) as T | undefined
+}
+
+function assemblyDeps(ctx: CherryBridgeContext): CherryHttpDeps & CherryToolsDeps {
   return {
     store: state.store,
     // The scope document's authority and the recompute entry, read through the
@@ -889,6 +900,14 @@ function assemblyDeps(): CherryHttpDeps & CherryToolsDeps {
         return engine.listTargets(device, agentId)
       },
     },
+    /**
+     * The host filesystem / working directory, used ONLY by `cherry_send`'s
+     * attachment upload (issue #306). Resolved lazily: this object is built
+     * before every host service has mounted, and a test rig that never uploads
+     * never touches either service.
+     */
+    fs: () => hostService<CherryFsLike>(ctx, 'fs'),
+    workingDirectory: () => hostService<CherryWorkingDirectoryLike>(ctx, 'workingDirectory'),
     /**
      * The pairing seam, shared by `cherry_pair` and `POST /pair`.
      *
@@ -1086,7 +1105,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
     log: (message) => console.warn(message),
   })
 
-  const deps = assemblyDeps()
+  const deps = assemblyDeps(ctx)
   // `registerHttpApi` owns the headless degradation (warn + skip) and the route
   // disposer. The TOOL registrations deliberately have no seat here: they are
   // gated on the scope subsystem's capability tri-state and belong to the host

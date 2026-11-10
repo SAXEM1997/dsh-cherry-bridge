@@ -165,12 +165,18 @@ describe('the cherry_send argument face', () => {
   it('② cherry_send answers `text-empty` locally: no send, no subscription, no wire call at all', async () => {
     const rig = await makeRig()
 
-    // The MISSING/EMPTY string keeps the argument-error face every tool shares
-    // (`requiredString`): an absent body is an argument-shape fault, not a rule
-    // the peer taught us.
-    await expect(rig.call('cherry_send', { device: 'dev-A', sessionId: 's-1', text: '' })).rejects.toThrow(
-      /"text" is required/,
-    )
+    // `text` became OPTIONAL when attachments arrived (issue #306): an absent
+    // or empty body without attachments is now a STRUCTURED verdict, not an
+    // argument-shape error. The e2e attachment suite covers the legal blank-
+    // text-with-attachments form.
+    for (const blank of ['', undefined]) {
+      const verdict = (await rig.call(
+        'cherry_send',
+        { device: 'dev-A', sessionId: 's-1', ...(blank === undefined ? {} : { text: blank }) },
+      )) as { error?: string; message?: string }
+      expect(verdict.error).toBe('text-empty')
+      expect(verdict.message).toMatch(/blank|empty/i)
+    }
 
     // Whitespace is the case `min(1)` never caught and the peer now refuses:
     // it reaches the plugin as a present, in-cap body, and gets the structured
