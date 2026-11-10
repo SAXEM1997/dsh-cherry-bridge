@@ -6904,6 +6904,11 @@ const MESSAGE_CACHE_ENTRY_BYTES = 1048576;
 * drive 32 MiB honestly.
 */
 const MESSAGE_CACHE_BYTES_PER_DEVICE = 33554432;
+/** Whether two `attachments[]` arguments name the same local files, verbatim. */
+function sameSendAttachmentRequests(a, b) {
+	if (a.length !== b.length) return false;
+	return a.every((item, index) => item.path === b[index].path && item.filename === b[index].filename && item.mediaType === b[index].mediaType);
+}
 /**
 * How many command bodies the engine remembers PER DEVICE, keyed by the
 * CALLER-SUPPLIED `commandId` (issues #115, #118).
@@ -9611,6 +9616,27 @@ var CherryToolEngine = class {
 					wait: args["wait"] !== false,
 					timeoutMs: waitTimeout(args["timeoutMs"])
 				});
+				const callerCommandId = optionalString(args["commandId"]);
+				const remembered = callerCommandId === void 0 ? void 0 : this.#recallCommandBody(record.deviceId, callerCommandId);
+				if (remembered !== void 0) {
+					if (remembered.method !== SEND_METHOD) throw commandBodyDiffers();
+					const send = remembered.send;
+					if (send === void 0 || !sameSendAttachmentRequests(send.requests, parsed.value) || remembered.body["sessionId"] !== sessionId || remembered.body["text"] !== text) throw commandBodyDiffers();
+					return {
+						...await this.#runOnce({
+							connection,
+							deviceId: record.deviceId,
+							sessionId,
+							text,
+							commandId: callerCommandId,
+							wait: args["wait"] !== false,
+							timeoutMs: waitTimeout(args["timeoutMs"]),
+							attachments: send.echo.map((file) => ({ uploadId: file.uploadId })),
+							...remembered.body["selectionId"] === void 0 ? {} : { selectionId: String(remembered.body["selectionId"]) }
+						}),
+						attachments: send.echo
+					};
+				}
 				if (connection.limits.uploads !== 1) return {
 					error: "unsupported",
 					message: "this desktop does not advertise the upload surface (agentUploadsVersion); it cannot receive attachments. Upgrade Cherry Studio to 2.1.5 or newer."
@@ -9618,16 +9644,26 @@ var CherryToolEngine = class {
 				const uploaded = await this.#uploadSendAttachments(connection, files, exec);
 				if (!Array.isArray(uploaded)) return uploaded;
 				const selectionId = await this.#presentSendAttachments(connection, sessionId, uploaded);
+				const echo = uploaded.map((file) => ({
+					filename: file.filename,
+					mediaType: file.mediaType,
+					byteLength: file.byteLength,
+					uploadId: file.uploadId
+				}));
 				const answer = await this.#runOnce({
 					connection,
 					deviceId: record.deviceId,
 					sessionId,
 					text,
-					commandId: optionalString(args["commandId"]),
+					commandId: callerCommandId,
 					wait: args["wait"] !== false,
 					timeoutMs: waitTimeout(args["timeoutMs"]),
 					attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
-					...selectionId === void 0 ? {} : { selectionId }
+					...selectionId === void 0 ? {} : { selectionId },
+					send: {
+						requests: parsed.value,
+						echo
+					}
 				});
 				if (answer["status"] === "rejected") {
 					await this.#cancelUploads(connection, uploaded);
@@ -9635,12 +9671,7 @@ var CherryToolEngine = class {
 				}
 				return {
 					...answer,
-					attachments: uploaded.map((file) => ({
-						filename: file.filename,
-						mediaType: file.mediaType,
-						byteLength: file.byteLength,
-						uploadId: file.uploadId
-					}))
+					attachments: echo
 				};
 			}
 		});
@@ -9837,7 +9868,8 @@ var CherryToolEngine = class {
 			commandId,
 			text,
 			...request.attachments === void 0 ? {} : { attachments: request.attachments },
-			...request.selectionId === void 0 ? {} : { selectionId: request.selectionId }
+			...request.selectionId === void 0 ? {} : { selectionId: request.selectionId },
+			...request.send === void 0 ? {} : { send: request.send }
 		});
 		if (!wait) return receipt;
 		if (receipt["status"] === "rejected" || receipt["status"] === "interrupted") return receipt;
@@ -10156,7 +10188,8 @@ var CherryToolEngine = class {
 					expectedIdleRevision,
 					...attachments.length === 0 ? {} : { attachments },
 					...selectionId === void 0 ? {} : { selectionId }
-				}
+				},
+				...request.send === void 0 && remembered?.send === void 0 ? {} : { send: request.send ?? remembered.send }
 			});
 			return {
 				receipt: await this.#command(connection, SEND_METHOD, {
