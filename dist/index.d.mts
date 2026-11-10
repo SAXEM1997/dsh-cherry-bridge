@@ -100,11 +100,23 @@ interface ToolParametersSchema {
   required?: string[];
   additionalProperties?: boolean;
 }
+/** A durable image reference, as the host's `ImageAttachmentRef` carries it. */
+interface ToolImageAttachment {
+  attachmentId: string;
+  mediaType: string;
+  bytes: number;
+  width: number;
+  height: number;
+  name?: string;
+}
 /** A content block the host turns into model-facing tool output. */
-interface ToolContentBlock {
+type ToolContentBlock = {
   type: 'text';
   text: string;
-}
+} | {
+  type: 'image';
+  attachment: ToolImageAttachment;
+};
 /**
  * The execution context the host hands a tool body.
  *

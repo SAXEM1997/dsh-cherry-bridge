@@ -123,6 +123,20 @@ export const RATE_LIMIT_MAX_WAIT_MS = 1_000
  */
 export const DEVICE_SETTLE_WAIT_MS = 5_000
 
+/**
+ * How many uploaded IMAGES one `cherry_read(includeImages: true)` may attach,
+ * and how many image BYTES it may fetch in total (#307).
+ *
+ * A per-CALL budget, not a per-session cap: the read walks the newest messages
+ * first, so the limit spends itself on the newest pictures, and a later part
+ * that finds the budget exhausted keeps its metadata plus `imagesOmitted:
+ * 'cap'` rather than failing the read. Four is this ticket's per-call cap;
+ * the deployment's `attachments.imageLimits` can only tighten these further,
+ * never widen them.
+ */
+export const DEFAULT_READ_IMAGES_PER_CALL = 4
+export const DEFAULT_READ_IMAGE_BYTES_PER_CALL = 8 * 1024 * 1024
+
 /** 2 MiB of event text cached per session (spec §3.5). */
 export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 

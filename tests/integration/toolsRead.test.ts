@@ -14,10 +14,14 @@ import { DeviceConnection, DeviceUnavailableError } from '../../src/connection.j
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
 import type {
+  AttachmentServiceLike,
   CherryToolDefinition,
   CherryToolEngineOptions,
+  CherryToolExec,
   CherryToolsContext,
   CherryToolsDeps,
+  LlmServiceLike,
+  ToolContentBlock,
 } from '../../src/tools.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions, FakePartRecord } from '../loopback/fakeCherry.js'
@@ -79,7 +83,9 @@ interface Rig {
   tmp: string
   tool(name: string): CherryToolDefinition
   /** Invoke one registered tool by name, exactly as the host would. */
-  call(name: string, args?: Record<string, unknown>): Promise<unknown>
+  call(name: string, args?: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>
+  /** Render one tool result the way the host renders it to the model. */
+  render(name: string, value: unknown): ToolContentBlock[]
   /** Dial a seeded device explicitly (makeRig only dials dev-A by default). */
   connectDevice(deviceId: string): Promise<void>
   stop(): Promise<void>
@@ -129,6 +135,14 @@ interface RigOptions {
   deviceSettleWaitMs?: number
   /** Local policy knobs (e.g. a low parts circuit-breaker) for the engine. */
   engine?: CherryToolEngineOptions
+  /**
+   * The host attachment service (#307). Absent models a deployment without one,
+   * which is the `unsupported` arm — and the default, so every pre-#307 case
+   * keeps the metadata-only path byte-identically.
+   */
+  attachments?: AttachmentServiceLike
+  /** The host LLM service, used only by the calling route's image-input gate. */
+  llm?: LlmServiceLike
 }
 
 async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions = {}): Promise<Rig> {
@@ -197,6 +211,8 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
       throw new Error('the read-only suite never evicts')
     },
     ...(rigOptions.deviceSettleWaitMs === undefined ? {} : { deviceSettleWaitMs: rigOptions.deviceSettleWaitMs }),
+    attachments: () => rigOptions.attachments,
+    llm: () => rigOptions.llm,
   }
   registerCherryTools(ctx, deps, rigOptions.engine ?? {})
 
@@ -216,7 +232,8 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
     store,
     tmp,
     tool,
-    call: (name, args = {}) => tool(name).execute(args),
+    call: (name, args = {}, exec) => tool(name).execute(args, exec),
+    render: (name, value) => tool(name).output.render({}, value),
     connectDevice: async (deviceId) => {
       await connect(deviceId).connect()
     },
@@ -3087,5 +3104,517 @@ describe('issue #104: a rate-limited content read is not degraded', () => {
     expect((error as Error).message).not.toContain('SAME commandId')
     // The slice was refused and replayed exactly once; the second refusal ended it.
     expect(rig.fake.methodCount('agent.content.read')).toBe(2)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// issue #307: uploaded images reach the model as image blocks
+// ---------------------------------------------------------------------------
+
+interface SavedImageInput {
+  data: Uint8Array
+  mediaType: string
+  name?: string
+}
+
+/**
+ * A recording attachment service. It validates nothing on purpose: the engine's
+ * job is to fetch the peer's bytes, verify the digest and hand them over — the
+ * host's own `saveImage` owns image decoding, and a loopback fixture's "image"
+ * bytes do not need to be a real PNG for that seam.
+ */
+function fakeAttachments(options: {
+  mediaTypes?: string[]
+  maxImageBytes?: number
+  maxImagesPerMessage?: number
+  maxMessageImageBytes?: number
+  /** Make a save fail with this `AttachmentError`-shaped value. */
+  failWith?: Error
+} = {}): { service: AttachmentServiceLike; saved: SavedImageInput[] } {
+  const saved: SavedImageInput[] = []
+  const service: AttachmentServiceLike = {
+    imageLimits: {
+      maxImageBytes: options.maxImageBytes ?? 8 * 1024 * 1024,
+      maxImagesPerMessage: options.maxImagesPerMessage ?? 4,
+      maxMessageImageBytes: options.maxMessageImageBytes ?? 8 * 1024 * 1024,
+      mediaTypes: options.mediaTypes ?? ['image/png', 'image/jpeg', 'image/webp', 'image/gif'],
+    },
+    async saveImage(input) {
+      if (options.failWith !== undefined) throw options.failWith
+      saved.push(input)
+      return {
+        attachmentId: `att-${saved.length}`,
+        mediaType: input.mediaType,
+        bytes: input.data.length,
+        width: 2,
+        height: 3,
+        ...(input.name === undefined ? {} : { name: input.name }),
+      }
+    },
+  }
+  return { service, saved }
+}
+
+/** The host LLM service's one method the route gate consults. */
+function fakeLlm(inputModalities: string[] = ['text', 'image']): LlmServiceLike & {
+  readonly calls: Array<{ provider: string; model: string }>
+} {
+  const calls: Array<{ provider: string; model: string }> = []
+  return {
+    calls,
+    async resolveModelInfo(provider, model) {
+      calls.push({ provider, model })
+      return { inputModalities }
+    },
+  }
+}
+
+/** The calling route, exactly as the host's tool run context supplies it. */
+function imageExec(): CherryToolExec {
+  return {
+    agent: { options: { provider: 'provider-1', model: 'vision-model' } },
+    signal: new AbortController().signal,
+  }
+}
+
+describe('issue #307: cherry_read reads uploaded images', () => {
+  it('⑱a includeImages reads a `file` image through content.read, saves it, and renders an image block', async () => {
+    const imageText = 'I'.repeat(2048)
+    const attachments = fakeAttachments()
+    const llm = fakeLlm()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            {
+              sessionId: 's-1',
+              agentId: 'agent-1',
+              workspaceId: 'ws-1',
+              title: 'Images',
+              historyRevision: '1000',
+            },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [
+                { kind: 'text', text: 'look at this' },
+                { kind: 'file', text: imageText, name: 'photo.png', mediaType: 'image/png' },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        engine: { contentReadSliceBytes: TEST_SLICE_BYTES },
+        attachments: attachments.service,
+        llm,
+      },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as {
+      messages: Array<{
+        parts: Array<{
+          kind: string
+          content: string
+          image?: {
+            attachmentId: string
+            mediaType: string
+            bytes: number
+            width: number
+            height: number
+            name?: string
+          }
+        }>
+      }>
+    }
+
+    // TWO slices: the fixture sits across the 1 KiB test slice size.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(2)
+    // The route gate ran against the calling agent's own provider/model.
+    expect(llm.calls).toEqual([{ provider: 'provider-1', model: 'vision-model' }])
+    // The peer's exact bytes reached the attachment service, under the ref's
+    // declared media type and the part's own name.
+    expect(attachments.saved).toHaveLength(1)
+    expect(Buffer.from(attachments.saved[0]!.data).toString()).toBe(imageText)
+    expect(attachments.saved[0]!.mediaType).toBe('image/png')
+    expect(attachments.saved[0]!.name).toBe('photo.png')
+
+    const parts = result.messages[0]!.parts
+    expect(parts[0]!.content).toBe('look at this')
+    expect(parts[1]!.content).toBe('')
+    expect(parts[1]!.image).toEqual({
+      attachmentId: 'att-1',
+      mediaType: 'image/png',
+      bytes: 2048,
+      width: 2,
+      height: 3,
+      name: 'photo.png',
+    })
+
+    // The render keeps the snapshot's text block and appends the image itself.
+    const blocks = rig.render('cherry_read', result)
+    expect(blocks[0]!.type).toBe('text')
+    expect(blocks[1]).toEqual({ type: 'image', attachment: parts[1]!.image })
+  })
+})
+
+
+describe('issue #307: the image path keeps the metadata-only faces intact', () => {
+  it('⑱b includeImages leaves a NON-image file part metadata-only, with no content read', async () => {
+    const pdfText = 'not an image'
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Files', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: pdfText, name: 'report.pdf', mediaType: 'application/pdf' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const part = result.messages[0]!.parts[0]!
+    expect(part).toMatchObject({
+      kind: 'file',
+      content: '',
+      name: 'report.pdf',
+      mediaType: 'application/pdf',
+      byteLength: String(Buffer.byteLength(pdfText)),
+    })
+    expect(part).not.toHaveProperty('image')
+    expect(part).not.toHaveProperty('imagesOmitted')
+    expect(attachments.saved).toHaveLength(0)
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('⑱c includeImages leaves a legacy `data` attachment metadata-only: a desktop-local paste has no contentId', async () => {
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Files', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'data', text: '', mediaType: 'image/png', filename: 'paste.png' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    expect(result.messages[0]!.parts[0]).toMatchObject({
+      kind: 'data',
+      content: '',
+      name: 'paste.png',
+      mediaType: 'image/png',
+    })
+    expect(result.messages[0]!.parts[0]).not.toHaveProperty('image')
+    expect(attachments.saved).toHaveLength(0)
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('⑱d a text-only model route is refused BEFORE any image byte is fetched', async () => {
+    const attachments = fakeAttachments()
+    const llm = fakeLlm(['text'])
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: 'I'.repeat(64), name: 'photo.png', mediaType: 'image/png' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm },
+    )
+
+    await expect(
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', includeImages: true }, imageExec()),
+    ).rejects.toThrow(/does not declare image input/i)
+    // The refusal is structural and free: no image read, no store write.
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+    expect(attachments.saved).toHaveLength(0)
+    // ...and it happened before the baseline RPC too, so no device work was
+    // spent on a route that cannot display the answer.
+    expect(rig.fake.methodCount('agent.sessions.get')).toBe(0)
+  })
+
+  it('⑱e a deployment with no attachment service answers the structured `unsupported` verdict', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: '1001',
+            role: 'user',
+            status: 'success',
+            parts: [{ kind: 'file', text: 'I'.repeat(64), name: 'photo.png', mediaType: 'image/png' }],
+          },
+        ],
+      },
+    })
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { error?: string; message?: string }
+
+    expect(result).toMatchObject({ error: 'unsupported' })
+    expect(result.message).toMatch(/attachment service/i)
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+    expect(rig.fake.methodCount('agent.sessions.get')).toBe(0)
+  })
+})
+
+
+describe('issue #307: the image budget degrades per part', () => {
+  it('⑱f the per-call image COUNT cap keeps the over-cap part metadata-only and reads only the first image', async () => {
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [
+                { kind: 'file', text: 'A'.repeat(64), name: 'one.png', mediaType: 'image/png' },
+                { kind: 'file', text: 'B'.repeat(64), name: 'two.png', mediaType: 'image/png' },
+              ],
+            },
+          ],
+        },
+      },
+      { engine: { readImagesPerCall: 1 }, attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const parts = result.messages[0]!.parts
+    expect(parts[0]!.image).toMatchObject({ attachmentId: 'att-1', name: 'one.png' })
+    // The second image is NOT fetched: its part keeps the metadata and names
+    // the cap, so the caller can see the loss without a failed read.
+    expect(parts[1]).toMatchObject({ name: 'two.png', mediaType: 'image/png', imagesOmitted: 'cap' })
+    expect(parts[1]).not.toHaveProperty('image')
+    expect(attachments.saved).toHaveLength(1)
+    expect(rig.fake.methodCount('agent.content.read')).toBe(1)
+  })
+
+  it('⑱g the per-call image BYTE cap refuses the walk before the first slice, and the part says `cap`', async () => {
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              // 1024 bytes declared, 512 allowed: the count is fine, the sum is not.
+              parts: [{ kind: 'file', text: 'A'.repeat(1024), name: 'big.png', mediaType: 'image/png' }],
+            },
+          ],
+        },
+      },
+      { engine: { readImageBytesPerCall: 512 }, attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const part = result.messages[0]!.parts[0]!
+    expect(part).toMatchObject({ name: 'big.png', byteLength: '1024', imagesOmitted: 'cap' })
+    expect(part).not.toHaveProperty('image')
+    expect(part).not.toHaveProperty('unavailable')
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('⑱h an image whose sha256 does not match fails the WHOLE read, never a partial success', async () => {
+    const attachments = fakeAttachments()
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [{ kind: 'file', text: 'A'.repeat(64), name: 'photo.png', mediaType: 'image/png' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    // First read pins the peer's bytes; then the peer serves different bytes
+    // under the digest it already advertised.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    rig.fake.tamperContent('m-1:0', '1001')
+
+    await expect(
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', includeImages: true }, imageExec()),
+    ).rejects.toThrow(/sha256|digest|integrity/i)
+    // Unverified bytes never reached the store.
+    expect(attachments.saved).toHaveLength(0)
+  })
+
+  it('⑱j the DEPLOYMENT limits tighten the budget: a per-image ceiling refuses before the first slice', async () => {
+    const attachments = fakeAttachments({ maxImageBytes: 32 })
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              // 64 bytes: inside the engine's 8 MiB default, above this host's
+              // 32-byte per-image ceiling.
+              parts: [{ kind: 'file', text: 'A'.repeat(64), name: 'photo.png', mediaType: 'image/png' }],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const part = result.messages[0]!.parts[0]!
+    expect(part).toMatchObject({ name: 'photo.png', imagesOmitted: 'cap' })
+    expect(part).not.toHaveProperty('image')
+    expect(rig.fake.methodCount('agent.content.read')).toBe(0)
+  })
+
+  it('⑱i an `AttachmentError` degrades to that part\'s metadata plus `unavailable`, leaving the text intact', async () => {
+    const failure = Object.assign(new Error('image too large'), { code: 'IMAGE_TOO_LARGE' })
+    const attachments = fakeAttachments({ failWith: failure })
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Images', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [
+                { kind: 'text', text: 'the words still arrive' },
+                { kind: 'file', text: 'A'.repeat(64), name: 'photo.png', mediaType: 'image/png' },
+              ],
+            },
+          ],
+        },
+      },
+      { attachments: attachments.service, llm: fakeLlm() },
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ incomplete?: true; parts: Array<Record<string, unknown>> }> }
+
+    expect(result.messages[0]!.parts[0]!.content).toBe('the words still arrive')
+    const imagePart = result.messages[0]!.parts[1]!
+    expect(imagePart).toMatchObject({
+      name: 'photo.png',
+      mediaType: 'image/png',
+      unavailable: 'image too large',
+    })
+    expect(imagePart).not.toHaveProperty('image')
+    // The message-level completeness flag follows the ordinary projection.
+    expect(result.messages[0]!.incomplete).toBe(true)
   })
 })
