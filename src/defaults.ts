@@ -135,6 +135,15 @@ export const MAX_SEND_MESSAGE_BYTES = 2 * 1024 ** 3
 /** Media type for a file whose extension names no image format (issue #306). */
 export const DEFAULT_ATTACHMENT_MEDIA_TYPE = 'application/octet-stream'
 
+/** How long one 1 MiB chunk waits for its `agent.uploads.ack` (issue #306). */
+export const DEFAULT_UPLOAD_ACK_TIMEOUT_MS = 60_000
+
+/** `agent.uploads.get` polling while the peer verifies (issue #306). */
+export const DEFAULT_UPLOAD_READY_POLLS = 120
+
+/** Interval between `agent.uploads.get` polls (issue #306). */
+export const DEFAULT_UPLOAD_POLL_INTERVAL_MS = 50
+
 /** 2 MiB of event text cached per session (spec §3.5). */
 export const DEFAULT_PER_SESSION_CACHE_BYTES = 2 * 1024 * 1024
 

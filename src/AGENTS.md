@@ -97,7 +97,8 @@ normalizes the host). Learned hosts join the archive as candidates — see
   the desktop closes the whole session (`1011`); from 2.1.7 (PR #21687) it
   refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps the
   session. The generations cannot be told apart before one answers, so the
-  default is sized for the harsher: 32/s is 2× under 64, 8× under 256.
+  default is sized for the harsher: 32/s is 2× under 64, 8× under 256; the
+  content tier is 2× under 512.
 - The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
   widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
@@ -132,9 +133,8 @@ These are load-bearing; the code comments are the long version.
 attachments (`unsupported`) before any upload RPC.
 
 - `prepare` → 1 MiB `{kind:'upload'}` records (window 2), each acked by an
-  `agent.uploads.ack` NOTIFICATION (no JSON-RPC reply); `complete` carries the
-  measured sha256, then `get` polls to `ready`; any failure after `prepare`
-  cancels. Ack timeout 60 s; readiness 120 polls.
+  `agent.uploads.ack` notification; `complete` carries the measured sha256,
+  then `get` polls to `ready`; any failure after `prepare` cancels.
 - `present` is best-effort (`accepted:false` never blocks); the send carries
   `attachments` + `selectionId`. Blank text needs attachments (`text-empty`
   otherwise). Limits: 8 files, 1 GiB each, 2 GiB per message.
@@ -757,7 +757,7 @@ selector, `cherry_pair` does not.
   host without `tools.restrict`, where the scope subsystem registers nothing and
   installs no deny layer; `restrict` + `guard` stay as the belt.
 - A save re-installs the restriction layer for **every live agent** and takes
-  effect **next turn** — no restart.
+  effect on the **next turn** — no restart, no new session.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - Capability missing is never papered over: `pending` is a neutral wait,
@@ -866,7 +866,7 @@ the error message).
 - **Never emitted**: `accessToken`, `tokenExpiresAt`, `invitationSecret`, the
   raw pinned `desktopIdentity`, message text and part text.
 - The report is built field by field, so a later credential is excluded **by
-  construction**; `limits` is re-projected from its four keys.
+  construction**; `limits` is re-projected from its known keys.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
   RPC requests; counters and the error ring are zeroed on every `apply`.
 

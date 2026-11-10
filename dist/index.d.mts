@@ -105,6 +105,20 @@ interface ToolContentBlock {
   type: 'text';
   text: string;
 }
+/**
+ * The execution context the host hands a tool body.
+ *
+ * A transcription of the two fields this plugin reads out of the host's
+ * `ToolRunContext` (`@deepseek-ai/dsh-tools@0.2.2-rc.1`, `contracts.d.ts:231` →
+ * `ToolExecutionInput`): `agent` is OPTIONAL there because a call can arrive
+ * without a delegating agent (a nested/PTC dispatch, a headless run), and
+ * `signal` is the caller's required cancellation.
+ *
+ * `agent` stays `unknown` on purpose: the fourteen `cherry_*` tools address the
+ * PEER and never the calling agent, so nothing in this file should be tempted to
+ * reach into the host's `Agent` shape. The one tool that does need it
+ * (`cherry_subagent`) only forwards it to the seam.
+ */
 interface CherryToolExec {
   readonly agent?: unknown;
   /** Required on the host's own contract (`ToolExecutionInput.signal`). */

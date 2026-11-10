@@ -77,20 +77,6 @@ export interface ToolContentBlock {
 }
 
 /**
- * The execution context the host hands a tool body.
- *
- * A transcription of the two fields this plugin reads out of the host's
- * `ToolRunContext` (`@deepseek-ai/dsh-tools@0.2.2-rc.1`, `contracts.d.ts:231` →
- * `ToolExecutionInput`): `agent` is OPTIONAL there because a call can arrive
- * without a delegating agent (a nested/PTC dispatch, a headless run), and
- * `signal` is the caller's required cancellation.
- *
- * `agent` stays `unknown` on purpose: the fourteen `cherry_*` tools address the
- * PEER and never the calling agent, so nothing in this file should be tempted to
- * reach into the host's `Agent` shape. The one tool that does need it
- * (`cherry_subagent`) only forwards it to the seam.
- */
-/**
  * The filesystem slice `cherry_send` needs to upload local files (issue #306).
  *
  * Structural, like every other host seam here: the tool calls exactly three
@@ -142,6 +128,21 @@ interface UploadedSendAttachment extends PreparedSendAttachment {
   readonly writerEpoch: string
   readonly sha256: string
 }
+
+/**
+ * The execution context the host hands a tool body.
+ *
+ * A transcription of the two fields this plugin reads out of the host's
+ * `ToolRunContext` (`@deepseek-ai/dsh-tools@0.2.2-rc.1`, `contracts.d.ts:231` →
+ * `ToolExecutionInput`): `agent` is OPTIONAL there because a call can arrive
+ * without a delegating agent (a nested/PTC dispatch, a headless run), and
+ * `signal` is the caller's required cancellation.
+ *
+ * `agent` stays `unknown` on purpose: the fourteen `cherry_*` tools address the
+ * PEER and never the calling agent, so nothing in this file should be tempted to
+ * reach into the host's `Agent` shape. The one tool that does need it
+ * (`cherry_subagent`) only forwards it to the seam.
+ */
 
 export interface CherryToolExec {
   readonly agent?: unknown
@@ -5117,7 +5118,10 @@ export class CherryToolEngine {
         sessionId,
         sequence: '1',
         items: uploaded.map((file) => ({
-          attachmentId: file.uploadId,
+          // `attachmentId` is the selection's own handle (the official app
+          // mints a UUID); `uploadId` is the staging record's. They must not be
+          // conflated: the peer's `FileIntakeService` looks items up BY uploadId.
+          attachmentId: randomUUID(),
           uploadId: file.uploadId,
           filename: file.filename,
           mediaType: file.mediaType,

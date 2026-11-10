@@ -2830,6 +2830,8 @@ const RATE_LIMIT_MAX_WAIT_MS = 1e3;
 const MAX_SEND_ATTACHMENT_BYTES = 1024 ** 3;
 /** The peer's per-message attachment ceiling (`agentUploadLimits.messageBytes`). */
 const MAX_SEND_MESSAGE_BYTES = 2 * 1024 ** 3;
+/** How long one 1 MiB chunk waits for its `agent.uploads.ack` (issue #306). */
+const DEFAULT_UPLOAD_ACK_TIMEOUT_MS = 6e4;
 /** 2 MiB of event text cached per session (spec §3.5). */
 const DEFAULT_PER_SESSION_CACHE_BYTES = 2097152;
 /**
@@ -3765,7 +3767,7 @@ var DeviceConnection = class {
 		};
 		timer = setTimeout(() => {
 			reject(/* @__PURE__ */ new Error(`upload ack for ${uploadId} timed out`));
-		}, 6e4);
+		}, DEFAULT_UPLOAD_ACK_TIMEOUT_MS);
 		if (signal?.aborted === true) onAbort();
 		else signal?.addEventListener("abort", onAbort, { once: true });
 		if (!settled) this.#uploadAcks.set(requestId, {
@@ -3812,7 +3814,7 @@ var DeviceConnection = class {
 			}
 			await new Promise((resolve) => setTimeout(resolve, pollMs));
 		}
-		throw new Error(`upload ${uploadId} is still verifying after 120 polls; the peer may be stuck`);
+		throw new Error(`upload ${uploadId} is still verifying after its poll budget; the peer may be stuck`);
 	}
 	/** Link teardown rejects every chunk waiter: no ack can arrive any more. */
 	#rejectUploadAcks(error) {
@@ -9554,7 +9556,7 @@ var CherryToolEngine = class {
 				sessionId,
 				sequence: "1",
 				items: uploaded.map((file) => ({
-					attachmentId: file.uploadId,
+					attachmentId: randomUUID(),
 					uploadId: file.uploadId,
 					filename: file.filename,
 					mediaType: file.mediaType,

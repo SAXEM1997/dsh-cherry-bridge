@@ -313,7 +313,7 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(rig.fake.methodCount('agent.attachments.present')).toBe(0)
   })
 
-  it('㉑l the client keeps at most TWO chunks in flight', async () => {
+  it('㉑i the client keeps at most TWO chunks in flight', async () => {
     // 2.5 MiB = three chunks; delayed acks make the window observable.
     const bytes = Buffer.alloc(2 * 1024 * 1024 + 512 * 1024, 3)
     const files = new Map([['/work/large.bin', bytes]])
@@ -351,7 +351,7 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(rig.fake.uploadCancelCount()).toBe(2)
   })
 
-  it('㉑i a refused present is best-effort: the send still carries the attachments, without a selectionId', async () => {
+  it('㉑k a refused present is best-effort: the send still carries the attachments, without a selectionId', async () => {
     const files = new Map([['/work/a.txt', Buffer.from('hello')]])
     const rig = await makeRig({ files })
     rig.fake.failNextPresent({ reason: 'INTERNAL', message: 'presence unavailable' })
@@ -369,7 +369,7 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(sent).not.toHaveProperty('selectionId')
   })
 
-  it('㉑k text over the protocol cap is refused before any upload, even with attachments', async () => {
+  it('㉑l text over the protocol cap is refused before any upload, even with attachments', async () => {
     const files = new Map([['/work/a.txt', Buffer.from('hello')]])
     const rig = await makeRig({ files })
     const verdict = (await rig.call(

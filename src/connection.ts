@@ -12,6 +12,9 @@ import {
   DEFAULT_CONTENT_READ_BUDGET_PER_SECOND,
   DEFAULT_RATE_BUDGET_PER_SECOND,
   DEFAULT_TRANSPORT_RETRY_WAIT_MS,
+  DEFAULT_UPLOAD_ACK_TIMEOUT_MS,
+  DEFAULT_UPLOAD_POLL_INTERVAL_MS,
+  DEFAULT_UPLOAD_READY_POLLS,
   RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
 import type { DeviceRecord } from './deviceStore.js'
@@ -1200,7 +1203,7 @@ export class DeviceConnection {
       await Promise.all(window)
       const sha256 = hash.digest('hex')
       await this.rpc.request('agent.uploads.complete', { uploadId, writerEpoch, expectedSha256: sha256 })
-      await this.#waitUploadReady(uploadId, input.pollMs ?? 50, signal)
+      await this.#waitUploadReady(uploadId, input.pollMs ?? DEFAULT_UPLOAD_POLL_INTERVAL_MS, signal)
       return { uploadId, writerEpoch, sha256, byteLength: input.byteLength }
     } catch (error) {
       if (staged) {
@@ -1289,7 +1292,7 @@ export class DeviceConnection {
     }
     timer = setTimeout(() => {
       reject(new Error(`upload ack for ${uploadId} timed out`))
-    }, 60_000)
+    }, DEFAULT_UPLOAD_ACK_TIMEOUT_MS)
     if (signal?.aborted === true) {
       onAbort()
     } else {
@@ -1328,10 +1331,10 @@ export class DeviceConnection {
     pollMs: number,
     signal: AbortSignal | undefined,
   ): Promise<void> {
-    // 120 polls at the caller's interval (default 50 ms) is a six-second
+    // The default poll interval times the poll bound is a six-second
     // verification budget: a peer still 'verifying' past it is stuck, not slow,
     // and the caller deserves a verdict rather than an unbounded hang.
-    for (let attempt = 0; attempt < 120; attempt += 1) {
+    for (let attempt = 0; attempt < DEFAULT_UPLOAD_READY_POLLS; attempt += 1) {
       signal?.throwIfAborted()
       const snapshot = await this.rpc.request<Record<string, unknown>>('agent.uploads.get', { uploadId })
       const state = String(snapshot['state'] ?? '')
@@ -1342,7 +1345,7 @@ export class DeviceConnection {
       }
       await new Promise<void>((resolve) => setTimeout(resolve, pollMs))
     }
-    throw new Error(`upload ${uploadId} is still verifying after 120 polls; the peer may be stuck`)
+    throw new Error(`upload ${uploadId} is still verifying after its poll budget; the peer may be stuck`)
   }
 
   /** Link teardown rejects every chunk waiter: no ack can arrive any more. */
