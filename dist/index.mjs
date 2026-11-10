@@ -3670,6 +3670,7 @@ var DeviceConnection = class {
 		const { signal } = input;
 		const uploadId = randomUUID();
 		let staged = false;
+		const window = [];
 		try {
 			const prepared = await this.rpc.request("agent.uploads.prepare", {
 				uploadId,
@@ -3681,7 +3682,6 @@ var DeviceConnection = class {
 			staged = true;
 			const writerEpoch = String(prepared["writerEpoch"] ?? "0");
 			const hash = createHash("sha256");
-			const window = [];
 			let offset = 0;
 			while (offset < input.byteLength) {
 				signal?.throwIfAborted();
@@ -3709,6 +3709,7 @@ var DeviceConnection = class {
 				byteLength: input.byteLength
 			};
 		} catch (error) {
+			await Promise.allSettled(window);
 			if (staged) try {
 				await this.rpc.request("agent.uploads.cancel", { uploadId });
 			} catch {}
@@ -7551,10 +7552,12 @@ function parseSendAttachments(value) {
 				message: `attachments[${index}].path must be a non-empty string.`
 			}
 		};
+		const filename = optionalString(item["filename"]);
+		const mediaType = optionalString(item["mediaType"]);
 		parsed.push({
 			path,
-			...optionalString(item["filename"]) === void 0 ? {} : { filename: optionalString(item["filename"]) },
-			...optionalString(item["mediaType"]) === void 0 ? {} : { mediaType: optionalString(item["mediaType"]) }
+			...filename === void 0 ? {} : { filename },
+			...mediaType === void 0 ? {} : { mediaType }
 		});
 	}
 	return {
@@ -9383,18 +9386,23 @@ var CherryToolEngine = class {
 				const uploaded = await this.#uploadSendAttachments(connection, files, exec);
 				if (!Array.isArray(uploaded)) return uploaded;
 				const selectionId = await this.#presentSendAttachments(connection, sessionId, uploaded);
+				const answer = await this.#runOnce({
+					connection,
+					deviceId: record.deviceId,
+					sessionId,
+					text,
+					commandId: optionalString(args["commandId"]),
+					wait: args["wait"] !== false,
+					timeoutMs: waitTimeout(args["timeoutMs"]),
+					attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
+					...selectionId === void 0 ? {} : { selectionId }
+				});
+				if (answer["status"] === "rejected" || answer["status"] === "interrupted") {
+					await this.#cancelUploads(connection, uploaded);
+					return answer;
+				}
 				return {
-					...await this.#runOnce({
-						connection,
-						deviceId: record.deviceId,
-						sessionId,
-						text,
-						commandId: optionalString(args["commandId"]),
-						wait: args["wait"] !== false,
-						timeoutMs: waitTimeout(args["timeoutMs"]),
-						attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
-						...selectionId === void 0 ? {} : { selectionId }
-					}),
+					...answer,
 					attachments: uploaded.map((file) => ({
 						filename: file.filename,
 						mediaType: file.mediaType,
@@ -9430,7 +9438,6 @@ var CherryToolEngine = class {
 		};
 		const cwd = await this.#sendWorkingDirectory(exec);
 		const prepared = [];
-		total = 0;
 		for (const request of requests) {
 			let target;
 			let info;
@@ -9551,7 +9558,7 @@ var CherryToolEngine = class {
 	async #presentSendAttachments(connection, sessionId, uploaded) {
 		const selectionId = randomUUID();
 		try {
-			await connection.rpc.request("agent.attachments.present", {
+			return (await connection.rpc.request("agent.attachments.present", {
 				selectionId,
 				sessionId,
 				sequence: "1",
@@ -9562,8 +9569,7 @@ var CherryToolEngine = class {
 					mediaType: file.mediaType,
 					byteLength: file.byteLength
 				}))
-			});
-			return selectionId;
+			}))["accepted"] === false ? void 0 : selectionId;
 		} catch {
 			return;
 		}

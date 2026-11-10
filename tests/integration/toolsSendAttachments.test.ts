@@ -78,12 +78,14 @@ async function makeRig(options: {
   uploads?: boolean
   fs?: CherryFsLike
   ackDelayMs?: number
+  sendOutcome?: 'busy' | 'target-unavailable' | 'resource-exhausted' | 'interrupted'
 } = {}): Promise<Rig> {
   const uploads = options.uploads ?? true
   const fake = new FakeCherry({
     ...(uploads ? { hello: { capabilities: { agentUploadsVersion: 1 } } } : {}),
     ...(options.ackDelayMs === undefined ? {} : { uploadAckDelayMs: options.ackDelayMs }),
     agent: {
+      ...(options.sendOutcome === undefined ? {} : { sendOutcome: options.sendOutcome }),
       agents: [{ agentId: 'agent-1', name: 'Agent One' }],
       sessions: [
         { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Uploads', historyRevision: '1000' },
@@ -379,5 +381,21 @@ describe('issue #306: cherry_send uploads local files', () => {
     )) as Record<string, unknown>
     expect(verdict['error']).toBe('text-too-long')
     expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(0)
+  })
+
+  it('㉒a a rejected send cancels the staged uploads and suppresses the attachment echo', async () => {
+    const files = new Map([['/work/a.txt', Buffer.from('hello')]])
+    const rig = await makeRig({ files, sendOutcome: 'busy' })
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', attachments: [{ path: '/work/a.txt' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    expect(verdict['status']).toBe('rejected')
+    expect(verdict).not.toHaveProperty('attachments')
+    // The refusal never consumed the staging record: the tool frees it.
+    expect(rig.fake.uploadCancelCount()).toBe(1)
   })
 })

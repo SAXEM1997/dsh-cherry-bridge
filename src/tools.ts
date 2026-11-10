@@ -2061,10 +2061,12 @@ function parseSendAttachments(
         },
       }
     }
+    const filename = optionalString(item['filename'])
+    const mediaType = optionalString(item['mediaType'])
     parsed.push({
       path,
-      ...(optionalString(item['filename']) === undefined ? {} : { filename: optionalString(item['filename']) }),
-      ...(optionalString(item['mediaType']) === undefined ? {} : { mediaType: optionalString(item['mediaType']) }),
+      ...(filename === undefined ? {} : { filename }),
+      ...(mediaType === undefined ? {} : { mediaType }),
     })
   }
   return { ok: true, value: parsed }
@@ -4921,6 +4923,14 @@ export class CherryToolEngine {
           attachments: uploaded.map((file) => ({ uploadId: file.uploadId })),
           ...(selectionId === undefined ? {} : { selectionId }),
         })
+        // A REFUSED send never consumed the staging records, and a receipt that
+        // says so is a final answer: free them instead of leaving the desktop
+        // holding bytes for 24 h. The echo is suppressed too — it would read as
+        // "these were attached" beside a rejection (issue #306 review).
+        if (answer['status'] === 'rejected' || answer['status'] === 'interrupted') {
+          await this.#cancelUploads(connection, uploaded)
+          return answer
+        }
         // The echo is the caller's handle on what was staged: no bytes and no
         // base64, just the ids the peer assigned (issue #306).
         return {
@@ -4965,7 +4975,6 @@ export class CherryToolEngine {
     }
     const cwd = await this.#sendWorkingDirectory(exec)
     const prepared: PreparedSendAttachment[] = []
-    total = 0
     for (const request of requests) {
       let target: CherryFsTargetLike
       let info: CherryFsStatLike | undefined
@@ -5113,7 +5122,7 @@ export class CherryToolEngine {
   ): Promise<string | undefined> {
     const selectionId = randomUUID()
     try {
-      await connection.rpc.request('agent.attachments.present', {
+      const answer = await connection.rpc.request<Record<string, unknown>>('agent.attachments.present', {
         selectionId,
         sessionId,
         sequence: '1',
@@ -5128,7 +5137,10 @@ export class CherryToolEngine {
           byteLength: file.byteLength,
         })),
       })
-      return selectionId
+      // `accepted:false` is an ordinary answer (stale generation, a replayed
+      // sequence, a full table): the uploads are still sendable by uploadId,
+      // but naming a selection the peer declined would be a false claim.
+      return answer['accepted'] === false ? undefined : selectionId
     } catch {
       return undefined
     }

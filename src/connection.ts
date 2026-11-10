@@ -1168,6 +1168,11 @@ export class DeviceConnection {
     const { signal } = input
     const uploadId = randomUUID()
     let staged = false
+    // Declared OUTSIDE the try so the failure path can drain it: a chunk that
+    // is still in flight when a SIBLING fails would otherwise reject with no
+    // observer (link teardown rejects every waiter at once), which surfaces as
+    // a process-level unhandledRejection rather than the upload's own error.
+    const window: Promise<void>[] = []
     try {
       const prepared = await this.rpc.request<Record<string, unknown>>('agent.uploads.prepare', {
         uploadId,
@@ -1179,7 +1184,6 @@ export class DeviceConnection {
       staged = true
       const writerEpoch = String(prepared['writerEpoch'] ?? '0')
       const hash = createHash('sha256')
-      const window: Promise<void>[] = []
       let offset = 0
       while (offset < input.byteLength) {
         signal?.throwIfAborted()
@@ -1206,6 +1210,9 @@ export class DeviceConnection {
       await this.#waitUploadReady(uploadId, input.pollMs ?? DEFAULT_UPLOAD_POLL_INTERVAL_MS, signal)
       return { uploadId, writerEpoch, sha256, byteLength: input.byteLength }
     } catch (error) {
+      // Drain siblings BEFORE cancelling: their rejections are observed here,
+      // and a cancel resolves the staging record they may still be writing to.
+      await Promise.allSettled(window)
       if (staged) {
         // Best-effort: the staging record expires on its own, and a cancel
         // failure must not replace the error that caused it.
