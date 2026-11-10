@@ -279,8 +279,8 @@ this beside the cache).
 The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
 timeout and idle faces) runs AFTER the caller's wait window, so the window
 cannot bound it. It once had no time bound: since #12 a read whose link dies
-waits `transportRetryWaitMs` (5 s), so under a flapping link each of ~30 requests
-could absorb it — a 1 s window answering ~150 s later (#3, #21).
+waits up to `transportRetryWaitMs` (5 s), so under a flapping link each of ~30
+requests absorbed it — a 1 s window answering ~150 s later (#3, #21).
 
 - **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
   clamp(window, WAIT_ANSWER_TAIL_FLOOR_MS, WAIT_ANSWER_TAIL_MS)` — one more
@@ -625,11 +625,11 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 - A failed message may carry `failure: {reasonCode, retryable, message}`
   (peer classification, retry-worthiness, bounded summary); only its
   `source`/`context` are withheld.
-- Attachments — `kind: 'file'`, and legacy `kind: 'data'` named `file` whose
+- Attachments — `kind: 'file'`, and legacy `data` named `file` whose
   `{mediaType, filename}` is JSON in `content.text` — report `name`/`mediaType`
   (`byteLength` from a ref only), no `unavailable` unless `includeImages`
-  asked and the store refused that image, and `content` **empty** unless the
-  record has a key we skip. `includeImages` is the exception: an accepted
+  asked and the image could not be fetched or saved, and `content` **empty**
+  unless the record has a key we skip. `includeImages` is the exception: an accepted
   `file` image is fetched, verified and saved via `saveImage` under our
   4-image / 8 MiB per-call cap (`imagesOmitted: 'cap'` when over); the route
   must declare `image` input, and `includeImages` without an attachments
