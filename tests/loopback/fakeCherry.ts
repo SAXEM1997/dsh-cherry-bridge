@@ -1124,6 +1124,7 @@ export class FakeCherry {
   /** Parts-list calls served, and the one-shot refusal after N of them (#310). */
   #partsListCalls = 0
   #partsListFailureAfter: { count: number; failure: FakeFailure } | undefined
+  #nextVerificationFailure: string | undefined
   /** One-shot hooks that fire AFTER the next successful read of a method. */
   #afterReadOnce = new Map<string, () => void>()
   /** One-shot hooks that fire AS a method's next frame arrives (see `beforeNextCall`). */
@@ -1872,6 +1873,11 @@ export class FakeCherry {
     this.#partsListFailureAfter = { count, failure }
   }
 
+  /** The NEXT `agent.uploads.complete` verifies as failed with this code (#312). */
+  failNextUploadVerification(code = 'CHECKSUM_MISMATCH'): void {
+    this.#nextVerificationFailure = code
+  }
+
   /** The digest the peer currently advertises for one pinned content. */
   contentDigestFor(contentId: string, revision: string): string | undefined {
     return this.#contentDigests.get(`${contentId}:${revision}`)
@@ -2355,9 +2361,14 @@ export class FakeCherry {
     }
     upload.sha256 = createHash('sha256').update(upload.bytes).digest('hex')
     const expected = params['expectedSha256']
+    const verificationFailure = this.#nextVerificationFailure
+    this.#nextVerificationFailure = undefined
     if (typeof expected === 'string' && expected !== upload.sha256) {
       upload.state = 'failed'
       upload.failureCode = 'CHECKSUM_MISMATCH'
+    } else if (verificationFailure !== undefined) {
+      upload.state = 'failed'
+      upload.failureCode = verificationFailure
     } else {
       upload.state = 'ready'
     }
