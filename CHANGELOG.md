@@ -17,6 +17,71 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.3.2 (2026-11-11)
+
+**中文**
+
+本版把附件在两个方向上打通：`cherry_send` 可以先把本地文件上传到已配对的桌面再随消息发送，
+`cherry_read` 可以把会话里**由桌面端上传**的图片取回、校验后以 image block 交给模型。两条路径
+都走协议既有的上传面（1 MiB 分块、窗口 2、`complete` 时校验 sha256），没有新增工具，也没有改动
+配置形状。边界如实说明：桌面端**本地粘贴、未经上传**的附件在协议上只有元数据、取不到字节，这一侧
+仍然只回 `name`/`mediaType`/`byteLength`；上传要求桌面端 **2.1.5+**（`agentUploadsVersion`），更早的
+桌面返回 `unsupported`，而兼容范围本身仍是 **2.1.4 – 2.1.10**，协议包未动，工具数量仍是 15。证据
+边界：这两条能力目前只有环回对端的覆盖，`docs/e2e-checklist.md` 里对应的真机勾选框保持未勾。
+
+关于版本号：附件收发严格说属于新增能力，按本文件约定的「minor 承载新能力」应当发 0.4.0；
+本次按维护者决定发补丁号。协议面没有变化，工具数量与配置形状也没有变化。
+
+**新增**
+
+- #308 `cherry_read` 新增 `includeImages`：把桌面端上传的图片取字节、校验 sha256 后存入宿主附件库，并在快照旁以 image block 返回；调用路由的模型须声明 image 输入，单次最多 4 张 / 8 MiB，超出的 part 保留元数据并标 `imagesOmitted: "cap"`。
+- #314 `cherry_send` 新增 `attachments`：按 1 MiB 分块、窗口 2 上传本地文件（≤8 个、单文件 ≤1 GiB、单消息 ≤2 GiB），带附件时 `text` 可为空。
+- #316 同一 `commandId` 的附件发送重试复用已暂存的 uploadIds 并重放原回执，不再重新上传；换新 id 才重新上传。
+
+**修复**
+
+- #320 被拒回执的附件重放不再回显首次发送已取消的 uploadIds。
+
+**文档与测试**
+
+- #315 用例钉住 `REVISION_EXPIRED` 重试时按调用重置读图预算。
+- #317 上传失败统一为 `upload-failed` 加 peer 原码 `reason`，四个 code 各有用例（`CHECKSUM_MISMATCH` 经 `agent.uploads.get` 上报）。
+- #322 用例钉住命令记忆淘汰后的附件重放：重新上传，由 peer 判定幂等冲突。
+
+**English**
+
+This release connects attachments in both directions: `cherry_send` can upload a local file to a
+paired desktop before sending the message, and `cherry_read` can fetch an image **the desktop
+uploaded**, verify it and hand it to the model as an image block. Both paths use the protocol's
+existing upload surface (1 MiB chunks, window 2, sha256 checked at `complete`); no tool was added
+and the config shape is unchanged. The boundaries, stated plainly: an attachment the desktop
+pasted locally and never uploaded carries metadata only in the protocol, so its bytes stay
+unreachable and that side still returns `name`/`mediaType`/`byteLength` alone; uploading requires
+desktop **2.1.5+** (`agentUploadsVersion`), where older desktops answer `unsupported`, while the
+supported range itself is still **2.1.4 – 2.1.10**, no protocol package moved, and there are still
+15 tools. Evidence boundary: both capabilities are covered by the loopback peer only, and the
+corresponding real-desktop boxes in `docs/e2e-checklist.md` remain unticked.
+
+On the version number: attachments are strictly new capability, and this file's own convention
+would make that a 0.4.0 minor; it ships as a patch by the maintainer's decision. The protocol
+surface, the tool count and the config shape are unchanged.
+
+**Added**
+
+- #308 `cherry_read` gains `includeImages`: a desktop-uploaded image is fetched, its sha256 verified, saved to the host attachment store, and returned as an image block beside the snapshot; the calling route must declare image input, at most 4 images / 8 MiB per call, and a part over the cap keeps its metadata and is marked `imagesOmitted: "cap"`.
+- #314 `cherry_send` gains `attachments`: local files are uploaded in 1 MiB chunks with window 2 (up to 8 files, 1 GiB each, 2 GiB per message), and `text` may be blank when attachments are present.
+- #316 a retry of an attachment send under the same `commandId` reuses the staged uploadIds and replays the original receipt instead of uploading again; a new id uploads again.
+
+**Fixed**
+
+- #320 a replay of a rejected receipt no longer echoes the uploadIds the first send cancelled.
+
+**Docs and tests**
+
+- #315 a case pins that a `REVISION_EXPIRED` retry resets the image budget per call.
+- #317 upload failures answer one `upload-failed` verdict with the peer's code in `reason`, with a case per code (`CHECKSUM_MISMATCH` arrives through `agent.uploads.get`).
+- #322 a case pins attachment replay after command-memory eviction: the file is uploaded again and the peer decides the idempotency conflict.
+
 ## v0.3.1 (2026-11-09)
 
 **中文**
