@@ -21,8 +21,7 @@ Pinned at **exact versions**, no `^`, with contract assertions on the pins:
 | `ws` | `8.22.0` |
 | `zod` | `4.3.4` |
 
-These are the versions desktop 2.1.8–2.1.10 ship (tags `v2.1.8`, `v2.1.9`,
-`v2.1.10`).
+Desktop 2.1.8–2.1.10 ship these.
 Upgrading either protocol package means re-running
 `tests/contract/contract.test.ts` against schema drift — the suite models the
 **six behavioral differences** between our loopback fake peer and a real
@@ -137,12 +136,13 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   `selectionId`. `rejected` frees staging records; `interrupted` keeps them and
   the echo. Blank text needs attachments. Limits: 8 files, 1 GiB
   each, 2 GiB.
-- Upload failures are `upload-failed` + the peer's `reason`; no per-code
-  verdict (#312). A LINK loss is not a verdict: `uploads.get` → `resume` from
-  `committedOffset` once, then `ready` is certified by hashing locally (#327).
-  The retry waits `DEFAULT_UPLOAD_RESUME_WAIT_MS` (30 s); any failure that does
-  NOT resume best-effort cancels the staged record and reports
-  `reason: LINK_LOST` — the one reason here that is OURS, not the peer's (#334).
+- Upload failures are `upload-failed`; `reason` is a code the PEER stated, or
+  `LINK_LOST` when a link loss could not resume; a LOCAL failure (an I/O errno)
+  carries none (#312, #334, #339). A LINK loss is not a verdict:
+  `uploads.get` → `resume` from `committedOffset` once, then `ready` is certified
+  by hashing locally (#327). The retry waits `DEFAULT_UPLOAD_RESUME_WAIT_MS`
+  (30 s); a link loss that does NOT resume best-effort cancels the staged record
+  and reports `reason: LINK_LOST`.
   Pre-observe every in-flight chunk promise: a teardown rejects them all at
   once, and an unobserved one is process-fatal.
 
