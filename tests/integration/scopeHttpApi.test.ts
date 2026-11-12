@@ -301,7 +301,10 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
     host,
     server,
     scopeFile,
-    refreshCalls,
+    // A GETTER, not a snapshot: `refreshScope` mutates the closure variable.
+    get refreshCalls() {
+      return refreshCalls
+    },
     order,
     get rebuilds() {
       return rebuilds
