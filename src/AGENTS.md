@@ -139,7 +139,10 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   the echo. Blank text needs attachments. Limits: 8 files, 1 GiB
   each, 2 GiB.
 - Upload failures are `upload-failed` + the peer's `reason`; no per-code
-  verdict (#312).
+  verdict (#312). A LINK loss is not a verdict: `uploads.get` → `resume` from
+  `committedOffset` once, then `ready` is certified by hashing locally (#327).
+  Pre-observe every in-flight chunk promise: a teardown rejects them all at
+  once, and an unobserved one is process-fatal.
 
 ### The `connecting` window: waited out, then judged
 
@@ -699,7 +702,7 @@ Forgetting the LAST candidate is refused (`LastCandidateHostError`) and writes
 nothing — a record with nothing to dial answers `offline` until a re-pair or a
 PATCH writes a fresh `hosts` list.
 `forgottenHosts` is optional and versionless: absence means "nothing forgotten",
-an older build ignores the key, and no migration was needed. TWO consequences:
+an older build ignores the key. TWO consequences:
 a RE-PAIR replaces the record wholesale and clears every mark, and a DOWNGRADE
 can produce the overlap the write paths refuse — the READ path repairs it
 (`reconcileForgottenMarks`: keeps the dial list, drops the mark, warns), while
@@ -733,8 +736,7 @@ Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
 `<label>: <detail>` (marker `… (+N chars)` included), so 32 candidates join to
 ≤ 7,742 characters.
 The progress line is bounded (first host always, 160 chars of host names,
-`(+K more)`); a stage-failure verdict is ONE error, not a join, capped at
-`FAILURE_SEGMENT_MAX`.
+`(+K more)`); a stage-failure verdict is ONE error, not a join.
 
 ### Device selector
 
@@ -925,14 +927,12 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 Neither reference is published with this repository.
 
 - **`.scratch-csa`** (gitignored) — the official Cherry Studio **app**
-  (`CherryHQ/cherry-studio-app` @ v0.5.2, read 2026-10-31), the **same role we
-  play** (protocol *client* against the desktop's server). Its remote layer is
+  (`CherryHQ/cherry-studio-app`), the **same role we play** (protocol *client*).
+  Its remote layer is
   `src/backend/services/remoteAgent/`; "what the official client does" comes
-  from there. v0.5.0 moved onto the pinned generation, whose one behavioural
-  change is the versioned pairing QR; v0.5.1 and v0.5.2 changed NOTHING on that
-  face — `git rev-parse <tag>:src/backend/services/remoteAgent` is
-  `16e505fe…` at all three tags, and the pins are still 0.7.0 / 0.2.5. Check
-  that tree hash before believing a new app version changed the wire.
+  from there. v0.5.0–v0.5.4 changed NOTHING on that face — the tree hash is
+  `16e505fe…` at every tag, and the pins are still 0.7.0 / 0.2.5. Check that
+  tree hash before believing a new app version changed the wire.
 - **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
   of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
   through `v2.1.10` (`c60cd41a6`). Diff TREES between tags; attribute a change

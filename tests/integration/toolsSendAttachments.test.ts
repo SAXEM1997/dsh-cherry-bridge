@@ -732,3 +732,90 @@ describe('issue #306: cherry_send uploads local files', () => {
     expect(rig.fake.methodCount('agent.messages.send')).toBe(2)
   })
 })
+
+/** The same in-memory files, read with a delay, so a drop can land between writes. */
+function slowFs(files: Map<string, Uint8Array>, delayMs: number): CherryFsLike {
+  return {
+    async resolve(path) {
+      return { displayPath: path } satisfies CherryFsTargetLike
+    },
+    async stat(target) {
+      const bytes = files.get(target.displayPath)
+      return bytes === undefined ? undefined : { type: 'file', size: bytes.length }
+    },
+    async readByteRange(target, range) {
+      const bytes = files.get(target.displayPath)
+      if (bytes === undefined) throw new Error('missing')
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs))
+      return bytes.slice(range.offset, range.offset + range.length)
+    },
+  }
+}
+
+/**
+ * Issue #327: a link lost MID-TRANSFER resumes from the peer's committed offset
+ * instead of throwing the transfer away.
+ *
+ * The protocol's `agent.uploads.resume` exists for exactly this; the official
+ * mobile client uses it (`remoteUploads.ts:155-168`). Before this the client
+ * cancelled and the caller had to re-upload every byte.
+ */
+describe('issue #327: an interrupted upload resumes', () => {
+  it('㉘a a link drop mid-upload resumes from the committed offset, never from zero', async () => {
+    // Two 1 MiB chunks, read slowly: the drop lands while the client is between
+    // writes, so the chunk after the committed prefix is never pushed into the
+    // dead socket's queue (a write racing a close leaves the transport's own
+    // send queue rejecting unobserved, which is not this ticket's subject).
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 9)
+    const files = new Map([['/work/big.bin', bytes]])
+    const rig = await makeRig({ fs: slowFs(files, 120) })
+    // The FIRST chunk is staged, then the link dies before its ack: the peer
+    // has a committed prefix the resume must skip.
+    rig.fake.dropLinkAfterUploadChunks(1)
+
+    const result = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/big.bin' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    // ONE upload: no second `prepare`, no cancel, exactly one resume.
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    expect(rig.fake.uploadCancelCount()).toBe(0)
+    const resumes = rig.fake.uploadResumes()
+    expect(resumes).toHaveLength(1)
+    expect(resumes[0]!['expectedWriterEpoch']).toBe('0')
+    expect(typeof resumes[0]!['resumeId']).toBe('string')
+
+    // The peer ended up with the whole file, certified by its own digest.
+    const uploadId = ((result['attachments'] as Array<{ uploadId: string }>)[0]!).uploadId
+    expect(uploadId).toBe(String(resumes[0]!['uploadId']))
+    expect(rig.fake.uploadedBytes(uploadId)?.equals(bytes)).toBe(true)
+    expect(rig.fake.uploadedSha256(uploadId)).toBe(createHash('sha256').update(bytes).digest('hex'))
+  })
+
+  it('㉘b a drop while `complete` is answered certifies the bytes instead of re-sending them', async () => {
+    // The peer finishes the upload and dies before the answer lands: every byte
+    // is already there, so a resume must certify, never transfer.
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 4)
+    const files = new Map([['/work/done.bin', bytes]])
+    const rig = await makeRig({ files })
+    rig.fake.dropLinkAfterUploadComplete()
+
+    const result = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/done.bin' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    // The `ready` branch: no second `complete`, no `resume`, no cancel.
+    expect(rig.fake.methodCount('agent.uploads.complete')).toBe(1)
+    expect(rig.fake.uploadResumes()).toHaveLength(0)
+    expect(rig.fake.uploadCancelCount()).toBe(0)
+
+    const uploadId = ((result['attachments'] as Array<{ uploadId: string }>)[0]!).uploadId
+    expect(rig.fake.uploadedBytes(uploadId)?.equals(bytes)).toBe(true)
+    expect(rig.fake.uploadedSha256(uploadId)).toBe(createHash('sha256').update(bytes).digest('hex'))
+  })
+})

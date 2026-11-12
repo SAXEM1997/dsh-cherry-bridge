@@ -1171,6 +1171,12 @@ export class FakeCherry {
   #uploadAckFailEveryFrom: { count: number; failure: FakeFailure } | undefined
   #presented: Array<Record<string, unknown>> = []
   #presentFailure: FakeFailure | undefined
+  /** Every `agent.uploads.resume` this peer received, params verbatim (#327). */
+  #uploadResumes: Array<Record<string, unknown>> = []
+  /** Drop every live socket once this many upload chunks have been acked (#327). */
+  #dropAfterUploadChunks: number | undefined
+  /** Drop every live socket as `agent.uploads.complete` is answered (#327). */
+  #dropOnUploadComplete = false
   /** Interactions the peer currently serves via `agent.interactions.list`. */
   #interactions: FakeInteractionRecord[]
   /** The execution id the peer reports as active for the session. */
@@ -1505,6 +1511,31 @@ export class FakeCherry {
   /** Every `agent.attachments.present` this peer received (#306). */
   presentedSelections(): readonly Record<string, unknown>[] {
     return this.#presented
+  }
+
+  /** Every `agent.uploads.resume` this peer received, params verbatim (#327). */
+  uploadResumes(): readonly Record<string, unknown>[] {
+    return this.#uploadResumes
+  }
+
+  /**
+   * Drops every live socket once `count` upload chunks have been ACKED (#327).
+   * The ack is delivered first, so the client has a committed prefix to resume
+   * from; the next write finds a dead channel, which is the failure the resume
+   * path exists for.
+   */
+  dropLinkAfterUploadChunks(count: number): void {
+    this.#dropAfterUploadChunks = count
+  }
+
+  /**
+   * Drops every live socket while answering the NEXT `agent.uploads.complete`
+   * (#327): the peer really does move the upload to `ready`, but the answer
+   * never reaches the client. That is the case a resume must serve WITHOUT
+   * re-sending a byte.
+   */
+  dropLinkAfterUploadComplete(): void {
+    this.#dropOnUploadComplete = true
   }
 
   /** Refuses the NEXT upload chunk's ack once (#306). */
@@ -2298,6 +2329,18 @@ export class FakeCherry {
     chunk.bytes.forEach((byte, index) => {
       upload.bytes[offset + index] = byte
     })
+    // The chunk is STAGED, then the link dies before its ack can be delivered:
+    // the peer keeps the bytes, the client never learns they landed, and the
+    // resume has a committed prefix to skip (#327). Deterministic by
+    // construction — no timer races the client's next action.
+    const dropAfter = this.#dropAfterUploadChunks
+    if (dropAfter !== undefined && this.#uploadAckSuccesses >= dropAfter) {
+      this.#dropAfterUploadChunks = undefined
+      upload.offset = offset + chunk.bytes.length
+      this.#uploadInFlight -= 1
+      this.injectClose(1011, 'upload link drop')
+      return
+    }
     upload.offset = offset + chunk.bytes.length
     ack({
       ok: true,
@@ -2372,6 +2415,24 @@ export class FakeCherry {
     } else {
       upload.state = 'ready'
     }
+    if (this.#dropOnUploadComplete) {
+      this.#dropOnUploadComplete = false
+      this.injectClose(1011, 'upload complete link drop')
+    }
+    return this.#uploadSnapshot(upload)
+  }
+
+  /**
+   * The real resume: the writer epoch is a capability, so a resume carrying a
+   * stale one is refused rather than allowed to write into a newer writer's
+   * stream. The snapshot's `committedOffset` is the resume point.
+   */
+  #handleUploadResume(params: Record<string, unknown>): Record<string, unknown> {
+    const upload = this.#uploadOf(String(params['uploadId'] ?? ''))
+    if (params['expectedWriterEpoch'] !== upload.writerEpoch) {
+      throw new FakeRpcError({ reason: 'CONFLICT', message: 'Writer epoch changed' })
+    }
+    this.#uploadResumes.push(params)
     return this.#uploadSnapshot(upload)
   }
 
@@ -2646,6 +2707,8 @@ export class FakeCherry {
         return this.#uploadSnapshotOrThrow(String(params['uploadId'] ?? ''))
       case 'agent.uploads.complete':
         return this.#handleUploadComplete(params)
+      case 'agent.uploads.resume':
+        return this.#handleUploadResume(params)
       case 'agent.uploads.cancel':
         return this.#handleUploadCancel(params)
       case 'agent.attachments.present':

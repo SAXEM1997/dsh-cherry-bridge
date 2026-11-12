@@ -143,6 +143,14 @@ export const DEFAULT_UPLOAD_READY_POLLS = 120
 
 /** Interval between `agent.uploads.get` polls (issue #306). */
 export const DEFAULT_UPLOAD_POLL_INTERVAL_MS = 50
+
+/**
+ * How long a dropped upload waits for the link to come back before it gives
+ * up and cancels (#327). One resume attempt rides this window; the reconnect
+ * backoff starts at one second, so this is a handful of attempts, not a
+ * minute of silence.
+ */
+export const DEFAULT_UPLOAD_RESUME_WAIT_MS = 30_000
 /**
  * How many uploaded IMAGES one `cherry_read(includeImages: true)` may attach,
  * and how many image BYTES it may fetch in total (#307).
