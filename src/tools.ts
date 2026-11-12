@@ -2212,7 +2212,16 @@ function sameAttachmentIds(value: unknown, ids: readonly string[]): boolean {
   )
 }
 
-/** A peer refusal's stable code, when it carried one. */
+/**
+ * The `reason` an upload failure reports: a peer refusal's own code, or the
+ * reason a LOCAL failure states as a `code` field.
+ *
+ * A link lost mid-upload has no peer code to carry — the peer never answered —
+ * so {@link UploadInterruptedError} declares `LINK_LOST` as a class field and
+ * this one reader picks it up (#334). Without it the verdict is `upload-failed`
+ * with no reason at all, indistinguishable from a peer refusal whose code was
+ * dropped.
+ */
 function uploadFailureCode(error: unknown): string | undefined {
   return isRecord(error) && typeof error['code'] === 'string' ? error['code'] : undefined
 }
