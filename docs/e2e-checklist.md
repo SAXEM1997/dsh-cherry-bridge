@@ -523,3 +523,29 @@ A–G 各节要真人 + Electron 端批准，无法被 CI 化；下表只记录�
 **本轮观察到的、值得写进已知限制的事实**：子 agent 在桌面端跑的是它**自己**的运行时（Claude Code，
 带 `Bash`、`Write`、SSH MCP 等全套工具），不是 DSH 的工具集。README 那条「无沙箱继承」不是理论
 风险——委派的那个 agent 确实可以执行 shell 命令。
+
+### 0.3.2（2026-11-12 · DSH profile `web` · 桌面端 ISV-ZYX）
+
+> 本轮走查的是 0.3.2 新增的**附件收发**（#306 / #307）。设备档案未变，桌面端没有重新配对。
+> 工具调用由一个同工作区（`/workspace/dsh`）的新会话执行；它的模型路由**声明了 image 输入**，
+> 所以 `includeImages` 走的是正向路径——文本路由的拒绝路径本轮没有走。
+
+| 项 | 结果 | 观测 |
+| --- | --- | --- |
+| 装机生效 | 通过 | `dsh-cherry-bridge: 0.3.2`；`dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`、`locale/zh.json`、`locale/en.json` 与 npm tarball **逐文件 sha256 全同**；包 mtime `09:51` 早于宿主 PID 1 启动 `09:51:54` |
+| `cherry_create` 缺 workspace（0.3.0 的拒绝面） | 通过 | 不传 `workspace` / `workspaceId` → `{"error":"workspace-required","message":"a workspace selection is required: …"}`，会话未建 |
+| `cherry_send` 带 1 个附件、`text: ""`（§B 新增项） | 部分通过 | 317 B PNG：`status: "applied"`，回显 `{filename:".e2e-0.3.2.png", mediaType:"image/png", byteLength:317, uploadId:"cb4959ab…"}`；随后 `cherry_read` 读到该 part（`kind:"file"`、`byteLength:"317"`、`content:""`），说明桌面端确实收下并持久化了它。<2.1.5 桌面的 `unsupported` 分支本轮**未走查**（只有一台 2.1.10 桌面） |
+| 一次 6 个附件（5 PNG + 1 txt） | 通过 | 6 条 echo 齐全；`.txt` 按扩展名推成 `application/octet-stream`；`status: "applied"` |
+| 默认读取（不带 `includeImages`） | 通过 | 附件 part 为 `kind:"file"` 加 `name` / `mediaType` / `byteLength`，`content: ""`，**没有** `image` 字段。注：「`agent.content.read` 为 0」是按代码路径断言的（不请求图片就不进读取分支），本轮没有从桌面端侧计数 |
+| `includeImages: true`（§3 行） | 通过 | 同一 part 多出 `image: {attachmentId:"sha256:7beaff2c…", mediaType:"image/png", bytes:317, width:128, height:128, name:".e2e-0.3.2.png"}`；工具结果出现 **1 个 image block**；宿主落盘对象 `/dsh-home/attachments/v1/objects/7b/7beaff…` 为 317 B，sha256 与本地文件一致 |
+| 每调用上限（4 张 / 8 MiB） | 通过 | 同一会话 6 个附件、其中 5 张 PNG：**恰好 4 张**拿到 `image`（cap-1…cap-4），第 5 张与更早那张 `.e2e-0.3.2.png` 都标 `"imagesOmitted": "cap"`，`.txt` 既不报 image 也不标 omission |
+| 桌面端本地粘贴的图 / 未上传附件 | **未走查** | 需要人工在桌面会话里粘贴一张图；本轮没有构造 |
+| 文本路由的拒绝 | **未走查** | 执行会话的模型声明了 image 输入，走的是正向路径 |
+
+**本轮未覆盖**（**不是通过**）：
+
+- **`<2.1.5` 桌面的 `unsupported`**：环境里只有一台 2.1.10 桌面。环回用例 ㉑c 覆盖该分支。
+- **桌面聊天里「附件能打开」的目视确认**：本轮证据是回读到的 part 与宿主落盘对象，不是截图。
+- **本地粘贴 / 未上传附件（旧式 `data` part）**：协议上没有 `contentId`，只能人工粘贴后走一遍。
+- **文本路由拒绝**：需要一个只声明文本输入的模型路由。
+- 第二部分其余小节（配对、交互应答、断连恢复、多设备、`/scope`、语言切换）本轮没有重跑：它们不在 0.3.2 的改动面上。
