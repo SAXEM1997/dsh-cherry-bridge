@@ -843,4 +843,29 @@ describe('issue #327: an interrupted upload resumes', () => {
     expect(rig.fake.uploadCancelCount()).toBe(1)
     expect(rig.fake.methodCount('agent.messages.send')).toBe(0)
   })
+
+  it('㉘d a link lost TWICE reports `upload-failed` with a reason of our own', async () => {
+    // The first drop interrupts the transfer; the resume reconnects and asks
+    // `uploads.get`, which drops the link again. Nothing was learned about what
+    // the peer holds, so the interruption stands — and the caller gets a REASON
+    // for it, not a bare verdict it cannot tell apart from a peer refusal.
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 5)
+    const files = new Map([['/work/flaky.bin', bytes]])
+    const rig = await makeRig({ fs: slowFs(files, 120) })
+    rig.fake.dropLinkAfterUploadChunks(1)
+    rig.fake.dropLinkOnUploadGet()
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/flaky.bin' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    expect(verdict['error']).toBe('upload-failed')
+    expect(verdict['reason']).toBe('LINK_LOST')
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    // The resume never got an answer, so it never asked to continue.
+    expect(rig.fake.uploadResumes()).toHaveLength(0)
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(0)
+  })
 })

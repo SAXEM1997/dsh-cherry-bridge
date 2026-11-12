@@ -279,6 +279,15 @@ export class UploadUnsupportedError extends Error {
  * inspecting the message.
  */
 export class UploadInterruptedError extends Error {
+  /**
+   * The `reason` a caller sees when this failure ends an upload (#334).
+   *
+   * The ONLY reason in that vocabulary that is OURS rather than the peer's: the
+   * peer never got to answer, so there is no code of its own to carry. Without
+   * it a link lost mid-upload answers `upload-failed` with no `reason` at all,
+   * which a caller cannot tell apart from a peer refusal whose code it dropped.
+   */
+  readonly code = 'LINK_LOST'
   readonly device: string
   readonly uploadId: string
 

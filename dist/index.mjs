@@ -3003,6 +3003,15 @@ var UploadUnsupportedError = class extends Error {
 * inspecting the message.
 */
 var UploadInterruptedError = class extends Error {
+	/**
+	* The `reason` a caller sees when this failure ends an upload (#334).
+	*
+	* The ONLY reason in that vocabulary that is OURS rather than the peer's: the
+	* peer never got to answer, so there is no code of its own to carry. Without
+	* it a link lost mid-upload answers `upload-failed` with no `reason` at all,
+	* which a caller cannot tell apart from a peer refusal whose code it dropped.
+	*/
+	code = "LINK_LOST";
 	device;
 	uploadId;
 	constructor(deviceId, uploadId) {
@@ -7721,7 +7730,16 @@ function sameAttachmentIds(value, ids) {
 	if (!Array.isArray(value) || value.length !== ids.length) return false;
 	return value.every((item, index) => isRecord$1(item) && item["uploadId"] === ids[index]);
 }
-/** A peer refusal's stable code, when it carried one. */
+/**
+* The `reason` an upload failure reports: a peer refusal's own code, or the
+* reason a LOCAL failure states as a `code` field.
+*
+* A link lost mid-upload has no peer code to carry — the peer never answered —
+* so {@link UploadInterruptedError} declares `LINK_LOST` as a class field and
+* this one reader picks it up (#334). Without it the verdict is `upload-failed`
+* with no reason at all, indistinguishable from a peer refusal whose code was
+* dropped.
+*/
 function uploadFailureCode(error) {
 	return isRecord$1(error) && typeof error["code"] === "string" ? error["code"] : void 0;
 }

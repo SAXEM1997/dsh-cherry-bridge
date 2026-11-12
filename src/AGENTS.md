@@ -140,8 +140,9 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
 - Upload failures are `upload-failed` + the peer's `reason`; no per-code
   verdict (#312). A LINK loss is not a verdict: `uploads.get` → `resume` from
   `committedOffset` once, then `ready` is certified by hashing locally (#327).
-  The retry waits `DEFAULT_UPLOAD_RESUME_WAIT_MS` (30 s) for a reconnect, and
-  any failure that does NOT resume best-effort cancels the staged record.
+  The retry waits `DEFAULT_UPLOAD_RESUME_WAIT_MS` (30 s); any failure that does
+  NOT resume best-effort cancels the staged record and reports
+  `reason: LINK_LOST` — the one reason here that is OURS, not the peer's (#334).
   Pre-observe every in-flight chunk promise: a teardown rejects them all at
   once, and an unobserved one is process-fatal.
 
@@ -180,7 +181,7 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   call, every device — shares it, so the ASSEMBLY peak is
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
   `4 × 3 × (the declared size)`.
-  It bounds what is being ASSEMBLED, not everything resident: finished content
+  It bounds what is ASSEMBLED, not everything resident: finished content
   is retained by its caller OUTSIDE this product (up to one whole message per
   concurrent read, because `AGGREGATE_BYTES` is judged only between messages),
   plus the parts cache's own budgeted bytes (32 MiB per device).
@@ -252,11 +253,11 @@ this beside the cache).
   (self-eviction would reorder it). A drop warns once per insert that dropped
   anything: device and count only, never a message id.
 - **A hit hands the PAGE out BY REFERENCE** — safe while projection only reads
-  it; a future mutator must copy first.
+  it; a mutator must copy first.
 - **Invalidation** rides `#forgetDevice` with the three session caches;
   `#watchConnection` routes `offline` / `identity-mismatch` there. An ordinary
   link loss also publishes `offline`, so a reconnect drops the cache — one
-  re-walk per session, the documented cost of the seam.
+  re-walk per session, the documented cost.
 
 ### Walks: what is tolerated, what is refused
 
@@ -276,14 +277,13 @@ this beside the cache).
   non-terminating shape.
 - **Ordering of guards.** The stuck-cursor check runs **before** the empty-page
   tolerance, so tolerating empties cannot blunt the no-progress guard.
-- A truncated walk is **always surfaced** (a `truncationReason` plus a
-  stop-point token), never a silent short result or a partial passed off as
-  complete.
+- A truncated walk is **always surfaced** (`truncationReason` + stop-point
+  token), never a silent short result or a partial passed off as complete.
 - **An overshooting page is absorbed, not refused.** `limit` is a MAXIMUM on a
   list method, so a page carrying more items than were asked for is a peer fault
   — but nothing is lost yet, and throwing would make the list unreadable. The
-  walk takes what its ceiling allows, stops with the
-  caller's own attribution, and **re-uses the position it SENT** for that page:
+  walk takes what its ceiling allows, stops with the caller's attribution, and
+  **re-uses the position it SENT** for that page:
   the page's own `nextCursor` sits past items the walk never collected, so a
   resume from it would skip them, and a terminal overshooting page would
   otherwise be reported complete while dropping its tail. `CherryPage.pageOverflow`
@@ -419,14 +419,13 @@ with the anchor still unfound, the read throws naming the message id (it is
 probably gone: deleted, or the session replaced), rather than an empty page that
 reads as "no older history" — the opposite of what happened. A scan
 past `MAX_ANCHOR_SCAN_PAGES` (500 pages) throws for the same reason: a session
-that deep is not one this tool should chase.
+that deep is not one to chase.
 
 **Every existing guard stays in force during a scan** — the stuck-cursor check,
 the cursor-cycle `seen` set, the consecutive-empty-page run and
 `MAX_AGGREGATE_PAGES`. The empty-page run counts the **raw** page the peer
-served, never what the scan kept: a non-empty page nobody wanted is still
-progress. The collected-item ceiling counts **returned** items, so a scan's
-discarded pages do not spend the caller's `limit`.
+served, never what the scan kept: a page nobody wanted is still progress. The item ceiling counts **returned** items, so a scan's discarded pages do
+not spend the caller's `limit`.
 
 **The LIST face (issue #65) speaks the same vocabulary with one addition.** A
 list walk is scoped by (method, device, filters), and the peer's page position is
@@ -875,7 +874,7 @@ the error message).
 - Built field by field, so a later credential is excluded **by
   construction**; `limits` is re-projected from its known keys.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
-  RPC requests; counters and the error ring are zeroed on every `apply`.
+  RPC requests; counters and the error ring reset on every `apply`.
 
 ### Logging: levels, identifiers, and what never appears
 

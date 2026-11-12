@@ -1196,6 +1196,12 @@ export class FakeCherry {
    * DIFFERENT epoch can only be driven from here.
    */
   #uploadGetEpoch: string | undefined
+  /**
+   * Drop every live socket as `agent.uploads.get` is answered (#334). The link
+   * dies a SECOND time while the resume is asking what the peer already has, so
+   * the resume cannot complete and the original interruption stands.
+   */
+  #dropOnUploadGet = false
   /** Interactions the peer currently serves via `agent.interactions.list`. */
   #interactions: FakeInteractionRecord[]
   /** The execution id the peer reports as active for the session. */
@@ -1545,6 +1551,15 @@ export class FakeCherry {
    */
   reportUploadWriterEpochOnGet(epoch: string): void {
     this.#uploadGetEpoch = epoch
+  }
+
+  /**
+   * Drop the link ONCE, as `agent.uploads.get` is answered (#334): the resume
+   * learns nothing and gives up, which is the state the caller's verdict must
+   * describe.
+   */
+  dropLinkOnUploadGet(): void {
+    this.#dropOnUploadGet = true
   }
 
   /** The most `agent.content.read` slices this peer ever served at once (#329). */
@@ -2768,6 +2783,10 @@ export class FakeCherry {
       case 'agent.uploads.get': {
         const snapshot = this.#uploadSnapshotOrThrow(String(params['uploadId'] ?? ''))
         if (this.#uploadGetEpoch !== undefined) snapshot['writerEpoch'] = this.#uploadGetEpoch
+        if (this.#dropOnUploadGet) {
+          this.#dropOnUploadGet = false
+          this.injectClose(1011, 'upload get link drop')
+        }
         return snapshot
       }
       case 'agent.uploads.complete':
