@@ -53,8 +53,7 @@ afterEach(() => {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const READY_REASON =
-  '宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达'
+const READY_REASON = '宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性'
 
 const WS_ALPHA: ScopeWorkspace = { id: 'ws-1', title: '项目甲', path: '/srv/alpha' }
 const WS_BETA: ScopeWorkspace = { id: 'ws-2', title: '项目乙', path: '/srv/beta' }
@@ -386,17 +385,9 @@ describe('启用范围面板 (§6.4)', () => {
 
   it('⑤ renders EVERY degradation note at once, not just the last one', async () => {
     const notes: DegradedNote[] = [
-      {
-        source: 'install',
-        // Verbatim from the host's missing-`restrict` writer (src/toolScopeHost.ts):
-        // the install note has no "registration failed" writer at all.
-        reason:
-          'agent agent-1 缺少 agent.ctx.tools.restrict，无法安装 restriction：目标工具保持可见且 guard 放行（无 scoped ctx 的 agent；配置保存 / 下一次重算会重试）',
-      },
       { source: 'workspace-list', reason: '注册表列表读取失败（原因乙）' },
-      { source: 'visibility-only', reason: 'tools.guard 缺失，仅可见性降级（原因丙）' },
-      { source: 'scope-version', reason: '作用域文档版本高于本插件支持（原因丁）' },
-      { source: 'path-normalization', reason: '真实路径解析失败（原因戊）' },
+      { source: 'scope-version', reason: '作用域文档版本高于本插件支持（原因丙）' },
+      { source: 'path-normalization', reason: '真实路径解析失败（原因丁）' },
     ]
     renderPanel(installScope(snapshot({ host: host({ degraded: notes }) })))
     await loaded()
@@ -404,12 +395,10 @@ describe('启用范围面板 (§6.4)', () => {
     for (const note of notes) {
       expect(slotText(`[data-degraded-source="${note.source}"]`)).toContain(note.reason)
     }
-    // Different sources coexist: all five reasons are in the document together.
-    for (const reason of ['缺少 agent.ctx.tools.restrict', '原因乙', '原因丙', '原因丁', '原因戊']) {
+    // Different sources coexist: all three reasons are in the document together.
+    for (const reason of ['原因乙', '原因丙', '原因丁']) {
       expect(pageText()).toContain(reason)
     }
-    expect(slotText('[data-degraded-source="install"]')).toContain('隐藏层应用曾失败（install）')
-    expect(slotText('[data-degraded-source="visibility-only"]')).toContain('仅可见性降级')
     expect(slotText('[data-degraded-source="path-normalization"]')).toContain('路径规范化降级')
   })
 

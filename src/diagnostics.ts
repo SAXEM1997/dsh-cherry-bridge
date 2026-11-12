@@ -619,9 +619,7 @@ function hostStateOr(raw: unknown): ScopeHostState['state'] {
  * grows, which a plain array literal could not.
  */
 const DEGRADED_SOURCES: Readonly<Record<DegradedSource, true>> = {
-  install: true,
   'workspace-list': true,
-  'visibility-only': true,
   'scope-version': true,
   'path-normalization': true,
 }

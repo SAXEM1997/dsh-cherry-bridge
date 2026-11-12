@@ -225,9 +225,7 @@ export type ScopeHostState = 'pending' | 'unsupported' | 'ready'
  * NOT by a sixth member here (B9).
  */
 export type DegradedSource =
-  | 'install'
   | 'workspace-list'
-  | 'visibility-only'
   | 'scope-version'
   | 'path-normalization'
 

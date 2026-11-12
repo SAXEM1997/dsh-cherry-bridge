@@ -223,7 +223,7 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
         state: 'ready',
         capable: true,
         reason: '宿主就绪',
-        degraded: [{ source: 'install', reason: '安装被拒' }],
+        degraded: [{ source: 'path-normalization', reason: '安装被拒' }],
       },
       pathUnmatched: [{ agentId: 'agent-1', cwd: '/home/op/other-project' }],
     }
@@ -238,7 +238,7 @@ describe('Task 9①: the report carries the enablement-scope segment', () => {
         state: 'ready',
         capable: true,
         reason: '宿主就绪',
-        degraded: [{ source: 'install', reason: '安装被拒' }],
+        degraded: [{ source: 'path-normalization', reason: '安装被拒' }],
       },
       pathUnmatched: [{ agentId: 'agent-1', cwd: '/home/op/other-project' }],
       // The report adds it; the input does not carry it.
@@ -278,9 +278,9 @@ describe('Task 9②: the report host IS `GET /scope`\'s host, never a second cop
     expect(upgradeHint).toBe(SCOPE_UPGRADE_HINT)
 
     // `degraded` is part of the same read, so a state write moves it too.
-    scope.noteDegraded({ source: 'install', reason: '安装被拒' })
+    scope.noteDegraded({ source: 'path-normalization', reason: '安装被拒' })
     const noted = buildDiagnostics(seam)
-    expect(noted.scope.host.degraded).toEqual([{ source: 'install', reason: '安装被拒' }])
+    expect(noted.scope.host.degraded).toEqual([{ source: 'path-normalization', reason: '安装被拒' }])
     expect(readScopeSegment(scope).host.degraded).toEqual(noted.scope.host.degraded)
   })
 })
@@ -315,7 +315,7 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
         degraded: [
           // A VALID source carrying a smuggled key: the inner projection is what
           // strips `accessToken`, and this note must survive.
-          { source: 'install', reason: '安装被拒', accessToken: 'scope-leaked' },
+          { source: 'scope-version', reason: '安装被拒', accessToken: 'scope-leaked' },
           { source: 'path-normalization', reason: '路径规范化降级' },
           // …and a source OUTSIDE the closed set, which must not survive at all.
           { source: BOGUS_SOURCE, reason: BOGUS_REASON, accessToken: 'scope-leaked-3' },
@@ -374,14 +374,14 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
         capable: true,
         reason: '宿主就绪',
         degraded: [
-          { source: 'install', reason: '安装被拒' },
+          { source: 'scope-version', reason: '安装被拒' },
           { source: 'path-normalization', reason: '路径规范化降级' },
         ],
       },
     })
   })
 
-  it('③ drops a `degraded` note whose `source` is not one of the five known values', () => {
+  it('③ drops a `degraded` note whose `source` is not one of the three known values', () => {
     // THE BRANCH THIS EXISTS FOR: the `continue` in `projectDegraded` that
     // discards a foreign source. The probe below carried a VALID source with an
     // extra key, which exercises the inner `{source, reason}` projection but
@@ -392,7 +392,7 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
     // while the valid ones survive, in order. Asserting only "no error was
     // thrown" (or only the absence of one string) would pass over a
     // re-labelled, truncated or passthrough note just as happily.
-    expect(sanitized.scope.host.degraded.map((note) => note.source)).toEqual(['install', 'path-normalization'])
+    expect(sanitized.scope.host.degraded.map((note) => note.source)).toEqual(['scope-version', 'path-normalization'])
     expect(sanitized.scope.host.degraded).toHaveLength(2)
     // Nothing of it survives anywhere in the body an operator receives — not the
     // source, not its reason.
@@ -405,7 +405,7 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
       diagnosticsSources({ scope: () => overstuffed() as unknown as DiagnosticsScope }),
     )
     expect(report.scope.host.degraded).toEqual([
-      { source: 'install', reason: '安装被拒' },
+      { source: 'scope-version', reason: '安装被拒' },
       { source: 'path-normalization', reason: '路径规范化降级' },
     ])
     expect(JSON.stringify(report.scope)).not.toContain(BOGUS_SOURCE)

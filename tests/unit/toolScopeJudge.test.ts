@@ -452,13 +452,11 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     )
     expect(state.judgement('a1')).toBeDefined()
     expect(state.pathUnmatched()).toHaveLength(1)
-    state.setLayer('a1', { deny: ['cherry_ping'], reason: 'test' })
 
     state.invalidateDerived()
 
     expect(state.judgement('a1')).toBeUndefined()
     expect(state.pathUnmatched()).toEqual([])
-    expect(state.layer('a1')).toBeUndefined()
 
     // R2-N1: the LIST state is part of that generation too. A surviving
     // `#workspaces` would let the next mount's synchronous pass answer rule one

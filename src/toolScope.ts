@@ -73,7 +73,7 @@ export const DEFAULT_SCOPE: ScopeDoc = {
 /**
  * The five, fixed degradation sources.
  *
- * Deliberately five: a parse failure or an invalid field has NO member here. Its
+ * Deliberately three: a parse failure or an invalid field has NO member here. Its
  * carrier is the existing warn channel (`log`, else `console.warn`) plus the
  * strictness order, and its document stays writable (B9) — unlike
  * `scope-version`, which is the dedicated "the document is newer than this
@@ -81,9 +81,7 @@ export const DEFAULT_SCOPE: ScopeDoc = {
  * write entirely.
  */
 export type DegradedSource =
-  | 'install'
   | 'workspace-list'
-  | 'visibility-only'
   | 'scope-version'
   | 'path-normalization'
 
@@ -105,16 +103,6 @@ export interface ScopeWorkspace {
 export interface ScopeHostState {
   state: 'pending' | 'unsupported' | 'ready'
   capable: boolean
-  reason: string
-}
-
-/**
- * One installed restriction layer, as recorded by the host integration layer:
- * the deny set it was installed with, and the judgement reason it carries.
- * `guard` reads this record (and only this) to decide 层在 ⇒ 拒绝.
- */
-export interface MountedLayer {
-  deny: readonly string[]
   reason: string
 }
 
@@ -439,9 +427,6 @@ export class ToolScopeState {
 
   #listState: 'unread' | 'read' | 'unavailable' = 'unread'
   #workspaces: ScopeWorkspace[] = []
-
-  /** Per-agent installed layers: the execution-side mirror `guard` reads. */
-  #layers = new Map<string, MountedLayer>()
 
   /** The current generation's canonical path map: entity path ⇒ workspaceId. */
   #pathMap = new Map<string, string>()
@@ -861,24 +846,9 @@ export class ToolScopeState {
     return { ok: true, doc, pruned }
   }
 
-  /** The installed layer for one agent, or `undefined` when none is mounted. */
-  layer(agentId: string): MountedLayer | undefined {
-    return this.#layers.get(agentId)
-  }
-
-  /** Records the layer installed for one agent (the record IS the mirror). */
-  setLayer(agentId: string, layer: MountedLayer): void {
-    this.#layers.set(agentId, layer)
-  }
-
-  /** Forgets one agent's layer, in the same turn its restriction is released. */
-  clearLayer(agentId: string): void {
-    this.#layers.delete(agentId)
-  }
-
   /**
-   * Drops everything derived from a previous mount: the installed-layer records
-   * and the whole judgement generation — the canonical path map, the per-agent
+   * Drops everything derived from a previous mount: the whole judgement
+   * generation — the canonical path map, the per-agent
    * judgements and the `pathUnmatched` diagnostics (Task 4's teardown asserts
    * exactly this).
    *
@@ -897,7 +867,6 @@ export class ToolScopeState {
    * `[]` for the same reason.
    */
   invalidateDerived(): void {
-    this.#layers.clear()
     this.#pathMap = new Map()
     this.#judgements = new Map()
     this.#pathUnmatched = []

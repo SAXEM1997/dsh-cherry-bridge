@@ -206,10 +206,7 @@ const zh: Dict = {
   // message would go: there is no server message when nothing answered.
   'scope.error.timeout': '请求长时间没有回应，已中止——请稍后重试',
   'scope.serverSaid': '服务端返回 {code}（HTTP {status}）。',
-  'scope.degraded.install': '隐藏层应用曾失败（install）：相关 agent 的隐藏层未生效或无法确认，启用范围对它可能不适用',
   'scope.degraded.workspace-list': '注册表列表当前读不到',
-  'scope.degraded.visibility-only':
-    '仅可见性降级（缺 tools.guard）：restrict 仍在装配层移除这 15 个工具，但执行侧没有任何一层拒绝它们的调用（不是渲染层假过滤）；连 restrict 都装不上的 agent 则既隐藏不了、也无人拒绝',
   'scope.degraded.scope-version': '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）',
   'scope.degraded.path-normalization': '路径规范化降级：cwd 比对可能不准确',
   'scope.saveFailure.scope-revision-conflict': '配置已被他处修改，请重新读取后再保存。',
@@ -488,11 +485,7 @@ const en: Dict = {
   'scope.saveFailed': 'Save failed: {cause}',
   'scope.error.timeout': 'The request stopped answering and was abandoned. Try again in a moment.',
   'scope.serverSaid': 'The server answered {code} (HTTP {status}).',
-  'scope.degraded.install':
-    'Applying a hidden layer failed earlier (install): the affected agent’s hidden layer is not in effect or cannot be confirmed, so the tool scope may not apply to it',
   'scope.degraded.workspace-list': 'The workspace registry list is currently unreadable',
-  'scope.degraded.visibility-only':
-    'Visibility-only degradation (tools.guard is missing): restrict still removes these 15 tools at the assembly layer, but nothing on the execution side refuses a call to them (this is not a render-layer fake filter). An agent that cannot install restrict at all both fails to hide them and has nothing to refuse them',
   'scope.degraded.scope-version': 'The scope document version does not match the one this plugin supports (one guard covers newer and older)',
   'scope.degraded.path-normalization': 'Path normalization degraded: the cwd comparison may be inaccurate',
   'scope.saveFailure.scope-revision-conflict': 'The configuration changed elsewhere. Reload before saving again.',

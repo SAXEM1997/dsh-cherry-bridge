@@ -40,7 +40,7 @@ flowchart TB
 
 ## Install
 
-> **DSH version requirement**: `>=0.2.0-rc.2 <0.3.0-0` (declared via `engines.dsh` in `package.json`; when unmet the bundle is skipped and its settings-page row disabled — `dsh plugin allow-version` grants an explicit exemption; 0.3.0 needs a fresh compatibility pass before the range widens).
+> **DSH version requirement**: `>=0.2.2-rc.1 <0.3.0-0` (declared via `engines.dsh` in `package.json`; when unmet the bundle is skipped and its settings-page row disabled — `dsh plugin allow-version` grants an explicit exemption; 0.3.0 needs a fresh compatibility pass before the range widens).
 >
 > **Cherry Studio compatibility**: desktop **2.1.4 – 2.1.10 is verified** — the `v3` custom-address QR needs **2.1.8+**, and the `v2` QR of 2.1.4 – 2.1.7 works too. 2.1.9/2.1.10 differ from 2.1.8 on the remote-access face by exactly one robustness fix in the desktop's write chain (PR #22593, no client impact), and were smoke-tested on a real 2.1.10 (create a session → send → wait → read). Outside that range is unverified: the handshake negotiates protocol version `[1]` only, so an incompatible peer fails loudly as `unreachable` instead of misbehaving. The protocol packages are pinned to `0.7.0` / `0.2.5` — 2.1.10 still ships that same pair.
 
@@ -301,9 +301,8 @@ experiment on, its configuration usable, the host providing a subagent service,
 - **`Selected workspaces only`**: only sessions inside ticked workspaces can see
   the tools; sessions with no workspace never do.
 - **`Global`**: visible everywhere; the ticks play no part.
-- **Saves take effect immediately**: the restriction layer is re-installed or
-  released for every live agent, effective from the **next turn** — no restart,
-  no new session.
+- **Saves take effect immediately**: the next model step's condition reads the
+  new document, effective from the **next turn** — no restart, no new session.
 - **Scope governs tools only**: the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - **No pretending**: on `pending` / `unsupported` host capability the panel says
