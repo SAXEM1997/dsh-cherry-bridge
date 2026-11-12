@@ -76,6 +76,30 @@ function memoryFs(files: Map<string, Uint8Array>): CherryFsLike {
   }
 }
 
+/**
+ * An fs whose `failingRead`-th content read fails with `failure` — a LOCAL
+ * failure mid-upload, not a peer refusal (#339).
+ */
+function failingFs(files: Map<string, Uint8Array>, failingRead: number, failure: Error): CherryFsLike {
+  let reads = 0
+  return {
+    async resolve(path) {
+      return { displayPath: path } satisfies CherryFsTargetLike
+    },
+    async stat(target) {
+      const bytes = files.get(target.displayPath)
+      return bytes === undefined ? undefined : { type: 'file', size: bytes.length }
+    },
+    async readByteRange(target, range) {
+      const bytes = files.get(target.displayPath)
+      if (bytes === undefined) throw new Error('missing')
+      reads += 1
+      if (reads >= failingRead) throw failure
+      return bytes.slice(range.offset, range.offset + range.length)
+    },
+  }
+}
+
 async function makeRig(options: {
   files?: Map<string, Uint8Array>
   uploads?: boolean
@@ -837,6 +861,9 @@ describe('issue #327: an interrupted upload resumes', () => {
     )) as Record<string, unknown>
 
     // The ORIGINAL link-loss verdict stands, and nothing was written twice.
+    // `error` and `resumes 0` are the discriminating pins: the failure path
+    // cancels whatever was staged, so the cancel count alone cannot tell the
+    // epoch guard from its absence.
     expect(verdict['error']).toBe('upload-failed')
     expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
     expect(rig.fake.uploadResumes()).toHaveLength(0)
@@ -867,5 +894,29 @@ describe('issue #327: an interrupted upload resumes', () => {
     // The resume never got an answer, so it never asked to continue.
     expect(rig.fake.uploadResumes()).toHaveLength(0)
     expect(rig.fake.methodCount('agent.messages.send')).toBe(0)
+  })
+
+  it('㉘e a LOCAL read failure is not a peer reason', async () => {
+    // The file disappears mid-upload: an errno carrying a `code` field, which
+    // the old duck-typed reader published as if the peer had said it (#339).
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 11)
+    const files = new Map([['/work/vanished.bin', bytes]])
+    const failure = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' })
+    const rig = await makeRig({ fs: failingFs(files, 2, failure) })
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/vanished.bin' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    expect(verdict['error']).toBe('upload-failed')
+    // No `reason`: an errno is OUR failure, never the peer's vocabulary.
+    expect(verdict).not.toHaveProperty('reason')
+    expect(String(verdict['message'])).toContain('ENOENT')
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(0)
+    // The staged record is still freed.
+    expect(rig.fake.uploadCancelCount()).toBe(1)
   })
 })

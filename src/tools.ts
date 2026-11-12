@@ -11,7 +11,12 @@ import {
 } from './defaults.js'
 import { matchRoute, resolveTargetDevice } from './subagent.js'
 import type { CherrySubagentRoute, CherrySubagentRunOutcome, SubagentTarget } from './subagent.js'
-import { DeviceUnavailableError, RpcDeadlineExceededError } from './connection.js'
+import {
+  DeviceUnavailableError,
+  RpcDeadlineExceededError,
+  UploadInterruptedError,
+  UploadRefusedError,
+} from './connection.js'
 import type { DeviceConnection, DeviceState } from './connection.js'
 import type { DeviceRecord, DeviceResolution, DeviceStore } from './deviceStore.js'
 import { LastCandidateHostError, QUARANTINE_RECOVERY, QuarantinedArchiveError } from './deviceStore.js'
@@ -2213,17 +2218,19 @@ function sameAttachmentIds(value: unknown, ids: readonly string[]): boolean {
 }
 
 /**
- * The `reason` an upload failure reports: a peer refusal's own code, or the
- * reason a LOCAL failure states as a `code` field.
+ * The `reason` an upload failure reports: a code the PEER stated, or the one
+ * LOCAL fact the vocabulary carries (`LINK_LOST`).
  *
- * A link lost mid-upload has no peer code to carry — the peer never answered —
- * so {@link UploadInterruptedError} declares `LINK_LOST` as a class field and
- * this one reader picks it up (#334). Without it the verdict is `upload-failed`
- * with no reason at all, indistinguishable from a peer refusal whose code was
- * dropped.
+ * The reader is deliberately by TYPE, not by shape (#339). While it duck-typed
+ * `error['code']`, a local I/O errno travelled to callers as if the peer had
+ * said it — falsifying this field's meaning and #334's "the only reason of
+ * ours". A refused upload is {@link UploadRefusedError}; a lost link is
+ * {@link UploadInterruptedError}.
  */
-function uploadFailureCode(error: unknown): string | undefined {
-  return isRecord(error) && typeof error['code'] === 'string' ? error['code'] : undefined
+function uploadFailureReason(error: unknown): string | undefined {
+  if (error instanceof UploadRefusedError) return error.code
+  if (error instanceof UploadInterruptedError) return error.code
+  return undefined
 }
 
 /** The route gate's refusal when no provider/model pair can be read. */
@@ -4875,9 +4882,8 @@ export class CherryToolEngine {
    * and parts are projected sequentially, so an aggregate's own peak is one
    * ref's. The slice window (#329) adds at most eight undecoded `dataBase64`
    * strings — one 24 KiB slice each, so ~192 KiB, NOT eight record caps. It is
-   * NOT a process-wide
-   * bound: independent reads (separate tool calls) in flight together multiply
-   * the peak by their count. What bounds that count is the
+   * NOT a process-wide bound: independent reads (separate tool calls) in flight
+   * together multiply the peak by their count. What bounds that count is the
    * {@link ContentReadGate} a caller holds for this REF — across the whole
    * projection, `saveImage` included, never per slice — so this method acquires
    * nothing itself.
@@ -5746,7 +5752,7 @@ export class CherryToolEngine {
         uploaded.push({ ...file, ...result })
       } catch (error) {
         await this.#cancelUploads(connection, uploaded)
-        const code = uploadFailureCode(error)
+        const code = uploadFailureReason(error)
         return {
           error: 'upload-failed',
           filename: file.filename,
