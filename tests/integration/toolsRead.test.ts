@@ -3919,6 +3919,15 @@ describe('issue #329: one content is read through a bounded window', () => {
     await waitFor(() => rig.fake.contentReadsInFlight() === 0, 3_000, 'the abandoned window to settle')
   })
 
+  it('㉙d a slice that arrives OUT of order still lands at its own offset', async () => {
+    const rig = await rigWithLongText()
+    // Slice two is slow, so slices three..nine answer FIRST. Assembly is by
+    // position, not by arrival, and the digest covers the ordered bytes.
+    rig.fake.delayContentReadAt(String(SLICE), 80)
+    const result = await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    expect(textOf(result)).toBe(TEXT)
+  })
+
   it('㉙e a DEGRADABLE slice failure still costs only that part, window or not', async () => {
     const rig = await rigWithLongText()
     rig.fake.slowContentReads(10)
@@ -3930,14 +3939,5 @@ describe('issue #329: one content is read through a bounded window', () => {
     expect(result.messages[0]!.parts[0]!.unavailable).toBe('INTERNAL')
     expect(result.messages[0]!.parts[0]!.content).toBe('')
     await waitFor(() => rig.fake.contentReadsInFlight() === 0, 3_000, 'the abandoned window to settle')
-  })
-
-  it('㉙d a slice that arrives OUT of order still lands at its own offset', async () => {
-    const rig = await rigWithLongText()
-    // Slice two is slow, so slices three..nine answer FIRST. Assembly is by
-    // position, not by arrival, and the digest covers the ordered bytes.
-    rig.fake.delayContentReadAt(String(SLICE), 80)
-    const result = await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
-    expect(textOf(result)).toBe(TEXT)
   })
 })

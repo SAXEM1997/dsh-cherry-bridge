@@ -21,8 +21,8 @@ Pinned at **exact versions**, no `^`, with contract assertions on the pins:
 | `ws` | `8.22.0` |
 | `zod` | `4.3.4` |
 
-These are the versions Cherry Studio **desktop 2.1.8** ships, and 2.1.9/2.1.10
-still ship the same pair (verified at tags `v2.1.8`, `v2.1.9`, `v2.1.10`).
+These are the versions desktop 2.1.8–2.1.10 ship (tags `v2.1.8`, `v2.1.9`,
+`v2.1.10`).
 Upgrading either protocol package means re-running
 `tests/contract/contract.test.ts` against schema drift — the suite models the
 **six behavioral differences** between our loopback fake peer and a real
@@ -39,7 +39,7 @@ in [`docs/e2e-checklist.md`](../docs/e2e-checklist.md).
 | `unackedBytes` | 262,144 (256 KiB) | the peer HOLDS `agent.events` beyond this much un-acked delivery — terminal included; the layer acks at ¼ of it (hello value, else this) (issue #212) |
 
 Through 2.1.7 the desktop's `pageOf` pages by **count alone** (2.1.8's byte
-budget aside, still count-paged): `pageItems: 100` fat parts produced a record
+budget aside): `pageItems: 100` fat parts produced a record
 the transport killed — reading a complex session reset the connection. The
 byte-safe clamps (`defaults.ts`: a 4-bytes-per-char worst case over the peer's
 4,096-char `INLINE_TEXT_LIMIT`, +2 KiB margin) fix it; the effective page size
@@ -54,7 +54,7 @@ peers mostly page by count alone and the clamps stay.
 Follow-up [`#21951`](https://github.com/CherryHQ/cherry-studio/issues/21951):
 an item above the budget **dead-ends the cursor** — it and everything behind it
 become unreachable via a schema-valid record (`partIds` has no bound) —
-`RESOURCE_EXHAUSTED` presents that permanent condition as retryable, and
+`RESOURCE_EXHAUSTED` calls that permanent condition retryable, and
 `queryPage`'s halving wastes up to half the budget. A peer may therefore
 come back with a page **shorter** than requested while still promising more,
 which our walk already follows (`toolsListWalkCompat.test.ts` T2); it must
@@ -97,8 +97,8 @@ normalizes the host). Learned hosts join the archive as candidates — see
   the desktop closes the whole session (`1011`); from 2.1.7 (PR #21687) it
   refuses that one request (`RATE_LIMITED` + `retryAfterMs`) and keeps the
   session. The generations cannot be told apart before one answers, so the
-  default is sized for the harsher: 32/s is 2× under 64, 8× under 256; the
-  content tier is 2× under 512.
+  default is sized for the harsher: 32/s is 2× under 64, 8× under 256; content 2×
+  under 512.
 - The tier is chosen by `classifyRateTier`, an **exact match**, not a prefix:
   widening it gives a shared-tier method the content budget silently.
 - The content tier is **not a config key** — it derives from the one injected
@@ -140,6 +140,8 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
 - Upload failures are `upload-failed` + the peer's `reason`; no per-code
   verdict (#312). A LINK loss is not a verdict: `uploads.get` → `resume` from
   `committedOffset` once, then `ready` is certified by hashing locally (#327).
+  The retry waits `DEFAULT_UPLOAD_RESUME_WAIT_MS` (30 s) for a reconnect, and
+  any failure that does NOT resume best-effort cancels the staged record.
   Pre-observe every in-flight chunk promise: a teardown rejects them all at
   once, and an unobserved one is process-fatal.
 
@@ -188,7 +190,9 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   64 KiB record cap). It fills only by PREDICTION (a run of full contiguous
   slices fixes the stride); any deviation DISCARDS it and finishes serially. A
   window is never awaited, only pre-observed: a sibling the peer never answers
-  would otherwise hold a deadline-less read for the rpc default.
+  would otherwise hold a deadline-less read for the rpc default. Its EFFECTIVE
+  width is `min(8, reported / 2)`: the protocol default (`inFlightRequests`
+  16) admits 8, the loopback fake's 8 admits 4 — hence ㉙a's 32.
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
   (`ContentGateTimeoutError`, which the projection degrades to one part's
@@ -273,12 +277,12 @@ this beside the cache).
 - **Ordering of guards.** The stuck-cursor check runs **before** the empty-page
   tolerance, so tolerating empties cannot blunt the no-progress guard.
 - A truncated walk is **always surfaced** (a `truncationReason` plus a
-  stop-point token), never a silent short result. Hitting a safety bound fails
-  or reports; it never returns a partial as if it were complete.
+  stop-point token), never a silent short result or a partial passed off as
+  complete.
 - **An overshooting page is absorbed, not refused.** `limit` is a MAXIMUM on a
   list method, so a page carrying more items than were asked for is a peer fault
-  — but nothing is lost yet, and throwing would make the list unreadable (the
-  worse failure). The walk takes what its ceiling allows, stops with the
+  — but nothing is lost yet, and throwing would make the list unreadable. The
+  walk takes what its ceiling allows, stops with the
   caller's own attribution, and **re-uses the position it SENT** for that page:
   the page's own `nextCursor` sits past items the walk never collected, so a
   resume from it would skip them, and a terminal overshooting page would
@@ -286,8 +290,8 @@ this beside the cache).
   records the case and `messageResumeToken` then prefers the exact `after:`
   anchor.
 - A **resume** (an `after:` anchor scan) obeys every guard above unchanged —
-  the stuck-cursor and cycle checks are pinned during a scan by their own
-  tests. Its two failures are its own: an anchor that is not on any page up to
+  its own tests pin the stuck-cursor and cycle checks. Its two failures are its
+  own: an anchor that is not on any page up to
   the peer's last one, and a scan longer than `MAX_ANCHOR_SCAN_PAGES`. Both throw. A scan asks for a **full page**
   regardless of the caller's `limit`: its items are discarded either way, and
   paging at `limit: 1` would spend the page budget on a history a full page
@@ -298,8 +302,8 @@ this beside the cache).
 The aggregate behind `cherry_send(wait: true)` / `cherry_wait` (the terminal,
 timeout and idle faces) runs AFTER the caller's wait window, so the window
 cannot bound it. It once had no time bound: since #12 a read whose link dies
-waits up to `transportRetryWaitMs` (5 s), so under a flapping link each of ~30
-requests absorbed it — a 1 s window answering ~150 s later (#3, #21).
+waits up to `transportRetryWaitMs` (5 s), so a flapping link's ~30 requests each
+absorbed it — a 1 s window answering ~150 s later (#3, #21).
 
 - **One instant, derived once.** `AssemblyDeadline` = `startedAt + window +
   clamp(window, WAIT_ANSWER_TAIL_FLOOR_MS, WAIT_ANSWER_TAIL_MS)` — one more
@@ -403,18 +407,17 @@ the cut-off history.
   it has met the anchor (discarding pages whole), and returns what follows it.
 
 **The peer's cursor format is never parsed or validated.** The real desktop's is
-an opaque keyset token, the loopback peer's is a numeric offset, and a future
-desktop may change it. Every token we emit is
-therefore self-describing, and every token we accept must carry one of our two
-prefixes; anything else is refused **before any device work**. This is not
+an opaque keyset token, the loopback peer's a numeric offset, and a future
+desktop may change it; so every token we emit is self-describing and every token
+we accept must carry one of our two prefixes; anything else is refused **before any device work**. This is not
 pedantry: a malformed cursor handed to the real desktop is **silently swallowed**
 (it falls back to the newest page), so a forwarded foreign string would come
 back as the newest page presented as "continued history".
 
 **An anchor the walk cannot find is loud.** If the peer's terminal page arrives
 with the anchor still unfound, the read throws naming the message id (it is
-probably gone: deleted, or the session replaced), rather than returning an empty
-page that reads as "no older history" — the opposite of what happened. A scan
+probably gone: deleted, or the session replaced), rather than an empty page that
+reads as "no older history" — the opposite of what happened. A scan
 past `MAX_ANCHOR_SCAN_PAGES` (500 pages) throws for the same reason: a session
 that deep is not one this tool should chase.
 
@@ -516,8 +519,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   message id is an `opaqueId` too, so a padded id is schema-valid and really does
   reach the anchor arm. The LENGTH ceiling is the sibling guard in the next
   bullet.
-- **The ceiling is enforced on the way OUT too — the same refusal in one more
-  dimension.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
+- **The ceiling is enforced on the way OUT too.** `MAX_RESUME_TOKEN_CHARS` is judged by both parsers, so a token
   over it is one this tool would refuse on replay, and emitting it would hand
   the caller a stop point that can never be used. Both emitters run the FINAL
   token string through `withinResumeTokenCeiling` — the message face's
@@ -547,7 +549,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
 - **The tool DESCRIPTION is part of the contract, and it is pinned.** The guards
   above bound what a tool ACCEPTS and NAMES, so a description promising a token
   unconditionally is a claim the tool contradicts — and it is the claim a model
-  reads first, more consequentially than the READMEs. Every TOP-LEVEL description
+  reads first. Every TOP-LEVEL description
   that mentions a resume token says "when the stop point can be named", and none
   names the wrong absent case ("reached the peer's last page" was the stale one:
   a TRUNCATED walk by definition never reaches it). `cherry_read` states the
