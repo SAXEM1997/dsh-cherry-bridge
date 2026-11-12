@@ -9361,6 +9361,12 @@ var CherryToolEngine = class {
 				offset,
 				maxBytes: this.#contentReadSliceBytes
 			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
+			const echoedOffset = String(slice["offset"] ?? "");
+			if (echoedOffset !== offset) throw new ContentIntegrityError(`agent.content.read for ${contentId} echoed offset ${echoedOffset} at slice ${sliceIndex + 1}, expected ${offset}; refusing to splice bytes at an unrequested position`);
+			const echoedContentId = String(slice["contentId"] ?? "");
+			if (echoedContentId !== contentId) throw new ContentIntegrityError(`agent.content.read for ${contentId} echoed contentId ${echoedContentId} at slice ${sliceIndex + 1}, expected ${contentId}`);
+			const echoedRevision = String(slice["revision"] ?? "");
+			if (echoedRevision !== revision) throw new ContentIntegrityError(`agent.content.read for ${contentId} echoed revision ${echoedRevision} at slice ${sliceIndex + 1}, expected ${revision}`);
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
 			const cap = byteCap;
 			if (read + Math.ceil(data.length / 4) * 3 > cap + 2) throw new ContentByteCapError(`agent.content.read for ${contentId} exceeded the ${cap}-byte limit for this read; not read`);
