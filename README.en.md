@@ -301,9 +301,8 @@ experiment on, its configuration usable, the host providing a subagent service,
 - **`Selected workspaces only`**: only sessions inside ticked workspaces can see
   the tools; sessions with no workspace never do.
 - **`Global`**: visible everywhere; the ticks play no part.
-- **Saves take effect immediately**: the restriction layer is re-installed or
-  released for every live agent, effective from the **next turn** — no restart,
-  no new session.
+- **Saves take effect immediately**: the next model step's condition reads the
+  new document, effective from the **next turn** — no restart, no new session.
 - **Scope governs tools only**: the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - **No pretending**: on `pending` / `unsupported` host capability the panel says
