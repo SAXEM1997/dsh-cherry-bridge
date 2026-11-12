@@ -7138,6 +7138,18 @@ const MAX_EXTERNALIZED_BYTES = 33554432;
 * needs one.
 */
 const DEFAULT_CONTENT_READ_CONCURRENCY = 4;
+/**
+* How many `agent.content.read` slices ONE content may have in flight (issue
+* #329) — the official mobile client's `downloadWindow`
+* (`remoteDownloads.ts`: `downloadChunkBytes = 24_576`, `downloadWindow = 8`).
+*
+* The peer's offsets are opaque, so a window can only be filled by prediction:
+* the first slice is asked for alone, and a run of FULL contiguous slices then
+* fixes the stride. Eight is 2× under the desktop's content allowance (512/s
+* against our 256/s tier), so the window changes latency, never pacing: each
+* request still takes its own admission.
+*/
+const CONTENT_READ_WINDOW = 8;
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
 const TEXT_MAX_LENGTH = MESSAGE_TEXT_MAX_CHARS;
 /** The default wait window, in ms (spec §3.6). A default, never a cap. */
@@ -9469,14 +9481,31 @@ var CherryToolEngine = class {
 		let read = 0;
 		const chunks = [];
 		const hash = createHash("sha256");
-		for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
-			const slice = await connection.rpc.request("agent.content.read", {
+		const inFlight = [];
+		const requestSlice = (at) => {
+			const promise = connection.rpc.request("agent.content.read", {
 				sessionId,
 				contentId,
 				revision,
-				offset,
+				offset: at,
 				maxBytes: this.#contentReadSliceBytes
-			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
+			}, deadline === void 0 ? void 0 : { deadline: deadline.instant }).then((answer) => answer);
+			promise.catch(() => {});
+			return promise;
+		};
+		const discardWindow = () => {
+			inFlight.length = 0;
+		};
+		let stride;
+		let issued = 0;
+		for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
+			while (inFlight.length < CONTENT_READ_WINDOW && (inFlight.length === 0 || issued < maxSlices)) {
+				const at = inFlight.length === 0 ? offset : stride === void 0 ? void 0 : String(BigInt(offset) + BigInt(inFlight.length * stride));
+				if (at === void 0) break;
+				inFlight.push(requestSlice(at));
+				issued += 1;
+			}
+			const slice = await inFlight.shift();
 			const echoedOffset = String(slice["offset"] ?? "");
 			if (echoedOffset !== offset) throw new ContentIntegrityError(`agent.content.read for ${contentId} echoed offset ${echoedOffset} at slice ${sliceIndex + 1}, expected ${offset}; refusing to splice bytes at an unrequested position`);
 			const echoedContentId = String(slice["contentId"] ?? "");
@@ -9500,6 +9529,13 @@ var CherryToolEngine = class {
 			}
 			const next = slice["nextOffset"];
 			if (typeof next !== "string" || next === offset) throw new ContentIntegrityError(`agent.content.read for ${contentId} did not advance (offset ${offset})`);
+			const full = chunk.length === this.#contentReadSliceBytes;
+			const contiguous = next === String(BigInt(offset) + BigInt(chunk.length));
+			if (full && contiguous) stride = chunk.length;
+			else if (stride !== void 0 || inFlight.length > 0) {
+				stride = void 0;
+				discardWindow();
+			}
 			offset = next;
 		}
 		if (!complete) throw new ContentIntegrityError(`agent.content.read for ${contentId} did not reach eof within ${maxSlices} slice(s); refusing to aggregate a partial content`);

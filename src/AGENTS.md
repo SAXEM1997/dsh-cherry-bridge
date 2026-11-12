@@ -106,8 +106,7 @@ normalizes the host). Learned hosts join the archive as candidates — see
   **capped at the peer's 512/s** (both generations), so a shared budget above 64
   stops scaling it.
 - Since 2.1.6 the desktop externalizes every part over **4,096 characters**,
-  making multi-slice content walks the common case — the reason the content
-  tier exists.
+  making multi-slice content walks the common case.
 
 ## Design decisions and invariants
 
@@ -178,13 +177,18 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   the official client's read-concurrency policy. The whole engine — every tool
   call, every device — shares it, so the ASSEMBLY peak is
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
-  `4 × 3 × (the declared size)`. It bounds the COUNT, not bytes: a byte budget
-  must reserve each ref's declared size (optimistic) or its cap when unusable
-  (serializing all behind one slot) — deliberately not what landed.
+  `4 × 3 × (the declared size)`.
   It bounds what is being ASSEMBLED, not everything resident: finished content
   is retained by its caller OUTSIDE this product (up to one whole message per
   concurrent read, because `AGGREGATE_BYTES` is judged only between messages),
   plus the parts cache's own budgeted bytes (32 MiB per device).
+- **A slice window does not change that peak (#329).** Slices are decoded as
+  they are CONSUMED, one at a time, so the 3× stands per content; the window
+  costs up to 8 undecoded `dataBase64` strings (~192 KiB, each bounded by the
+  64 KiB record cap). It fills only by PREDICTION (a run of full contiguous
+  slices fixes the stride); any deviation DISCARDS it and finishes serially. A
+  window is never awaited, only pre-observed: a sibling the peer never answers
+  would otherwise hold a deadline-less read for the rpc default.
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
   (`ContentGateTimeoutError`, which the projection degrades to one part's
@@ -260,15 +264,14 @@ this beside the cache).
   PROTOCOL violation, refused on EVERY page, terminal or not: `pageOf` types the
   field `array(item)`, so a page with no rows says `items: []`. Read as an empty
   page it loses a whole page silently — on a terminal page even as
-  `truncated: false`. The throw names the shape it got (`missing`, `null`,
-  `string`, …) and never the payload, and it sits **before** the dropped-item
-  bookkeeping (no array, no drop count to report).
+  `truncated: false`. The throw names the shape it got (`missing`, `null`, …)
+  and never the payload, and runs **before** the dropped-item bookkeeping.
 - **Cursors.** A cursor that does not advance is refused, and so is a cursor
   that **loops back** to one already served (a `seen` set per walk) — never spun
   on. `MAX_AGGREGATE_PAGES` (10,000) is the backstop for every other
   non-terminating shape.
 - **Ordering of guards.** The stuck-cursor check runs **before** the empty-page
-  tolerance: tolerating empty pages must not blunt the no-progress guard.
+  tolerance, so tolerating empties cannot blunt the no-progress guard.
 - A truncated walk is **always surfaced** (a `truncationReason` plus a
   stop-point token), never a silent short result. Hitting a safety bound fails
   or reports; it never returns a partial as if it were complete.
@@ -283,10 +286,9 @@ this beside the cache).
   records the case and `messageResumeToken` then prefers the exact `after:`
   anchor.
 - A **resume** (an `after:` anchor scan) obeys every guard above unchanged —
-  including the stuck-cursor and cycle checks, which are pinned during a scan by
-  their own tests. Its two failures are its own: an anchor that is not on any
-  page up to the peer's last one, and a scan longer than
-  `MAX_ANCHOR_SCAN_PAGES`. Both throw. A scan asks for a **full page**
+  the stuck-cursor and cycle checks are pinned during a scan by their own
+  tests. Its two failures are its own: an anchor that is not on any page up to
+  the peer's last one, and a scan longer than `MAX_ANCHOR_SCAN_PAGES`. Both throw. A scan asks for a **full page**
   regardless of the caller's `limit`: its items are discarded either way, and
   paging at `limit: 1` would spend the page budget on a history a full page
   reaches in dozens.
@@ -304,8 +306,9 @@ requests absorbed it — a 1 s window answering ~150 s later (#3, #21).
   window, floored at 1 s (the tool's window has a 1 ms minimum, and a 1 ms
   budget would return the stub receipt for a reply one round trip away) and
   capped at 15 s (the largest single item in the walk is one 32 MiB `{ref}` at
-  ~1,365 sequential slices, single-digit seconds on a LAN; the rest of the walk
-  is bounded to 20 messages). It is built on `performance.now()`, the same
+  ~1,365 slices, which the content tier's 5 ms admission spacing alone bounds at
+  ~7 s — a slice window removes the round-trip term, never the pacing term; the
+  rest of the walk is bounded to 20 messages). It is built on `performance.now()`, the same
   monotonic clock as the waiter's own deadline.
 - **Every wait is charged to it, where the wait happens.** The rpc layer clamps
   a request's own timeout to `min(timeoutMs, remaining)` (so a budget farther
@@ -384,9 +387,8 @@ Three `truncationReason` values mean different things:
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
 Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
-`limit`" was a field defect (a caller paid every round trip and still never saw
-the cut-off history), and a marker with no consumer states a loss nothing can
-act on.
+`limit`" was a field defect: a caller paid every round trip and still never saw
+the cut-off history.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -603,8 +605,7 @@ integer ≤ 32 MiB (`RESOURCE_UNAVAILABLE`). We are **more tolerant**: a missing
 unusable `byteLength` falls back to a slice bound (`DEFAULT_CONTENT_SLICE_BOUND`
 = 4,096 slices), and the **cumulative bytes-read arm** still caps the walk, so a
 peer that serves more than it declared is stopped by bytes actually read.
-It is commented and covered by a test (a peer serving more than it declared);
-do not "align" it without a reason.
+A test covers it; do not "align" it without a reason.
 
 ### Integrity: what degrades, what is fatal
 
@@ -640,8 +641,8 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   its parts.
 - Messages are **newest-first**; `limit` drops the **oldest**.
 - A failed message may carry `failure: {reasonCode, retryable, message}`
-  (peer classification, retry-worthiness, bounded summary); only its
-  `source`/`context` are withheld.
+  (peer classification and bounded summary); only its `source`/`context` are
+  withheld.
 - Attachments — `kind: 'file'`, and legacy `data` named `file` whose
   `{mediaType, filename}` is JSON in `content.text` — report `name`/`mediaType`
   (`byteLength` from a ref only), no `unavailable` unless `includeImages`
@@ -709,9 +710,9 @@ can produce the overlap the write paths refuse — the READ path repairs it
 `upsert`/`forgetEndpoints`/`rememberEndpoints` stay strict. Both write actions
 EVICT the pooled connection ON A CHANGE, because a `DeviceConnection` captures
 its record at construction.
-`GET /devices` reports `forgottenHosts` beside the address maps, and since issue
-#204 the settings page shows the marks with a 恢复 each, plus a 忘记 beside every
-dialed host: both ride the two POST routes in the table, call the SAME store
+`GET /devices` reports `forgottenHosts`, and since issue #204 the settings page
+shows the marks with a 恢复 each, plus a 忘记 beside every dialed host: both ride
+the two POST routes, call the SAME store
 methods the `cherry_devices` action does, and answer the PATCH's projection. A
 PATCH that includes a marked host still clears its mark, so re-admitting an
 address immediately stays the PATCH's job (恢复 only lifts the mark).
@@ -736,7 +737,7 @@ Each segment is capped: `FAILURE_LABEL_MAX` = 128 clips an over-long host
 `<label>: <detail>` (marker `… (+N chars)` included), so 32 candidates join to
 ≤ 7,742 characters.
 The progress line is bounded (first host always, 160 chars of host names,
-`(+K more)`); a stage-failure verdict is ONE error, not a join.
+`(+K more)`); a stage failure is ONE error, not a join.
 
 ### Device selector
 
@@ -869,7 +870,7 @@ the error message).
   `config` keys, and error `reason`/`message`.
 - **Never emitted**: `accessToken`, `tokenExpiresAt`, `invitationSecret`, the
   raw pinned `desktopIdentity`, message text and part text.
-- The report is built field by field, so a later credential is excluded **by
+- Built field by field, so a later credential is excluded **by
   construction**; `limits` is re-projected from its known keys.
 - `stats.connectionsBuilt` counts connections built since the last `apply`, not
   RPC requests; counters and the error ring are zeroed on every `apply`.
@@ -888,8 +889,7 @@ strings never reach a console channel (`contract.test.ts` — “leaks no secret
 to the log”). **Peer-controlled text in a log line or a pairing verdict is
 clipped where it is RENDERED**: `clipText` (one detail, `… (+N chars)`) or
 `boundedJoin` (a list, `(+K more)`) in `src/text.ts`, per-site ceilings;
-`deviceId` is exempt, and `bounded()` is the frame-drop path's older
-count-less form.
+`deviceId` is exempt.
 
 **A CAUGHT failure renders as ONE bounded string** — `failureText` (the message,
 `LOG_TEXT_MAX`) — in every catch that PEER traffic reaches: the notification
@@ -966,5 +966,4 @@ faces:
   honour `details.retryable: false`; it has no adaptive page size, so a
   byte-budget `RESOURCE_EXHAUSTED` still does not converge at a fixed limit. Our
   answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
-- Its read path refuses an unusable `byteLength` (see above).
 

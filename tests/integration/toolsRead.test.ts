@@ -3834,3 +3834,110 @@ describe('issue #328: a content slice must echo the request it answers', () => {
     )
   })
 })
+
+describe('issue #329: one content is read through a bounded window', () => {
+  // Nine slices at the protocol's 24 KiB: enough for a window of 8 to fill
+  // BEFORE the walk ends, which is the only state a serial walk can never show.
+  const SLICE = 24_576
+  const TEXT = 'slice-'.repeat(Math.ceil(220_000 / 6)).slice(0, 220_000)
+  const REVISION = '1001'
+  const CONTENT_ID = 'm-1:0'
+
+  async function rigWithLongText(): Promise<Awaited<ReturnType<typeof makeRig>>> {
+    return makeRig({
+      // The client halves the peer's reported in-flight allowance and caps the
+      // result at 8 (`businessWindowFor`), so a peer that reports 8 admits 4
+      // concurrent requests and NO window wider than that can ever be reached.
+      // Advertising 32 is what lets the per-content window be observed at all.
+      hello: { limits: { inFlightRequests: 32 } },
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Window', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: REVISION,
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: TEXT, external: true }],
+          },
+        ],
+      },
+    })
+  }
+
+  function textOf(result: unknown): string {
+    const read = result as { messages: Array<{ parts: Array<{ content: string }> }> }
+    return read.messages[0]!.parts[0]!.content
+  }
+
+  it('㉙a nine slices are read with EIGHT in flight, and assemble to the exact text', async () => {
+    const rig = await rigWithLongText()
+    // A delay is what makes the window observable: without one a slice is
+    // served in the turn it was dispatched in, so nothing can overlap. It must
+    // outlast the content tier's own admission spacing (5 ms per request at
+    // 256/s, so 40 ms for eight) or the first reply arrives before the window
+    // is even full.
+    rig.fake.slowContentReads(100)
+    const result = await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    expect(textOf(result)).toBe(TEXT)
+    expect(TEXT.length).toBeGreaterThan(8 * SLICE)
+    expect(rig.fake.maxContentReadsInFlight()).toBe(8)
+  })
+
+  it('㉙b the assembled bytes are the peer\'s bytes, slice boundaries and all', async () => {
+    const rig = await rigWithLongText()
+    const result = await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    const text = textOf(result)
+    // The digest check already refuses a mis-ordered assembly; this pins the
+    // VALUE, so a window that quietly drops or duplicates a slice cannot pass.
+    expect(createHash('sha256').update(text, 'utf8').digest('hex')).toBe(
+      createHash('sha256').update(TEXT, 'utf8').digest('hex'),
+    )
+    expect(text.slice(0, SLICE)).toBe(TEXT.slice(0, SLICE))
+    expect(text.slice(-1)).toBe(TEXT.slice(-1))
+  })
+
+  it('㉙c a FATAL slice failure fails the whole read, and the window drains', async () => {
+    const rig = await rigWithLongText()
+    rig.fake.slowContentReads(10)
+    // RATE_LIMITED is the one RPC refusal that does NOT degrade to an
+    // `unavailable` part (`#degradableReadFailure`), so it reaches the caller —
+    // and TWO of them, so a walk that throws without draining leaves the second
+    // rejection unobserved, which vitest reports as an unhandled one.
+    rig.fake.failContentReadAt(String(SLICE), { reason: 'RATE_LIMITED', message: 'slice two is gone' })
+    rig.fake.failContentReadAt(String(SLICE * 2), { reason: 'RATE_LIMITED', message: 'slice three is gone' })
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /slice (two|three) is gone/i,
+    )
+    // The window is ABANDONED, not awaited (`discardWindow`): the caller's
+    // verdict must not wait for a sibling the peer may never answer. The
+    // abandoned requests still settle on their own, and the fake's counter is
+    // how that is observed without a sleep.
+    await waitFor(() => rig.fake.contentReadsInFlight() === 0, 3_000, 'the abandoned window to settle')
+  })
+
+  it('㉙e a DEGRADABLE slice failure still costs only that part, window or not', async () => {
+    const rig = await rigWithLongText()
+    rig.fake.slowContentReads(10)
+    rig.fake.failContentReadAt(String(SLICE), { reason: 'INTERNAL', message: 'slice two is gone' })
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ incomplete?: boolean; parts: Array<{ content: string; unavailable?: string }> }>
+    }
+    expect(result.messages[0]!.incomplete).toBe(true)
+    expect(result.messages[0]!.parts[0]!.unavailable).toBe('INTERNAL')
+    expect(result.messages[0]!.parts[0]!.content).toBe('')
+    await waitFor(() => rig.fake.contentReadsInFlight() === 0, 3_000, 'the abandoned window to settle')
+  })
+
+  it('㉙d a slice that arrives OUT of order still lands at its own offset', async () => {
+    const rig = await rigWithLongText()
+    // Slice two is slow, so slices three..nine answer FIRST. Assembly is by
+    // position, not by arrival, and the digest covers the ordered bytes.
+    rig.fake.delayContentReadAt(String(SLICE), 80)
+    const result = await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    expect(textOf(result)).toBe(TEXT)
+  })
+})

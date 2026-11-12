@@ -1329,6 +1329,18 @@ const MAX_EXTERNALIZED_BYTES = 32 * 1024 * 1024
  * needs one.
  */
 const DEFAULT_CONTENT_READ_CONCURRENCY = 4
+/**
+ * How many `agent.content.read` slices ONE content may have in flight (issue
+ * #329) — the official mobile client's `downloadWindow`
+ * (`remoteDownloads.ts`: `downloadChunkBytes = 24_576`, `downloadWindow = 8`).
+ *
+ * The peer's offsets are opaque, so a window can only be filled by prediction:
+ * the first slice is asked for alone, and a run of FULL contiguous slices then
+ * fixes the stride. Eight is 2× under the desktop's content allowance (512/s
+ * against our 256/s tier), so the window changes latency, never pacing: each
+ * request still takes its own admission.
+ */
+const CONTENT_READ_WINDOW = 8
 
 /** The protocol's `agent.messages.send.text` ceiling, pre-validated tool-side. */
 const TEXT_MAX_LENGTH = MESSAGE_TEXT_MAX_CHARS
@@ -4894,35 +4906,84 @@ export class CherryToolEngine {
     // has certified.
     const chunks: Buffer[] = []
     const hash = createHash('sha256')
+
+    // A BOUNDED WINDOW of slices (issue #329). The peer's offsets are opaque,
+    // so a window is only ever filled by PREDICTION: the first slice is asked
+    // for ALONE, and a run of FULL, CONTIGUOUS slices then fixes the stride,
+    // which is what makes the offsets further ahead knowable at all. Any
+    // deviation — a short slice, a `nextOffset` that is not the stride ahead,
+    // `eof` — ends the prediction: what is in flight is drained and DISCARDED
+    // (those requests were aimed at offsets the peer just told us are wrong),
+    // and the walk continues one slice at a time from the offset it named.
+    const inFlight: Array<Promise<Record<string, unknown>>> = []
+    const requestSlice = (at: string): Promise<Record<string, unknown>> => {
+      const promise = connection.rpc
+        .request(
+          'agent.content.read',
+          {
+            sessionId,
+            contentId,
+            revision,
+            offset: at,
+            // The protocol's slice size in production; injectable for tests
+            // that must reach a walk's SECOND slice (see the option's
+            // docblock).
+            maxBytes: this.#contentReadSliceBytes,
+          },
+          deadline === undefined ? undefined : { deadline: deadline.instant },
+        )
+        .then((answer) => answer as Record<string, unknown>)
+      // PRE-OBSERVE, exactly like the upload window (#327): the drain below
+      // decides the error the caller sees, but Node reports a rejection that
+      // has no handler in the SAME turn as unhandled — even when it is drained
+      // a few microtasks later.
+      promise.catch(() => {})
+      return promise
+    }
+    // A window is DISCARDED, never awaited. Awaiting it would make the read's
+    // verdict wait for siblings the peer may never answer: a slice still in
+    // flight is bounded only by the rpc default (60 s) — `cherry_read` carries
+    // no deadline — so one hung sibling would hold a failed read for a minute.
+    // Nothing is lost by walking away: every promise was pre-observed at
+    // creation (above), so abandonment cannot produce an unhandled rejection,
+    // and the answers were aimed at offsets the walk no longer stands at.
+    const discardWindow = (): void => {
+      inFlight.length = 0
+    }
+
+    let stride: number | undefined
+    let issued = 0
     for (let sliceIndex = 0; sliceIndex < maxSlices; sliceIndex += 1) {
+      // Fill the window. The head always asks for the offset the walk stands
+      // at; the rest only when a stride is known, so a peer whose slices are
+      // not uniform degrades to the serial walk instead of being mis-asked.
+      while (inFlight.length < CONTENT_READ_WINDOW && (inFlight.length === 0 || issued < maxSlices)) {
+        const at =
+          inFlight.length === 0
+            ? offset
+            : stride === undefined
+              ? undefined
+              : String(BigInt(offset) + BigInt(inFlight.length * stride))
+        if (at === undefined) break
+        inFlight.push(requestSlice(at))
+        issued += 1
+      }
+      const slice = await inFlight.shift()!
       // The slice walk is bounded by the answer's budget like every other
-      // request it makes (issue #21). A slice that cannot be read in time makes
-      // this ONE part `unavailable` — the degradable class — because the
-      // reassembled bytes could not be verified; the rest of the snapshot is
-      // still exactly what the peer said, and the message is flagged
+      // request it makes (issue #21). A slice that cannot be read in time
+      // makes this ONE part `unavailable` — the degradable class — because
+      // the reassembled bytes could not be verified; the rest of the snapshot
+      // is still exactly what the peer said, and the message is flagged
       // `incomplete` by the ordinary projection.
-      const slice = (await connection.rpc.request(
-        'agent.content.read',
-        {
-          sessionId,
-          contentId,
-          revision,
-          offset,
-          // The protocol's slice size in production; injectable for tests that
-          // must reach a walk's SECOND slice (see the option's docblock).
-          maxBytes: this.#contentReadSliceBytes,
-        },
-        deadline === undefined ? undefined : { deadline: deadline.instant },
-      )) as Record<string, unknown>
-      // THE SLICE MUST ECHO THE REQUEST IT ANSWERS (issue #328). `offset` is the
-      // only credential for "which position these bytes belong to": a peer that
-      // answers a different offset while `nextOffset` still advances would
-      // splice bytes at the wrong place, and every other check here — the
-      // digest against the ref, `eof`, "the walk advanced" — would still pass.
-      // The protocol makes all three required strings; the official client
-      // asserts all three on every slice. `String(...)` keeps a peer that sends
-      // a JSON number where the schema says string (0 vs "0") from being called
-      // a liar over a spelling.
+      // THE SLICE MUST ECHO THE REQUEST IT ANSWERS (issue #328). `offset` is
+      // the only credential for "which position these bytes belong to": a peer
+      // that answers a different offset while `nextOffset` still advances
+      // would splice bytes at the wrong place, and every other check here —
+      // the digest against the ref, `eof`, "the walk advanced" — would still
+      // pass. The protocol makes all three required strings; the official
+      // client asserts all three on every slice. `String(...)` keeps a peer
+      // that sends a JSON number where the schema says string (0 vs "0") from
+      // being called a liar over a spelling.
       const echoedOffset = String(slice['offset'] ?? '')
       if (echoedOffset !== offset) {
         throw new ContentIntegrityError(
@@ -4946,10 +5007,12 @@ export class CherryToolEngine {
       }
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
       // The cap is checked on the base64 LENGTH first, before the decode: a
-      // slice may carry any size a hostile peer puts in one frame, and decoding
-      // it just to measure it is the memory exposure the cap exists to bound.
-      // ceil(len/4)*3 is the exact byte count for unpadded base64 and errs high
-      // by at most the padding — the safe direction for a ceiling.
+      // slice may carry any size a hostile peer puts in one frame, and
+      // decoding it just to measure it is the memory exposure the cap exists
+      // to bound. ceil(len/4)*3 is the exact byte count for unpadded base64
+      // and errs high by at most the padding — the safe direction for a
+      // ceiling. Decoding happens HERE, at consumption, so `read` stays the
+      // ORDERED prefix total the serial walk kept.
       const cap = byteCap
       if (read + Math.ceil(data.length / 4) * 3 > cap + 2) {
         throw new ContentByteCapError(
@@ -4979,9 +5042,9 @@ export class CherryToolEngine {
       chunks.push(chunk)
       read += chunk.length
       // The slice budget cannot hold the cap on its own: a ref with no usable
-      // `byteLength` falls back to the slice bound, which the peer can fill with
-      // more than the cap, and a peer may simply serve more than it declared.
-      // Bytes actually read are the only honest measure here.
+      // `byteLength` falls back to the slice bound, which the peer can fill
+      // with more than the cap, and a peer may simply serve more than it
+      // declared. Bytes actually read are the only honest measure here.
       if (read > cap) {
         throw new ContentByteCapError(
           `agent.content.read for ${contentId} exceeded the ${cap}-byte limit ` +
@@ -4996,11 +5059,23 @@ export class CherryToolEngine {
       const next = slice['nextOffset']
       if (typeof next !== 'string' || next === offset) {
         // A walk that cannot progress leaves the content INCOMPLETE, and an
-        // incomplete content can never pass the digest check below — so this is
-        // the integrity class, not a degradable per-part miss.
+        // incomplete content can never pass the digest check below — so this
+        // is the integrity class, not a degradable per-part miss.
         throw new ContentIntegrityError(
           `agent.content.read for ${contentId} did not advance (offset ${offset})`,
         )
+      }
+      // The stride is only trustworthy while slices are FULL and land exactly
+      // where it said they would; anything else (a short tail that is not the
+      // last slice, a peer that resized its slices mid-walk) retires the
+      // window for the rest of this content.
+      const full = chunk.length === this.#contentReadSliceBytes
+      const contiguous = next === String(BigInt(offset) + BigInt(chunk.length))
+      if (full && contiguous) {
+        stride = chunk.length
+      } else if (stride !== undefined || inFlight.length > 0) {
+        stride = undefined
+        discardWindow()
       }
       offset = next
     }
