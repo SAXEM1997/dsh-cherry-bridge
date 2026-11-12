@@ -94,7 +94,6 @@ const EFFECT_NOTE_KEY = 'scope.effectNote'
 const DEGRADED_KEYS: Record<DegradedSource, string> = {
   install: 'scope.degraded.install',
   'workspace-list': 'scope.degraded.workspace-list',
-  'visibility-only': 'scope.degraded.visibility-only',
   'scope-version': 'scope.degraded.scope-version',
   'path-normalization': 'scope.degraded.path-normalization',
 }

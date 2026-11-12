@@ -234,17 +234,17 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
   const host = createToolScopeHost({
     scope: state,
     names,
-    registerTools: () => {
+    registerTools: (visibleFor) => {
       const disposers = names.map((name) =>
-        fake.root.tools!.register({ name, description: `fixture ${name}`, execute: async () => undefined }),
+        fake.root.tools!.register(
+          { name, description: `fixture ${name}`, execute: async () => undefined },
+          visibleFor === undefined ? undefined : { when: (context) => visibleFor(context.agent) },
+        ),
       )
       return () => {
         for (const dispose of disposers) dispose()
       }
     },
-    // The bounded recheck is Task 6's own surface; its 250 ms timer here would
-    // only add rounds nobody asked for.
-    recheckDelaysMs: [],
     log: (message) => logs.push(message),
   })
 
@@ -430,17 +430,12 @@ describe('GET /cherry-remote/api/scope', () => {
 // ---------------------------------------------------------------------------
 
 describe('PUT /cherry-remote/api/scope', () => {
-  it('③ saves, bumps the revision, prunes, and refreshes in the same await-free block', async () => {
+  it('③ saves, bumps the revision, prunes, and the next evaluation follows without a reinstall', async () => {
     const fixture = makeFixture({
       workspaces: [W1, W2],
       agents: [{ id: 'agent-1', cwd: '/work/w1' }, { id: 'agent-2', cwd: '/work/w2' }],
-      gate: true,
     })
     await settle()
-
-    // The fixture parked the very first judgement pass: no generation exists yet.
-    expect(fixture.rebuilds).toBe(1)
-    expect(fixture.state.judgement('agent-1')).toBeUndefined()
 
     const { status, json } = await put(fixture, {
       mode: 'selected',
@@ -449,47 +444,25 @@ describe('PUT /cherry-remote/api/scope', () => {
     })
 
     expect(status).toBe(200)
-    // The response carries the normalized document and the trimmed ids — and
-    // NOTHING else: `refreshScope()`'s summary is the round's own echo, never
-    // published as converged state (R24).
     expect(json).toEqual({ scope: { mode: 'selected', workspaceIds: ['w1'], revision: 1 }, pruned: ['ghost'] })
-    // `revision` is monotonic +1 and the stored authority is that same document.
     expect(fixture.state.doc().revision).toBe(1)
     expect(fixture.state.doc().mode).toBe('selected')
     expect(fixture.state.doc().workspaceIds).toEqual(['w1'])
 
-    // The parked round did NOT delay the answer, and the save started no second
-    // round in parallel (the gate coalesced the trigger instead).
-    const afterPut = fixture.rebuilds
-    expect(afterPut).toBe(1)
-    expect(fixture.roundsInFlight).toBe(1)
-
     // §6.3's hard constraint: `save` completed, then `refreshScope()` was called
     // with NO await between them — the microtask queued inside `save` is still
-    // BEHIND the refresh call.
+    // BEHIND the refresh call. The when path has no layer to install, so the
+    // round's echo is `undefined`.
     expect(fixture.order.indexOf('save')).toBeLessThan(fixture.order.indexOf('refresh'))
     expect(fixture.order.indexOf('save-microtask')).toBeGreaterThan(fixture.order.indexOf('refresh'))
-    expect(fixture.refreshCalls).toHaveLength(1)
-    // …and the recorded summary is the SYNCHRONOUS pass's echo only: the release
-    // that convergence performs below is deliberately not in it (R24).
-    expect(fixture.refreshCalls[0]).toEqual({ agents: 2, installed: 0, released: 0, skipped: 2 })
+    expect(fixture.refreshCalls).toEqual([undefined])
 
-    // Release the in-flight round: at most the coalesced catch-up is owed, and it
-    // is enough (B4) for EVERY live agent's layer to match the new document.
-    fixture.openGate()
     await settle()
-
     expect(fixture.state.judgement('agent-1')).toMatchObject({ workspaceId: 'w1', visible: true })
     expect(fixture.state.judgement('agent-2')).toMatchObject({ workspaceId: 'w2', visible: false })
-    expect(fixture.fake.layerCount('agent-1')).toBe(0)
-    expect(fixture.fake.agentView('agent-1')).toEqual(FAMILY)
-    expect(fixture.fake.layerCount('agent-2')).toBe(1)
-    expect(fixture.fake.agentView('agent-2')).toEqual([])
-
-    // The parked pass plus the catch-up it was owed, and its own no-op fixpoint
-    // pass — bounded, never overlapping.
-    expect(fixture.roundsInFlight).toBe(1)
-    expect(fixture.rebuilds - afterPut).toBeLessThanOrEqual(2)
+    // The next STEP follows the document: no reinstall, no host round.
+    expect(await fixture.fake.resolvedView('agent-1')).toEqual(FAMILY)
+    expect(await fixture.fake.resolvedView('agent-2')).toEqual([])
   })
 
   it('④ refuses an invalid scope with 400 invalid-scope, leaving the document alone', async () => {
@@ -636,7 +609,7 @@ describe('PUT /cherry-remote/api/scope', () => {
     // channel is not derived from (nor into) `staleWorkspaceIds`.
     expect(json.host.degraded).toEqual([])
     expect(json.staleWorkspaceIds).toEqual([])
-    expect(fixture.fake.agentView('agent-stray')).toEqual([])
+    expect(await fixture.fake.resolvedView('agent-stray')).toEqual([])
   })
 
   it('⑪ keeps serving and accepting a save while the host is pending (D9 self-rescue)', async () => {
@@ -700,33 +673,21 @@ describe('PUT /cherry-remote/api/scope', () => {
     expect(readFileSync(fixture.scopeFile, 'utf8')).toBe(before)
   })
 
-  it('⑬ keeps three degradation sources visible at once, one entry per source', async () => {
+  it('⑬ keeps the workspace-list degradation visible, one entry for the source', async () => {
     const fixture = makeFixture({
-      // `guard` absent ⇒ visibility-only; `list()` throws ⇒ workspace-list;
-      // `run_code` in the deny set is what the fake host refuses ⇒ install.
-      without: ['guard'],
       listThrows: true,
-      names: [...FAMILY, 'run_code'],
-      agents: [{ id: 'agent-a', cwd: '/work/a' }, { id: 'agent-b', cwd: '/work/b' }],
+      seed: seedDoc({ revision: 0, mode: 'selected', workspaceIds: [] }),
     })
     await settle()
 
     const first = await get(fixture)
     expect(Array.isArray(first.json.host.degraded)).toBe(true)
-    expect(degradedSources(first.json)).toEqual(['install', 'visibility-only', 'workspace-list'])
+    expect(degradedSources(first.json)).toEqual(['workspace-list'])
     for (const note of first.json.host.degraded) expect(note.reason.length).toBeGreaterThan(0)
 
-    // Re-trigger ONE source: a third agent fails its install too. Same source ⇒
-    // still exactly one entry, carrying the LATEST reason; the other two sources
-    // are not overwritten by it.
-    fixture.fake.addAgent({ id: 'agent-c' })
-    await settle()
-
     const second = await get(fixture)
-    expect(degradedSources(second.json)).toEqual(['install', 'visibility-only', 'workspace-list'])
-    const installNotes = second.json.host.degraded.filter((note: { source: string }) => note.source === 'install')
-    expect(installNotes).toHaveLength(1)
-    expect(installNotes[0].reason).toContain('agent-c')
-    expect(second.json.host.degraded).toHaveLength(3)
+    expect(degradedSources(second.json)).toEqual(['workspace-list'])
+    expect(second.json.host.degraded).toHaveLength(1)
   })
+
 })

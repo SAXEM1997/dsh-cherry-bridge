@@ -757,28 +757,21 @@ selector, `cherry_pair` does not.
 - The 14 tools are decided **per workspace**; the default is `selected` + an
   empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
   document lands on the stricter side).
-- **Two host modes.** With `tools.resolve` present, the family is ONE
-  registration carrying one shared step-time `when`
+- **One host mode: step-time `when`.** `tools.resolve` is the contract (#345):
+  the family is ONE registration carrying one shared condition
   (`ToolScopeState.visibleForAgent`): `judgement(agent.id) ?? resolveNow(agent)`,
-  fail-closed — no per-agent `restrict`, `guard`,
-  `agent/created|disposed` subscription or recheck timer, and a save is visible
-  on the **next step**. Without `resolve`, the legacy path stays: `restrict` +
-  `guard` per agent, reinstalled for every live agent, effective on the
-  **next turn**. `resolve` ships in dsh-tools **0.2.2-alpha.2**; the app
-  floor is `0.2.0-rc.2`, so dual mode is mandatory.
+  fail-closed. There is no per-agent `restrict`, `guard`, `agent/created|disposed`
+  subscription or recheck timer, and a save is visible on the **next step**.
+  `resolve` first ships in dsh-tools **0.2.2-alpha.2**, so the engine floor is
+  `>=0.2.2-rc.1`; a host without it is `unsupported` and gets NO registrations
+  (fail-closed), never a silent unconditional install.
 - A throwing condition would fail step PREPARATION
   (`TOOL_ACTIVATION_FAILED`), so it answers false; 14 calls/step ≈ 3 µs.
-- `cherry_subagent` (registered by the SUBAGENT subsystem) carries its own
-  `visibleFor` gate: one more condition on a `when` host, the
-  `restrict`-surviving registration on a legacy one.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
   never scope-gated.
 - Capability missing is never papered over: `pending` is a neutral wait,
   `unsupported` is a read-only warning with the real cause and save disabled;
   under both the fourteen stay **unregistered**.
-- `visibility-only` is a LEGACY degradation: `guard` is gone but `restrict`
-  still removes the tools from the table — visibility, not an execution
-  boundary.
 - The scope document lives at `<dataDir>/scope.json` (0600, atomic, monotonic
   `revision`), **not** in profile YAML. A document that fails to parse or has
   invalid fields is rebuilt on the stricter side with `revision` reset to 0,
@@ -839,7 +832,7 @@ registered workspace — treated as workspace-less, **not** a degradation), and
 `host` (`state` / `capable` / `reason` / `degraded`). `staleWorkspaceIds` and
 `pathUnmatched` are two separate channels and neither derives from the other.
 `degraded` is an array of `{source, reason}`, one latest entry per source, over
-exactly five closed sources — `install`, `workspace-list`, `visibility-only`,
+exactly four closed sources — `install`, `workspace-list`,
 `scope-version`, `path-normalization` (an empty array is the honest "no
 degradation"). `host` and `pathUnmatched` come from the same scope read the
 diagnostics report uses, so the two faces cannot drift.

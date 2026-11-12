@@ -621,7 +621,6 @@ function hostStateOr(raw: unknown): ScopeHostState['state'] {
 const DEGRADED_SOURCES: Readonly<Record<DegradedSource, true>> = {
   install: true,
   'workspace-list': true,
-  'visibility-only': true,
   'scope-version': true,
   'path-normalization': true,
 }

@@ -1528,13 +1528,13 @@ describe('③ release configuration', () => {
     // `evaluatePluginCompatibility` adjudicates `engines.dsh` ALONE (peers are
     // ignored when it is present), so this field is the gate's only input.
     //
-    // The bounds are deliberate: 0.2.0-rc.2 is the oldest host the
+    // The bounds are deliberate: 0.2.2-rc.1 is the oldest host the
     // `resolveTrustedHosts` `ctx.get` chain still supports (the `webRuntime`
     // world); `-0` on the upper bound excludes the whole 0.3.0 prerelease
     // family, because app-boot's ranges let prereleases participate and a
     // bare `<0.3.0` would wave 0.3.0-rc.1 through. Widening either end is a
     // compat decision that must pass review, not an edit that slips in.
-    expect(manifest.engines?.dsh).toBe('>=0.2.0-rc.2 <0.3.0-0')
+    expect(manifest.engines?.dsh).toBe('>=0.2.2-rc.1 <0.3.0-0')
   })
 
   it('keeps `client` and `bundle` as BOTH keys of ONE dsh object', () => {

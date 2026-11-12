@@ -2535,7 +2535,6 @@ function hostStateOr(raw) {
 const DEGRADED_SOURCES = {
 	install: true,
 	"workspace-list": true,
-	"visibility-only": true,
 	"scope-version": true,
 	"path-normalization": true
 };
@@ -13222,80 +13221,13 @@ function createSubagentHost(parts) {
 }
 //#endregion
 //#region src/toolScopeHost.ts
-/**
-* The host integration layer: capability tri-state, the injection gate, and the
-* ONE assembly point where registration, hiding and the dispatch guard are born
-* and die together (spec §6.2 + B7/B10/B17).
-*
-* Four decisions carry this file:
-*
-*  1. **The host is mounted, not merely constructed.** {@link ToolScopeHost.mount}
-*     is the only entry point that installs anything, and it returns the only
-*     release path. `apply()` calls it AFTER the assembly's root `ctx.effect`
-*     and pushes the returned disposer into `state.disposers`, so the plugin's
-*     existing teardown drains it — there is deliberately no second root effect.
-*
-*  2. **The capability probe runs at `mount()` time, off the plugin ROOT ctx's
-*     `tools` face** — never inside the injected effect. `register`, `restrict`
-*     and `schemas` are hard gates (missing any one ⇒ `unsupported`); `guard` is
-*     NOT a gate (missing ⇒ the `visibility-only` degradation). Because the probe
-*     does not depend on the injection arrival, "static capability missing" and
-*     "injection not yet arrived" can hold at once — and the static failure wins.
-*
-*  3. **The injected effect owns the lifecycle of all four faces**: the tool
-*     registrations, every agent's restriction layer, the single global guard,
-*     and the two subscriptions. Its merged disposer unsubscribes FIRST (the
-*     release side of `register`/`restrict` also emits `tools/change`, and a
-*     recompute running in that window would re-install a layer whose disposer
-*     the map no longer holds — an ownerless layer, unrecoverable under
-*     intersection semantics), then clears the pending recheck timers (they are
-*     the last thing outside a dispatch that could still reach into this
-*     generation), then releases registrations, then restrictions, and finally
-*     the guard (which notifies nobody).
-*
-*  4. **State ownership stays with {@link ToolScopeState}.** This module keeps
-*     no copy of the document, the degradation set, the judgement generation or
-*     the installed-layer records; it reads and writes them through the scope
-*     state's own surface (`judgement` / `layer` / `setLayer` / `clearLayer` /
-*     `invalidateDerived`), which is what makes `guard`'s "层在 ⇒ 拒绝" mirror
-*     true by construction.
-*
-*  5. **Every trigger of a recompute round goes through ONE coalescing gate**
-*     ({@link requestRound}, §4 ①'s 合并 / 置脏后补跑). The host emits
-*     `tools/change` on BOTH sides of `register`/`restrict`, so this module's own
-*     install and release work re-enters its own listener; the gate is what makes
-*     that terminating — an in-flight round is never overlapped, the trigger only
-*     marks it dirty, and the round runs one catch-up pass before it ends. The
-*     ONLY abstention point is teardown (§4), which every entry checks.
-*
-* Deliberately NOT here (Task 6): the bounded recheck. The install/release
-* criteria and the three subscriptions ARE here — every "completion" and
-* "retry" they describe is reachable through `refresh()` (the config-save path)
-* and through `tools/change`.
-*/
-/**
-* The label of this subsystem's mount lifecycle — §6.2 spells it, and this is
-* the ONLY place the string is written. The assembly point references the
-* constant through `mount()`; no caller re-spells it.
-*/
 const EFFECT_LABEL = "cherry-remote.tool-scope()";
 /** The neutral waiting wording: `pending` must never read as "the host refuses". */
 const PENDING_REASON = "等待宿主注入 agents / workspaceRegistry";
-/** `ready` means: the three static capabilities AND both injected services. */
-const READY_REASON = "宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达";
-/** `ready` for the step-time path: only `register` + `resolve` are needed. */
+/** `ready` for the step-time path: `register` + `resolve` are the whole contract. */
 const WHEN_READY_REASON = "宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性";
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS = ["agents", "workspaceRegistry"];
-/**
-* D14's bounded recheck schedule: two attempts, then the state is left as it is.
-*
-* A `cwd` whose resolution did not CONCLUDE may well resolve a moment later —
-* the registry was not ready, the directory was momentarily unreachable, or the
-* `sessionIds` projection had not caught up. Anything past two attempts is an
-* idle spin, which D14 forbids outright.
-*/
-const DEFAULT_RECHECK_DELAYS_MS = [250, 2e3];
 /**
 * Runs ONE aggregate registration entry — `register(ledgerCtx)` — and guarantees
 * that a FAILED registration leaves nothing behind.
@@ -13310,7 +13242,8 @@ const DEFAULT_RECHECK_DELAYS_MS = [250, 2e3];
 * ledgered, and a throw releases the partial set before it travels on.
 *
 * On success the ledger stays out of the way: the returned aggregate disposer
-* owns every registration.
+* owns every registration. The second `options` argument is FORWARDED: dropping
+* it here silently made every `when` registration unconditional (#343).
 */
 function registerAtomically(ctx, register) {
 	const releases = [];
@@ -13325,15 +13258,12 @@ function registerAtomically(ctx, register) {
 	} catch (error) {
 		for (const release of releases.splice(0)) try {
 			release();
-		} catch {}
+		} catch (releaseError) {
+			console.warn("[cherry-remote] 释放部分注册失败", releaseError);
+		}
 		throw error;
 	}
 }
-/**
-* The readable cause of a caught throw, for a message or a `degraded` note. A
-* host that rejects with a plain value is reported verbatim rather than as
-* `[object Object]`.
-*/
 function describeError(error) {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -13341,12 +13271,9 @@ function createToolScopeHost(deps) {
 	const { scope } = deps;
 	const names = deps.names;
 	const log = deps.log ?? ((message, error) => console.warn(message, error));
-	const recheckDelaysMs = deps.recheckDelaysMs ?? DEFAULT_RECHECK_DELAYS_MS;
-	let root;
-	let staticMode = "unsupported";
 	let staticCapable = false;
 	let mountTornDown = false;
-	/** The effect run currently holding the four faces, if any. */
+	/** The effect run currently holding the registration, if any. */
 	let current;
 	function probe(tools) {
 		if (tools === void 0) return {
@@ -13357,24 +13284,17 @@ function createToolScopeHost(deps) {
 			mode: "unsupported",
 			reason: UNSUPPORTED_REASON("tools.register")
 		};
-		if (typeof tools.resolve === "function") return {
+		if (typeof tools.resolve !== "function") return {
+			mode: "unsupported",
+			reason: UNSUPPORTED_REASON("tools.resolve（需要 dsh-tools ≥ 0.2.2-alpha.2 / 插件 engines.dsh ≥ 0.2.2-rc.1）")
+		};
+		return {
 			mode: "when",
 			reason: WHEN_READY_REASON
 		};
-		const missing = [];
-		if (typeof tools.restrict !== "function") missing.push("tools.restrict");
-		if (typeof tools.schemas !== "function") missing.push("tools.schemas");
-		if (missing.length > 0) return {
-			mode: "unsupported",
-			reason: UNSUPPORTED_REASON(...missing)
-		};
-		return {
-			mode: "legacy",
-			reason: READY_REASON
-		};
 	}
 	function UNSUPPORTED_REASON(...missing) {
-		return `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`;
+		return `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上步骤级条件；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`;
 	}
 	function projectAgent(raw) {
 		if (typeof raw !== "object" || raw === null) return void 0;
@@ -13383,12 +13303,9 @@ function createToolScopeHost(deps) {
 		if (typeof id !== "string" || id === "") return void 0;
 		const cwdValue = value.session?.header?.cwd;
 		const cwd = typeof cwdValue === "string" && cwdValue !== "" ? cwdValue : void 0;
-		const scopedTools = value.ctx?.tools;
-		const restrict = scopedTools?.restrict;
 		return {
 			id,
-			...cwd === void 0 ? {} : { cwd },
-			...typeof restrict !== "function" ? {} : { restrict: (filter) => restrict.call(scopedTools, filter) }
+			...cwd === void 0 ? {} : { cwd }
 		};
 	}
 	function liveAgents(state) {
@@ -13406,376 +13323,15 @@ function createToolScopeHost(deps) {
 		return raw.map((entry) => projectAgent(entry)).filter((agent) => agent !== void 0);
 	}
 	/**
-	* The ONE reporting site of an unreadable global view.
-	*
-	* The carrier is §6.1's EXISTING `install` source — an installation that could
-	* not be completed is exactly that degradation, and the five-value enum has no
-	* member for "unreadable view" (no sixth is added) — together with the warn
-	* channel. Reported, never silent.
-	*/
-	function noteUnobserved(cause, error) {
-		scope.noteDegraded({
-			source: "install",
-			reason: `无参 schemas() 不可读：${cause}（本轮既不安装也不释放任何层——既有层保持不动，绝不因为读不到就放开隐藏；下一次重算 / 配置保存会重试）`
-		});
-		log("[cherry-remote] 无参 schemas() 不可读；本轮不做任何装层 / 释放动作（fail-closed）", error);
-	}
-	/**
-	* The no-argument GLOBAL view of the tool registry — D12/B12①'s only
-	* sanctioned observation source for a deny set.
-	*
-	* `schemas(agent)` is deliberately never used: that view is already filtered by
-	* the agent's own layers, so deriving `deny` from it would re-admit the very
-	* names this plugin hides.
-	*
-	* `undefined` means the view could NOT be read, and it is deliberately NOT the
-	* same value as an empty `Set`:
-	*
-	*  - **observed empty** is B18③'s 观测集合为空 — nothing may be installed, while
-	*    an existing layer is still maintained by the ordinary rules;
-	*  - **failed to observe** must make NO layer-changing host call at all (see
-	*    {@link targetDeny}): routing it through the empty-target branch would
-	*    RELEASE the hiding layers of not-visible agents, i.e. fail open on an
-	*    unreadable input — the opposite of the module's own `agents.list()`
-	*    failure, which leaves layers installed (B7 calls "已注册未隐藏" the worst
-	*    state; B9/B16 resolve unreadable inputs to the stricter side).
-	*
-	* Contained HERE because this runs inside the injected effect body, which a real
-	* host may reach asynchronously (R16).
-	*/
-	function observeGlobalNames() {
-		const tools = root?.tools;
-		if (tools === void 0 || typeof tools.schemas !== "function") {
-			noteUnobserved("宿主 tools.schemas 不可用");
-			return;
-		}
-		try {
-			const view = tools.schemas();
-			return new Set((Array.isArray(view) ? view : []).map((definition) => definition?.name).filter((name) => typeof name === "string"));
-		} catch (error) {
-			noteUnobserved(describeError(error), error);
-			return;
-		}
-	}
-	/**
-	* The pinned target set — the names this agent must HIDE — with one definition
-	* and no second (B18):
-	*
-	*   visible under the CURRENT document and judgement ⇒ the EMPTY set
-	*   not visible ⇒ the governed `names` ∩ the observed global set
-	*   not visible, view unreadable ⇒ `undefined` (no target could be computed)
-	*
-	* `judgement()` is the per-agent cache; a MISS falls back to
-	* `scope.resolveNow(agent)` — the same §4 rules answered from the CURRENT
-	* generation WITHOUT awaiting anything. `rebuild()` is fed by the currently
-	* live agents alone, so a brand-new agent id can never be pre-judged; without
-	* that fallback the first install would deny every governed name and the tools
-	* would appear only once the asynchronous round converged — B13's 「第一轮就有工具」
-	* is exactly the other direction. Only when there is NO usable generation
-	* either (a read never taken, failed, or empty) does the expression collapse
-	* to `isVisible(doc, undefined)`: under `global` that is true (a miss releases
-	* only), while under `selected` it is false — the D7 fail-closed side.
-	* Visibility is derived from `isVisible`, never from `status === 'resolved'`,
-	* and the `visible` arm needs no observation at all.
-	*
-	* An EMPTY set means RELEASE ONLY. `{ deny: [] }` is never submitted: the host
-	* accepts it as a no-op layer admitting every name, which this plugin's guard
-	* (layer present ⇒ reject) would misread as "already hidden" — tools visible
-	* but rejected (B18③).
-	*
-	* `undefined` is NOT the empty set: the observation failed, so no target exists
-	* and the caller must leave every installed layer exactly where it is.
-	*/
-	function targetDeny(agent) {
-		const resolved = scope.judgement(agent.id) ?? scope.resolveNow(agent);
-		if (isVisible(scope.doc(), resolved?.workspaceId)) return [];
-		const observed = observeGlobalNames();
-		return observed === void 0 ? void 0 : names.filter((name) => observed.has(name));
-	}
-	function reasonFor(agent) {
-		const cached = scope.judgement(agent.id);
-		if (cached !== void 0) return cached.reason;
-		const sync = scope.resolveNow(agent);
-		if (sync === void 0) return "判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）";
-		if (sync.workspaceId !== void 0) return sync.reason;
-		return `判定缓存未命中（按 D7 fail-closed 隐藏；重算完成后按新判定补齐）；本窗口的同步判定：${sync.reason}`;
-	}
-	/** §4 ②'s 同名短路: two deny sets holding exactly the same names. */
-	function sameDenySet(a, b) {
-		return a.length === b.length && a.every((name) => b.includes(name));
-	}
-	/**
-	* THE release path for one installed layer: EVERY caller — the release-only
-	* arm of {@link applyForAgent}, `agent/disposed` and §6.2's teardown — goes
-	* through here, so the containment rule has exactly one definition.
-	*
-	* A release the host refuses is unrecoverable (the layer may still be installed
-	* while its record is already gone, so under intersection semantics it can
-	* never be released again and only a DSH restart clears it), but it must not
-	* travel into the caller either (B12②'s "不抛到调用方" is the same rule on both
-	* sides of the pair). So it is contained AND recorded: a `log` alone would leave
-	* the orphaned layer absent from `degraded` and from every diagnostics face.
-	* The wording names the agent and the consequence.
-	*/
-	function disposeQuietly(agentId, dispose) {
-		try {
-			dispose();
-		} catch (error) {
-			scope.noteDegraded({
-				source: "install",
-				reason: `agent ${agentId} 的 restriction 释放失败（层可能仍在生效，仅重启 DSH 可清除）：${describeError(error)}`
-			});
-			log(`[cherry-remote] 释放 agent ${agentId} 的 restriction 失败`, error);
-		}
-	}
-	function applyForAgent(state, agent) {
-		const target = targetDeny(agent);
-		const existing = state.layers.get(agent.id);
-		if (target === void 0) return "skipped";
-		if (target.length === 0) {
-			if (existing === void 0) return "skipped";
-			scope.clearLayer(agent.id);
-			state.layers.delete(agent.id);
-			disposeQuietly(agent.id, existing);
-			return "released";
-		}
-		const record = scope.layer(agent.id);
-		if (existing !== void 0 && record !== void 0 && sameDenySet(record.deny, target)) {
-			const reason = reasonFor(agent);
-			if (record.reason !== reason) scope.setLayer(agent.id, {
-				deny: record.deny,
-				reason
-			});
-			return "skipped";
-		}
-		if (agent.restrict === void 0) {
-			scope.noteDegraded({
-				source: "install",
-				reason: `agent ${agent.id} 缺少 agent.ctx.tools.restrict，无法安装 restriction：目标工具保持可见且 guard 放行（无 scoped ctx 的 agent；配置保存 / 下一次重算会重试）`
-			});
-			log(`[cherry-remote] agent ${agent.id} 没有 agent.ctx.tools.restrict，无法安装 restriction；跳过该 agent`);
-			return "skipped";
-		}
-		let dispose;
-		try {
-			dispose = agent.restrict({ deny: [...target] });
-		} catch (error) {
-			scope.noteDegraded({
-				source: "install",
-				reason: `agent ${agent.id} 的 restriction 安装被宿主拒绝：${describeError(error)}（该 agent 本轮未隐藏；下一次重算 / 配置保存会重试）`
-			});
-			log(`[cherry-remote] agent ${agent.id} 的 restriction 安装被宿主拒绝；本轮跳过该 agent`, error);
-			return "skipped";
-		}
-		state.layers.set(agent.id, dispose);
-		scope.setLayer(agent.id, {
-			deny: [...target],
-			reason: reasonFor(agent)
-		});
-		if (existing !== void 0) disposeQuietly(agent.id, existing);
-		return "installed";
-	}
-	function applyAll(state) {
-		const summary = {
-			agents: 0,
-			installed: 0,
-			released: 0,
-			skipped: 0
-		};
-		const agents = liveAgents(state);
-		summary.agents = agents.length;
-		for (const agent of agents) {
-			const outcome = applyForAgent(state, agent);
-			if (outcome === "installed") summary.installed += 1;
-			else if (outcome === "released") summary.released += 1;
-			else summary.skipped += 1;
-		}
-		return summary;
-	}
-	/**
-	* The asynchronous half of one round: one judgement generation, then the same
-	* (synchronous) install/release pass on top of it. Never rejects — a failed
-	* round is recorded, never thrown into a `@mode serial` event dispatch.
-	*/
-	async function converge(state) {
-		try {
-			if (state.tornDown || mountTornDown) return;
-			const registry = state.registry;
-			if (registry === void 0) return;
-			const agents = liveAgents(state).map((agent) => ({
-				id: agent.id,
-				...agent.cwd === void 0 ? {} : { cwd: agent.cwd }
-			}));
-			await scope.rebuild(registry, agents);
-			if (state.tornDown || mountTornDown) return;
-			applyAll(state);
-		} catch (error) {
-			log("[cherry-remote] 作用域重算失败（只记录，不抛；判定保持上一代）", error);
-		} finally {
-			scheduleRechecks(state);
-		}
-	}
-	/**
-	* §4 ①'s re-entrancy gate — the ONE entry of a recompute round.
-	*
-	* The host emits `tools/change` on BOTH sides of `register`/`restrict`, so the
-	* plugin's own install and release work necessarily re-enters its own listener.
-	* Coalescing is what makes that terminating:
-	*
-	*  - a round already in flight is never overlapped: the trigger only marks the
-	*    round DIRTY, and that round runs one catch-up pass before it ends (§4 ①,
-	*    "置脏后补跑，不丢弃") — an event arriving anywhere inside the round,
-	*    including its asynchronous interval, is therefore never lost;
-	*  - the loop stops at a FIXED POINT: a pass that changes no layer makes no
-	*    host call, so it emits nothing and leaves `dirty` false. §4 ③'s bounded
-	*    amplification (at most one reinstall per agent per round) rides on the
-	*    idempotent short-circuit inside {@link applyForAgent}.
-	*
-	* This is also §4's ONLY abstention point, and the check is deliberately the
-	* same one `refresh` / `onCreated` / `onDisposed` / {@link converge} carry: an
-	* event that was already dispatched when the merged disposer ran must reach a
-	* dead subsystem — never a recompute, never a layer.
-	*/
-	function requestRound(state) {
-		if (state.tornDown || mountTornDown || !staticCapable) return;
-		if (state.running) {
-			state.dirty = true;
-			return;
-		}
-		state.running = true;
-		runRounds(state);
-	}
-	/** The gate's body: the round itself, then every catch-up it accumulated. */
-	async function runRounds(state) {
-		try {
-			do {
-				state.dirty = false;
-				await converge(state);
-			} while (state.dirty && !state.tornDown && !mountTornDown);
-		} finally {
-			state.running = false;
-		}
-	}
-	/**
-	* D14's BOUNDED recheck — the other half of the synchronous judgement, and the
-	* only trigger of a round that is not an event.
-	*
-	* The synchronous window ({@link onCreated}, a config save) reads the CACHE and
-	* nothing else, so a judgement that is merely LATE — the registry was not
-	* ready, a `realpath` call failed, `sessionIds` had not caught up — leaves the
-	* agent fail-closed with no way to notice on its own. Every settled round
-	* therefore arms at most ONE timer per agent whose judgement is `unresolved`,
-	* at `recheckDelaysMs[attempt]`:
-	*
-	*  - `no-cwd` and `no-match` are terminally invisible (D14): the `cwd` is
-	*    detached, deep-frozen creation metadata and a conclusive "no workspace"
-	*    cannot become a hit by waiting, so arming a timer for either is exactly
-	*    the idle spin this rule exists to forbid;
-	*  - the schedule is FINITE — `recheckDelaysMs.length` attempts per agent, and
-	*    an attempt is spent by its FIRING — so an unresolvable state costs a
-	*    bounded number of rounds and then goes quiet;
-	*  - the timer is only a TRIGGER: it calls {@link requestRound} like every
-	*    other one, so a recheck landing inside an in-flight round is coalesced
-	*    into that round's catch-up pass instead of overlapping it. A direct
-	*    `applyAll` here would bypass the gate and could interleave with a round
-	*    already in flight.
-	*
-	* `tornDown` short-circuits the arming AND the firing, so no timer can outlive
-	* the generation that armed it (teardown clears the pending ones as well).
-	*/
-	function scheduleRechecks(state) {
-		if (state.tornDown || mountTornDown || !staticCapable) return;
-		const agents = liveAgents(state);
-		const live = new Set(agents.map((agent) => agent.id));
-		for (const [agentId, timer] of [...state.recheckTimers]) {
-			if (live.has(agentId)) continue;
-			clearTimeout(timer);
-			state.recheckTimers.delete(agentId);
-		}
-		for (const agentId of [...state.recheckSteps.keys()]) if (!live.has(agentId)) state.recheckSteps.delete(agentId);
-		for (const agent of agents) {
-			if (scope.judgement(agent.id)?.status !== "unresolved") continue;
-			if (state.recheckTimers.has(agent.id)) continue;
-			const attempt = state.recheckSteps.get(agent.id) ?? 0;
-			if (attempt >= recheckDelaysMs.length) continue;
-			const timer = setTimeout(() => {
-				state.recheckTimers.delete(agent.id);
-				state.recheckSteps.set(agent.id, attempt + 1);
-				requestRound(state);
-			}, recheckDelaysMs[attempt] ?? 0);
-			state.recheckTimers.set(agent.id, timer);
-		}
-	}
-	function guardVerdict(execution) {
-		if (!names.includes(execution.name)) return void 0;
-		const agentId = execution.agent?.id;
-		if (agentId === void 0) return void 0;
-		const layer = scope.layer(agentId);
-		return layer === void 0 ? void 0 : `cherry-remote 作用域限制：${layer.reason}`;
-	}
-	function refresh() {
-		const state = current;
-		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return void 0;
-		if (staticMode === "when") {
-			rebuildJudgements(state);
-			return;
-		}
-		const summary = applyAll(state);
-		requestRound(state);
-		return summary;
-	}
-	function teardownEffect(state) {
-		if (state.tornDown) return;
-		state.tornDown = true;
-		for (const off of state.offs.splice(0)) try {
-			off();
-		} catch (error) {
-			log("[cherry-remote] 作用域子系统退订失败", error);
-		}
-		for (const timer of state.recheckTimers.values()) clearTimeout(timer);
-		state.recheckTimers.clear();
-		state.recheckSteps.clear();
-		const releaseRegistrations = state.releaseRegistrations;
-		state.releaseRegistrations = void 0;
-		try {
-			releaseRegistrations?.();
-		} catch (error) {
-			log("[cherry-remote] 释放 cherry_* 工具注册失败", error);
-		}
-		for (const [agentId, dispose] of [...state.layers]) {
-			if (current === state) scope.clearLayer(agentId);
-			disposeQuietly(agentId, dispose);
-		}
-		state.layers.clear();
-		const releaseGuard = state.releaseGuard;
-		state.releaseGuard = void 0;
-		try {
-			releaseGuard?.();
-		} catch (error) {
-			log("[cherry-remote] 释放 tools.guard 失败", error);
-		}
-		if (current === state) {
-			scope.invalidateDerived();
-			current = void 0;
-			if (scope.host().state === "ready") scope.setHost({
-				state: "pending",
-				capable: false,
-				reason: `${PENDING_REASON}（注入回调已卸载）`
-			});
-		}
-	}
-	/**
-	* The step-time path (#343): ONE registration carrying one shared `when`.
-	*
 	* There is no layer to install, no agent lifecycle to follow and no recheck
-	* timer: the host evaluates the condition at every step, so a config save or
-	* a fresh agent is answered by the very next step. The async judgement
+	* timer: the host evaluates the condition at every step, so a config save or a
+	* fresh agent is answered by the very next step. The async judgement
 	* generation still runs (a `cwd` that only realpath can match), but only to
 	* improve the answer — the gate itself reads `judgement ?? resolveNow(agent)`
 	* synchronously and fails closed.
 	*/
 	function setupWhen(agentCtx) {
-		if (mountTornDown) return () => {};
+		if (!staticCapable || mountTornDown) return () => {};
 		scope.setHost({
 			state: "ready",
 			capable: true,
@@ -13783,16 +13339,9 @@ function createToolScopeHost(deps) {
 		});
 		const state = {
 			tornDown: false,
-			running: false,
-			dirty: false,
-			layers: /* @__PURE__ */ new Map(),
-			recheckSteps: /* @__PURE__ */ new Map(),
-			recheckTimers: /* @__PURE__ */ new Map(),
 			agents: agentCtx.agents,
 			registry: agentCtx.workspaceRegistry,
 			releaseRegistrations: void 0,
-			releaseGuard: void 0,
-			offs: [],
 			teardown: () => {}
 		};
 		state.teardown = () => teardownEffect(state);
@@ -13831,139 +13380,28 @@ function createToolScopeHost(deps) {
 			log("[cherry-remote] 作用域判定重建失败（保留上一代判定）", error);
 		});
 	}
-	function setup(agentCtx) {
-		if (mountTornDown) return () => {};
-		if (staticMode === "when") return setupWhen(agentCtx);
-		if (!staticCapable) return () => {};
-		scope.setHost({
-			state: "ready",
-			capable: true,
-			reason: READY_REASON
-		});
-		const state = {
-			tornDown: false,
-			running: false,
-			dirty: false,
-			layers: /* @__PURE__ */ new Map(),
-			recheckSteps: /* @__PURE__ */ new Map(),
-			recheckTimers: /* @__PURE__ */ new Map(),
-			agents: agentCtx.agents,
-			registry: agentCtx.workspaceRegistry,
-			releaseRegistrations: void 0,
-			releaseGuard: void 0,
-			offs: [],
-			teardown: () => {}
-		};
-		state.teardown = () => teardownEffect(state);
-		let releaseRegistrations;
-		try {
-			releaseRegistrations = deps.registerTools();
-		} catch (error) {
-			state.tornDown = true;
-			scope.setHost({
-				state: "unsupported",
-				capable: false,
-				reason: `cherry_* 工具注册失败：${describeError(error)}`
-			});
-			log("[cherry-remote] cherry_* 工具注册失败；作用域子系统未启用，未安装任何 restriction", error);
-			return state.teardown;
-		}
-		state.releaseRegistrations = releaseRegistrations;
-		current = state;
-		const rootTools = root?.tools;
-		if (typeof rootTools?.guard === "function") try {
-			state.releaseGuard = rootTools.guard((execution) => guardVerdict(execution));
-		} catch (error) {
-			degradeToVisibilityOnly(`宿主 tools.guard 安装被拒绝：${describeError(error)}`, error);
-		}
-		else degradeToVisibilityOnly(`宿主缺 tools.guard：执行层兜底不可用，降级为“仅可见性”（restrict 仍在装配层移除这 ${names.length} 个工具，不是渲染层假过滤）`);
-		const on = agentCtx.on;
-		if (typeof on === "function") {
-			subscribe(state, on, "agent/created", (payload) => {
-				onCreated(state, payload);
-			});
-			subscribe(state, on, "agent/disposed", (payload) => {
-				onDisposed(state, payload);
-			});
-			subscribe(state, on, "tools/change", () => {
-				requestRound(state);
-			});
-		}
-		refresh();
-		return state.teardown;
+	function refresh() {
+		const state = current;
+		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return void 0;
+		rebuildJudgements(state);
 	}
-	/**
-	* B17's single reporting site: the guard being ABSENT and the host REFUSING it
-	* are the same degradation — "仅可见性". It is reported through the existing
-	* warn carrier and recorded in §6.1's `degraded` set, never silent, and it is
-	* never a reason to refuse registration.
-	*/
-	function degradeToVisibilityOnly(reason, error) {
-		scope.noteDegraded({
-			source: "visibility-only",
-			reason
-		});
-		log(`[cherry-remote] ${reason}`, error);
-	}
-	/**
-	* One subscription, contained (R16): a host that refuses `on(…)` must not take
-	* the round down with it — the failure is reported and the round continues with
-	* whatever subscriptions succeeded. `DegradedSource` is a fixed five with no
-	* member for a refused subscription, so the honest carrier is the existing warn
-	* channel — the same way §6.1 handles a parse failure (B9).
-	*/
-	function subscribe(state, on, event, handle) {
+	function teardownEffect(state) {
+		if (state.tornDown) return;
+		state.tornDown = true;
+		const releaseRegistrations = state.releaseRegistrations;
+		state.releaseRegistrations = void 0;
 		try {
-			state.offs.push(on(event, handle));
+			releaseRegistrations?.();
 		} catch (error) {
-			log(`[cherry-remote] 订阅 ${event} 失败；该事件的重算触发器缺失，本轮继续（其余订阅与已装层不受影响）`, error);
+			log("[cherry-remote] 释放 cherry_* 工具注册失败", error);
 		}
-	}
-	/** `agent/created`: synchronous, cache-only, never throws (host `@mode serial`). */
-	function onCreated(state, payload) {
-		if (state.tornDown || mountTornDown) return;
-		const agent = projectAgent(payload?.agent);
-		if (agent === void 0) return;
-		try {
-			applyForAgent(state, agent);
-		} catch (error) {
-			log(`[cherry-remote] agent ${agent.id} 的首次装配失败（不阻塞建会话）`, error);
-		}
-		requestRound(state);
-	}
-	/**
-	* `agent/disposed`: releases exactly that agent's layer and its record.
-	*
-	* The agent's pending recheck goes with it: a session that no longer exists
-	* owes no later round, so an armed timer here would be one wasted recompute at
-	* best — the smaller version of the leak teardown closes for the whole
-	* generation.
-	*/
-	function onDisposed(state, payload) {
-		if (state.tornDown || mountTornDown) return;
-		const agent = projectAgent(payload?.agent);
-		if (agent === void 0) return;
-		try {
-			const timer = state.recheckTimers.get(agent.id);
-			if (timer !== void 0) {
-				clearTimeout(timer);
-				state.recheckTimers.delete(agent.id);
-			}
-			state.recheckSteps.delete(agent.id);
-			const dispose = state.layers.get(agent.id);
-			scope.clearLayer(agent.id);
-			state.layers.delete(agent.id);
-			if (dispose !== void 0) disposeQuietly(agent.id, dispose);
-		} catch (error) {
-			log(`[cherry-remote] 释放 agent ${agent.id} 的 restriction 失败（不阻塞处置）`, error);
-		}
+		if (current === state) current = void 0;
 	}
 	return {
 		mount(ctx) {
-			root = ctx;
 			mountTornDown = false;
 			const probed = probe(ctx.tools);
-			staticMode = probed.mode;
+			probed.mode;
 			staticCapable = probed.mode !== "unsupported";
 			if (!staticCapable) {
 				scope.setHost({
@@ -13979,7 +13417,7 @@ function createToolScopeHost(deps) {
 			});
 			try {
 				ctx.inject?.(INJECT_KEYS, (agentCtx) => {
-					agentCtx.effect?.(() => setup(agentCtx), EFFECT_LABEL);
+					agentCtx.effect?.(() => setupWhen(agentCtx), EFFECT_LABEL);
 				});
 			} catch (error) {
 				log("[cherry-remote] agents / workspaceRegistry 注入不可用；作用域子系统保持 pending", error);
