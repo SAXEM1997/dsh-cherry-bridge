@@ -1148,6 +1148,19 @@ export class FakeCherry {
   #contentDigests = new Map<string, string>()
   /** Deliberately FALSE `byteLength` declarations (see `understateContentLength`). */
   #contentByteOverrides = new Map<string, number>()
+  /**
+   * `agent.content.read` concurrency observation (#329): how many slice
+   * requests are being SERVED right now, and the high-water mark. The client's
+   * bounded window is only observable here — a serial walk never exceeds 1.
+   */
+  #contentReadsInFlight = 0
+  #contentReadsPeak = 0
+  /** Per-offset slice delay, so answers can arrive OUT of request order (#329). */
+  #contentReadDelays = new Map<string, number>()
+  /** A delay on EVERY slice, so a client window is observable at all (#329). */
+  #contentReadDelayAll = 0
+  /** Per-offset slice refusal, so one slice of a window can fail (#329). */
+  #contentReadFailures = new Map<string, FakeFailure>()
 
   // Interactive command face observation (Task 9).
   /**
@@ -1516,6 +1529,35 @@ export class FakeCherry {
   /** Every `agent.uploads.resume` this peer received, params verbatim (#327). */
   uploadResumes(): readonly Record<string, unknown>[] {
     return this.#uploadResumes
+  }
+
+  /** The most `agent.content.read` slices this peer ever served at once (#329). */
+  maxContentReadsInFlight(): number {
+    return this.#contentReadsPeak
+  }
+
+  /** Slices being served right now — 0 once every walk has settled (#329). */
+  contentReadsInFlight(): number {
+    return this.#contentReadsInFlight
+  }
+
+  /** Delay ONE offset's slice reply, so later slices overtake it (#329). */
+  delayContentReadAt(offset: string, delayMs: number): void {
+    this.#contentReadDelays.set(offset, delayMs)
+  }
+
+  /**
+   * Delay EVERY slice by `delayMs`. Without one, a handler runs to completion
+   * in the turn it was dispatched in, so two slices can never be observed at
+   * once however wide the client's window is.
+   */
+  slowContentReads(delayMs: number): void {
+    this.#contentReadDelayAll = delayMs
+  }
+
+  /** Refuse ONE offset's slice, leaving the rest of the window intact (#329). */
+  failContentReadAt(offset: string, failure: FakeFailure): void {
+    this.#contentReadFailures.set(offset, failure)
   }
 
   /**
@@ -2684,7 +2726,7 @@ export class FakeCherry {
       case 'agent.messages.list':
       case 'agent.parts.list':
       case 'agent.content.read':
-        return this.#handleRead(method, params)
+        return await this.#handleRead(method, params)
       case 'agent.sessions.create':
       case 'agent.messages.send':
       case 'agent.executions.cancel':
@@ -3432,7 +3474,28 @@ export class FakeCherry {
   // -------------------------------------------------------------------------
 
   /** One read-face call: inject a failure, then serve the ported semantics. */
-  #handleRead(method: string, params: Record<string, unknown>): Record<string, unknown> {
+  async #handleRead(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method !== 'agent.content.read') return this.#readResult(method, params)
+    // A content slice is the one read face a client may WINDOW (#329), so the
+    // peer counts them while it serves them: the delay (and the refusal) land
+    // inside the count, which is what makes an out-of-order arrival and a
+    // still-settling window observable from a test.
+    const offset = String(params['offset'] ?? '')
+    this.#contentReadsInFlight += 1
+    this.#contentReadsPeak = Math.max(this.#contentReadsPeak, this.#contentReadsInFlight)
+    try {
+      const delay = this.#contentReadDelays.get(offset) ?? this.#contentReadDelayAll
+      if (delay > 0) await sleep(delay)
+      const failure = this.#contentReadFailures.get(offset)
+      if (failure !== undefined) throw new FakeRpcError(failure)
+      return this.#readResult(method, params)
+    } finally {
+      this.#contentReadsInFlight -= 1
+    }
+  }
+
+  /** The read's answer plus its post-call hook, shared by every read method. */
+  #readResult(method: string, params: Record<string, unknown>): Record<string, unknown> {
     const result = this.#serveRead(method, params)
     const hook = this.#afterReadOnce.get(method)
     if (hook !== undefined) {
