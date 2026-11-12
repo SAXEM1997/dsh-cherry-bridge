@@ -3022,6 +3022,23 @@ var UploadInterruptedError = class extends Error {
 	}
 };
 /**
+* A refusal the PEER stated, carrying its own code (#339).
+*
+* `upload-failed`'s `reason` is the peer's vocabulary, not ours: only a code
+* that arrived in a peer answer — an `uploads.ack` failure, or a failed
+* `uploads.get` snapshot — may travel there. Keeping local failures on other
+* classes lets the tool layer decide by TYPE instead of by shape, so an I/O
+* errno can never impersonate a peer code.
+*/
+var UploadRefusedError = class extends Error {
+	code;
+	constructor(code, message) {
+		super(message);
+		this.name = "UploadRefusedError";
+		this.code = code;
+	}
+};
+/**
 * CEILING for the business-request window — not the window itself. The window
 * is owned by the rpc layer and is sized from the peer's hello-reported
 * `inFlightRequests` (spec §3.4「取回报一半」): see
@@ -3926,7 +3943,7 @@ var DeviceConnection = class {
 				return;
 			}
 			waiter.resolve(Number(ack.committedOffset));
-		} else waiter.reject(Object.assign(new Error(ack.error.message), { code: ack.error.reason }));
+		} else waiter.reject(new UploadRefusedError(ack.error.reason, ack.error.message));
 	}
 	/** Polls `agent.uploads.get` until the peer finishes verifying. */
 	async #waitUploadReady(uploadId, pollMs, signal) {
@@ -3937,7 +3954,7 @@ var DeviceConnection = class {
 			if (state === "ready") return;
 			if (state === "failed") {
 				const code = String(snapshot["failureCode"] ?? "VERIFICATION_FAILED");
-				throw Object.assign(/* @__PURE__ */ new Error(`upload ${uploadId} failed verification (${code})`), { code });
+				throw new UploadRefusedError(code, `upload ${uploadId} failed verification (${code})`);
 			}
 			await new Promise((resolve) => setTimeout(resolve, pollMs));
 		}
@@ -7731,17 +7748,18 @@ function sameAttachmentIds(value, ids) {
 	return value.every((item, index) => isRecord$1(item) && item["uploadId"] === ids[index]);
 }
 /**
-* The `reason` an upload failure reports: a peer refusal's own code, or the
-* reason a LOCAL failure states as a `code` field.
+* The `reason` an upload failure reports: a code the PEER stated, or the one
+* LOCAL fact the vocabulary carries (`LINK_LOST`).
 *
-* A link lost mid-upload has no peer code to carry — the peer never answered —
-* so {@link UploadInterruptedError} declares `LINK_LOST` as a class field and
-* this one reader picks it up (#334). Without it the verdict is `upload-failed`
-* with no reason at all, indistinguishable from a peer refusal whose code was
-* dropped.
+* The reader is deliberately by TYPE, not by shape (#339). While it duck-typed
+* `error['code']`, a local I/O errno travelled to callers as if the peer had
+* said it — falsifying this field's meaning and #334's "the only reason of
+* ours". A refused upload is {@link UploadRefusedError}; a lost link is
+* {@link UploadInterruptedError}.
 */
-function uploadFailureCode(error) {
-	return isRecord$1(error) && typeof error["code"] === "string" ? error["code"] : void 0;
+function uploadFailureReason(error) {
+	if (error instanceof UploadRefusedError) return error.code;
+	if (error instanceof UploadInterruptedError) return error.code;
 }
 /** The route gate's refusal when no provider/model pair can be read. */
 const IMAGE_ROUTE_UNRESOLVED = "cannot read images from this session: the current model route could not be resolved";
@@ -9484,9 +9502,8 @@ var CherryToolEngine = class {
 	* and parts are projected sequentially, so an aggregate's own peak is one
 	* ref's. The slice window (#329) adds at most eight undecoded `dataBase64`
 	* strings — one 24 KiB slice each, so ~192 KiB, NOT eight record caps. It is
-	* NOT a process-wide
-	* bound: independent reads (separate tool calls) in flight together multiply
-	* the peak by their count. What bounds that count is the
+	* NOT a process-wide bound: independent reads (separate tool calls) in flight
+	* together multiply the peak by their count. What bounds that count is the
 	* {@link ContentReadGate} a caller holds for this REF — across the whole
 	* projection, `saveImage` included, never per slice — so this method acquires
 	* nothing itself.
@@ -9978,7 +9995,7 @@ var CherryToolEngine = class {
 			});
 		} catch (error) {
 			await this.#cancelUploads(connection, uploaded);
-			const code = uploadFailureCode(error);
+			const code = uploadFailureReason(error);
 			return {
 				error: "upload-failed",
 				filename: file.filename,

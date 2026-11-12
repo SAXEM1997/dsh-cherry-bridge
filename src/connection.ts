@@ -300,6 +300,25 @@ export class UploadInterruptedError extends Error {
 }
 
 /**
+ * A refusal the PEER stated, carrying its own code (#339).
+ *
+ * `upload-failed`'s `reason` is the peer's vocabulary, not ours: only a code
+ * that arrived in a peer answer — an `uploads.ack` failure, or a failed
+ * `uploads.get` snapshot — may travel there. Keeping local failures on other
+ * classes lets the tool layer decide by TYPE instead of by shape, so an I/O
+ * errno can never impersonate a peer code.
+ */
+export class UploadRefusedError extends Error {
+  readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'UploadRefusedError'
+    this.code = code
+  }
+}
+
+/**
  * WHY a parked replay wait ended (issue #21).
  *
  * Its own type because the caller must not have to INFER the cause: before this
@@ -1504,9 +1523,7 @@ export class DeviceConnection {
       }
       waiter.resolve(Number(ack.committedOffset))
     } else {
-      waiter.reject(
-        Object.assign(new Error(ack.error.message), { code: ack.error.reason }),
-      )
+      waiter.reject(new UploadRefusedError(ack.error.reason, ack.error.message))
     }
   }
 
@@ -1526,7 +1543,7 @@ export class DeviceConnection {
       if (state === 'ready') return
       if (state === 'failed') {
         const code = String(snapshot['failureCode'] ?? 'VERIFICATION_FAILED')
-        throw Object.assign(new Error(`upload ${uploadId} failed verification (${code})`), { code })
+        throw new UploadRefusedError(code, `upload ${uploadId} failed verification (${code})`)
       }
       await new Promise<void>((resolve) => setTimeout(resolve, pollMs))
     }
