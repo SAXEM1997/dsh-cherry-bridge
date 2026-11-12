@@ -818,4 +818,29 @@ describe('issue #327: an interrupted upload resumes', () => {
     expect(rig.fake.uploadedBytes(uploadId)?.equals(bytes)).toBe(true)
     expect(rig.fake.uploadedSha256(uploadId)).toBe(createHash('sha256').update(bytes).digest('hex'))
   })
+
+  it('㉘c a peer that ROTATED its writer epoch is never resumed onto', async () => {
+    // The peer reports a different `writerEpoch` than the one the upload was
+    // staged under — its writer was replaced, so the staged bytes are no longer
+    // the ones this file describes. A resume must be abandoned (and the staged
+    // record cancelled), NOT carried over into the new writer.
+    const bytes = Buffer.alloc(2 * 1024 * 1024, 7)
+    const files = new Map([['/work/rotated.bin', bytes]])
+    const rig = await makeRig({ fs: slowFs(files, 120) })
+    rig.fake.dropLinkAfterUploadChunks(1)
+    rig.fake.reportUploadWriterEpochOnGet('7')
+
+    const verdict = (await rig.call(
+      'cherry_send',
+      { device: 'dev-A', sessionId: 's-1', text: '', wait: false, attachments: [{ path: '/work/rotated.bin' }] },
+      exec(),
+    )) as Record<string, unknown>
+
+    // The ORIGINAL link-loss verdict stands, and nothing was written twice.
+    expect(verdict['error']).toBe('upload-failed')
+    expect(rig.fake.methodCount('agent.uploads.prepare')).toBe(1)
+    expect(rig.fake.uploadResumes()).toHaveLength(0)
+    expect(rig.fake.uploadCancelCount()).toBe(1)
+    expect(rig.fake.methodCount('agent.messages.send')).toBe(0)
+  })
 })

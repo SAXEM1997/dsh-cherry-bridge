@@ -4864,9 +4864,12 @@ export class CherryToolEngine {
    * Three copies is the price of never hashing a buffer that the caller could
    * mutate, and it is paid ONE REF AT A TIME by this engine's walks — messages
    * and parts are projected sequentially, so an aggregate's own peak is one
-   * ref's. It is NOT a process-wide bound: independent reads (separate tool
-   * calls) in flight together multiply the peak by their count. A global gate
-   * or budget is a separate concern, deliberately outside this walk.
+   * ref's. The slice window (#329) adds at most eight undecoded `dataBase64`
+   * strings, each bounded by the 64 KiB record cap. It is NOT a process-wide
+   * bound: independent reads (separate tool calls) in flight together multiply
+   * the peak by their count. What bounds that count is the
+   * {@link ContentReadGate} a caller holds around this walk — a slot per REF,
+   * never per slice, so this method acquires nothing itself.
    */
   async #readVerifiedBytes(
     connection: DeviceConnection,

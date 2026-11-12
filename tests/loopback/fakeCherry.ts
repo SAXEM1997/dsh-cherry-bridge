@@ -1190,6 +1190,12 @@ export class FakeCherry {
   #dropAfterUploadChunks: number | undefined
   /** Drop every live socket as `agent.uploads.complete` is answered (#327). */
   #dropOnUploadComplete = false
+  /**
+   * The `writerEpoch` `agent.uploads.get` reports instead of the staged one
+   * (#333). A compliant peer never changes it, so the client's guard against a
+   * DIFFERENT epoch can only be driven from here.
+   */
+  #uploadGetEpoch: string | undefined
   /** Interactions the peer currently serves via `agent.interactions.list`. */
   #interactions: FakeInteractionRecord[]
   /** The execution id the peer reports as active for the session. */
@@ -1529,6 +1535,16 @@ export class FakeCherry {
   /** Every `agent.uploads.resume` this peer received, params verbatim (#327). */
   uploadResumes(): readonly Record<string, unknown>[] {
     return this.#uploadResumes
+  }
+
+  /**
+   * Answer `agent.uploads.get` with `epoch` instead of the epoch the upload was
+   * staged under (#333). A compliant peer never rewrites it, so this is the only
+   * way to drive the client's "the epoch I staged under is gone" guard: it must
+   * abandon the resume and surface the ORIGINAL link-loss error.
+   */
+  reportUploadWriterEpochOnGet(epoch: string): void {
+    this.#uploadGetEpoch = epoch
   }
 
   /** The most `agent.content.read` slices this peer ever served at once (#329). */
@@ -2471,7 +2487,11 @@ export class FakeCherry {
    */
   #handleUploadResume(params: Record<string, unknown>): Record<string, unknown> {
     const upload = this.#uploadOf(String(params['uploadId'] ?? ''))
-    if (params['expectedWriterEpoch'] !== upload.writerEpoch) {
+    // A peer that ROTATED its writer (see `reportUploadWriterEpochOnGet`) accepts
+    // the epoch it now reports, so a client that ignored the change would resume
+    // straight onto a different writer — the case the client's guard exists for.
+    const accepted = this.#uploadGetEpoch ?? upload.writerEpoch
+    if (params['expectedWriterEpoch'] !== accepted) {
       throw new FakeRpcError({ reason: 'CONFLICT', message: 'Writer epoch changed' })
     }
     this.#uploadResumes.push(params)
@@ -2745,8 +2765,11 @@ export class FakeCherry {
         return this.#handleClose(params)
       case 'agent.uploads.prepare':
         return this.#handleUploadPrepare(params)
-      case 'agent.uploads.get':
-        return this.#uploadSnapshotOrThrow(String(params['uploadId'] ?? ''))
+      case 'agent.uploads.get': {
+        const snapshot = this.#uploadSnapshotOrThrow(String(params['uploadId'] ?? ''))
+        if (this.#uploadGetEpoch !== undefined) snapshot['writerEpoch'] = this.#uploadGetEpoch
+        return snapshot
+      }
       case 'agent.uploads.complete':
         return this.#handleUploadComplete(params)
       case 'agent.uploads.resume':
