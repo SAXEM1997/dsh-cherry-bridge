@@ -9483,11 +9483,13 @@ var CherryToolEngine = class {
 	* mutate, and it is paid ONE REF AT A TIME by this engine's walks — messages
 	* and parts are projected sequentially, so an aggregate's own peak is one
 	* ref's. The slice window (#329) adds at most eight undecoded `dataBase64`
-	* strings, each bounded by the 64 KiB record cap. It is NOT a process-wide
+	* strings — one 24 KiB slice each, so ~192 KiB, NOT eight record caps. It is
+	* NOT a process-wide
 	* bound: independent reads (separate tool calls) in flight together multiply
 	* the peak by their count. What bounds that count is the
-	* {@link ContentReadGate} a caller holds around this walk — a slot per REF,
-	* never per slice, so this method acquires nothing itself.
+	* {@link ContentReadGate} a caller holds for this REF — across the whole
+	* projection, `saveImage` included, never per slice — so this method acquires
+	* nothing itself.
 	*/
 	async #readVerifiedBytes(connection, sessionId, ref, byteCap, deadline) {
 		const contentId = String(ref["contentId"] ?? "");
