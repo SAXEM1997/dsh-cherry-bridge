@@ -456,25 +456,23 @@ describe('the degraded set â€” same source dedupes, different sources coexist (â
 
     expect(state.degraded()).toEqual([])
 
-    state.noteDegraded({ source: 'install', reason: 'first' })
-    state.noteDegraded({ source: 'install', reason: 'second' })
+    state.noteDegraded({ source: 'path-normalization', reason: 'first' })
+    state.noteDegraded({ source: 'path-normalization', reason: 'second' })
 
-    expect(state.degraded()).toEqual([{ source: 'install', reason: 'second' }])
+    expect(state.degraded()).toEqual([{ source: 'path-normalization', reason: 'second' }])
   })
 
-  it('keeps one note per source while all four sources coexist', () => {
+  it('keeps one note per source while all three sources coexist', () => {
     const state = new ToolScopeState({ file: makeScopeFile() })
 
     // `workspace-list` is written by its one write site, not by the test.
     state.setWorkspaces([])
-    state.noteDegraded({ source: 'install', reason: 'install failed' })
     state.noteDegraded({ source: 'scope-version', reason: 'version above this plugin' })
     state.noteDegraded({ source: 'path-normalization', reason: 'no resolveByPath' })
 
     const notes = state.degraded()
-    expect(notes).toHaveLength(4)
+    expect(notes).toHaveLength(3)
     expect(notes.map((note) => note.source).sort()).toEqual([
-      'install',
       'path-normalization',
       'scope-version',
       'workspace-list',

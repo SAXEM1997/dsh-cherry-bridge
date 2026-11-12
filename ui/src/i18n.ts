@@ -206,7 +206,6 @@ const zh: Dict = {
   // message would go: there is no server message when nothing answered.
   'scope.error.timeout': '请求长时间没有回应，已中止——请稍后重试',
   'scope.serverSaid': '服务端返回 {code}（HTTP {status}）。',
-  'scope.degraded.install': '隐藏层应用曾失败（install）：相关 agent 的隐藏层未生效或无法确认，启用范围对它可能不适用',
   'scope.degraded.workspace-list': '注册表列表当前读不到',
   'scope.degraded.scope-version': '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）',
   'scope.degraded.path-normalization': '路径规范化降级：cwd 比对可能不准确',
@@ -486,8 +485,6 @@ const en: Dict = {
   'scope.saveFailed': 'Save failed: {cause}',
   'scope.error.timeout': 'The request stopped answering and was abandoned. Try again in a moment.',
   'scope.serverSaid': 'The server answered {code} (HTTP {status}).',
-  'scope.degraded.install':
-    'Applying a hidden layer failed earlier (install): the affected agent’s hidden layer is not in effect or cannot be confirmed, so the tool scope may not apply to it',
   'scope.degraded.workspace-list': 'The workspace registry list is currently unreadable',
   'scope.degraded.scope-version': 'The scope document version does not match the one this plugin supports (one guard covers newer and older)',
   'scope.degraded.path-normalization': 'Path normalization degraded: the cwd comparison may be inaccurate',

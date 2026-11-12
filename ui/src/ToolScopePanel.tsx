@@ -76,23 +76,14 @@ const EFFECT_NOTE_KEY = 'scope.effectNote'
 
 /**
  * One line per degradation source, as a module-level PURE KEY table; the
- * server's own reason is shown beside it.
- *
- * `install` is the general one — its four writers cover a `schemas()` read that
- * could not compute a target, a layer whose release threw, an agent with no
- * `agent.ctx.tools.restrict`, and a `restrict()` the host refused (the `reason`
- * says which) — so the line states the CONSEQUENCE common to all four rather
- * than any one cause. It says 曾 on purpose: the note is append-only (cleared
- * only by a successful workspace-list read), so after a recovered round the
- * surviving claim is that one application failed earlier in this session.
- *
- * The values are KEYS and only keys: the table is read at MODULE scope (the
- * render below) and inside `resolveEmptyHint`, where no `t` exists, so it must
- * not close over one. The text itself lives in `ui/src/i18n.ts`, the single
- * source of truth for every Chinese string the page shows.
+ * server's own reason is shown beside each. The table is exhaustive over the
+ * closed source set, and its values are KEYS and only keys: they are
+ * read at MODULE scope (the render below) and inside `resolveEmptyHint`, where
+ * no `t` exists, so the table must not close over one. The text itself lives in
+ * `ui/src/i18n.ts`, the single source of truth for every Chinese string the
+ * page shows.
  */
 const DEGRADED_KEYS: Record<DegradedSource, string> = {
-  install: 'scope.degraded.install',
   'workspace-list': 'scope.degraded.workspace-list',
   'scope-version': 'scope.degraded.scope-version',
   'path-normalization': 'scope.degraded.path-normalization',

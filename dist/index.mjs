@@ -2533,7 +2533,6 @@ function hostStateOr(raw) {
 * grows, which a plain array literal could not.
 */
 const DEGRADED_SOURCES = {
-	install: true,
 	"workspace-list": true,
 	"scope-version": true,
 	"path-normalization": true

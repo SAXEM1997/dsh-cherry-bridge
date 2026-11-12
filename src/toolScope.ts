@@ -73,7 +73,7 @@ export const DEFAULT_SCOPE: ScopeDoc = {
 /**
  * The five, fixed degradation sources.
  *
- * Deliberately four: a parse failure or an invalid field has NO member here. Its
+ * Deliberately three: a parse failure or an invalid field has NO member here. Its
  * carrier is the existing warn channel (`log`, else `console.warn`) plus the
  * strictness order, and its document stays writable (B9) — unlike
  * `scope-version`, which is the dedicated "the document is newer than this
@@ -81,7 +81,6 @@ export const DEFAULT_SCOPE: ScopeDoc = {
  * write entirely.
  */
 export type DegradedSource =
-  | 'install'
   | 'workspace-list'
   | 'scope-version'
   | 'path-normalization'

@@ -832,8 +832,8 @@ registered workspace — treated as workspace-less, **not** a degradation), and
 `host` (`state` / `capable` / `reason` / `degraded`). `staleWorkspaceIds` and
 `pathUnmatched` are two separate channels and neither derives from the other.
 `degraded` is an array of `{source, reason}`, one latest entry per source, over
-exactly four closed sources — `install`, `workspace-list`,
-`scope-version`, `path-normalization` (an empty array is the honest "no
+exactly three closed sources — `workspace-list`, `scope-version`,
+`path-normalization` (an empty array is the honest "no
 degradation"). `host` and `pathUnmatched` come from the same scope read the
 diagnostics report uses, so the two faces cannot drift.
 
