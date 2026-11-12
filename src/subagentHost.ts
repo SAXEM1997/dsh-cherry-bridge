@@ -120,7 +120,7 @@ export interface ActivationContextLike {
  * `ctx.tools.resolve` is the step-time resolver: it is what evaluates the
  * registered conditions, so a host that predates `ToolRegistrationOptions` has
  * no use for it and does not ship it. Our own host snapshot for `0.2.0-rc.2`
- * (the low end of the advertised `dsh` range) records exactly
+ * (a host below the advertised floor) records exactly
  * `register(definition): () => void` — no options object at all.
  *
  * That matters because such a host IGNORES a second argument rather than

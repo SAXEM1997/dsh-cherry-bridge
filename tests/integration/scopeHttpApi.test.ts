@@ -453,8 +453,8 @@ describe('PUT /cherry-remote/api/scope', () => {
 
     // §6.3's hard constraint: `save` completed, then `refreshScope()` was called
     // with NO await between them — the microtask queued inside `save` is still
-    // BEHIND the refresh call. The when path has no layer to install, so the
-    // round's echo is `undefined`.
+    // BEHIND the refresh call. `refreshScope()` returns nothing; the call
+    // count is the observable.
     expect(fixture.order.indexOf('save')).toBeLessThan(fixture.order.indexOf('refresh'))
     expect(fixture.order.indexOf('save-microtask')).toBeGreaterThan(fixture.order.indexOf('refresh'))
     expect(fixture.refreshCalls).toBe(1)
@@ -644,7 +644,7 @@ describe('PUT /cherry-remote/api/scope', () => {
     expect(json.scope.workspaceIds).toEqual(['fresh', 'ghost'])
     // No authoritative list ⇒ no pruning: 'ghost' survives.
     expect(fixture.state.doc().workspaceIds).toContain('ghost')
-    // No round to run: the round's own echo is `undefined` (Task 6's contract).
+    // No round to run: the call count is the observable (Task 6's contract).
     expect(fixture.refreshCalls).toBe(1)
 
     const after = await get(fixture)

@@ -185,8 +185,7 @@ export interface CherryHttpDeps {
   store: DeviceStore
   /**
    * The scope document's in-memory authority — the ONE owner of the document,
-   * the `degraded` set, the judgement generation and the installed-layer
-   * records (spec §6.1). REQUIRED, not optional: the `/scope` routes and the
+   * the `degraded` set and the judgement generation (spec §6.1). REQUIRED, not optional: the `/scope` routes and the
    * diagnostics report dereference it field by field, so a deployment that
    * forgot to wire it must fail at the type level rather than answer 500 at
    * request time.
@@ -194,9 +193,9 @@ export interface CherryHttpDeps {
   scope: ToolScopeState
   /**
    * The scope subsystem's recompute entry (spec §6.2): "save ⇒ immediate
-   * effect" is an await-free `save → refreshScope()` call, and the returned
-   * summary is the round's own echo. Absent capability (pending/unsupported) or
-   * a torn-down mount has no round to run and answers `undefined`.
+   * effect" is an await-free `save → refreshScope()` call. It rebuilds the next
+   * judgement generation and returns nothing; absent capability
+   * (pending/unsupported) or a torn-down mount simply does nothing.
    */
   refreshScope: () => void
   /**

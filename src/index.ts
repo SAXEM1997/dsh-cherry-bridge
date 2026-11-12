@@ -351,8 +351,7 @@ interface AssemblyState {
   subagentResolution?: SubagentConfigResolution
   /**
    * The scope document's in-memory authority — the ONE owner of the document,
-   * the degradation set, the judgement generation and the installed-layer
-   * records (spec §6.1). `apply` replaces this placeholder with the instance
+   * the degradation set and the judgement generation (spec §6.1). `apply` replaces this placeholder with the instance
    * bound to the current data directory BEFORE any face can read it.
    */
   scope: ToolScopeState

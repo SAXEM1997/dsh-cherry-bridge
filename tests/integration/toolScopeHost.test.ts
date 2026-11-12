@@ -91,7 +91,6 @@ describe('mount: capability probe and the injection gate', () => {
       expect(host.capable).toBe(false)
       expect(host.reason).toContain(capability)
       expect(fixture.fake.registeredNames()).toEqual([])
-      expect(fixture.host.refresh()).toBeUndefined()
       unmount()
     }
   })
@@ -156,9 +155,22 @@ describe('mount: capability probe and the injection gate', () => {
     expect(state.host().state).toBe('unsupported')
     expect(state.host().reason).toContain('host refused the family')
     expect(fake.registeredNames()).toEqual([])
-    expect(host.refresh()).toBeUndefined()
     unmount()
     rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('⑧ unmount voids the judgement generation, so no stale answer survives it', async () => {
+    const fixture = makeFixture()
+    fixture.fake.setWorkspaces([W1])
+    fixture.fake.addAgent({ id: 'agent-a', cwd: '/work/w1' })
+    const unmount = fixture.mount()
+    await settle()
+    expect(fixture.state.judgement('agent-a')).toBeDefined()
+
+    unmount()
+
+    expect(fixture.state.judgement('agent-a')).toBeUndefined()
+    expect(fixture.state.pathUnmatched()).toEqual([])
   })
 
   it('⑦ the condition follows the document both ways, and survives a save with no host round', async () => {
@@ -170,7 +182,6 @@ describe('mount: capability probe and the injection gate', () => {
 
     expect(fixture.state.save({ mode: 'global', workspaceIds: [] }, 0).ok).toBe(true)
     expect(await fixture.fake.resolvedView('agent-a')).toEqual(FAMILY)
-    expect(fixture.host.refresh()).toBeUndefined()
 
     expect(fixture.state.save({ mode: 'selected', workspaceIds: [], }, 1).ok).toBe(true)
     expect(await fixture.fake.resolvedView('agent-a')).toEqual([])

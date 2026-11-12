@@ -205,7 +205,7 @@ describe('the warn carrier — parse failures only, exactly once (②)', () => {
 
     expect(state.doc()).toEqual(DEFAULT_SCOPE)
     // No new DegradedSource member exists for parse failures (the enum is
-    // exactly five values) — the carrier is this warn plus the strict side.
+    // exactly three values) — the carrier is this warn plus the strict side.
     expect(state.degraded()).toEqual([])
     expect(log).toHaveBeenCalledTimes(1)
   })

@@ -613,7 +613,7 @@ function hostStateOr(raw: unknown): ScopeHostState['state'] {
 }
 
 /**
- * The five degradation sources as a VALUE, and the reason the projection can
+ * The three degradation sources as a VALUE, and the reason the projection can
  * reject a hand-stuffed one without a second list that could drift: `Record<
  * DegradedSource, true>` makes TypeScript refuse a missing member when the union
  * grows, which a plain array literal could not.
@@ -624,7 +624,7 @@ const DEGRADED_SOURCES: Readonly<Record<DegradedSource, true>> = {
   'path-normalization': true,
 }
 
-/** Narrows an unknown value to one of the closed five-source set. */
+/** Narrows an unknown value to one of the closed three-source set. */
 function isDegradedSource(value: unknown): value is DegradedSource {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(DEGRADED_SOURCES, value)
 }

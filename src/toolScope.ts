@@ -26,11 +26,11 @@ import { writeFileAtomicSync } from './atomicFile.js'
  *     `save()` completes validate → prune → revision+1 → write → swap without a
  *     single `await`, so the HTTP critical section (§6.3) cannot be interleaved.
  *
- * Ownership: this module owns the scope document, the `degraded` set, and (from
- * Task 3 on) the canonical path map, the per-agent judgement cache and the
- * installed-layer records. `guard` reads ONLY the installed-layer records — the
- * layer is present ⇒ deny — and never recomputes a judgement (G4/B6). No other
- * module may keep a copy of any of it.
+ * Ownership: this module owns the scope document, the `degraded` set, the
+ * canonical path map and the per-agent judgement cache. The fourteen tools read
+ * the answer through ONE step-time predicate ({@link ToolScopeState.visibleForAgent});
+ * no layer is installed or released any more (#345). No other module may keep a
+ * copy of any of it.
  */
 
 /** The only `version` this build reads and writes. */
@@ -71,9 +71,9 @@ export const DEFAULT_SCOPE: ScopeDoc = {
 }
 
 /**
- * The five, fixed degradation sources.
+ * The three, fixed degradation sources.
  *
- * Deliberately three: a parse failure or an invalid field has NO member here. Its
+ * A parse failure or an invalid field has NO member here. Its
  * carrier is the existing warn channel (`log`, else `console.warn`) plus the
  * strictness order, and its document stays writable (B9) — unlike
  * `scope-version`, which is the dedicated "the document is newer than this
@@ -121,8 +121,8 @@ export type ResolutionStatus = 'resolved' | 'unresolved' | 'no-cwd' | 'no-match'
  * `visible` is NOT derived from `status`: it is `isVisible(doc, workspaceId)`
  * and nothing else, so under `global` every state is visible (B2) while
  * `selected` fails closed. `reason` names the workspace (title or id) whenever
- * there is one — Task 5 copies it into the installed-layer record, and `guard`
- * echoes it back without recomputing anything (B6).
+ * there is one — it travels to the settings page, and the step-time gate reads
+ * `visible` alone, never recomputing a judgement (B6).
  */
 export interface AgentJudgement {
   agentId: string
@@ -208,7 +208,7 @@ export function toScopeWorkspace(raw: unknown): ScopeWorkspace | undefined {
  * the visibility layer, diagnostics, the settings page and the tests share.
  *
  * `global` is visible for any id — including `undefined`, which is why a
- * `global` document never installs a deny layer even when no judgement exists.
+ * `global` document never denies an agent for lack of a judgement.
  * `selected` is fail-closed: a hit is visible, and a miss, `undefined`, or an
  * empty list is not. Both sides of the comparison are normalized through
  * {@link normalizeWorkspaceId} first; normalizing still unequal means "not a
@@ -253,9 +253,9 @@ function judged(
 
 /**
  * A workspace as a `reason` fragment: the title when the registry supplied one,
- * and always the id. Task 5 writes this reason into the installed-layer record
- * and `guard` echoes it back, so it has to name a workspace a reader can resolve
- * — the tuple is what makes that true for a titleless item (B6).
+ * and always the id. This reason travels to the settings page, so it has to name
+ * a workspace a reader can resolve — the tuple is what makes that true for a
+ * titleless item (B6).
  */
 function describeWorkspace(workspace: Pick<ScopeWorkspace, 'id' | 'title'>): string {
   return workspace.title === ''
@@ -583,7 +583,7 @@ export class ToolScopeState {
           entity = await resolveByPath.call(registry, workspace.path)
         } catch (error) {
           // ⑪: one unreadable item is skipped — never a failed read, and never a
-          // `degraded` entry (the five-value enum has no member for it).
+          // `degraded` entry (the three-value enum has no member for it).
           this.#warn(
             `工作区注册表项 ${workspace.path} 的路径解析失败（resolveByPath reject）；本轮跳过该项，其余项与全部 agent 的判定不受影响`,
             error,
@@ -658,16 +658,16 @@ export class ToolScopeState {
    * which is the documented fail-closed reading — `global` answers `true` for
    * any id including that one, `selected` answers `false`. That fallback is the
    * whole reason this is a method instead of `judgement()?.visible`: an agent
-   * the cache has never seen is exactly the case a host without
-   * `tools.restrict` is stuck in, because its scope subsystem registers nothing
-   * and therefore never builds a generation.
+   * the cache has never seen is exactly the window before the first judgement
+   * lands, and that step must fail closed rather than throw.
    *
    * LATE-BOUND BY CONSTRUCTION: the caller captures the closure once, at
    * assembly, and the host calls it per step. Nothing here is cached, so a
    * config save or a `rebuild()` changes the answer for the very next step.
    *
-   * ONE DELIBERATE DIVERGENCE from the layer install, which composes
-   * `judgement(agent.id) ?? resolveNow(agent)`: this reads the GENERATION ONLY.
+   * ONE DELIBERATE DIVERGENCE from the fourteen tools' condition, which
+   * composes `judgement(agent.id) ?? resolveNow(agent)`: this reads the
+   * GENERATION ONLY.
    * So a brand-new agent in a permitted workspace answers `false` until the
    * async round that judges it lands — the other fourteen tools are offered on
    * its first step and this one is not. It self-heals on the next round, and it
@@ -686,8 +686,7 @@ export class ToolScopeState {
    * The same question answered with the AGENT in hand (#343) — the predicate the
    * fourteen tools are registered with when the host supports step-time `when`.
    *
-   * It composes the cached judgement with {@link resolveNow}, which is exactly
-   * what the layer-install window does; the difference is that `when` HAS the
+   * It composes the cached judgement with {@link resolveNow}: `when` HAS the
    * agent (and therefore its `cwd`), so a brand-new agent is judged on its first
    * step instead of waiting for the async generation. A genuinely unresolved
    * `cwd` (only realpath can decide) still answers fail-closed until the next

@@ -632,9 +632,6 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         definition: CherryToolDefinition,
         options?: { when?: (context: { agent: { id: string } }) => boolean },
       ): () => void
-      restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void
-      guard(guard: (execution: { name: string; agent?: { id: string } }) => string | undefined): () => void
-      schemas(scope?: unknown): ReadonlyArray<{ name: string; description: string; parameters?: unknown }>
     }
     /** webServer present (browser deploy) unless `headless`. */
     headless: boolean
@@ -661,20 +658,15 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
 
   /**
    * @param headless - omit `webServer`, the browser-less deploy.
-   * @param missing - a capability to DELETE from the fake tool registry, which
-   *   is how the scope host's own unsupported verdict (and the tool count it
-   *   names) becomes observable through `apply`.
    */
-  /** One live agent, as `projectAgent` reads it (`agent.ctx.tools.restrict`). */
+  /** One live agent, as `projectAgent` reads it. */
   interface LiveAgent {
     id: string
     session: { header: { cwd: string } }
-    ctx: { tools: { restrict(filter: { deny: readonly string[] }): () => void } }
   }
 
   function assemblyCtx(
     headless = false,
-    missing?: 'restrict',
     /**
      * Live agents the scope subsystem will see. `[]` by default: every other case
      * here cares that the tool REGISTERS, and a layer is only installed for a
@@ -756,22 +748,6 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
             if (index >= 0) this.definitions.splice(index, 1)
           }
         },
-        // Not a scoped agent ctx: the real host throws here, and the subsystem
-        // must never call it on this face.
-        restrict() {
-          throw new Error('tools.restrict() requires a scoped context (agent.ctx)')
-        },
-        guard() {
-          return () => {}
-        },
-        // The no-argument global view (D12's observation source).
-        schemas() {
-          return this.definitions.map((definition) => ({
-            name: definition.name,
-            description: definition.description,
-            ...(definition.parameters === undefined ? {} : { parameters: definition.parameters }),
-          }))
-        },
       },
       headless,
       inject(deps, cb) {
@@ -803,9 +779,6 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       effect(cb) {
         ctx.effects.push(cb())
       },
-    }
-    if (missing === 'restrict') {
-      delete (ctx.tools as { restrict?: unknown }).restrict
     }
     return ctx
   }
@@ -896,14 +869,11 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       rmSync(dataDir, { recursive: true, force: true })
     })
 
-    it('⑳g a restrict-less host that supports when is READY and gates every tool per step', async () => {
-      // #343 changes the verdict for this host shape: `tools.restrict` is no
-      // longer required once `tools.resolve` exists, because the family is
-      // hidden by a step-time `when` instead of a per-agent layer. The old
-      // fail-closed verdict is still what a host with NEITHER capability gets
-      // (⑦a/⑦b cover that host).
+    it('⑳g a when-capable host is READY and gates every tool per step', async () => {
+      // #345 has one host mode: `tools.resolve` is the whole contract. A host
+      // without it registers nothing (⑦a/⑦b cover that host).
       const index = await import('../../src/index.js')
-      const ctx = assemblyCtx(false, 'restrict')
+      const ctx = assemblyCtx(false)
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
       await applyAssembly(ctx as never, { dataDir })
       const response = new FakeResponse()
@@ -923,15 +893,13 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       rmSync(dataDir, { recursive: true, force: true })
     })
 
-    it('⑳h on a restrict-less host the tool is GATED per step, not left visible (SUB-04)', async () => {
-      // The regression this closes: `tools.restrict` is how the scope subsystem
-      // hides tools, but without it the subsystem registers NOTHING (fail-closed)
-      // and installs no deny layer — so `cherry_subagent`, registered by the
-      // SUBAGENT subsystem, used to stay visible in every workspace, excluded
-      // ones included. `when` needs no extra host capability, so it is the one
-      // gate that survives this host.
+    it('⑳h on a when-capable host the tool is GATED per step, not left visible (SUB-04)', async () => {
+      // The regression this closes: `cherry_subagent` is registered by the
+      // SUBAGENT subsystem, not by the shared family registration, so without
+      // its own condition it would stay visible in every workspace, excluded
+      // ones included. `when` is the gate that covers it.
       const index = await import('../../src/index.js')
-      const ctx = assemblyCtx(false, 'restrict')
+      const ctx = assemblyCtx(false)
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
       await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
@@ -948,7 +916,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       // including one the cache has never seen — a `?? false` simplification
       // would hide the tool from everyone on exactly this host.
       const index = await import('../../src/index.js')
-      const ctx = assemblyCtx(false, 'restrict')
+      const ctx = assemblyCtx(false)
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
       writeFileSync(
         join(dataDir, 'scope.json'),
@@ -966,17 +934,10 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       // directions. The renamed tool must be the one carrying it; the default
       // name is registered by nobody under this config.
       const index = await import('../../src/index.js')
-      const ctx = assemblyCtx(false, undefined, [
+      const ctx = assemblyCtx(false, [
         {
           id: 'agent-a',
           session: { header: { cwd: '/w/excluded' } },
-          ctx: {
-            tools: {
-              restrict() {
-                return () => {}
-              },
-            },
-          },
         },
       ])
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))

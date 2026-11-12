@@ -2496,10 +2496,9 @@ export const CHERRY_TOOL_NAMES: readonly string[] = [
  * switch is on — so folding it into the first list would make that bidirectional
  * assertion describe a registration that never happens.
  *
- * Scope hides and guards **by name**, not by ownership (`toolScopeHost`'s
- * `targetDeny` intersects this list with the registry's live `schemas()`, and
- * its dispatch guard rejects a listed name outright), so a tool registered
- * elsewhere in the assembly is still governed here. That is the whole reason
+ * Scope governs **by name**, not by ownership: every family tool carries the
+ * step-time condition, and a tool registered elsewhere in the assembly carries
+ * its own over the same judgement — so it is still governed here. That is why
  * the delegation tool defaults to `cherry_subagent`: an operator who excludes a
  * workspace from the bridge is not offered a way around it by the experiment.
  *

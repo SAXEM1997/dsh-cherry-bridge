@@ -218,11 +218,11 @@ export interface ScopeWorkspace {
 export type ScopeHostState = 'pending' | 'unsupported' | 'ready'
 
 /**
- * The five degradation sources (B12/B16/B17).
+ * The three degradation sources (B12/B16/B17).
  *
  * The list is FIXED: a corrupt scope document is carried by the strictness
  * order (`selected` + an empty list) and the page's own empty-state wording,
- * NOT by a sixth member here (B9).
+ * NOT by a fourth member here (B9).
  */
 export type DegradedSource =
   | 'workspace-list'
