@@ -4914,6 +4914,36 @@ export class CherryToolEngine {
         },
         deadline === undefined ? undefined : { deadline: deadline.instant },
       )) as Record<string, unknown>
+      // THE SLICE MUST ECHO THE REQUEST IT ANSWERS (issue #328). `offset` is the
+      // only credential for "which position these bytes belong to": a peer that
+      // answers a different offset while `nextOffset` still advances would
+      // splice bytes at the wrong place, and every other check here — the
+      // digest against the ref, `eof`, "the walk advanced" — would still pass.
+      // The protocol makes all three required strings; the official client
+      // asserts all three on every slice. `String(...)` keeps a peer that sends
+      // a JSON number where the schema says string (0 vs "0") from being called
+      // a liar over a spelling.
+      const echoedOffset = String(slice['offset'] ?? '')
+      if (echoedOffset !== offset) {
+        throw new ContentIntegrityError(
+          `agent.content.read for ${contentId} echoed offset ${echoedOffset} at slice ${sliceIndex + 1}, ` +
+            `expected ${offset}; refusing to splice bytes at an unrequested position`,
+        )
+      }
+      const echoedContentId = String(slice['contentId'] ?? '')
+      if (echoedContentId !== contentId) {
+        throw new ContentIntegrityError(
+          `agent.content.read for ${contentId} echoed contentId ${echoedContentId} at slice ${sliceIndex + 1}, ` +
+            `expected ${contentId}`,
+        )
+      }
+      const echoedRevision = String(slice['revision'] ?? '')
+      if (echoedRevision !== revision) {
+        throw new ContentIntegrityError(
+          `agent.content.read for ${contentId} echoed revision ${echoedRevision} at slice ${sliceIndex + 1}, ` +
+            `expected ${revision}`,
+        )
+      }
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
       // The cap is checked on the base64 LENGTH first, before the decode: a
       // slice may carry any size a hostile peer puts in one frame, and decoding

@@ -3746,3 +3746,91 @@ describe('issue #307: the image budget degrades per part', () => {
     expect(parts.some((part) => part['imagesOmitted'] === 'cap')).toBe(false)
   })
 })
+
+/**
+ * Issue #328: a `agent.content.read` slice must ECHO the request it answers.
+ *
+ * The protocol's result carries `contentId`, `revision` and `offset` as required
+ * strings, and the official client asserts all three on every slice. `offset`
+ * is the only credential for "which position these bytes belong to": a peer
+ * that answers a different offset while `nextOffset` still advances would
+ * splice bytes at the wrong place, and every existing check (`sha256` against
+ * the ref, `eof`, "the walk advanced") would still pass. A slice that does not
+ * echo its request is therefore self-contradictory content: the integrity
+ * class, never a degraded part.
+ */
+describe('issue #328: a content slice must echo the request it answers', () => {
+  const TEXT = 'hello'
+  const CONTENT_ID = 'm-1:0'
+  const REVISION = '1001'
+
+  /** One assistant message whose only part is externalized into `{ref}`. */
+  async function rigWithExternalText(): Promise<Awaited<ReturnType<typeof makeRig>>> {
+    return makeRig({
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Echo', historyRevision: '1000' },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: REVISION,
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: TEXT, external: true }],
+          },
+        ],
+      },
+    })
+  }
+
+  /** A slice that is honest in every field unless `overrides` says otherwise. */
+  function slice(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      contentId: CONTENT_ID,
+      revision: REVISION,
+      offset: '0',
+      dataBase64: Buffer.from(TEXT).toString('base64'),
+      nextOffset: String(TEXT.length),
+      eof: true,
+      sha256: createHash('sha256').update(TEXT).digest('hex'),
+      ...overrides,
+    }
+  }
+
+  it('㉗a the honest walk returns the certified text (the fixture this suite rests on)', async () => {
+    const rig = await rigWithExternalText()
+    const result = (await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })) as {
+      messages: Array<{ parts: Array<{ content: string }> }>
+    }
+    expect(result.messages[0]!.parts[0]!.content).toBe(TEXT)
+  })
+
+  it('㉗b a slice echoing a different offset fails the WHOLE read', async () => {
+    const rig = await rigWithExternalText()
+    // `nextOffset` still advances past the requested offset, and the digest is
+    // the ref's own: without the echo check this slice is accepted and the text
+    // is spliced at the wrong position.
+    rig.fake.scriptContentSlice(slice({ offset: '3' }))
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /echoed offset/i,
+    )
+  })
+
+  it('㉗c a slice echoing a different contentId fails the WHOLE read', async () => {
+    const rig = await rigWithExternalText()
+    rig.fake.scriptContentSlice(slice({ contentId: 'm-9:0' }))
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /echoed contentId/i,
+    )
+  })
+
+  it('㉗d a slice echoing a different revision fails the WHOLE read', async () => {
+    const rig = await rigWithExternalText()
+    rig.fake.scriptContentSlice(slice({ revision: '9999' }))
+    await expect(rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })).rejects.toThrow(
+      /echoed revision/i,
+    )
+  })
+})
