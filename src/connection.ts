@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import type { Hash } from 'node:crypto'
 import { WebSocket } from 'ws'
 import { connectSecureChannel, RemoteSocketStream } from '@cherrystudio/remote-transport'
 import type { ChannelOptions, SecureChannel } from '@cherrystudio/remote-transport'
@@ -15,6 +16,7 @@ import {
   DEFAULT_UPLOAD_ACK_TIMEOUT_MS,
   DEFAULT_UPLOAD_POLL_INTERVAL_MS,
   DEFAULT_UPLOAD_READY_POLLS,
+  DEFAULT_UPLOAD_RESUME_WAIT_MS,
   RATE_LIMIT_MAX_WAIT_MS,
 } from './defaults.js'
 import type { DeviceRecord } from './deviceStore.js'
@@ -265,6 +267,26 @@ export class UploadUnsupportedError extends Error {
   constructor(deviceId: string) {
     super(`device ${deviceId} does not advertise the upload capability (agentUploadsVersion)`)
     this.name = 'UploadUnsupportedError'
+  }
+}
+
+/**
+ * The link died while an upload was in flight (#327).
+ *
+ * Distinct from every other upload failure because the staged bytes SURVIVE it:
+ * the peer keeps what it committed, and `agent.uploads.resume` can continue from
+ * there. This class is what makes that judgement by type instead of by
+ * inspecting the message.
+ */
+export class UploadInterruptedError extends Error {
+  readonly device: string
+  readonly uploadId: string
+
+  constructor(deviceId: string, uploadId: string) {
+    super(`device ${deviceId}: the link was lost during upload ${uploadId}`)
+    this.name = 'UploadInterruptedError'
+    this.device = deviceId
+    this.uploadId = uploadId
   }
 }
 
@@ -1167,12 +1189,12 @@ export class DeviceConnection {
     if (this.#state !== 'connected') throw new DeviceUnavailableError(this.record.deviceId, this.#state)
     const { signal } = input
     const uploadId = randomUUID()
+    // The link this attempt rides. A resume must not be handed the client that
+    // just died (the supervisor may not have noticed yet), so it is captured
+    // BEFORE the transfer and handed to `#awaitReconnect` as the dead one.
+    const attemptClient = this.#link?.client
     let staged = false
-    // Declared OUTSIDE the try so the failure path can drain it: a chunk that
-    // is still in flight when a SIBLING fails would otherwise reject with no
-    // observer (link teardown rejects every waiter at once), which surfaces as
-    // a process-level unhandledRejection rather than the upload's own error.
-    const window: Promise<void>[] = []
+    let writerEpoch = '0'
     try {
       const prepared = await this.rpc.request<Record<string, unknown>>('agent.uploads.prepare', {
         uploadId,
@@ -1182,9 +1204,52 @@ export class DeviceConnection {
         byteLength: input.byteLength,
       })
       staged = true
-      const writerEpoch = String(prepared['writerEpoch'] ?? '0')
+      writerEpoch = String(prepared['writerEpoch'] ?? '0')
       const hash = createHash('sha256')
-      let offset = 0
+      await this.#sendUploadChunks(uploadId, writerEpoch, input, 0, hash, signal)
+      const sha256 = hash.digest('hex')
+      await this.rpc.request('agent.uploads.complete', { uploadId, writerEpoch, expectedSha256: sha256 })
+      await this.#waitUploadReady(uploadId, input.pollMs ?? DEFAULT_UPLOAD_POLL_INTERVAL_MS, signal)
+      return { uploadId, writerEpoch, sha256, byteLength: input.byteLength }
+    } catch (error) {
+      // ONE resume attempt when the LINK died (issue #327): the peer kept what
+      // it committed, so the bytes below `committedOffset` never need to cross
+      // the wire again. Any other failure is a verdict, not an accident, and
+      // must not be retried as if the transfer had merely been interrupted.
+      if (staged) {
+        const resumed = await this.#resumeUpload(uploadId, writerEpoch, input, attemptClient, error, signal)
+        if (resumed !== undefined) return resumed
+        // Best-effort: the staging record expires on its own, and a cancel
+        // failure must not replace the error that caused it.
+        try {
+          await this.rpc.request('agent.uploads.cancel', { uploadId })
+        } catch {
+          // Deliberately swallowed — see above.
+        }
+      }
+      throw error
+    }
+  }
+
+  /**
+   * Writes `input` from `from` to the end, hashing every byte it SENDS.
+   *
+   * The window is drained before any failure leaves this function: a chunk
+   * still in flight when a SIBLING fails would otherwise reject with no
+   * observer (link teardown rejects every waiter at once), which surfaces as a
+   * process-level unhandledRejection rather than the upload's own error.
+   */
+  async #sendUploadChunks(
+    uploadId: string,
+    writerEpoch: string,
+    input: UploadFileInput,
+    from: number,
+    hash: Hash,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const window: Promise<void>[] = []
+    let offset = from
+    try {
       while (offset < input.byteLength) {
         signal?.throwIfAborted()
         const length = Math.min(uploadTransferLimits.chunkBytes, input.byteLength - offset)
@@ -1196,7 +1261,15 @@ export class DeviceConnection {
         }
         hash.update(bytes)
         const chunkOffset = offset
-        window.push(this.#writeUploadChunk(uploadId, writerEpoch, chunkOffset, bytes, signal))
+        const chunkWrite = this.#writeUploadChunk(uploadId, writerEpoch, chunkOffset, bytes, signal)
+        // PRE-OBSERVE, exactly like the ack promise one level down: a teardown
+        // rejects every in-flight chunk at once, and Node reports a rejection
+        // that has no handler in the SAME turn as unhandled — even when the
+        // window is drained a few microtasks later. The drain still decides the
+        // error the caller sees; this only stops the transient from becoming a
+        // process-level unhandledRejection (#327).
+        chunkWrite.catch(() => {})
+        window.push(chunkWrite)
         if (window.length >= uploadTransferLimits.window) {
           // `shift()` can only be undefined for an empty array, and the length
           // was just checked; the non-null assertion is local to that fact.
@@ -1205,24 +1278,112 @@ export class DeviceConnection {
         offset += length
       }
       await Promise.all(window)
+    } catch (error) {
+      await Promise.allSettled(window)
+      throw error
+    }
+  }
+
+  /**
+   * Hashes `[0, upTo)` WITHOUT sending it: after a resume the peer already holds
+   * those bytes, but `complete` still needs one digest over the WHOLE file, and
+   * the peer's own digest is not a substitute for computing it here (the two
+   * independent runs are the point of `expectedSha256`).
+   */
+  async #hashUploadPrefix(
+    input: UploadFileInput,
+    upTo: number,
+    hash: Hash,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    let offset = 0
+    while (offset < upTo) {
+      signal?.throwIfAborted()
+      const length = Math.min(uploadTransferLimits.chunkBytes, upTo - offset)
+      const bytes = await input.read(offset, length, signal)
+      if (bytes.length !== length) {
+        throw new Error(
+          `upload read returned ${bytes.length} bytes at offset ${offset}, expected ${length}`,
+        )
+      }
+      hash.update(bytes)
+      offset += length
+    }
+  }
+
+  /**
+   * The single resume attempt of issue #327.
+   *
+   * Returns the finished upload, or `undefined` when this is not a case the
+   * resume can honestly serve — a non-transport failure, no reconnect inside
+   * the window, a peer that no longer knows the upload, a different writer
+   * epoch, or any failure of the resume itself. `undefined` means "the caller's
+   * original error stands"; it never masks that error with a new one.
+   */
+  async #resumeUpload(
+    uploadId: string,
+    writerEpoch: string,
+    input: UploadFileInput,
+    deadClient: JsonRpcClient | undefined,
+    error: unknown,
+    signal: AbortSignal | undefined,
+  ): Promise<UploadedFile | undefined> {
+    // Three shapes, one meaning: the link died under this upload. A chunk write
+    // fails with `UploadInterruptedError` (teardown rejects every ack waiter), a
+    // chunk that never left the client fails with `DeviceUnavailableError`, and
+    // an RPC in flight (`complete`, a `get`) fails with `TransportLostError`.
+    const interrupted =
+      error instanceof UploadInterruptedError ||
+      error instanceof DeviceUnavailableError ||
+      error instanceof TransportLostError
+    if (!interrupted) return undefined
+    const wait = await this.#awaitReconnect(
+      DEFAULT_UPLOAD_RESUME_WAIT_MS,
+      deadClient ?? this.#link?.client,
+    )
+    if (wait.kind !== 'connected') return undefined
+    try {
+      const state = await this.rpc.request<Record<string, unknown>>('agent.uploads.get', { uploadId })
+      if (String(state['uploadId'] ?? '') !== uploadId) return undefined
+      // A writer epoch is a capability: a different one means another writer
+      // owns this upload now, and continuing would interleave two streams.
+      const peerEpoch = String(state['writerEpoch'] ?? '')
+      if (peerEpoch !== writerEpoch) return undefined
+      const hash = createHash('sha256')
+      if (state['state'] === 'ready') {
+        // The bytes all landed before the link died; only the answer was lost.
+        // Certify them locally instead of re-sending a file the peer has.
+        await this.#hashUploadPrefix(input, input.byteLength, hash, signal)
+        const sha256 = hash.digest('hex')
+        if (String(state['sha256'] ?? '') !== sha256) return undefined
+        return { uploadId, writerEpoch, sha256, byteLength: input.byteLength }
+      }
+      if (state['state'] !== 'receiving') return undefined
+      const committed = Number(state['committedOffset'])
+      if (!Number.isSafeInteger(committed) || committed < 0 || committed > input.byteLength) {
+        return undefined
+      }
+      const resumed = await this.rpc.request<Record<string, unknown>>('agent.uploads.resume', {
+        uploadId,
+        resumeId: randomUUID(),
+        expectedWriterEpoch: peerEpoch,
+      })
+      const resumedFrom = Number(resumed['committedOffset'])
+      if (!Number.isSafeInteger(resumedFrom) || resumedFrom < 0 || resumedFrom > input.byteLength) {
+        return undefined
+      }
+      // Re-read what the peer already committed, purely to hash it, then send
+      // only the remainder.
+      await this.#hashUploadPrefix(input, resumedFrom, hash, signal)
+      await this.#sendUploadChunks(uploadId, writerEpoch, input, resumedFrom, hash, signal)
       const sha256 = hash.digest('hex')
       await this.rpc.request('agent.uploads.complete', { uploadId, writerEpoch, expectedSha256: sha256 })
       await this.#waitUploadReady(uploadId, input.pollMs ?? DEFAULT_UPLOAD_POLL_INTERVAL_MS, signal)
       return { uploadId, writerEpoch, sha256, byteLength: input.byteLength }
-    } catch (error) {
-      // Drain siblings BEFORE cancelling: their rejections are observed here,
-      // and a cancel resolves the staging record they may still be writing to.
-      await Promise.allSettled(window)
-      if (staged) {
-        // Best-effort: the staging record expires on its own, and a cancel
-        // failure must not replace the error that caused it.
-        try {
-          await this.rpc.request('agent.uploads.cancel', { uploadId })
-        } catch {
-          // Deliberately swallowed — see above.
-        }
-      }
-      throw error
+    } catch {
+      // The resume is an OPTIMISATION, never a second failure: whatever went
+      // wrong here, the caller still sees the error that started it.
+      return undefined
     }
   }
 
@@ -1240,11 +1401,9 @@ export class DeviceConnection {
       throw new DeviceUnavailableError(this.record.deviceId, this.#state)
     }
     const requestId = randomUUID()
+    // `#waitUploadAck` already pre-observes its own rejection: the ack timer, an
+    // abort or a teardown can settle it before `ack.promise` is awaited below.
     const ack = this.#waitUploadAck(requestId, uploadId, signal)
-    // Observe a rejection that lands while the write is still pending: the ack
-    // timer, an abort or a teardown can settle it before `ack.promise` is
-    // awaited below, and an unobserved rejection is process-fatal in Node.
-    ack.promise.catch(() => {})
     try {
       const chunk: UploadChunk = {
         kind: 'upload',
@@ -1280,6 +1439,12 @@ export class DeviceConnection {
       settleResolve = resolve
       settleReject = reject
     })
+    // The teardown rejects every waiter as an EVENT, not in response to a call,
+    // so a waiter whose caller has not reached its own `await` yet would leave
+    // an unobserved rejection behind (#327). Pre-observing it here keeps that
+    // rejection from becoming process-fatal; the caller that DOES await the
+    // promise still receives it.
+    promise.catch(() => {})
     let timer: ReturnType<typeof setTimeout> | undefined
     const cleanup = (): void => {
       if (timer !== undefined) clearTimeout(timer)
@@ -1360,8 +1525,12 @@ export class DeviceConnection {
   }
 
   /** Link teardown rejects every chunk waiter: no ack can arrive any more. */
-  #rejectUploadAcks(error: Error): void {
-    for (const waiter of [...this.#uploadAcks.values()]) waiter.reject(error)
+  #rejectUploadAcks(): void {
+    for (const waiter of [...this.#uploadAcks.values()]) {
+      // Per WAITER, because the upload id is what a resume needs and the map
+      // knows it while a shared error object cannot (#327).
+      waiter.reject(new UploadInterruptedError(this.record.deviceId, waiter.uploadId))
+    }
   }
 
   /**
@@ -2032,7 +2201,7 @@ export class DeviceConnection {
     this.#link = undefined
     // No ack can arrive on a torn-down channel; parking an upload until its
     // 60 s timer would turn a link loss into a minute-long hang.
-    this.#rejectUploadAcks(new Error(`device ${this.record.deviceId}: link lost during upload`))
+    this.#rejectUploadAcks()
     this.#clearTimer('heartbeat')
     this.#clearTimer('refresh')
     this.#clearTimer('refreshRetry')
@@ -2339,7 +2508,7 @@ export class DeviceConnection {
    * commits `#link` before its hello/authenticate pair completes, and a replay
    * into that window would ride an unauthenticated client.
    */
-  #awaitReconnect(waitMs: number, deadClient: JsonRpcClient): Promise<ReplayWait> {
+  #awaitReconnect(waitMs: number, deadClient: JsonRpcClient | undefined): Promise<ReplayWait> {
     if (!this.#running) return Promise.resolve({ kind: 'abandoned' })
     // The link whose channel just died must not be handed back: the supervisor
     // may not have observed the loss yet, and replaying into the SAME dead

@@ -2995,6 +2995,24 @@ var UploadUnsupportedError = class extends Error {
 	}
 };
 /**
+* The link died while an upload was in flight (#327).
+*
+* Distinct from every other upload failure because the staged bytes SURVIVE it:
+* the peer keeps what it committed, and `agent.uploads.resume` can continue from
+* there. This class is what makes that judgement by type instead of by
+* inspecting the message.
+*/
+var UploadInterruptedError = class extends Error {
+	device;
+	uploadId;
+	constructor(deviceId, uploadId) {
+		super(`device ${deviceId}: the link was lost during upload ${uploadId}`);
+		this.name = "UploadInterruptedError";
+		this.device = deviceId;
+		this.uploadId = uploadId;
+	}
+};
+/**
 * CEILING for the business-request window — not the window itself. The window
 * is owned by the rpc layer and is sized from the peer's hello-reported
 * `inFlightRequests` (spec §3.4「取回报一半」): see
@@ -3669,8 +3687,9 @@ var DeviceConnection = class {
 		if (this.#state !== "connected") throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		const { signal } = input;
 		const uploadId = randomUUID();
+		const attemptClient = this.#link?.client;
 		let staged = false;
-		const window = [];
+		let writerEpoch = "0";
 		try {
 			const prepared = await this.rpc.request("agent.uploads.prepare", {
 				uploadId,
@@ -3680,21 +3699,9 @@ var DeviceConnection = class {
 				byteLength: input.byteLength
 			});
 			staged = true;
-			const writerEpoch = String(prepared["writerEpoch"] ?? "0");
+			writerEpoch = String(prepared["writerEpoch"] ?? "0");
 			const hash = createHash("sha256");
-			let offset = 0;
-			while (offset < input.byteLength) {
-				signal?.throwIfAborted();
-				const length = Math.min(uploadTransferLimits.chunkBytes, input.byteLength - offset);
-				const bytes = await input.read(offset, length, signal);
-				if (bytes.length !== length) throw new Error(`upload read returned ${bytes.length} bytes at offset ${offset}, expected ${length}`);
-				hash.update(bytes);
-				const chunkOffset = offset;
-				window.push(this.#writeUploadChunk(uploadId, writerEpoch, chunkOffset, bytes, signal));
-				if (window.length >= uploadTransferLimits.window) await window.shift();
-				offset += length;
-			}
-			await Promise.all(window);
+			await this.#sendUploadChunks(uploadId, writerEpoch, input, 0, hash, signal);
 			const sha256 = hash.digest("hex");
 			await this.rpc.request("agent.uploads.complete", {
 				uploadId,
@@ -3709,11 +3716,120 @@ var DeviceConnection = class {
 				byteLength: input.byteLength
 			};
 		} catch (error) {
-			await Promise.allSettled(window);
-			if (staged) try {
-				await this.rpc.request("agent.uploads.cancel", { uploadId });
-			} catch {}
+			if (staged) {
+				const resumed = await this.#resumeUpload(uploadId, writerEpoch, input, attemptClient, error, signal);
+				if (resumed !== void 0) return resumed;
+				try {
+					await this.rpc.request("agent.uploads.cancel", { uploadId });
+				} catch {}
+			}
 			throw error;
+		}
+	}
+	/**
+	* Writes `input` from `from` to the end, hashing every byte it SENDS.
+	*
+	* The window is drained before any failure leaves this function: a chunk
+	* still in flight when a SIBLING fails would otherwise reject with no
+	* observer (link teardown rejects every waiter at once), which surfaces as a
+	* process-level unhandledRejection rather than the upload's own error.
+	*/
+	async #sendUploadChunks(uploadId, writerEpoch, input, from, hash, signal) {
+		const window = [];
+		let offset = from;
+		try {
+			while (offset < input.byteLength) {
+				signal?.throwIfAborted();
+				const length = Math.min(uploadTransferLimits.chunkBytes, input.byteLength - offset);
+				const bytes = await input.read(offset, length, signal);
+				if (bytes.length !== length) throw new Error(`upload read returned ${bytes.length} bytes at offset ${offset}, expected ${length}`);
+				hash.update(bytes);
+				const chunkOffset = offset;
+				const chunkWrite = this.#writeUploadChunk(uploadId, writerEpoch, chunkOffset, bytes, signal);
+				chunkWrite.catch(() => {});
+				window.push(chunkWrite);
+				if (window.length >= uploadTransferLimits.window) await window.shift();
+				offset += length;
+			}
+			await Promise.all(window);
+		} catch (error) {
+			await Promise.allSettled(window);
+			throw error;
+		}
+	}
+	/**
+	* Hashes `[0, upTo)` WITHOUT sending it: after a resume the peer already holds
+	* those bytes, but `complete` still needs one digest over the WHOLE file, and
+	* the peer's own digest is not a substitute for computing it here (the two
+	* independent runs are the point of `expectedSha256`).
+	*/
+	async #hashUploadPrefix(input, upTo, hash, signal) {
+		let offset = 0;
+		while (offset < upTo) {
+			signal?.throwIfAborted();
+			const length = Math.min(uploadTransferLimits.chunkBytes, upTo - offset);
+			const bytes = await input.read(offset, length, signal);
+			if (bytes.length !== length) throw new Error(`upload read returned ${bytes.length} bytes at offset ${offset}, expected ${length}`);
+			hash.update(bytes);
+			offset += length;
+		}
+	}
+	/**
+	* The single resume attempt of issue #327.
+	*
+	* Returns the finished upload, or `undefined` when this is not a case the
+	* resume can honestly serve — a non-transport failure, no reconnect inside
+	* the window, a peer that no longer knows the upload, a different writer
+	* epoch, or any failure of the resume itself. `undefined` means "the caller's
+	* original error stands"; it never masks that error with a new one.
+	*/
+	async #resumeUpload(uploadId, writerEpoch, input, deadClient, error, signal) {
+		if (!(error instanceof UploadInterruptedError || error instanceof DeviceUnavailableError || error instanceof TransportLostError)) return void 0;
+		if ((await this.#awaitReconnect(3e4, deadClient ?? this.#link?.client)).kind !== "connected") return void 0;
+		try {
+			const state = await this.rpc.request("agent.uploads.get", { uploadId });
+			if (String(state["uploadId"] ?? "") !== uploadId) return void 0;
+			const peerEpoch = String(state["writerEpoch"] ?? "");
+			if (peerEpoch !== writerEpoch) return void 0;
+			const hash = createHash("sha256");
+			if (state["state"] === "ready") {
+				await this.#hashUploadPrefix(input, input.byteLength, hash, signal);
+				const sha256 = hash.digest("hex");
+				if (String(state["sha256"] ?? "") !== sha256) return void 0;
+				return {
+					uploadId,
+					writerEpoch,
+					sha256,
+					byteLength: input.byteLength
+				};
+			}
+			if (state["state"] !== "receiving") return void 0;
+			const committed = Number(state["committedOffset"]);
+			if (!Number.isSafeInteger(committed) || committed < 0 || committed > input.byteLength) return;
+			const resumed = await this.rpc.request("agent.uploads.resume", {
+				uploadId,
+				resumeId: randomUUID(),
+				expectedWriterEpoch: peerEpoch
+			});
+			const resumedFrom = Number(resumed["committedOffset"]);
+			if (!Number.isSafeInteger(resumedFrom) || resumedFrom < 0 || resumedFrom > input.byteLength) return;
+			await this.#hashUploadPrefix(input, resumedFrom, hash, signal);
+			await this.#sendUploadChunks(uploadId, writerEpoch, input, resumedFrom, hash, signal);
+			const sha256 = hash.digest("hex");
+			await this.rpc.request("agent.uploads.complete", {
+				uploadId,
+				writerEpoch,
+				expectedSha256: sha256
+			});
+			await this.#waitUploadReady(uploadId, input.pollMs ?? 50, signal);
+			return {
+				uploadId,
+				writerEpoch,
+				sha256,
+				byteLength: input.byteLength
+			};
+		} catch {
+			return;
 		}
 	}
 	/** One chunk plus its ack. The waiter is registered BEFORE the write, so an
@@ -3723,7 +3839,6 @@ var DeviceConnection = class {
 		if (this.#state !== "connected" || link === void 0) throw new DeviceUnavailableError(this.record.deviceId, this.#state);
 		const requestId = randomUUID();
 		const ack = this.#waitUploadAck(requestId, uploadId, signal);
-		ack.promise.catch(() => {});
 		try {
 			const chunk = {
 				kind: "upload",
@@ -3750,6 +3865,7 @@ var DeviceConnection = class {
 			settleResolve = resolve;
 			settleReject = reject;
 		});
+		promise.catch(() => {});
 		let timer;
 		const cleanup = () => {
 			if (timer !== void 0) clearTimeout(timer);
@@ -3819,8 +3935,8 @@ var DeviceConnection = class {
 		throw new Error(`upload ${uploadId} is still verifying after its poll budget; the peer may be stuck`);
 	}
 	/** Link teardown rejects every chunk waiter: no ack can arrive any more. */
-	#rejectUploadAcks(error) {
-		for (const waiter of [...this.#uploadAcks.values()]) waiter.reject(error);
+	#rejectUploadAcks() {
+		for (const waiter of [...this.#uploadAcks.values()]) waiter.reject(new UploadInterruptedError(this.record.deviceId, waiter.uploadId));
 	}
 	/**
 	* Starts (or joins) the supervised lifecycle. Resolves once this cycle
@@ -4219,7 +4335,7 @@ var DeviceConnection = class {
 	#teardownLink() {
 		const link = this.#link;
 		this.#link = void 0;
-		this.#rejectUploadAcks(/* @__PURE__ */ new Error(`device ${this.record.deviceId}: link lost during upload`));
+		this.#rejectUploadAcks();
 		this.#clearTimer("heartbeat");
 		this.#clearTimer("refresh");
 		this.#clearTimer("refreshRetry");
