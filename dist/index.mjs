@@ -1818,8 +1818,6 @@ var ToolScopeState = class {
 	};
 	#listState = "unread";
 	#workspaces = [];
-	/** Per-agent installed layers: the execution-side mirror `guard` reads. */
-	#layers = /* @__PURE__ */ new Map();
 	/** The current generation's canonical path map: entity path ⇒ workspaceId. */
 	#pathMap = /* @__PURE__ */ new Map();
 	/** The current generation's per-agent judgements. `rebuild()` replaces it whole. */
@@ -2139,21 +2137,9 @@ var ToolScopeState = class {
 			pruned
 		};
 	}
-	/** The installed layer for one agent, or `undefined` when none is mounted. */
-	layer(agentId) {
-		return this.#layers.get(agentId);
-	}
-	/** Records the layer installed for one agent (the record IS the mirror). */
-	setLayer(agentId, layer) {
-		this.#layers.set(agentId, layer);
-	}
-	/** Forgets one agent's layer, in the same turn its restriction is released. */
-	clearLayer(agentId) {
-		this.#layers.delete(agentId);
-	}
 	/**
-	* Drops everything derived from a previous mount: the installed-layer records
-	* and the whole judgement generation — the canonical path map, the per-agent
+	* Drops everything derived from a previous mount: the whole judgement
+	* generation — the canonical path map, the per-agent
 	* judgements and the `pathUnmatched` diagnostics (Task 4's teardown asserts
 	* exactly this).
 	*
@@ -2172,7 +2158,6 @@ var ToolScopeState = class {
 	* `[]` for the same reason.
 	*/
 	invalidateDerived() {
-		this.#layers.clear();
 		this.#pathMap = /* @__PURE__ */ new Map();
 		this.#judgements = /* @__PURE__ */ new Map();
 		this.#pathUnmatched = [];
@@ -2909,8 +2894,8 @@ const MAX_RESUME_TOKEN_CHARS = 4096;
 * The tool name a delegation is exposed to the model under.
 *
 * `cherry_subagent`, not `subagent_cherry`: it has to read as the fifteenth
-* `cherry_*` tool so it falls inside the scope subsystem's `restrict`/`guard`
-* name list without a second convention.
+* `cherry_*` tool so it falls inside the scope subsystem's governed-name list
+* without a second convention.
 */
 const CHERRY_SUBAGENT_TOOL_DEFAULT = "cherry_subagent";
 /**
@@ -13276,19 +13261,19 @@ function createToolScopeHost(deps) {
 	let current;
 	function probe(tools) {
 		if (tools === void 0) return {
-			mode: "unsupported",
+			capable: false,
 			reason: UNSUPPORTED_REASON("tools")
 		};
 		if (typeof tools.register !== "function") return {
-			mode: "unsupported",
+			capable: false,
 			reason: UNSUPPORTED_REASON("tools.register")
 		};
 		if (typeof tools.resolve !== "function") return {
-			mode: "unsupported",
+			capable: false,
 			reason: UNSUPPORTED_REASON("tools.resolve（需要 dsh-tools ≥ 0.2.2-alpha.2 / 插件 engines.dsh ≥ 0.2.2-rc.1）")
 		};
 		return {
-			mode: "when",
+			capable: true,
 			reason: WHEN_READY_REASON
 		};
 	}
@@ -13381,7 +13366,7 @@ function createToolScopeHost(deps) {
 	}
 	function refresh() {
 		const state = current;
-		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return void 0;
+		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return;
 		rebuildJudgements(state);
 	}
 	function teardownEffect(state) {
@@ -13400,8 +13385,7 @@ function createToolScopeHost(deps) {
 		mount(ctx) {
 			mountTornDown = false;
 			const probed = probe(ctx.tools);
-			probed.mode;
-			staticCapable = probed.mode !== "unsupported";
+			staticCapable = probed.capable;
 			if (!staticCapable) {
 				scope.setHost({
 					state: "unsupported",

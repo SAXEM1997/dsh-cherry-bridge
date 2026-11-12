@@ -235,12 +235,12 @@ export function createSubagentHost(parts: {
    * STEP time. Absent ⇒ the tool is registered unconditionally, which is what
    * every host got before the condition existed.
    *
-   * It exists because `tools.restrict` is not always available: a host without
-   * it makes the scope subsystem register nothing (fail-closed) and install no
-   * deny layer, so before this the delegation tool was visible in EVERY
-   * workspace, excluded ones included. `when` is the one gate that needs no
-   * extra host capability — it is consulted per step and drops the tool from the
-   * declarations and the dispatch alike.
+   * It exists because the delegation tool is registered by THIS subsystem, not
+   * by the shared scope registration: without a condition it would be visible in
+   * EVERY workspace, excluded ones included. `when` is the gate the host
+   * consults per step; it drops the tool from the declarations and the dispatch
+   * alike, and the host capability it needs (`tools.resolve`) is guaranteed by
+   * the plugin's engine floor.
    *
    * MUST NOT THROW: the host turns a rejection into a `ToolActivationError` that
    * fails the whole step preparation, so a broken predicate would take down

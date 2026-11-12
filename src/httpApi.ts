@@ -9,7 +9,6 @@ import type { PairWithPayloadOptions } from './pairing.js'
 import { CONTRACT_DIFFERENCES, buildDiagnostics, readScopeSegment } from './diagnostics.js'
 import type { DiagnosticsError, DiagnosticsStats, SubscriptionStat } from './diagnostics.js'
 import type { ScopeDoc, ToolScopeState } from './toolScope.js'
-import type { RefreshSummary } from './toolScopeHost.js'
 import { resolveSubagentConfig, sameSubagentResolution } from './subagent.js'
 import type { SubagentConfigResolution } from './subagent.js'
 import type { SubagentConfigDocument, StoredSubagentConfig } from './subagentConfigStore.js'
@@ -199,7 +198,7 @@ export interface CherryHttpDeps {
    * summary is the round's own echo. Absent capability (pending/unsupported) or
    * a torn-down mount has no round to run and answers `undefined`.
    */
-  refreshScope: () => RefreshSummary | undefined
+  refreshScope: () => void
   /**
    * The experiment's document, the decision THIS apply made from it, and the
    * subsystem's live verdict (#233).

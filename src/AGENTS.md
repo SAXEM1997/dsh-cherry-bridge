@@ -767,6 +767,9 @@ selector, `cherry_pair` does not.
   (fail-closed), never a silent unconditional install.
 - A throwing condition would fail step PREPARATION
   (`TOOL_ACTIVATION_FAILED`), so it answers false; 14 calls/step ≈ 3 µs.
+- `cherry_subagent` is registered by the SUBAGENT subsystem, not this family; it
+  carries its own step-time `visibleFor` gate over the same judgement, so it
+  follows the document too.
 - Scope governs **tools only**; the settings page and `/cherry-remote/api` are
   never scope-gated.
 - Capability missing is never papered over: `pending` is a neutral wait,

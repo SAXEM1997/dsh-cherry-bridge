@@ -21,7 +21,7 @@ import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLi
 import { ToolScopeState } from '../../src/toolScope.js'
 import type { WorkspaceRegistryLike } from '../../src/toolScope.js'
 import { createToolScopeHost } from '../../src/toolScopeHost.js'
-import type { RefreshSummary, ScopeHostContext, ScopeInjectedContext, ToolScopeHost } from '../../src/toolScopeHost.js'
+import type { ScopeHostContext, ScopeInjectedContext, ToolScopeHost } from '../../src/toolScopeHost.js'
 import { FakeToolHost } from '../helpers/fakeToolHost.js'
 import type { FakeAgentSeed, FakeCapability, FakeWorkspace } from '../helpers/fakeToolHost.js'
 
@@ -164,8 +164,8 @@ interface ScopeHttpFixture {
   host: ToolScopeHost
   server: FakeWebServer
   scopeFile: string
-  /** One entry per `refreshScope()` call: the summary THAT CALL returned. */
-  refreshCalls: Array<RefreshSummary | undefined>
+  /** How many times `refreshScope()` ran. */
+  refreshCalls: number
   /** `save` / `refresh` / the microtask queued inside `save`, in execution order. */
   order: string[]
   /** One `rebuild()` per recompute pass. */
@@ -224,7 +224,7 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
 
   const logs: string[] = []
   const order: string[] = []
-  const refreshCalls: Array<RefreshSummary | undefined> = []
+  let refreshCalls = 0
   let rebuilds = 0
   let running = 0
   let roundsInFlight = 0
@@ -276,9 +276,8 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
     scope: state,
     refreshScope: () => {
       order.push('refresh')
-      const summary = host.refresh()
-      refreshCalls.push(summary)
-      return summary
+      host.refresh()
+      refreshCalls += 1
     },
     pair: async () => {
       throw new Error('the scope suite never pairs')
@@ -455,7 +454,7 @@ describe('PUT /cherry-remote/api/scope', () => {
     // round's echo is `undefined`.
     expect(fixture.order.indexOf('save')).toBeLessThan(fixture.order.indexOf('refresh'))
     expect(fixture.order.indexOf('save-microtask')).toBeGreaterThan(fixture.order.indexOf('refresh'))
-    expect(fixture.refreshCalls).toEqual([undefined])
+    expect(fixture.refreshCalls).toBe(1)
 
     await settle()
     expect(fixture.state.judgement('agent-1')).toMatchObject({ workspaceId: 'w1', visible: true })
@@ -643,7 +642,7 @@ describe('PUT /cherry-remote/api/scope', () => {
     // No authoritative list ⇒ no pruning: 'ghost' survives.
     expect(fixture.state.doc().workspaceIds).toContain('ghost')
     // No round to run: the round's own echo is `undefined` (Task 6's contract).
-    expect(fixture.refreshCalls).toEqual([undefined])
+    expect(fixture.refreshCalls).toBe(1)
 
     const after = await get(fixture)
     expect(after.json.host.degraded).toEqual([])

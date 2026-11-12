@@ -29,7 +29,6 @@ import type { SubagentConfigDocument } from './subagentConfigStore.js'
 import { createSubagentHost } from './subagentHost.js'
 import type { SubagentHost } from './subagentHost.js'
 import { createToolScopeHost, registerAtomically } from './toolScopeHost.js'
-import type { RefreshSummary } from './toolScopeHost.js'
 import { registerHttpApi } from './httpApi.js'
 import type {
   CherryHttpContext,
@@ -363,7 +362,7 @@ interface AssemblyState {
    * captured by `assemblyDeps()`, so a re-apply moves the HTTP face onto the
    * NEW host's entry point instead of the previous one's.
    */
-  refreshScope: () => RefreshSummary | undefined
+  refreshScope: () => void
   /** Resolved once the identity load settles; pairing reads it lazily. */
   identity: Uint8Array | undefined
   /**
@@ -1119,7 +1118,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // disposer. The TOOL registrations deliberately have no seat here: they are
   // gated on the scope subsystem's capability tri-state and belong to the host
   // mounted below, which registers them inside its injection callback and
-  // releases them with the same disposer that releases the restrictions.
+  // releases them with its own disposer.
   state.disposers.push(registerHttpApi(ctx, deps))
 
   // `ctx.effect` ties the teardown to plugin disable/unload. The disposer
@@ -1190,13 +1189,11 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // fourteen tools down with it.
   const subagents = createSubagentHost({
     resolution: subagentResolution,
-    // THE STEP-TIME SCOPE GATE (spec §5.7 SUB-04). The scope subsystem hides the
-    // family with `tools.restrict`, but a host WITHOUT that capability makes it
-    // register nothing and install no deny layer — and `cherry_subagent` is
-    // registered by THIS subsystem, so it stayed visible in every workspace,
-    // excluded ones included. `when` is the one gate that needs no extra host
-    // capability: the host consults it per step and drops the tool from the
-    // declarations and the dispatch alike.
+    // THE STEP-TIME SCOPE GATE (spec §5.7 SUB-04). `cherry_subagent` is
+    // registered by THIS subsystem, not by the shared scope registration, so it
+    // needs its own condition or it would be visible in every workspace,
+    // excluded ones included. The host consults `when` per step and drops the
+    // tool from the declarations and the dispatch alike.
     //
     // A closure, not a snapshot: `visibleFor` reads the current document and the
     // current judgement generation, so a config save changes the very next step.

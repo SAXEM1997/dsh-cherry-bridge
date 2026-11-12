@@ -53,8 +53,7 @@ afterEach(() => {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const READY_REASON =
-  '宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达'
+const READY_REASON = '宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性'
 
 const WS_ALPHA: ScopeWorkspace = { id: 'ws-1', title: '项目甲', path: '/srv/alpha' }
 const WS_BETA: ScopeWorkspace = { id: 'ws-2', title: '项目乙', path: '/srv/beta' }

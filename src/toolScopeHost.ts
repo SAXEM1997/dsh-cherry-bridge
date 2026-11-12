@@ -29,9 +29,6 @@ const PENDING_REASON = '等待宿主注入 agents / workspaceRegistry'
 /** `ready` for the step-time path: `register` + `resolve` are the whole contract. */
 const WHEN_READY_REASON = '宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性'
 
-/** How this host can hide the family: step-time conditions, or nothing. */
-type ScopeHostMode = 'when' | 'unsupported'
-
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS: readonly string[] = ['agents', 'workspaceRegistry']
 
@@ -171,19 +168,11 @@ export interface ScopeHostDeps {
   log?: (message: string, error?: unknown) => void
 }
 
-/** What one recompute round did, for the HTTP face's echo (spec §6.2/§6.3). */
-export interface RefreshSummary {
-  agents: number
-  installed: number
-  released: number
-  skipped: number
-}
-
 export interface ToolScopeHost {
   /** Instantiates nothing on its own: this is the assembly point. */
   mount(ctx: ScopeHostContext): () => void
-  /** One recompute round; `undefined` while `pending` / `unsupported` / torn down. */
-  refresh(): RefreshSummary | undefined
+  /** Re-reads the document for the next step; inert while `pending` / torn down. */
+  refresh(): void
   state(): ScopeHostState
 }
 
@@ -208,7 +197,6 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   const log = deps.log ?? ((message: string, error?: unknown) => console.warn(message, error))
 
   let root: ScopeHostContext | undefined
-  let staticMode: ScopeHostMode = 'unsupported'
   let staticCapable = false
   let mountTornDown = false
   /** The effect run currently holding the registration, if any. */
@@ -218,21 +206,21 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   // Capability probe (mount time, plugin ROOT ctx — never the injected ctx)
   // -------------------------------------------------------------------------
 
-  function probe(tools: ScopeHostContext['tools']): { mode: ScopeHostMode; reason: string } {
-    if (tools === undefined) return { mode: 'unsupported', reason: UNSUPPORTED_REASON('tools') }
+  function probe(tools: ScopeHostContext['tools']): { capable: boolean; reason: string } {
+    if (tools === undefined) return { capable: false, reason: UNSUPPORTED_REASON('tools') }
     if (typeof tools.register !== 'function') {
-      return { mode: 'unsupported', reason: UNSUPPORTED_REASON('tools.register') }
+      return { capable: false, reason: UNSUPPORTED_REASON('tools.register') }
     }
     // `resolve()` IS the host's declaration that `when` is honoured: older hosts
     // accept the option and silently ignore it (#343). The engine floor is
     // `>=0.2.2-rc.1`, so this is the ONLY supported mode (#345).
     if (typeof tools.resolve !== 'function') {
       return {
-        mode: 'unsupported',
+        capable: false,
         reason: UNSUPPORTED_REASON('tools.resolve（需要 dsh-tools ≥ 0.2.2-alpha.2 / 插件 engines.dsh ≥ 0.2.2-rc.1）'),
       }
     }
-    return { mode: 'when', reason: WHEN_READY_REASON }
+    return { capable: true, reason: WHEN_READY_REASON }
   }
 
   function UNSUPPORTED_REASON(...missing: string[]): string {
@@ -341,13 +329,12 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     })
   }
 
-  function refresh(): RefreshSummary | undefined {
+  function refresh(): void {
     const state = current
-    if (state === undefined || state.tornDown || mountTornDown || !staticCapable) return undefined
+    if (state === undefined || state.tornDown || mountTornDown || !staticCapable) return
     // Nothing to install: the next step's condition reads the saved document.
     // The async generation only refines realpath judgements and the report.
     rebuildJudgements(state)
-    return undefined
   }
 
   function teardownEffect(state: EffectState): void {
@@ -369,8 +356,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       mountTornDown = false
 
       const probed = probe(ctx.tools)
-      staticMode = probed.mode
-      staticCapable = probed.mode !== 'unsupported'
+      staticCapable = probed.capable
       if (!staticCapable) {
         // The static failure is decided HERE, before/independently of the
         // injection arrival — which is why "missing capability" and "injection
