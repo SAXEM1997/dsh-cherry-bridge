@@ -187,13 +187,14 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   plus the parts cache's own budgeted bytes (32 MiB per device).
 - **A slice window does not change that peak (#329).** Slices are decoded as
   they are CONSUMED, one at a time, so the 3× stands per content; the window
-  costs up to 8 undecoded `dataBase64` strings (~192 KiB, each bounded by the
-  64 KiB record cap). It fills only by PREDICTION (a run of full contiguous
+  costs up to 8 undecoded `dataBase64` strings (~192 KiB at 24 KiB a slice). It
+  fills only by PREDICTION (a run of full contiguous
   slices fixes the stride); any deviation DISCARDS it and finishes serially. A
   window is never awaited, only pre-observed: a sibling the peer never answers
   would otherwise hold a deadline-less read for the rpc default. Its EFFECTIVE
   width is `min(8, reported / 2)`: the protocol default (`inFlightRequests`
-  16) admits 8, the loopback fake's 8 admits 4 — hence ㉙a's 32.
+  16) admits 8, and a peer that reports none falls back to 8 → 4 — hence ㉙a's
+  32.
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
   (`ContentGateTimeoutError`, which the projection degrades to one part's
