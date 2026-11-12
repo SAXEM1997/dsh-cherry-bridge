@@ -204,9 +204,14 @@ export interface CherryToolDefinition {
   execute(args: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>
 }
 
+/** The host's step-time activation option, as this plugin consumes it. */
+export interface ToolStepCondition {
+  when?(context: { readonly agent: unknown; readonly signal?: AbortSignal }): boolean | Promise<boolean>
+}
+
 /** The host's tool registry, as this plugin consumes it. */
 export interface ToolsServiceLike {
-  register(definition: CherryToolDefinition): () => void
+  register(definition: CherryToolDefinition, options?: ToolStepCondition): () => void
 }
 
 /** The context slice the tool face needs. */
@@ -2525,8 +2530,9 @@ export function registerCherryTools(
   ctx: CherryToolsContext,
   deps: CherryToolsDeps,
   options: CherryToolEngineOptions = {},
+  visibleFor?: (agent: unknown) => boolean,
 ): () => void {
-  return registerCherryToolsWithEngine(ctx, deps, options).dispose
+  return registerCherryToolsWithEngine(ctx, deps, options, undefined, visibleFor).dispose
 }
 
 /**
@@ -2557,6 +2563,8 @@ export function registerCherryToolsWithEngine(
    * built in `apply` rather than inside the tool host's injection callback.
    */
   shared: CherryToolEngine | undefined = undefined,
+  /** The scope host's step-time predicate; absent ⇒ unconditional registrations. */
+  visibleFor?: (agent: unknown) => boolean,
 ): { dispose: () => void; engine: CherryToolEngine | undefined } {
   const tools = ctx.tools
   if (tools === undefined) {
@@ -2567,7 +2575,24 @@ export function registerCherryToolsWithEngine(
   }
 
   const engine = shared ?? new CherryToolEngine(deps, options)
-  const disposers = engine.definitions().map((definition) => tools.register(definition))
+  // ONE condition object for the whole family: the host calls it once per model
+  // step (per tool), and a rejection there would fail step preparation rather
+  // than hide one tool — so it never throws (#343).
+  const registration =
+    visibleFor === undefined
+      ? undefined
+      : {
+          when: (context: { readonly agent: unknown }): boolean => {
+            try {
+              return visibleFor(context.agent)
+            } catch {
+              return false
+            }
+          },
+        }
+  const disposers = engine.definitions().map((definition) =>
+    registration === undefined ? tools.register(definition) : tools.register(definition, registration),
+  )
   return {
     engine,
     dispose: () => {

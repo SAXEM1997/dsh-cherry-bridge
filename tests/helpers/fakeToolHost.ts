@@ -48,6 +48,8 @@ export interface FakeHostOptions {
   injectThrows?: boolean
   /** Capabilities to REMOVE from the plugin root's `tools` face. */
   without?: readonly FakeCapability[]
+  /** Model a host that supports step-time `when` (`resolve()` exists). */
+  whenCapable?: boolean
 }
 
 /** One workspace registry entry, in the shape `list()` returns. */
@@ -135,6 +137,7 @@ export class FakeToolHost {
 
   readonly #options: FakeHostOptions
   #names = new Map<string, { name: string; description: string; parameters?: unknown }>()
+  #conditions = new Map<string, (context: { readonly agent: unknown }) => boolean | Promise<boolean>>()
   #guards: FakeGuard[] = []
   #subscriptions = new Map<string, Set<(payload: unknown) => void>>()
   #live = new Map<string, FakeAgentRecord>()
@@ -162,12 +165,15 @@ export class FakeToolHost {
     this.#options = options
 
     const tools: NonNullable<ScopeHostContext['tools']> = {
-      register: (definition) => this.#register(definition),
+      register: (definition, options) => this.#register(definition, options),
       restrict: () => {
         throw new Error(SCOPED_ONLY)
       },
       guard: (guard) => this.#installGuard(guard),
       schemas: (scope) => this.#schemas(scope),
+      ...(options.whenCapable === true
+        ? { resolve: async (context: { readonly agent: unknown }) => context.agent }
+        : {}),
     }
     for (const capability of options.without ?? []) {
       delete (tools as Record<string, unknown>)[capability]
@@ -241,6 +247,27 @@ export class FakeToolHost {
   agentView(agentId: string): string[] {
     const layers = this.#layers.get(agentId) ?? []
     return [...this.#names.keys()].filter((name) => layers.every((layer) => admits(layer, name)))
+  }
+
+  /**
+   * The step-time view: every registered name whose `when` (if any) answers true
+   * for this agent. Models `ToolsService.resolve()` (#343).
+   */
+  async resolvedView(agentId: string): Promise<string[]> {
+    const record = this.#live.get(agentId)
+    const agent =
+      record?.raw ?? ({ id: agentId, session: { header: {} } } as FakeAgentRecord['raw'])
+    const admitted: string[] = []
+    for (const name of this.#names.keys()) {
+      const when = this.#conditions.get(name)
+      if (when === undefined || (await when({ agent }))) admitted.push(name)
+    }
+    return admitted
+  }
+
+  /** How many registered definitions carry a step-time condition (#343). */
+  whenConditions(): number {
+    return this.#conditions.size
   }
 
   /** The guard verdict for one dispatch: a string rejects, `undefined` allows. */
@@ -396,7 +423,15 @@ export class FakeToolHost {
     this.#emit('tools/change', undefined, true)
   }
 
-  #register(definition: { readonly name: string; readonly description: string; readonly parameters?: unknown }): () => void {
+  #register(
+    definition: { readonly name: string; readonly description: string; readonly parameters?: unknown },
+    options?: {
+      when?(context: { readonly agent: unknown; readonly signal?: AbortSignal }): boolean | Promise<boolean>
+    },
+  ): () => void {
+    const when = options?.when
+    if (when === undefined) this.#conditions.delete(definition.name)
+    else this.#conditions.set(definition.name, when)
     if (this.#names.has(definition.name)) {
       throw new Error(`tool already registered: ${definition.name}`)
     }

@@ -64,6 +64,8 @@ interface RigOptions {
   deferInjection?: boolean
   injectThrows?: boolean
   without?: readonly FakeCapability[]
+  /** Model a host with step-time `when` (`tools.resolve` present, #343). */
+  whenCapable?: boolean
   /** Override the aggregate registration entry (⑦). */
   registerTools?: (host: FakeToolHost) => () => void
   /**
@@ -92,6 +94,7 @@ function rig(options: RigOptions = {}) {
     ...(options.deferInjection === undefined ? {} : { deferInjection: options.deferInjection }),
     ...(options.injectThrows === undefined ? {} : { injectThrows: options.injectThrows }),
     ...(options.without === undefined ? {} : { without: options.without }),
+    ...(options.whenCapable === undefined ? {} : { whenCapable: options.whenCapable }),
   })
   const dir = mkdtempSync(join(tmpdir(), 'cherry-scope-host-'))
   dirs.push(dir)
@@ -108,9 +111,11 @@ function rig(options: RigOptions = {}) {
     // plugin root ctx (the same call the assembly makes), through the same
     // atomic entry `apply()` uses. The factory runs when the effect actually
     // registers, never at rig-construction time.
-    registerTools: () =>
+    registerTools: (visibleFor) =>
       options.registerTools?.(host) ??
-      registerAtomically(host.root, (toolsCtx) => registerCherryTools(toolsCtx, inertToolDeps())),
+      registerAtomically(host.root, (toolsCtx) =>
+        registerCherryTools(toolsCtx, inertToolDeps(), {}, visibleFor),
+      ),
   })
   options.patchRoot?.(host)
   const dispose = tools.mount(host.root)
@@ -2929,5 +2934,39 @@ describe('Gate 3 round 2 fixes: an empty generation on re-mount, a shared record
     expect(fresh.scope.judgement('agent-b')).toBeDefined()
     expect(fresh.tools.state().state).toBe('ready')
     expect(fresh.host.effectFailures).toEqual([])
+  })
+})
+
+describe('spike #343: step-time when replaces the per-agent layer', () => {
+  it('⑬ registers one condition, installs no layer, guard or subscription, and answers per step', async () => {
+    const { host, scope, tools } = rig({ whenCapable: true })
+    expect(tools.state().state).toBe('ready')
+    expect(host.registeredNames()).toHaveLength(14)
+    // The whole lifecycle machinery is absent: no per-agent layer, no guard and
+    // no subscription — the host evaluates the condition at each step.
+    expect(host.restrictCalls).toEqual([])
+    expect(host.guardLive()).toBe(0)
+    expect(host.liveSubscriptions()).toBe(0)
+
+    host.setWorkspaces([{ id: 'ws-a', path: '/w/oa' }])
+    host.addAgent({ id: 'agent-a', cwd: '/w/oa' })
+    host.addAgent({ id: 'agent-b', cwd: '/w/elsewhere' })
+    // The async generation supplies the realpath table AND makes the list
+    // authoritative, which `save()` requires; `when` already answers from
+    // `resolveNow` for a plain cwd.
+    tools.refresh()
+    await vi.waitFor(() => {
+      expect(scope.judgement('agent-a')).toBeDefined()
+    })
+    saveScope(scope, 'selected', ['ws-a'])
+
+    await vi.waitFor(async () => {
+      expect(await host.resolvedView('agent-a')).toEqual([...CHERRY_TOOL_NAMES])
+    })
+    expect(await host.resolvedView('agent-b')).toEqual([])
+
+    // A save is visible on the VERY NEXT evaluation — no reinstall round.
+    saveScope(scope, 'global', [])
+    expect(await host.resolvedView('agent-b')).toEqual([...CHERRY_TOOL_NAMES])
   })
 })

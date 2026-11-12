@@ -159,9 +159,16 @@ interface CherryToolDefinition {
    */
   execute(args: Record<string, unknown>, exec?: CherryToolExec): Promise<unknown>;
 }
+/** The host's step-time activation option, as this plugin consumes it. */
+interface ToolStepCondition {
+  when?(context: {
+    readonly agent: unknown;
+    readonly signal?: AbortSignal;
+  }): boolean | Promise<boolean>;
+}
 /** The host's tool registry, as this plugin consumes it. */
 interface ToolsServiceLike {
-  register(definition: CherryToolDefinition): () => void;
+  register(definition: CherryToolDefinition, options?: ToolStepCondition): () => void;
 }
 /** The context slice the tool face needs. */
 interface CherryToolsContext {

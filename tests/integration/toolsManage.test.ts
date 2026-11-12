@@ -9,7 +9,7 @@ import { QuarantinedArchiveError } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
 import { pairWithPayload } from '../../src/pairing.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
-import { registerCherryTools } from '../../src/tools.js'
+import { CHERRY_TOOL_NAMES, registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
 import { LOG_TEXT_MAX } from '../../src/text.js'
 import { FakeCherry } from '../loopback/fakeCherry.js'
@@ -896,35 +896,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       rmSync(dataDir, { recursive: true, force: true })
     })
 
-    it('⑳g the scope list `apply` hands the host carries the delegation tool too', async () => {
-      // The ONE place the assembly's `names` choice is observable. A host
-      // missing `tools.restrict` makes the scope subsystem refuse to register
-      // anything, and its verdict names how many tools it WOULD have governed.
-      //
-      // Fifteen, not fourteen: the delegation tool is scope-governed even though
-      // the subagent subsystem registers it, so an excluded workspace cannot
-      // reach the experiment as a way around the bridge. Reverting `apply` to
-      // `CHERRY_TOOL_NAMES` turns this red.
-      //
-      // DIAGNOSTIC, because a review reported this as intermittent: FOURTEEN is
-      // structurally impossible here. `cherryScopeToolNames()` is
-      // `[...CHERRY_TOOL_NAMES, toolName]` — it appends unconditionally, with no
-      // deduplication — so `apply` cannot hand the host fourteen names unless it
-      // hands over `CHERRY_TOOL_NAMES` itself. A run that reports "14 个受治理的
-      // 名字" is therefore reading such a tree (a mutation, or a stale
-      // transform), not seeing this assertion flake: `GET /scope` reads THIS
-      // apply's `ToolScopeState` (the HTTP deps are built per apply from
-      // `state.scope`, assigned one statement earlier), so no earlier case can
-      // contribute a count. Ten runs of this file TOGETHER with
-      // `toolScopeHost.test.ts` (98 cases each) and three runs of this file
-      // alone (46 each) were clean.
-      //
-      // The phrase is pinned with the count inside it rather than as a bare
-      // `15`: this string is the ONLY apply-level surface for the governed list,
-      // so a wording change here is a legitimate reason for this case to go red
-      // (it did, when the sentence was corrected to stop claiming the delegation
-      // tool "cannot be hidden" — that claim stopped being true when the tool
-      // grew its step-time gate).
+    it('⑳g a restrict-less host that supports when is READY and gates every tool per step', async () => {
+      // #343 changes the verdict for this host shape: `tools.restrict` is no
+      // longer required once `tools.resolve` exists, because the family is
+      // hidden by a step-time `when` instead of a per-agent layer. The old
+      // fail-closed verdict is still what a host with NEITHER capability gets
+      // (⑦a/⑦b cover that host).
       const index = await import('../../src/index.js')
       const ctx = assemblyCtx(false, 'restrict')
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
@@ -935,8 +912,14 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         response as never,
       )
       const body = JSON.parse(response.body) as { host: { reason: string; capable: boolean } }
-      expect(body.host.capable).toBe(false)
-      expect(body.host.reason).toContain('15 个受治理的名字')
+      expect(body.host.capable).toBe(true)
+      expect(body.host.reason).toContain('when')
+      // Every one of the fourteen is registered WITH the shared condition; a
+      // single unconditional registration would be visible in every workspace.
+      expect([...ctx.tools.registerOptions.keys()].sort()).toEqual([...CHERRY_TOOL_NAMES].sort())
+      for (const options of ctx.tools.registerOptions.values()) {
+        expect(typeof options.when).toBe('function')
+      }
       rmSync(dataDir, { recursive: true, force: true })
     })
 
@@ -977,23 +960,19 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       rmSync(dataDir, { recursive: true, force: true })
     })
 
-    it('⑳i the governed list honours a RENAMED tool, not the default (SUB-04)', async () => {
-      // The belt (`restrict` + `guard`) is built from a NAME, so a list built
-      // from a constant instead of the resolved config governs a tool that does
-      // not exist and leaves the real one ungoverned. The braces (`when`) hide it
-      // either way, which is exactly why this needs its own case: without one the
-      // mutation `cherryScopeToolNames()` — the argument dropped — leaves every
-      // relevant test green.
+    it('⑳i the condition honours a RENAMED tool, not the default (SUB-04)', async () => {
+      // On a `when`-capable host there is no deny layer to inspect: the proof is
+      // the registered CONDITION, and that it follows the document in both
+      // directions. The renamed tool must be the one carrying it; the default
+      // name is registered by nobody under this config.
       const index = await import('../../src/index.js')
-      const denials: string[][] = []
       const ctx = assemblyCtx(false, undefined, [
         {
           id: 'agent-a',
           session: { header: { cwd: '/w/excluded' } },
           ctx: {
             tools: {
-              restrict(filter) {
-                denials.push([...filter.deny])
+              restrict() {
                 return () => {}
               },
             },
@@ -1002,27 +981,32 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       ])
       const dataDir = mkdtempSync(join(tmpdir(), 'cherry-manage-subagent-'))
       await applyAssembly(ctx as never, { dataDir, subagent: { ...SUBAGENT, toolName: 'custom_delegate' } })
-      // The first synchronous round runs before the subagent host has registered
-      // the fifteenth name, so a `PUT /scope` — which calls `refresh()` inline —
-      // is what makes the deny set observably complete.
-      const response = new FakeResponse()
-      await ctx.server.dispatch(
-        new FakeRequest(`${PREFIX}/scope`, {
-          host: HOST,
-          method: 'PUT',
-          body: JSON.stringify({ mode: 'selected', workspaceIds: [], expectedRevision: 0 }),
-        }) as never,
-        response as never,
-      )
-      expect(response.status).toBe(200)
-      const denied = denials.at(-1)
-      expect(denied).toBeDefined()
-      expect(denied).toContain('custom_delegate')
-      // The default name is registered by nobody under this config, so governing
-      // it would submit an unknown name to `restrict()` — which the host refuses.
-      expect(denied).not.toContain('cherry_subagent')
+      const when = ctx.tools.registerOptions.get('custom_delegate')?.when
+      expect(when).toBeDefined()
+      expect(ctx.tools.registerOptions.has('cherry_subagent')).toBe(false)
+
+      const put = async (body: unknown): Promise<void> => {
+        const response = new FakeResponse()
+        await ctx.server.dispatch(
+          new FakeRequest(`${PREFIX}/scope`, {
+            host: HOST,
+            method: 'PUT',
+            body: JSON.stringify(body),
+          }) as never,
+          response as never,
+        )
+        expect(response.status).toBe(200)
+      }
+
+      // Default document: selected + no workspace ⇒ hidden.
+      expect(await when!({ agent: { id: 'agent-a' } })).toBe(false)
+      await put({ mode: 'global', workspaceIds: [], expectedRevision: 0 })
+      expect(await when!({ agent: { id: 'agent-a' } })).toBe(true)
+      await put({ mode: 'selected', workspaceIds: [], expectedRevision: 1 })
+      expect(await when!({ agent: { id: 'agent-a' } })).toBe(false)
       rmSync(dataDir, { recursive: true, force: true })
     })
+
 
     it('⑳c with no `subagent` key nothing is registered (SUB-01)', async () => {
       const index = await import('../../src/index.js')

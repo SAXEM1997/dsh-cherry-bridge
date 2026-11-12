@@ -698,6 +698,21 @@ export class ToolScopeState {
   }
 
   /**
+   * The same question answered with the AGENT in hand (#343) — the predicate the
+   * fourteen tools are registered with when the host supports step-time `when`.
+   *
+   * It composes the cached judgement with {@link resolveNow}, which is exactly
+   * what the layer-install window does; the difference is that `when` HAS the
+   * agent (and therefore its `cwd`), so a brand-new agent is judged on its first
+   * step instead of waiting for the async generation. A genuinely unresolved
+   * `cwd` (only realpath can decide) still answers fail-closed until the next
+   * rebuild lands, which is the documented conservative direction.
+   */
+  visibleForAgent(agent: ScopeAgentLike): boolean {
+    return isVisible(this.doc(), (this.judgement(agent.id) ?? this.resolveNow(agent))?.workspaceId)
+  }
+
+  /**
    * The same two §4 rules as `#judge`, answered from the CURRENT generation
    * without awaiting anything — the synchronous window's fallback when
    * `judgement()` misses.

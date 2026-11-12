@@ -2022,6 +2022,20 @@ var ToolScopeState = class {
 		return isVisible(this.doc(), this.judgement(agentId)?.workspaceId);
 	}
 	/**
+	* The same question answered with the AGENT in hand (#343) — the predicate the
+	* fourteen tools are registered with when the host supports step-time `when`.
+	*
+	* It composes the cached judgement with {@link resolveNow}, which is exactly
+	* what the layer-install window does; the difference is that `when` HAS the
+	* agent (and therefore its `cwd`), so a brand-new agent is judged on its first
+	* step instead of waiting for the async generation. A genuinely unresolved
+	* `cwd` (only realpath can decide) still answers fail-closed until the next
+	* rebuild lands, which is the documented conservative direction.
+	*/
+	visibleForAgent(agent) {
+		return isVisible(this.doc(), (this.judgement(agent.id) ?? this.resolveNow(agent))?.workspaceId);
+	}
+	/**
 	* The same two §4 rules as `#judge`, answered from the CURRENT generation
 	* without awaiting anything — the synchronous window's fallback when
 	* `judgement()` misses.
@@ -7905,7 +7919,7 @@ function cherryScopeToolNames(toolName = CHERRY_SUBAGENT_TOOL_DEFAULT) {
 * (`src` is published on purpose, see AGENTS.md → Build facts), so they are a
 * compatibility commitment — which is why this seam is kept minimal.
 */
-function registerCherryToolsWithEngine(ctx, deps, options = {}, shared = void 0) {
+function registerCherryToolsWithEngine(ctx, deps, options = {}, shared = void 0, visibleFor) {
 	const tools = ctx.tools;
 	if (tools === void 0) {
 		console.warn("[cherry-remote] ctx.tools is unavailable; the cherry_* tools were not registered");
@@ -7915,7 +7929,14 @@ function registerCherryToolsWithEngine(ctx, deps, options = {}, shared = void 0)
 		};
 	}
 	const engine = shared ?? new CherryToolEngine(deps, options);
-	const disposers = engine.definitions().map((definition) => tools.register(definition));
+	const registration = visibleFor === void 0 ? void 0 : { when: (context) => {
+		try {
+			return visibleFor(context.agent);
+		} catch {
+			return false;
+		}
+	} };
+	const disposers = engine.definitions().map((definition) => registration === void 0 ? tools.register(definition) : tools.register(definition, registration));
 	return {
 		engine,
 		dispose: () => {
@@ -13262,6 +13283,8 @@ const EFFECT_LABEL = "cherry-remote.tool-scope()";
 const PENDING_REASON = "等待宿主注入 agents / workspaceRegistry";
 /** `ready` means: the three static capabilities AND both injected services. */
 const READY_REASON = "宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达";
+/** `ready` for the step-time path: only `register` + `resolve` are needed. */
+const WHEN_READY_REASON = "宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性";
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS = ["agents", "workspaceRegistry"];
 /**
@@ -13292,8 +13315,8 @@ const DEFAULT_RECHECK_DELAYS_MS = [250, 2e3];
 function registerAtomically(ctx, register) {
 	const releases = [];
 	const tools = ctx.tools;
-	const ledger = tools === void 0 ? ctx : { tools: { register: (definition) => {
-		const release = tools.register(definition);
+	const ledger = tools === void 0 ? ctx : { tools: { register: (definition, options) => {
+		const release = tools.register(definition, options);
 		releases.push(release);
 		return release;
 	} } };
@@ -13320,26 +13343,38 @@ function createToolScopeHost(deps) {
 	const log = deps.log ?? ((message, error) => console.warn(message, error));
 	const recheckDelaysMs = deps.recheckDelaysMs ?? DEFAULT_RECHECK_DELAYS_MS;
 	let root;
+	let staticMode = "unsupported";
 	let staticCapable = false;
 	let mountTornDown = false;
 	/** The effect run currently holding the four faces, if any. */
 	let current;
 	function probe(tools) {
+		if (tools === void 0) return {
+			mode: "unsupported",
+			reason: UNSUPPORTED_REASON("tools")
+		};
+		if (typeof tools.register !== "function") return {
+			mode: "unsupported",
+			reason: UNSUPPORTED_REASON("tools.register")
+		};
+		if (typeof tools.resolve === "function") return {
+			mode: "when",
+			reason: WHEN_READY_REASON
+		};
 		const missing = [];
-		if (tools === void 0) missing.push("tools");
-		else {
-			if (typeof tools.register !== "function") missing.push("tools.register");
-			if (typeof tools.restrict !== "function") missing.push("tools.restrict");
-			if (typeof tools.schemas !== "function") missing.push("tools.schemas");
-		}
-		if (missing.length === 0) return {
-			capable: true,
-			reason: READY_REASON
+		if (typeof tools.restrict !== "function") missing.push("tools.restrict");
+		if (typeof tools.schemas !== "function") missing.push("tools.schemas");
+		if (missing.length > 0) return {
+			mode: "unsupported",
+			reason: UNSUPPORTED_REASON(...missing)
 		};
 		return {
-			capable: false,
-			reason: `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`
+			mode: "legacy",
+			reason: READY_REASON
 		};
+	}
+	function UNSUPPORTED_REASON(...missing) {
+		return `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`;
 	}
 	function projectAgent(raw) {
 		if (typeof raw !== "object" || raw === null) return void 0;
@@ -13681,6 +13716,10 @@ function createToolScopeHost(deps) {
 	function refresh() {
 		const state = current;
 		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return void 0;
+		if (staticMode === "when") {
+			rebuildJudgements(state);
+			return;
+		}
 		const summary = applyAll(state);
 		requestRound(state);
 		return summary;
@@ -13725,8 +13764,76 @@ function createToolScopeHost(deps) {
 			});
 		}
 	}
+	/**
+	* The step-time path (#343): ONE registration carrying one shared `when`.
+	*
+	* There is no layer to install, no agent lifecycle to follow and no recheck
+	* timer: the host evaluates the condition at every step, so a config save or
+	* a fresh agent is answered by the very next step. The async judgement
+	* generation still runs (a `cwd` that only realpath can match), but only to
+	* improve the answer — the gate itself reads `judgement ?? resolveNow(agent)`
+	* synchronously and fails closed.
+	*/
+	function setupWhen(agentCtx) {
+		if (mountTornDown) return () => {};
+		scope.setHost({
+			state: "ready",
+			capable: true,
+			reason: WHEN_READY_REASON
+		});
+		const state = {
+			tornDown: false,
+			running: false,
+			dirty: false,
+			layers: /* @__PURE__ */ new Map(),
+			recheckSteps: /* @__PURE__ */ new Map(),
+			recheckTimers: /* @__PURE__ */ new Map(),
+			agents: agentCtx.agents,
+			registry: agentCtx.workspaceRegistry,
+			releaseRegistrations: void 0,
+			releaseGuard: void 0,
+			offs: [],
+			teardown: () => {}
+		};
+		state.teardown = () => teardownEffect(state);
+		let release;
+		try {
+			release = deps.registerTools((raw) => {
+				const agent = projectAgent(raw);
+				if (agent === void 0) return false;
+				try {
+					return scope.visibleForAgent(agent);
+				} catch (error) {
+					log("[cherry-remote] 步骤级作用域判定抛错；本步按不可见处理", error);
+					return false;
+				}
+			});
+		} catch (error) {
+			state.tornDown = true;
+			scope.setHost({
+				state: "unsupported",
+				capable: false,
+				reason: `cherry_* 工具注册失败：${describeError(error)}`
+			});
+			log("[cherry-remote] cherry_* 工具注册失败；作用域子系统未启用", error);
+			return state.teardown;
+		}
+		state.releaseRegistrations = release;
+		current = state;
+		rebuildJudgements(state);
+		return state.teardown;
+	}
+	/** One async judgement generation, never awaited by a step (#343). */
+	function rebuildJudgements(state) {
+		const registry = state.registry;
+		if (registry === void 0) return;
+		scope.rebuild(registry, liveAgents(state)).catch((error) => {
+			log("[cherry-remote] 作用域判定重建失败（保留上一代判定）", error);
+		});
+	}
 	function setup(agentCtx) {
 		if (mountTornDown) return () => {};
+		if (staticMode === "when") return setupWhen(agentCtx);
 		if (!staticCapable) return () => {};
 		scope.setHost({
 			state: "ready",
@@ -13856,7 +13963,8 @@ function createToolScopeHost(deps) {
 			root = ctx;
 			mountTornDown = false;
 			const probed = probe(ctx.tools);
-			staticCapable = probed.capable;
+			staticMode = probed.mode;
+			staticCapable = probed.mode !== "unsupported";
 			if (!staticCapable) {
 				scope.setHost({
 					state: "unsupported",
@@ -15932,7 +16040,7 @@ function apply(ctx, config = {}) {
 	const host = createToolScopeHost({
 		scope,
 		names: cherryScopeToolNames(subagentResolution.kind === "ready" ? subagentResolution.config.toolName : CHERRY_SUBAGENT_TOOL_DEFAULT),
-		registerTools: () => registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine).dispose)
+		registerTools: (visibleFor) => registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine, visibleFor).dispose)
 	});
 	state.disposers.push(host.mount(ctx));
 	const subagents = createSubagentHost({
