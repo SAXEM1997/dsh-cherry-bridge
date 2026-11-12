@@ -41,7 +41,17 @@ what loads it.
 
 **Flow — GitHub Flow, one issue per branch.**
 
-    issue → branch (off main) → TDD → PR → independent review → squash merge
+    issue → branch (off main) → TDD → PR → independent review → squash merge → delete the branch
+
+- **Delete the branch on BOTH remotes after the merge.** `gh pr merge
+  --delete-branch` only touches `github`; the `origin` (GitLab) mirror keeps the
+  branch forever unless it is pushed a deletion too. A stale branch there is not
+  harmless: it is a checkout someone can resume from a commit that was never in
+  `main` (squash merges make the branch tip a non-ancestor, so `git branch
+  --merged` will NOT flag it). Sweep with
+  `git ls-remote --heads origin` and delete anything whose PR is MERGED or CLOSED;
+  GitHub keeps `refs/pull/<n>/head`, so a closed PR's commits survive its branch
+  being removed.
 
 - **Test first.** Write the failing test, watch it fail for the intended
   reason, then implement. Every new or changed test must be **mutation-verified**:
