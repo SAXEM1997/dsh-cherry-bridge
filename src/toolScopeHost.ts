@@ -65,6 +65,12 @@ const PENDING_REASON = '等待宿主注入 agents / workspaceRegistry'
 /** `ready` means: the three static capabilities AND both injected services. */
 const READY_REASON = '宿主能力齐备（tools.register / tools.restrict / tools.schemas）且 agents / workspaceRegistry 注入已到达'
 
+/** `ready` for the step-time path: only `register` + `resolve` are needed. */
+const WHEN_READY_REASON = '宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性'
+
+/** How this host hides the family: step-time conditions, per-agent layers, or nothing. */
+type ScopeHostMode = 'legacy' | 'when' | 'unsupported'
+
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS: readonly string[] = ['agents', 'workspaceRegistry']
 
@@ -90,12 +96,19 @@ const DEFAULT_RECHECK_DELAYS_MS: readonly number[] = [250, 2000]
  */
 export interface ScopeHostContext {
   tools?: {
-    register(definition: {
-      readonly name: string
-      readonly description: string
-      readonly parameters?: unknown
-      execute(args: unknown, exec: unknown): Promise<unknown>
-    }): () => void
+    register(
+      definition: {
+        readonly name: string
+        readonly description: string
+        readonly parameters?: unknown
+        execute(args: unknown, exec: unknown): Promise<unknown>
+      },
+      options?: {
+        when?(context: { readonly agent: unknown; readonly signal?: AbortSignal }): boolean | Promise<boolean>
+      },
+    ): () => void
+    /** Present on hosts that support step-time `when` (0.2.2-alpha.2+). */
+    resolve?(context: { readonly agent: unknown; readonly signal?: AbortSignal }): Promise<unknown>
     restrict?(filter: { readonly allow?: readonly string[]; readonly deny?: readonly string[] }): () => void
     guard?(
       guard: (execution: { readonly name: string; readonly agent?: { readonly id: string } }) => string | undefined,
@@ -138,11 +151,16 @@ export interface ScopeInjectedContext {
  */
 export interface ScopeRegistrationContext {
   tools?: {
-    register(definition: {
-      readonly name: string
-      readonly description: string
-      readonly parameters?: unknown
-    }): () => void
+    register(
+      definition: {
+        readonly name: string
+        readonly description: string
+        readonly parameters?: unknown
+      },
+      options?: {
+        when?(context: { readonly agent: unknown; readonly signal?: AbortSignal }): boolean | Promise<boolean>
+      },
+    ): () => void
   }
 }
 
@@ -173,10 +191,12 @@ export function registerAtomically(
       ? ctx
       : {
           tools: {
-            register: (definition) => {
+            register: (definition, options) => {
               // `tools.register(…)` keeps its receiver, so a host method that
               // relies on `this` behaves exactly as it does without the ledger.
-              const release = tools.register(definition)
+              // The OPTIONS go through too: dropping them here would silently
+              // turn every `when` registration unconditional (#343).
+              const release = tools.register(definition, options)
               releases.push(release)
               return release
             },
@@ -218,7 +238,7 @@ export interface ScopeHostDeps {
    * registrations behind. `registerAtomically` is the one implementation of
    * that, and the assembly wires it.
    */
-  registerTools: () => () => void
+  registerTools: (visibleFor?: (agent: unknown) => boolean) => () => void
   /** Consumed by the bounded recheck: one timer per entry, per `unresolved` agent. */
   recheckDelaysMs?: readonly number[]
   /** The existing warn carrier; absent ⇒ `console.warn`. */
@@ -286,6 +306,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   const recheckDelaysMs: readonly number[] = deps.recheckDelaysMs ?? DEFAULT_RECHECK_DELAYS_MS
 
   let root: ScopeHostContext | undefined
+  let staticMode: ScopeHostMode = 'unsupported'
   let staticCapable = false
   let mountTornDown = false
   /** The effect run currently holding the four faces, if any. */
@@ -295,32 +316,24 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   // Capability probe (mount time, plugin ROOT ctx — never the injected ctx)
   // -------------------------------------------------------------------------
 
-  function probe(tools: ScopeHostContext['tools']): { capable: boolean; reason: string } {
+  function probe(tools: ScopeHostContext['tools']): { mode: ScopeHostMode; reason: string } {
+    if (tools === undefined) return { mode: 'unsupported', reason: UNSUPPORTED_REASON('tools') }
+    if (typeof tools.register !== 'function') {
+      return { mode: 'unsupported', reason: UNSUPPORTED_REASON('tools.register') }
+    }
+    // The `resolve()` method IS the host's declaration that `when` is honoured:
+    // older hosts accept the option and silently ignore it (#343).
+    if (typeof tools.resolve === 'function') return { mode: 'when', reason: WHEN_READY_REASON }
+
     const missing: string[] = []
-    if (tools === undefined) {
-      missing.push('tools')
-    } else {
-      // `guard` is deliberately NOT in this list: its absence is the
-      // visibility-only degradation (B17), not a registration gate (B7/D13).
-      if (typeof tools.register !== 'function') missing.push('tools.register')
-      if (typeof tools.restrict !== 'function') missing.push('tools.restrict')
-      if (typeof tools.schemas !== 'function') missing.push('tools.schemas')
-    }
-    if (missing.length === 0) return { capable: true, reason: READY_REASON }
-    return {
-      capable: false,
-      // B7③: the reason names the REAL gap — never a hardcoded "agents
-      // service unavailable", and never a `pending` phrased as "unsupported".
-      // Both clauses are about SCOPE and both stay true whatever else the
-      // assembly registers: this subsystem registers nothing, and none of the
-      // names it was given can be hidden. (The experimental delegation tool is
-      // registered by the subagent subsystem and is not hidden either — but it
-      // is not left to its switch here: it carries a step-time
-      // `register({ when })` condition built from the SAME visibility
-      // judgement, so it is still dropped per step. Claiming "none of them is
-      // registered" was true only while this list WAS the whole registry.)
-      reason: `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`,
-    }
+    if (typeof tools.restrict !== 'function') missing.push('tools.restrict')
+    if (typeof tools.schemas !== 'function') missing.push('tools.schemas')
+    if (missing.length > 0) return { mode: 'unsupported', reason: UNSUPPORTED_REASON(...missing) }
+    return { mode: 'legacy', reason: READY_REASON }
+  }
+
+  function UNSUPPORTED_REASON(...missing: string[]): string {
+    return `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上 restriction 层；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`
   }
 
   // -------------------------------------------------------------------------
@@ -771,6 +784,12 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   function refresh(): RefreshSummary | undefined {
     const state = current
     if (state === undefined || state.tornDown || mountTornDown || !staticCapable) return undefined
+    if (staticMode === 'when') {
+      // Nothing to install: the next step's condition reads the saved document.
+      // The async generation only refines realpath judgements and the report.
+      rebuildJudgements(state)
+      return undefined
+    }
     // The synchronous window: install/release decisions read the CACHE only, so
     // `save → refresh` is await-free (the convergence rides behind it).
     const summary = applyAll(state)
@@ -857,9 +876,80 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     }
   }
 
+  /**
+   * The step-time path (#343): ONE registration carrying one shared `when`.
+   *
+   * There is no layer to install, no agent lifecycle to follow and no recheck
+   * timer: the host evaluates the condition at every step, so a config save or
+   * a fresh agent is answered by the very next step. The async judgement
+   * generation still runs (a `cwd` that only realpath can match), but only to
+   * improve the answer — the gate itself reads `judgement ?? resolveNow(agent)`
+   * synchronously and fails closed.
+   */
+  function setupWhen(agentCtx: ScopeInjectedContext): () => void {
+    if (mountTornDown) return () => {}
+    scope.setHost({ state: 'ready', capable: true, reason: WHEN_READY_REASON })
+    const state: EffectState = {
+      tornDown: false,
+      running: false,
+      dirty: false,
+      layers: new Map(),
+      recheckSteps: new Map(),
+      recheckTimers: new Map(),
+      agents: agentCtx.agents,
+      registry: agentCtx.workspaceRegistry,
+      releaseRegistrations: undefined,
+      releaseGuard: undefined,
+      offs: [],
+      teardown: () => {},
+    }
+    state.teardown = () => teardownEffect(state)
+
+    let release: (() => void) | undefined
+    try {
+      release = deps.registerTools((raw) => {
+        const agent = projectAgent(raw)
+        if (agent === undefined) return false
+        try {
+          return scope.visibleForAgent(agent)
+        } catch (error) {
+          // A throwing condition fails step PREPARATION (`TOOL_ACTIVATION_FAILED`),
+          // so one bad judgement must never take a turn down (#343).
+          log('[cherry-remote] 步骤级作用域判定抛错；本步按不可见处理', error)
+          return false
+        }
+      })
+    } catch (error) {
+      state.tornDown = true
+      scope.setHost({
+        state: 'unsupported',
+        capable: false,
+        reason: `cherry_* 工具注册失败：${describeError(error)}`,
+      })
+      log('[cherry-remote] cherry_* 工具注册失败；作用域子系统未启用', error)
+      return state.teardown
+    }
+    state.releaseRegistrations = release
+    current = state
+    // The first judgement generation: improves the synchronous answer for a
+    // symlinked cwd, and populates `pathUnmatched` for the HTTP face.
+    rebuildJudgements(state)
+    return state.teardown
+  }
+
+  /** One async judgement generation, never awaited by a step (#343). */
+  function rebuildJudgements(state: EffectState): void {
+    const registry = state.registry
+    if (registry === undefined) return
+    void scope.rebuild(registry, liveAgents(state)).catch((error: unknown) => {
+      log('[cherry-remote] 作用域判定重建失败（保留上一代判定）', error)
+    })
+  }
+
   function setup(agentCtx: ScopeInjectedContext): () => void {
     // A late arrival after the assembly released the host must install nothing.
     if (mountTornDown) return () => {}
+    if (staticMode === 'when') return setupWhen(agentCtx)
     if (!staticCapable) {
       // `mount()` already recorded `unsupported` and warned once; a late
       // injection must not be able to promote it.
@@ -1051,7 +1141,8 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       mountTornDown = false
 
       const probed = probe(ctx.tools)
-      staticCapable = probed.capable
+      staticMode = probed.mode
+      staticCapable = probed.mode !== 'unsupported'
       if (!staticCapable) {
         // The static failure is decided HERE, before/independently of the
         // injection arrival — which is why "missing capability" and "injection

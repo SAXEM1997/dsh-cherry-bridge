@@ -1174,8 +1174,10 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
         ? subagentResolution.config.toolName
         : CHERRY_SUBAGENT_TOOL_DEFAULT,
     ),
-    registerTools: () =>
-      registerAtomically(ctx, (toolsCtx) => registerCherryToolsWithEngine(toolsCtx, deps, {}, engine).dispose),
+    registerTools: (visibleFor) =>
+      registerAtomically(ctx, (toolsCtx) =>
+        registerCherryToolsWithEngine(toolsCtx, deps, {}, engine, visibleFor).dispose,
+      ),
   })
   // Mounted AFTER the root effect above and released ONLY through this disposer
   // (the root effect drains `state.disposers`): there is deliberately no second
