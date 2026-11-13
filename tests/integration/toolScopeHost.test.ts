@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { registerAtomically, createToolScopeHost } from '../../src/toolScopeHost.js'
 import type { ScopeHostContext, ToolScopeHost } from '../../src/toolScopeHost.js'
 import { ToolScopeState } from '../../src/toolScope.js'
@@ -159,20 +159,6 @@ describe('mount: capability probe and the injection gate', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('⑧ unmount voids the judgement generation, so no stale answer survives it', async () => {
-    const fixture = makeFixture()
-    fixture.fake.setWorkspaces([W1])
-    fixture.fake.addAgent({ id: 'agent-a', cwd: '/work/w1' })
-    const unmount = fixture.mount()
-    await settle()
-    expect(fixture.state.judgement('agent-a')).toBeDefined()
-
-    unmount()
-
-    expect(fixture.state.judgement('agent-a')).toBeUndefined()
-    expect(fixture.state.pathUnmatched()).toEqual([])
-  })
-
   it('⑦ the condition follows the document both ways, and survives a save with no host round', async () => {
     const fixture = makeFixture()
     fixture.fake.setWorkspaces([W1])
@@ -186,5 +172,23 @@ describe('mount: capability probe and the injection gate', () => {
     expect(fixture.state.save({ mode: 'selected', workspaceIds: [], }, 1).ok).toBe(true)
     expect(await fixture.fake.resolvedView('agent-a')).toEqual([])
     unmount()
+  })
+
+  it('⑧ unmount voids the judgement generation, so no stale answer survives it', async () => {
+    const fixture = makeFixture()
+    fixture.fake.setWorkspaces([W1])
+    fixture.fake.addAgent({ id: 'agent-a', cwd: '/work/w1' })
+    const unmount = fixture.mount()
+    await vi.waitFor(() => expect(fixture.state.judgement('agent-a')).toBeDefined())
+
+    // Make a stale generation OBSERVABLE: with W1 selected the old answer is
+    // `visible: true`, so a surviving cache would hand the next mount a grant.
+    expect(fixture.state.save({ mode: 'selected', workspaceIds: ['w1'] }, 0).ok).toBe(true)
+    fixture.host.refresh()
+    await vi.waitFor(() => expect(fixture.state.judgement('agent-a')?.visible).toBe(true))
+
+    unmount()
+
+    expect(fixture.state.judgement('agent-a')).toBeUndefined()
   })
 })

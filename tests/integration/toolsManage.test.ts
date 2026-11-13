@@ -669,9 +669,8 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     headless = false,
     /**
      * Live agents the scope subsystem will see. `[]` by default: every other case
-     * here cares that the tool REGISTERS, and a layer is only installed for a
-     * live agent, so an agent-less rig keeps those cases from depending on the
-     * install path.
+     * here cares that the tool REGISTERS; live agents only populate the
+     * judgement cache, so an agent-less rig keeps those cases independent of it.
      */
     live: readonly LiveAgent[] = [],
   ): AssemblyCtx {
@@ -905,7 +904,8 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const when = ctx.tools.registerOptions.get('cherry_subagent')?.when
       expect(typeof when).toBe('function')
       // No scope document ⇒ `selected` with an empty list (the D3 default), and
-      // on THIS host no judgement is ever built. Fail-closed: not visible.
+      // no live agent is listed here, so the cache stays empty. Fail-closed:
+      // not visible.
       expect(when!({ agent: { id: 'any-agent' } })).toBe(false)
       rmSync(dataDir, { recursive: true, force: true })
     })

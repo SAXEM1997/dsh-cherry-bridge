@@ -855,9 +855,9 @@ export class ToolScopeState {
    * `#workspaces` are reset with it. Keeping the previous mount's list made
    * 「no usable generation」 false for {@link resolveNow}: a re-mounted
    * generation's FIRST synchronous pass runs before its own round has read
-   * anything, so it would answer §4's rule one from the OLD registry and
-   * RELEASE a layer instead of denying — and `GET /scope` would serve that list
-   * until the round landed.
+   * anything, so it would answer §4's rule one from the OLD registry and offer a
+   * workspace the operator had already excluded — and `GET /scope` would serve
+   * that list until the round landed.
    *
    * `'unread'` and not `'unavailable'` on purpose: nothing FAILED here, so no
    * `workspace-list` note is recorded, and `save()` keeps the never-read
