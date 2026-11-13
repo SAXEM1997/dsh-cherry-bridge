@@ -1996,7 +1996,8 @@ var ToolScopeState = class {
 			agents: agents.length,
 			resolved: 0,
 			unresolved: 0,
-			pathUnmatched: 0
+			pathUnmatched: 0,
+			discarded: true
 		};
 		this.#pathMap = pathMap;
 		this.#judgements = judgements;
@@ -2010,7 +2011,8 @@ var ToolScopeState = class {
 			agents: agents.length,
 			resolved,
 			unresolved,
-			pathUnmatched: pathUnmatched.length
+			pathUnmatched: pathUnmatched.length,
+			discarded: false
 		};
 	}
 	/** The current generation's judgement for one agent, or a cache miss. */
@@ -2084,11 +2086,9 @@ var ToolScopeState = class {
 	resolveNow(agent) {
 		if (this.#listState !== "read") return void 0;
 		const doc = this.#doc;
-		const member = this.#workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
-		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
-		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）");
-		const workspaceId = this.#pathMap.get(agent.cwd);
-		return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`) : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`);
+		const shared = this.#sharedRule(doc, this.#workspaces, agent);
+		if ("judgement" in shared) return shared.judgement;
+		return this.#byCanonicalPath(doc, this.#workspaces, agent, shared.cwd, this.#pathMap) ?? judged(doc, agent, "no-match", void 0, `cwd ${shared.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`);
 	}
 	/**
 	* Agents whose `cwd` resolved outside every registered workspace, with the
@@ -2206,28 +2206,53 @@ var ToolScopeState = class {
 	* round, so two agents of one generation can never be judged against two
 	* different documents or lists.
 	*/
+	/**
+	* Rules one and two, in the ONE place both entries read them (#356).
+	*
+	* `#judge` and {@link resolveNow} used to carry byte-identical copies of the
+	* membership projection and the missing-`cwd` verdict — two places to change
+	* a §4 rule, and two chances for the reason strings (which travel to the
+	* settings page) to drift apart. They differ only in what they do with a
+	* `cwd`, so a resolved `cwd` is handed BACK rather than read again: that is
+	* also what keeps the caller's narrowing (the agent has a cwd from here on).
+	*/
+	#sharedRule(doc, workspaces, agent) {
+		const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
+		if (member !== void 0) return { judgement: judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`) };
+		if (agent.cwd === void 0) return { judgement: judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）") };
+		return { cwd: agent.cwd };
+	}
+	/**
+	* The canonical-path HIT both entries end with. `undefined` means the cwd
+	* matches no registered item, and each caller supplies its own `no-match`
+	* wording on purpose: the asynchronous round can afford to say "the host does
+	* not own this directory", while the synchronous window must warn that its map
+	* may be a generation behind (D14).
+	*/
+	#byCanonicalPath(doc, workspaces, agent, cwd, pathMap) {
+		const workspaceId = pathMap.get(cwd);
+		return workspaceId === void 0 ? void 0 : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`);
+	}
 	async #judge(round, agent) {
-		const member = round.workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
-		if (member !== void 0) return judged(round.doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
-		if (agent.cwd === void 0) return judged(round.doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）");
-		if (!round.listAvailable) return judged(round.doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（下一次 rebuild 会重新解析）`);
+		const shared = this.#sharedRule(round.doc, round.workspaces, agent);
+		if ("judgement" in shared) return shared.judgement;
+		const { cwd } = shared;
+		if (!round.listAvailable) return judged(round.doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${cwd} 本次无法解析（下一次 rebuild 会重新解析）`);
 		const resolveByPath = round.registry.resolveByPath;
 		if (typeof resolveByPath !== "function") {
-			const workspaceId = round.pathMap.get(agent.cwd);
-			return workspaceId === void 0 ? judged(round.doc, agent, "no-match", void 0, `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`) : judged(round.doc, agent, "resolved", workspaceId, `路径字符串等价命中 ${this.#label(round.workspaces, workspaceId)}`);
+			const workspaceId = round.pathMap.get(cwd);
+			return workspaceId === void 0 ? judged(round.doc, agent, "no-match", void 0, `宿主无 resolveByPath，cwd ${cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`) : judged(round.doc, agent, "resolved", workspaceId, `路径字符串等价命中 ${this.#label(round.workspaces, workspaceId)}`);
 		}
 		let entity;
 		try {
-			entity = await resolveByPath.call(round.registry, agent.cwd);
+			entity = await resolveByPath.call(round.registry, cwd);
 		} catch (error) {
-			this.#warn(`cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`, error);
-			return judged(round.doc, agent, "unresolved", void 0, `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
+			this.#warn(`cwd ${cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`, error);
+			return judged(round.doc, agent, "unresolved", void 0, `cwd ${cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
 		}
 		if (entity === void 0) return judged(round.doc, agent, "no-match", void 0, `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
 		const resolved = toScopeWorkspace(entity);
-		const workspaceId = resolved === void 0 ? void 0 : round.pathMap.get(resolved.path);
-		if (workspaceId === void 0) return judged(round.doc, agent, "no-match", void 0, `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`);
-		return judged(round.doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(round.workspaces, workspaceId)}`);
+		return (resolved === void 0 ? void 0 : this.#byCanonicalPath(round.doc, round.workspaces, agent, resolved.path, round.pathMap)) ?? judged(round.doc, agent, "no-match", void 0, `cwd ${cwd} 解析成功但不属任何已注册工作区（D7）`);
 	}
 	/** The workspace id, plus its title when this generation's list carries one. */
 	#label(workspaces, workspaceId) {

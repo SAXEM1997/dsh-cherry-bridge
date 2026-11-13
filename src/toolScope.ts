@@ -175,6 +175,13 @@ export interface RebuildSummary {
   resolved: number
   unresolved: number
   pathUnmatched: number
+  /**
+   * True when a NEWER generation superseded this round before it could commit
+   * (`save`, `invalidateDerived`, a teardown). The counters below are then all
+   * `0` because nothing was written — which is NOT the same answer as a round
+   * that committed and resolved nothing, and only this flag can tell them apart.
+   */
+  discarded: boolean
 }
 
 /**
@@ -673,7 +680,7 @@ export class ToolScopeState {
     // A round that lost the race is DISCARDED whole: no list, no map, no
     // judgements. The newer round (or `invalidateDerived`) owns the state.
     if (generation !== this.#generation) {
-      return { listAvailable, agents: agents.length, resolved: 0, unresolved: 0, pathUnmatched: 0 }
+      return { listAvailable, agents: agents.length, resolved: 0, unresolved: 0, pathUnmatched: 0, discarded: true }
     }
 
     // One assignment: the judgement generation switches whole.
@@ -694,6 +701,7 @@ export class ToolScopeState {
       resolved,
       unresolved,
       pathUnmatched: pathUnmatched.length,
+      discarded: false,
     }
   }
 
@@ -772,33 +780,19 @@ export class ToolScopeState {
     if (this.#listState !== 'read') return undefined
     const doc = this.#doc
 
-    // Rule one.
-    const member = this.#workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
-    if (member !== undefined) {
-      return judged(doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`)
-    }
+    const shared = this.#sharedRule(doc, this.#workspaces, agent)
+    if ('judgement' in shared) return shared.judgement
 
-    // Rule two.
-    if (agent.cwd === undefined) {
-      return judged(
+    return (
+      this.#byCanonicalPath(doc, this.#workspaces, agent, shared.cwd, this.#pathMap) ??
+      judged(
         doc,
         agent,
-        'no-cwd',
+        'no-match',
         undefined,
-        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）',
+        `cwd ${shared.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`,
       )
-    }
-
-    const workspaceId = this.#pathMap.get(agent.cwd)
-    return workspaceId === undefined
-      ? judged(
-          doc,
-          agent,
-          'no-match',
-          undefined,
-          `cwd ${agent.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`,
-        )
-      : judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`)
+    )
   }
 
   /**
@@ -942,23 +936,66 @@ export class ToolScopeState {
    * round, so two agents of one generation can never be judged against two
    * different documents or lists.
    */
-  async #judge(round: RoundInputs, agent: ScopeAgentLike): Promise<AgentJudgement> {
+  /**
+   * Rules one and two, in the ONE place both entries read them (#356).
+   *
+   * `#judge` and {@link resolveNow} used to carry byte-identical copies of the
+   * membership projection and the missing-`cwd` verdict — two places to change
+   * a §4 rule, and two chances for the reason strings (which travel to the
+   * settings page) to drift apart. They differ only in what they do with a
+   * `cwd`, so a resolved `cwd` is handed BACK rather than read again: that is
+   * also what keeps the caller's narrowing (the agent has a cwd from here on).
+   */
+  #sharedRule(
+    doc: ScopeDoc,
+    workspaces: readonly ScopeWorkspace[],
+    agent: ScopeAgentLike,
+  ): { judgement: AgentJudgement } | { cwd: string } {
     // Rule one.
-    const member = round.workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
+    const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
     if (member !== undefined) {
-      return judged(round.doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`)
+      return { judgement: judged(doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`) }
     }
 
     // Rule two.
     if (agent.cwd === undefined) {
-      return judged(
-        round.doc,
-        agent,
-        'no-cwd',
-        undefined,
-        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）',
-      )
+      return {
+        judgement: judged(
+          doc,
+          agent,
+          'no-cwd',
+          undefined,
+          '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）',
+        ),
+      }
     }
+    return { cwd: agent.cwd }
+  }
+
+  /**
+   * The canonical-path HIT both entries end with. `undefined` means the cwd
+   * matches no registered item, and each caller supplies its own `no-match`
+   * wording on purpose: the asynchronous round can afford to say "the host does
+   * not own this directory", while the synchronous window must warn that its map
+   * may be a generation behind (D14).
+   */
+  #byCanonicalPath(
+    doc: ScopeDoc,
+    workspaces: readonly ScopeWorkspace[],
+    agent: ScopeAgentLike,
+    cwd: string,
+    pathMap: ReadonlyMap<string, string>,
+  ): AgentJudgement | undefined {
+    const workspaceId = pathMap.get(cwd)
+    return workspaceId === undefined
+      ? undefined
+      : judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`)
+  }
+
+  async #judge(round: RoundInputs, agent: ScopeAgentLike): Promise<AgentJudgement> {
+    const shared = this.#sharedRule(round.doc, round.workspaces, agent)
+    if ('judgement' in shared) return shared.judgement
+    const { cwd } = shared
 
     if (!round.listAvailable) {
       // ⑧/B16: "the list could not be read" is "this resolution failed" — the
@@ -968,31 +1005,31 @@ export class ToolScopeState {
         agent,
         'unresolved',
         undefined,
-        `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（下一次 rebuild 会重新解析）`,
+        `工作区列表不可用，cwd ${cwd} 本次无法解析（下一次 rebuild 会重新解析）`,
       )
     }
 
     const resolveByPath = round.registry.resolveByPath
     if (typeof resolveByPath !== 'function') {
       // Old host (D14): case-sensitive string equality against the item paths.
-      const workspaceId = round.pathMap.get(agent.cwd)
+      const workspaceId = round.pathMap.get(cwd)
       return workspaceId === undefined
         ? judged(
             round.doc,
             agent,
             'no-match',
             undefined,
-            `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`,
+            `宿主无 resolveByPath，cwd ${cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`,
           )
         : judged(round.doc, agent, 'resolved', workspaceId, `路径字符串等价命中 ${this.#label(round.workspaces, workspaceId)}`)
     }
 
     let entity: unknown
     try {
-      entity = await resolveByPath.call(round.registry, agent.cwd)
+      entity = await resolveByPath.call(round.registry, cwd)
     } catch (error) {
       this.#warn(
-        `cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`,
+        `cwd ${cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`,
         error,
       )
       return judged(
@@ -1000,7 +1037,7 @@ export class ToolScopeState {
         agent,
         'unresolved',
         undefined,
-        `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`,
+        `cwd ${cwd} 本次解析失败（注册表未就绪或 realpath 失败）`,
       )
     }
 
@@ -1018,17 +1055,14 @@ export class ToolScopeState {
     // comparison in this module. An entity outside it is `no-match`, not a hit
     // on the entity's own id.
     const resolved = toScopeWorkspace(entity)
-    const workspaceId = resolved === undefined ? undefined : round.pathMap.get(resolved.path)
-    if (workspaceId === undefined) {
-      return judged(
-        round.doc,
-        agent,
-        'no-match',
-        undefined,
-        `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`,
-      )
-    }
-    return judged(round.doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(round.workspaces, workspaceId)}`)
+    const hit =
+      resolved === undefined
+        ? undefined
+        : this.#byCanonicalPath(round.doc, round.workspaces, agent, resolved.path, round.pathMap)
+    return (
+      hit ??
+      judged(round.doc, agent, 'no-match', undefined, `cwd ${cwd} 解析成功但不属任何已注册工作区（D7）`)
+    )
   }
 
   /** The workspace id, plus its title when this generation's list carries one. */
