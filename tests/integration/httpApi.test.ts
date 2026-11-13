@@ -10,6 +10,7 @@ import type { PairWithPayloadOptions } from '../../src/pairing.js'
 import type { DeviceState } from '../../src/connection.js'
 import { isTrustedWebRequest, registerHttpApi, resolveTrustedHosts } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
+import { FakeRequest, FakeResponse, type FakeRequestInit as RequestInitLike } from '../helpers/fakeHttp.js'
 import { ToolScopeState } from '../../src/toolScope.js'
 import { resolveSubagentConfig } from '../../src/subagent.js'
 import type { SubagentConfigResolution } from '../../src/subagent.js'
@@ -165,101 +166,6 @@ function makeCtx(
     on() {},
   }
   return ctx
-}
-
-// ---------------------------------------------------------------------------
-// Fake request / response
-// ---------------------------------------------------------------------------
-
-interface RequestInitLike {
-  method?: string
-  host?: string
-  origin?: string
-  headers?: Record<string, string>
-  body?: string
-}
-
-class FakeRequest extends EventEmitter implements HttpRequestLike {
-  readonly method: string
-  readonly url: string
-  readonly headers: Record<string, string | string[] | undefined>
-  readonly #body: string
-
-  constructor(url: string, init: RequestInitLike = {}) {
-    super()
-    this.url = url
-    this.method = init.method ?? 'GET'
-    this.#body = init.body ?? ''
-    this.headers = { ...(init.headers ?? {}) }
-    if (init.host !== undefined) this.headers['host'] = init.host
-    if (init.origin !== undefined) this.headers['origin'] = init.origin
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<Buffer> {
-    if (this.#body !== '') yield Buffer.from(this.#body, 'utf8')
-  }
-
-  /** Simulates the client hanging up (SSE disconnect). */
-  disconnect(): void {
-    this.emit('close')
-  }
-}
-
-interface SentFrame {
-  event?: string
-  data?: string
-  comment?: string
-}
-
-class FakeResponse implements HttpResponseLike {
-  status = 0
-  headers: Record<string, string> = {}
-  body = ''
-  ended = false
-  writes = 0
-  readonly #emitter = new EventEmitter()
-
-  writeHead(status: number, headers: Record<string, string | number> = {}): void {
-    this.status = status
-    for (const [key, value] of Object.entries(headers)) this.headers[key.toLowerCase()] = String(value)
-  }
-
-  write(chunk: string): void {
-    this.writes += 1
-    this.body += chunk
-  }
-
-  end(chunk?: string): void {
-    if (chunk !== undefined) this.body += chunk
-    this.ended = true
-  }
-
-  on(event: string, listener: () => void): void {
-    this.#emitter.on(event, listener)
-  }
-
-  /** All SSE frames written so far, parsed into event/data/comment triples. */
-  frames(): SentFrame[] {
-    const frames: SentFrame[] = []
-    for (const block of this.body.split('\n\n')) {
-      if (block.trim() === '') continue
-      const frame: SentFrame = {}
-      for (const line of block.split('\n')) {
-        if (line.startsWith('event: ')) frame.event = line.slice(7)
-        else if (line.startsWith('data: ')) frame.data = line.slice(6)
-        else if (line.startsWith(': ')) frame.comment = line.slice(2)
-      }
-      frames.push(frame)
-    }
-    return frames
-  }
-
-  /** Frames of one SSE event type; data parsed as JSON. */
-  events<T = unknown>(type: string): T[] {
-    return this.frames()
-      .filter((frame) => frame.event === type)
-      .map((frame) => JSON.parse(frame.data ?? 'null') as T)
-  }
 }
 
 // ---------------------------------------------------------------------------
