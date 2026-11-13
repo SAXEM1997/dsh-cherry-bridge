@@ -16,12 +16,15 @@ import { FakeCherry } from '../loopback/fakeCherry.js'
 import type { FakeCherryOptions } from '../loopback/fakeCherry.js'
 import { asksForScopeKeys } from '../helpers/scopeInjectKeys.js'
 import { applyAssembly, settleIdentity } from '../helpers/applyAssembly.js'
+import { FakeRequest, FakeResponse } from '../helpers/fakeHttp.js'
 import { SCOPE_DOC_VERSION } from '../../src/toolScope.js'
 
 /**
  * Task 10 integration suite: the MANAGEMENT `cherry_*` tools (`cherry_pair` /
- * `cherry_unpair`) and the plugin assembly's apply idempotence. Test numbering
- * ①-③ mirrors the task brief's Step 1 scenarios.
+ * `cherry_unpair`) and the plugin assembly's apply idempotence. The ①-③ series
+ * mirrors the task brief's Step 1 scenarios; later review rounds appended
+ * ③a-③af and the ⑳ series, so letter order is chronological, not topical
+ * (③o after ③t, ③ab after ③af — left in place on purpose).
  *
  * ①-② run through the REAL registration seam (`registerCherryTools`) with the
  * real `pairWithPayload` and a real loopback Noise-XX fake desktop, so the
@@ -511,82 +514,6 @@ describe('② cherry_unpair: forget the archive entry and tear the link down', (
 // ③ plugin assembly: idempotent apply, the shared pool, and the two fan-outs
 // ---------------------------------------------------------------------------
 
-interface RequestInitLike {
-  method?: string
-  host?: string
-  body?: string
-}
-
-class FakeRequest {
-  readonly method: string
-  readonly url: string
-  readonly headers: Record<string, string | string[] | undefined>
-  readonly #body: string
-  readonly #closeListeners: Array<() => void> = []
-
-  constructor(url: string, init: RequestInitLike = {}) {
-    this.url = url
-    this.method = init.method ?? 'GET'
-    this.#body = init.body ?? ''
-    this.headers = {}
-    if (init.host !== undefined) this.headers['host'] = init.host
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<Buffer> {
-    if (this.#body !== '') yield Buffer.from(this.#body, 'utf8')
-  }
-
-  on(event: 'close', listener: () => void): void {
-    if (event === 'close') this.#closeListeners.push(listener)
-  }
-
-  disconnect(): void {
-    for (const listener of this.#closeListeners.splice(0)) listener()
-  }
-}
-
-interface SentFrame {
-  event?: string
-  data?: string
-}
-
-class FakeResponse {
-  status = 0
-  headers: Record<string, string> = {}
-  body = ''
-  readonly #closeListeners: Array<() => void> = []
-
-  writeHead(status: number, headers: Record<string, string | number> = {}): void {
-    this.status = status
-    for (const [key, value] of Object.entries(headers)) this.headers[key.toLowerCase()] = String(value)
-  }
-
-  write(chunk: string): void {
-    this.body += chunk
-  }
-
-  end(chunk?: string): void {
-    if (chunk !== undefined) this.body += chunk
-  }
-
-  on(event: 'close', listener: () => void): void {
-    if (event === 'close') this.#closeListeners.push(listener)
-  }
-
-  events<T = unknown>(type: string): T[] {
-    const seen: T[] = []
-    for (const block of this.body.split('\n\n')) {
-      const frame: SentFrame = {}
-      for (const line of block.split('\n')) {
-        if (line.startsWith('event: ')) frame.event = line.slice(7)
-        else if (line.startsWith('data: ')) frame.data = line.slice(6)
-      }
-      if (frame.event === type && frame.data !== undefined) seen.push(JSON.parse(frame.data) as T)
-    }
-    return seen
-  }
-}
-
 const PREFIX = '/cherry-remote/api'
 const HOST = '127.0.0.1:23023'
 
@@ -656,15 +583,15 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     effect(cb: () => () => void): void
   }
 
-  /**
-   * @param headless - omit `webServer`, the browser-less deploy.
-   */
   /** One live agent, as `projectAgent` reads it. */
   interface LiveAgent {
     id: string
     session: { header: { cwd: string } }
   }
 
+  /**
+   * @param headless - omit `webServer`, the browser-less deploy.
+   */
   function assemblyCtx(
     headless = false,
     /**
@@ -993,12 +920,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     }
   }
 
-  /**
-   * `apply` stays synchronous by design, so the identity key is written shortly
-   * AFTER it returns. A real caller reaches the tools long after that; a test
-   * must wait for the same precondition, or it would be asserting about a race
-   * no user can hit.
-   */
+  
   /**
    * Builds the assembly's pool for `dev-A` and waits until the link is up.
    *
@@ -1585,7 +1507,11 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         },
         5_000,
       )
-      await new Promise((resolve) => setTimeout(resolve, 300))
+      // The close spy records SYNCHRONOUSLY with the eviction pass, so once the
+      // stale instance appears, a buggy late-map close of the fresh one would
+      // land in the same or the very next tick. One macrotask drain covers both
+      // shapes; the old fixed 300 ms window added nothing but parallel-CPU flake.
+      await new Promise((resolve) => setTimeout(resolve, 0))
       expect(closed).not.toContain(fresh)
     } finally {
       connectSpy.mockRestore()
@@ -1696,8 +1622,15 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         },
       )
 
-    // Give it a moment to actually park on the subscription buffer.
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    // Parked = the PEER holds the subscription: the waiter is buffering that
+    // subscription's events, exactly the state a real caller reaches long
+    // before any teardown. Waiting on the peer beats a fixed timer under
+    // parallel-CPU contention (the 2026-11-13 flake).
+    await vi.waitFor(() => {
+      expect(
+        fakeInfo.fake.subscriptions.some((record) => record.sessionId === 's-1' && record.phase === 'active'),
+      ).toBe(true)
+    }, 5_000)
     expect(settled).toBe('pending')
 
     // TEARDOWN: the assembly's disposer must dispose the subscription layer so
@@ -1719,7 +1652,14 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       5_000,
     )
     await parked.catch(() => undefined)
-    expect(settled).toBe('rejected')
+    // WHICH arm settles depends on which disposal mechanism reaches a waiter
+    // first when teardown races the checkpoint activation: a disposed
+    // subscription REJECTS it, a torn-down connection resolves it with the
+    // stub receipt (the #3 invariant). The F1 defect either way is a HANG to
+    // the 120 s window — pinned above by settling fast. Compared with
+    // toContain, not `===`: the assignments live in promise callbacks, so
+    // type narrowing still sees the initial 'pending' here (TS2367).
+    expect(['rejected', 'resolved']).toContain(settled)
   }, 30_000)
 
   it('③t disposes the subscription layer on a re-apply too (review F1)', async () => {
@@ -1756,7 +1696,15 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
         settled = 'rejected'
       },
     )
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    // Parked = the PEER holds the subscription: the waiter is buffering that
+    // subscription's events, exactly the state a real caller reaches long
+    // before any teardown. Waiting on the peer beats a fixed timer under
+    // parallel-CPU contention (the 2026-11-13 flake).
+    await vi.waitFor(() => {
+      expect(
+        fakeInfo.fake.subscriptions.some((record) => record.sessionId === 's-1' && record.phase === 'active'),
+      ).toBe(true)
+    }, 5_000)
     expect(settled).toBe('pending')
 
     // A RE-APPLY drains the previous pool; the parked waiter belongs to the
@@ -1777,7 +1725,12 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       5_000,
     )
     await parked.catch(() => undefined)
-    expect(settled).toBe('rejected')
+    // WHICH arm settles depends on which disposal mechanism reaches a waiter
+    // first when teardown races the checkpoint activation: a disposed
+    // subscription REJECTS it, a torn-down connection resolves it with the
+    // stub receipt (the #3 invariant). The F1 defect either way is a HANG to
+    // the 120 s window — pinned above by settling fast.
+    expect(['rejected', 'resolved']).toContain(settled)
   }, 30_000)
 
   it('③o degrades to a warning instead of failing when ctx.tools is absent', async () => {

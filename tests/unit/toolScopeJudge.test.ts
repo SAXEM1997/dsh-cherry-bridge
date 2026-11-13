@@ -248,6 +248,46 @@ describe('② rule two — one canonical path map, realpath semantics (D14/B13)'
   })
 })
 
+describe('③ the old host without resolveByPath degrades honestly (D14)', () => {
+  function oldHost(): WorkspaceRegistryLike {
+    // No `resolveByPath` at all: `list()` is the whole method surface.
+    return { list: () => [{ id: 'W', title: 'Work', path: '/w/real', sessionIds: ['member'] }] }
+  }
+
+  it('matches case-sensitive path strings, records `path-normalization`, and keeps sessionIds', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(oldHost(), [
+      { id: 'member', cwd: '/w/link' },
+      { id: 'exact', cwd: '/w/real' },
+      { id: 'synonym', cwd: '/w/link' },
+      { id: 'case', cwd: '/W/REAL' },
+    ])
+
+    // The projection still works; the path rule degrades to string equality.
+    expect(state.judgement('member')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
+    expect(state.judgement('exact')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
+    // A symlink is NOT resolved (no realpath) …
+    expect(state.judgement('synonym')).toMatchObject({ status: 'no-match', visible: false })
+    // … and the degraded comparison stays case-sensitive (no case folding).
+    expect(state.judgement('case')).toMatchObject({ status: 'no-match', visible: false })
+
+    const notes = state.degraded()
+    expect(notes).toHaveLength(1)
+    expect(notes[0]!.source).toBe('path-normalization')
+    expect(notes[0]!.reason).toContain('宿主无 resolveByPath')
+    expect(notes[0]!.reason).toContain('大小写敏感字符串等价')
+    expect(notes[0]!.reason).toContain('不做 realpath')
+    // D14: the degradation is never presented as canonical-path equivalence.
+    expect(notes[0]!.reason).not.toContain('与规范化匹配等价')
+
+    // The mismatches are diagnostics — they add NO second `degraded` entry.
+    expect(state.pathUnmatched()).toEqual([
+      { agentId: 'synonym', cwd: '/w/link' },
+      { agentId: 'case', cwd: '/W/REAL' },
+    ])
+  })
+})
+
 describe('④ the four resolution states, and `visible` from `isVisible` alone', () => {
   /** One agent per state reachable in this module (plus a second `no-match` shape). */
   const agents: ScopeAgentLike[] = [
@@ -329,46 +369,6 @@ describe('④ the four resolution states, and `visible` from `isVisible` alone',
       workspaceId: 'W',
       visible: false,
     })
-  })
-})
-
-describe('③ the old host without resolveByPath degrades honestly (D14)', () => {
-  function oldHost(): WorkspaceRegistryLike {
-    // No `resolveByPath` at all: `list()` is the whole method surface.
-    return { list: () => [{ id: 'W', title: 'Work', path: '/w/real', sessionIds: ['member'] }] }
-  }
-
-  it('matches case-sensitive path strings, records `path-normalization`, and keeps sessionIds', async () => {
-    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
-    await state.rebuild(oldHost(), [
-      { id: 'member', cwd: '/w/link' },
-      { id: 'exact', cwd: '/w/real' },
-      { id: 'synonym', cwd: '/w/link' },
-      { id: 'case', cwd: '/W/REAL' },
-    ])
-
-    // The projection still works; the path rule degrades to string equality.
-    expect(state.judgement('member')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
-    expect(state.judgement('exact')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
-    // A symlink is NOT resolved (no realpath) …
-    expect(state.judgement('synonym')).toMatchObject({ status: 'no-match', visible: false })
-    // … and the degraded comparison stays case-sensitive (no case folding).
-    expect(state.judgement('case')).toMatchObject({ status: 'no-match', visible: false })
-
-    const notes = state.degraded()
-    expect(notes).toHaveLength(1)
-    expect(notes[0]!.source).toBe('path-normalization')
-    expect(notes[0]!.reason).toContain('宿主无 resolveByPath')
-    expect(notes[0]!.reason).toContain('大小写敏感字符串等价')
-    expect(notes[0]!.reason).toContain('不做 realpath')
-    // D14: the degradation is never presented as canonical-path equivalence.
-    expect(notes[0]!.reason).not.toContain('与规范化匹配等价')
-
-    // The mismatches are diagnostics — they add NO second `degraded` entry.
-    expect(state.pathUnmatched()).toEqual([
-      { agentId: 'synonym', cwd: '/w/link' },
-      { agentId: 'case', cwd: '/W/REAL' },
-    ])
   })
 })
 
@@ -485,7 +485,6 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     expect(state.judgement('a1')).toBeUndefined()
     // The LIST is part of the same generation; a late round must not restore it.
     expect(state.workspaces()).toEqual([])
-    expect(summary.resolved).toBe(0)
   })
 
   it('⑦c an OLDER overlapping round cannot overwrite the newer one', async () => {

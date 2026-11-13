@@ -18,6 +18,7 @@ import { join } from 'node:path'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { registerHttpApi } from '../../src/httpApi.js'
 import type { CherryHttpContext, CherryHttpDeps, HttpRequestLike, HttpResponseLike } from '../../src/httpApi.js'
+import { FakeRequest, FakeResponse, type FakeRequestInit as RequestInitLike } from '../helpers/fakeHttp.js'
 import { ToolScopeState } from '../../src/toolScope.js'
 import type { WorkspaceRegistryLike } from '../../src/toolScope.js'
 import { createToolScopeHost } from '../../src/toolScopeHost.js'
@@ -57,61 +58,6 @@ class FakeWebServer {
   }
 }
 
-interface RequestInitLike {
-  method?: string
-  host?: string
-  origin?: string
-  headers?: Record<string, string>
-  body?: string
-  /** The body stream THROWS when read: proves a route refused before reading it. */
-  unreadableBody?: boolean
-}
-
-class FakeRequest extends EventEmitter implements HttpRequestLike {
-  readonly method: string
-  readonly url: string
-  readonly headers: Record<string, string | string[] | undefined>
-  readonly #body: string
-  readonly #unreadable: boolean
-
-  constructor(url: string, init: RequestInitLike = {}) {
-    super()
-    this.url = url
-    this.method = init.method ?? 'GET'
-    this.#body = init.body ?? ''
-    this.#unreadable = init.unreadableBody === true
-    this.headers = { ...(init.headers ?? {}) }
-    if (init.host !== undefined) this.headers['host'] = init.host
-    if (init.origin !== undefined) this.headers['origin'] = init.origin
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<Buffer> {
-    if (this.#unreadable) throw new Error('this route must not read the request body')
-    if (this.#body !== '') yield Buffer.from(this.#body, 'utf8')
-  }
-}
-
-class FakeResponse implements HttpResponseLike {
-  status = 0
-  headers: Record<string, string> = {}
-  body = ''
-  ended = false
-
-  writeHead(status: number, headers: Record<string, string | number> = {}): void {
-    this.status = status
-    for (const [key, value] of Object.entries(headers)) this.headers[key.toLowerCase()] = String(value)
-  }
-
-  write(chunk: string): void {
-    this.body += chunk
-  }
-
-  end(chunk?: string): void {
-    if (chunk !== undefined) this.body += chunk
-    this.ended = true
-  }
-}
-
 /** The fake `ctx.webServer`, as the host injects it (issue #9: `webServer` alone). */
 interface FakeCtx {
   server: FakeWebServer
@@ -139,7 +85,9 @@ function makeCtx(server: FakeWebServer): FakeCtx {
 const PREFIX = '/cherry-remote/api'
 const HOST = '127.0.0.1:23023'
 /** A stand-in for the tool family: on this face only the SHAPE of the names matters. */
-const FAMILY = ['cherry_status', 'cherry_devices', 'cherry_pair']
+// Shape-only fake names: this fixture tests registration/condition/visibility
+// FORM, deliberately not the real 14-tool table (that is toolSchemas's job).
+const FAMILY = ['fake-scope-one', 'fake-scope-two', 'fake-scope-three']
 
 interface FixtureOptions {
   workspaces?: readonly FakeWorkspace[]
