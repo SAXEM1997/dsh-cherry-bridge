@@ -203,6 +203,9 @@ export function toScopeWorkspace(raw: unknown): ScopeWorkspace | undefined {
   }
 }
 
+/** The one version-guard sentence the save refusal and the degraded note share. */
+const SCOPE_VERSION_GUARD = '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1'
+
 /** The normalized form `setWorkspaces` stores, computed without mutating state. */
 function normalizeWorkspaceList(list: readonly unknown[]): ScopeWorkspace[] {
   return list
@@ -586,6 +589,16 @@ export class ToolScopeState {
     // for the length of the round; only the derived maps/judgements wait for
     // the generation check below.
     this.setWorkspaces(listed)
+    if (!listAvailable) {
+      this.#pathMap = new Map()
+      this.#judgements = new Map()
+      this.#pathUnmatched = []
+    }
+    // A failed or empty list read fail-closes the DERIVED state at once as well
+    // (B16): the previous generation's judgements and path map are list-
+    // dependent, and if this round is later discarded (a save bumped the
+    // generation), leaving them would answer `visible` from a generation whose
+    // list is already gone.
     const workspaces = this.#workspaces
 
     const pathMap = new Map<string, string>()
@@ -800,8 +813,7 @@ export class ToolScopeState {
         ok: false,
         status: 503,
         error: 'scope-version-unsupported',
-        message:
-          '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1，文档版本高于本插件支持或低于本插件支持，不能覆写该文档；已存内容一位不动',
+        message: `${SCOPE_VERSION_GUARD}，不能覆写该文档；已存内容一位不动`,
       }
     }
 
@@ -1068,8 +1080,7 @@ export class ToolScopeState {
       this.#versionUnsupported = true
       this.noteDegraded({
         source: 'scope-version',
-        reason:
-          '作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1，文档版本高于本插件支持或低于本插件支持；已只读降级并拒绝写入，避免覆写不同格式的文档',
+        reason: `${SCOPE_VERSION_GUARD}；已只读降级并拒绝写入，避免覆写不同格式的文档`,
       })
     }
   }

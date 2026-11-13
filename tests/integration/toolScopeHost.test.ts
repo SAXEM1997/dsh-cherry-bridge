@@ -197,7 +197,10 @@ describe('mount: capability probe and the injection gate', () => {
     const unmountFirst = fixture.mount()
     const unmountSecond = fixture.mount()
     // A leaked first mount registers the same 14 names on top of live ones; the
-    // NAME set alone cannot see it, the duplicate counter can.
+    // NAME set alone cannot see it, the counters can.
+    // Cumulative: both mounts registered once each; the leak discriminator is
+    // the name-collision counter (0 here, 14 with the second-mount release deleted).
+    expect(fixture.fake.registrationCalls()).toBe(28)
     expect(fixture.fake.duplicateRegistrations()).toBe(0)
     expect(fixture.fake.registeredNames()).toHaveLength(14)
     expect(fixture.state.host()).toMatchObject({ state: 'ready', capable: true })
@@ -248,11 +251,31 @@ describe('mount: capability probe and the injection gate', () => {
     // The host re-runs the injection callback: a NEW effect run for the SAME
     // mount. Its disposer must be inert, not the live family's teardown.
     fixture.fake.redeliverInjection()
+    // Re-entry registers NOTHING: the count stays at the first run's 14.
+    expect(fixture.fake.registrationCalls()).toBe(14)
     fixture.fake.releaseEffect()
 
+    expect(fixture.fake.registrationCalls()).toBe(14)
     expect(fixture.fake.registeredNames()).toHaveLength(14)
     expect(fixture.state.host().state).toBe('ready')
     fixture.fake.releaseEffect()
     expect(fixture.fake.registeredNames()).toEqual([])
+  })
+
+  it('⑬ a stale effect run cannot register after a newer mount came and went', () => {
+    const fixture = makeFixture({ deferInjection: true })
+    fixture.mount()
+    const unmountSecond = fixture.mount()
+    unmountSecond()
+    expect(fixture.fake.injectionCount()).toBe(2)
+
+    // Mount #1's callback (its disposer was never called) and mount #2's own
+    // callback both arrive AFTER the second release: both mount tokens are
+    // spent, so neither may register anything.
+    fixture.fake.deliverInjection(0)
+    expect(fixture.fake.registeredNames()).toEqual([])
+    fixture.fake.deliverInjection(0)
+    expect(fixture.fake.registeredNames()).toEqual([])
+    expect(fixture.state.host()).toMatchObject({ state: 'pending', capable: false })
   })
 })

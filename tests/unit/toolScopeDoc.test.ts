@@ -267,7 +267,7 @@ describe('the version branch has two sides, asserted apart (②, ⑦)', () => {
     const notes = state.degraded()
     expect(notes).toHaveLength(1)
     expect(notes[0]!.source).toBe('scope-version')
-    expect(notes[0]!.reason).toContain('文档版本高于本插件支持')
+    expect(notes[0]!.reason).toContain('作用域文档版本与本插件支持的不一致')
 
     // The document is not ours to overwrite: refused, and byte-for-byte intact.
     expect(state.save({ mode: 'selected', workspaceIds: ['W'] }, 7)).toEqual({
@@ -298,7 +298,7 @@ describe('the version branch has two sides, asserted apart (②, ⑦)', () => {
 
     expect(state.doc()).toEqual(DEFAULT_SCOPE)
     expect(state.degraded()).toEqual([
-      { source: 'scope-version', reason: expect.stringContaining('文档版本高于本插件支持') },
+      { source: 'scope-version', reason: expect.stringContaining('作用域文档版本与本插件支持的不一致') },
     ])
     expect(state.save({ mode: 'global', workspaceIds: [] }, 0)).toEqual({
       ok: false,
