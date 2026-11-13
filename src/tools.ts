@@ -2750,6 +2750,18 @@ export class CherryToolEngine {
    */
   readonly #contentGate: ContentReadGate
   /**
+   * Content walks IN FLIGHT, keyed by the request they answer (#365).
+   *
+   * Two callers can ask for the same `{ref}` in the same step — two
+   * `cherry_read` calls over one session is a legal thing for a model to do —
+   * and without this each of them paginated the same 24 KiB slices again. A
+   * second caller now waits for the walk already running instead. It is a
+   * de-duplicator, NOT a cache: the entry is dropped the moment the walk
+   * settles, so a later read re-walks and re-certifies (see
+   * {@link CherryToolEngine.#readRefBytes}).
+   */
+  readonly #contentWalks = new Map<string, Promise<Buffer>>()
+  /**
    * The `maxBytes` one `agent.content.read` slice asks for
    * ({@link CONTENT_READ_MAX_BYTES} in production; injectable so a test can
    * reach a walk's second slice, see `CherryToolEngineOptions`).
@@ -4447,7 +4459,6 @@ export class CherryToolEngine {
       // content read the budget cut. Once the walk is RUNNING it is not
       // interrupted here; its per-slice requests carry the same deadline to the
       // transport, which is where the I/O actually stops.
-      let releaseSlot: (() => void) | undefined
       try {
         // A ref that can never be read is refused BEFORE a slot is queued for
         // (review finding 2): otherwise a zero-I/O refusal spends a queue
@@ -4457,7 +4468,9 @@ export class CherryToolEngine {
         // the ref's declared size.
         const refusal = this.#externalizedRefusal(content['ref'])
         if (refusal !== undefined) throw refusal
-        releaseSlot = await this.#contentGate.acquire(options.deadline?.instant)
+        // The gate slot is taken INSIDE the walk, not here (#365): a read that
+        // joins a walk already in flight must not hold a second slot for work
+        // it did not do.
         text = await this.#readExternalized(connection, sessionId, content['ref'], options.deadline)
       } catch (error) {
         // An INTEGRITY failure is not degradable: see `#degradableReadFailure`.
@@ -4472,8 +4485,6 @@ export class CherryToolEngine {
           ...(typeof raw['toolName'] === 'string' ? { toolName: raw['toolName'] } : {}),
           ...(typeof raw['toolCallId'] === 'string' ? { toolCallId: raw['toolCallId'] } : {}),
         }
-      } finally {
-        releaseSlot?.()
       }
     } else {
       text = ''
@@ -4872,7 +4883,7 @@ export class CherryToolEngine {
     // a declared size above this cap before a gate slot was taken; the walk
     // checks it again so the invariant holds for any caller that reaches it
     // directly.
-    const bytes = await this.#readVerifiedBytes(
+    const bytes = await this.#readRefBytes(
       connection,
       sessionId,
       ref,
@@ -4885,6 +4896,80 @@ export class CherryToolEngine {
       throw new Error(
         `agent.content.read for ${String(ref['contentId'] ?? '')} returned bytes that are not valid UTF-8; not decoded`,
       )
+    }
+  }
+
+  /**
+   * Read one `{ref}`'s certified bytes, SHARING a walk already in flight
+   * (#365).
+   *
+   * The key is the request the walk answers — device, session, contentId,
+   * revision — plus the byte budget, because those are the only things that
+   * decide what comes back: two callers that differ in ANY of them must not be
+   * handed one answer. `cherry_read` is the caller this exists for, and it
+   * always passes {@link MAX_EXTERNALIZED_BYTES}.
+   *
+   * A BUDGETED read never joins and is never joined. Its walk is bounded by an
+   * instant only its own caller owns — a wait answer's
+   * {@link AssemblyDeadline} — so sharing would spend one caller's window on
+   * another's content, and hand the joiner a stop its own clock never caused.
+   *
+   * The entry is dropped the moment the walk SETTLES, both arms, so this is
+   * de-duplication and never a cache: a later read walks again and certifies
+   * the bytes it gets. A remembered Buffer would outlive the revision it was
+   * read at, and the read cache above deliberately remembers only the parts
+   * LIST for exactly that reason.
+   */
+  #readRefBytes(
+    connection: DeviceConnection,
+    sessionId: string,
+    ref: Record<string, unknown>,
+    byteCap: number,
+    deadline?: AssemblyDeadline,
+  ): Promise<Buffer> {
+    if (deadline !== undefined) {
+      return this.#walkRefBytes(connection, sessionId, ref, byteCap, deadline)
+    }
+    const key = [
+      connection.record.deviceId,
+      sessionId,
+      String(ref['contentId'] ?? ''),
+      String(ref['revision'] ?? ''),
+      String(byteCap),
+    ].join('\0')
+    const inFlight = this.#contentWalks.get(key)
+    if (inFlight !== undefined) return inFlight
+    const walk = this.#walkRefBytes(connection, sessionId, ref, byteCap, deadline)
+    this.#contentWalks.set(key, walk)
+    // PRE-OBSERVE, like the upload window and the slice window: the callers
+    // attach a moment later, and Node reports a rejection with no handler in
+    // the same turn as unhandled.
+    const forget = (): void => {
+      if (this.#contentWalks.get(key) === walk) this.#contentWalks.delete(key)
+    }
+    walk.then(forget, forget)
+    return walk
+  }
+
+  /**
+   * ONE content walk, holding the process-wide gate slot for its whole length
+   * (issue #39) — slices, digest, and the caller's decode that follows.
+   *
+   * The slot lives HERE rather than at the call site so that a caller joining
+   * a walk already in flight takes no slot at all (#365).
+   */
+  async #walkRefBytes(
+    connection: DeviceConnection,
+    sessionId: string,
+    ref: Record<string, unknown>,
+    byteCap: number,
+    deadline?: AssemblyDeadline,
+  ): Promise<Buffer> {
+    const releaseSlot = await this.#contentGate.acquire(deadline?.instant)
+    try {
+      return await this.#readVerifiedBytes(connection, sessionId, ref, byteCap, deadline)
+    } finally {
+      releaseSlot()
     }
   }
 

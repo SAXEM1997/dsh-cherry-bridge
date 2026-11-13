@@ -1155,6 +1155,7 @@ export class FakeCherry {
    */
   #contentReadsInFlight = 0
   #contentReadsPeak = 0
+  #contentReadsServed = 0
   /** Per-offset slice delay, so answers can arrive OUT of request order (#329). */
   #contentReadDelays = new Map<string, number>()
   /** A delay on EVERY slice, so a client window is observable at all (#329). */
@@ -1570,6 +1571,15 @@ export class FakeCherry {
   /** Slices being served right now — 0 once every walk has settled (#329). */
   contentReadsInFlight(): number {
     return this.#contentReadsInFlight
+  }
+
+  /**
+   * Slices served SINCE THE RIG WAS BUILT (#365). The peak says how wide a
+   * window got; this says how many walks there were, which is what a
+   * de-duplicated read has to move.
+   */
+  contentReadsServed(): number {
+    return this.#contentReadsServed
   }
 
   /** Delay ONE offset's slice reply, so later slices overtake it (#329). */
@@ -3523,6 +3533,7 @@ export class FakeCherry {
     // inside the count, which is what makes an out-of-order arrival and a
     // still-settling window observable from a test.
     const offset = String(params['offset'] ?? '')
+    this.#contentReadsServed += 1
     this.#contentReadsInFlight += 1
     this.#contentReadsPeak = Math.max(this.#contentReadsPeak, this.#contentReadsInFlight)
     try {

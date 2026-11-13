@@ -3941,3 +3941,87 @@ describe('issue #329: one content is read through a bounded window', () => {
     await waitFor(() => rig.fake.contentReadsInFlight() === 0, 3_000, 'the abandoned window to settle')
   })
 })
+
+describe('issue #365: concurrent reads of one ref share a single walk', () => {
+  // Three slices at the protocol's 24 KiB, so ONE walk is three requests and
+  // two walks are six: a difference a counter can see without timing anything.
+  const SLICE = 24_576
+  const TEXT = 'chunk-'.repeat(Math.ceil(60_000 / 6)).slice(0, 60_000)
+  const REVISION = '2001'
+
+  async function rigWithLongText(): Promise<Awaited<ReturnType<typeof makeRig>>> {
+    return makeRig({
+      hello: { limits: { inFlightRequests: 32 } },
+      agent: {
+        agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+        sessions: [
+          {
+            sessionId: 's-1',
+            agentId: 'agent-1',
+            workspaceId: 'ws-1',
+            title: 'Share',
+            historyRevision: '2000',
+          },
+        ],
+        messages: [
+          {
+            messageId: 'm-1',
+            revision: REVISION,
+            role: 'assistant',
+            status: 'success',
+            parts: [{ kind: 'text', text: TEXT, external: true }],
+          },
+        ],
+      },
+    })
+  }
+
+  function textOf(result: unknown): string {
+    const read = result as { messages: Array<{ parts: Array<{ content: string }> }> }
+    return read.messages[0]!.parts[0]!.content
+  }
+
+  it('㉚a two reads of the same ref in flight walk it ONCE', async () => {
+    const rig = await rigWithLongText()
+    // The FIRST offset is held for 100 ms, so the second call is guaranteed to
+    // arrive while the first walk is still standing there. Without a hold, a
+    // three-slice content can settle between the two calls and the count would
+    // prove nothing either way.
+    rig.fake.delayContentReadAt('0', 100)
+    const [first, second] = await Promise.all([
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
+    ])
+    expect(textOf(first)).toBe(TEXT)
+    expect(textOf(second)).toBe(TEXT)
+    // 3 = one walk. 6 = both walked, which is what this case exists to refuse.
+    expect(rig.fake.contentReadsServed()).toBe(3)
+    expect(TEXT.length).toBeGreaterThan(2 * SLICE)
+  })
+
+  it('㉚b a read that starts AFTER the first settled walks again', async () => {
+    const rig = await rigWithLongText()
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    // In flight ONLY, never a cache: the bytes are certified per read, and a
+    // remembered Buffer would outlive the revision it was read at.
+    expect(rig.fake.contentReadsServed()).toBe(6)
+  })
+
+  it('㉚c a shared walk fails for EVERY caller that joined it', async () => {
+    const rig = await rigWithLongText()
+    // RATE_LIMITED is the one RPC refusal that does NOT degrade to an
+    // `unavailable` part, so it reaches both callers instead of being absorbed
+    // by one of them.
+    rig.fake.delayContentReadAt('0', 60)
+    rig.fake.failContentReadAt('0', { reason: 'RATE_LIMITED', message: 'shared walk is gone' })
+    const settled = await Promise.allSettled([
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
+      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
+    ])
+    expect(settled.map((entry) => entry.status)).toEqual(['rejected', 'rejected'])
+    for (const entry of settled) {
+      expect((entry as PromiseRejectedResult).reason).toMatchObject({ message: expect.stringMatching(/shared walk is gone/i) })
+    }
+  })
+})
