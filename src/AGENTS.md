@@ -168,12 +168,11 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
 
 - `MAX_EXTERNALIZED_BYTES` = 32 MiB caps **one `{ref}`**, the same ceiling the
   official client applies. It is a refusal to start a walk that could never
-  finish (a peer declaring 4 GiB would mean ~170,000 slices), not a proof about
-  the content. A part above it is `unavailable`.
+  finish, not a proof about the content. A part above it is `unavailable`.
 - Assembling one ref's content holds roughly **3× its size** at peak: the
   decoded slices, the single concatenation the digest and decoder need, and
-  the decoded string. That is the price of never hashing or decoding a buffer a
-  caller could mutate.
+  the decoded string. That is the price of never hashing or decoding a mutable
+  buffer.
 - An aggregate reads refs **sequentially**, so its own peak is one ref's 3×.
   Across calls, ONE process-wide gate (`ContentReadGate`, issue #39) bounds how
   many refs are being assembled at once: `DEFAULT_CONTENT_READ_CONCURRENCY` = 4,
@@ -181,17 +180,17 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   call, every device — shares it, so the ASSEMBLY peak is
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
   `4 × 3 × (the declared size)`.
-  It bounds what is ASSEMBLED, not everything resident: finished content
-  is retained by its caller OUTSIDE this product (up to one whole message per
-  concurrent read, because `AGGREGATE_BYTES` is judged only between messages),
-  plus the parts cache's own budgeted bytes (32 MiB per device).
+  It bounds what is ASSEMBLED, not everything resident: the caller keeps the
+  finished content OUTSIDE this product (up to one whole message per concurrent
+  read — `AGGREGATE_BYTES` is judged only between messages), plus the parts
+  cache's 32 MiB per device.
 - **A slice window does not change that peak (#329).** Slices are decoded as
   they are CONSUMED, one at a time, so the 3× stands per content; the window
   costs up to 8 undecoded `dataBase64` strings (~192 KiB at 24 KiB a slice). It
-  fills only by PREDICTION (a run of full contiguous
-  slices fixes the stride); any deviation DISCARDS it and finishes serially. A
-  window is never awaited, only pre-observed: a sibling the peer never answers
-  would otherwise hold a deadline-less read for the rpc default. Its EFFECTIVE
+  fills only by PREDICTION (a run of full contiguous slices fixes the stride);
+  any deviation DISCARDS it. A
+  window is never awaited, only pre-observed: an unanswered sibling would hold a
+  deadline-less read for the rpc default. Its EFFECTIVE
   width is `min(8, reported / 2)`, so a peer reporting none falls back to 4.
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
@@ -223,8 +222,8 @@ this beside the cache).
   revision is a millisecond wall clock, so two writes inside one millisecond
   can keep it equal while the parts differ — a shared property of the scheme,
   not one the cache invented.
-- **Never cached**: a row with an EMPTY revision (no fence — defensive only,
-  `messageRevision` is a strict decimal, so no test drives it), a TRUNCATED
+- **Never cached**: a row with an EMPTY revision (no fence — defensive only;
+  `messageRevision` is a strict decimal), a TRUNCATED
   parts page (a short list
   from a transient fault is retried, never remembered; the refusal is
   reason-blind so a future reason cannot reintroduce the bug), and a page above
@@ -259,6 +258,10 @@ this beside the cache).
   read never joins. `SessionSubscriptions.ensure` follows the same rule, but only
   when the joiner wants no REPLAY or the same one: a wait's recovery re-ensures
   from its cursor, and a checkpoint cannot answer that.
+- **A replay subscription is ACTIVATED, and resumes at the APPLIED cursor
+  (#369).** `subscribe` answers `prepared` in BOTH modes and the peer pumps only
+  after `activate`, which accepts the cursor the caller APPLIED — so the session
+  starts at `fromCursor`, never the descriptor's high watermark.
 - **Invalidation** rides `#forgetDevice` with the three session caches;
   `#watchConnection` routes `offline` / `identity-mismatch` there. An ordinary
   link loss also publishes `offline`, so a reconnect drops the cache — one
@@ -298,9 +301,9 @@ this beside the cache).
   its own tests pin the stuck-cursor and cycle checks. Its two failures are its
   own: an anchor that is not on any page up to
   the peer's last one, and a scan longer than `MAX_ANCHOR_SCAN_PAGES`. Both throw. A scan asks for a **full page**
-  regardless of the caller's `limit`: its items are discarded either way, and
-  paging at `limit: 1` would spend the page budget on a history a full page
-  reaches in dozens.
+  whatever the caller's `limit`: its items are discarded either way, and
+  `limit: 1` would spend the page budget on a history a full page reaches in
+  dozens.
 
 ### Wait answers: one absolute deadline
 
@@ -355,17 +358,16 @@ absorbed it — a 1 s window answering ~150 s later (#3, #21).
   `historyRevision`); it rides the same deadline, and its failure degrades to
   the stub receipt (`aggregateError` + `guidance`) exactly like a failed walk —
   the #3 invariant: a run's verdict and its identifiers survive a content
-  failure. Before #21 a dead link there made `cherry_send` reject.
-  The IDLE face is different, and it is no longer a gap (issue #51): its
+  failure. A dead link there once made `cherry_send` reject.
+  The IDLE face is different (issue #51): its
   `agent.sessions.get` is the §6 PRECONDITION that decides whether the session
   is idle at all, so there is nothing to degrade to — but it now rides an
   `AssemblyDeadline` of its own, anchored at TOOL ENTRY with the caller's window.
   A spent budget FAILS the call with a guidance error: nothing was learned about
   the run, so a retry is the recovery, and the caller is never handed a verdict
-  the snapshot never produced. Before #51 a flapping link could spend 5–10 s
-  behind a 500 ms window. The idle HISTORY walk anchors AFTER the snapshot
-  deliberately: a slow-but-successful snapshot must not leave the walk with
-  nothing, so the phases are bounded separately.
+  the snapshot never produced. The idle HISTORY walk anchors AFTER the
+  snapshot deliberately: a slow-but-successful snapshot must not leave the walk
+  with nothing, so the phases are bounded separately.
 
 What this is NOT: a global `cherry_read`/list-tool budget — they take no
 deadline; their bounds are `limit`, the safety breaker and the byte budgets.
@@ -414,10 +416,9 @@ the cut-off history.
 **The peer's cursor format is never parsed or validated.** The real desktop's is
 an opaque keyset token, the loopback peer's a numeric offset, and a future
 desktop may change it; so every token we emit is self-describing and every token
-we accept must carry one of our two prefixes; anything else is refused **before any device work**. This is not
-pedantry: a malformed cursor handed to the real desktop is **silently swallowed**
-(it falls back to the newest page), so a forwarded foreign string would come
-back as the newest page presented as "continued history".
+we accept must carry one of our two prefixes; anything else is refused **before any device work**. Not pedantry: a malformed cursor handed to the real desktop is **silently
+swallowed** (it falls back to the newest page), so a forwarded foreign string
+comes back as the newest page presented as "continued history".
 
 **An anchor the walk cannot find is loud.** If the peer's terminal page arrives
 with the anchor still unfound, the read throws naming the message id (it is
@@ -505,11 +506,11 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   It is asserted over a varied probe table (numeric, keyset, unicode, interior
   space, base64url-shaped, the retired v1 payload) rather than per-clause, so a
   refusal added to the parser WITHOUT mirroring it here turns red for any probe
-  that reaches it — the compensations are that a clause no probe reaches still
-  slips through, and that over-refusal (naming less than the parser would take)
-  is allowed by design, since it costs resumability rather than correctness.
-  The failure mode this prevents: an emitted stop point the same tool refuses —
-  a useless token whose refusal surfaces at resume, not at the answer. A
+  that reaches it — the compensations: a clause no probe reaches still slips
+  through, and over-refusal (naming less than the parser takes) is allowed — it
+  costs resumability, not correctness.
+  The failure mode: an emitted stop point the same tool refuses — a useless
+  token whose refusal surfaces at resume, not at the answer. A
   refused remainder yields no token at all — `truncated` already says the
   walk was cut, and the remedy then follows the REASON rather than the absence:
   a `'limit'` stop answers to a wider `limit` only where the caller owns that
@@ -552,8 +553,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   `toolsRead.test.ts` ⑦h), which is why that helper is exported.
 - **The tool DESCRIPTION is part of the contract, and it is pinned.** The guards
   above bound what a tool ACCEPTS and NAMES, so a description promising a token
-  unconditionally is a claim the tool contradicts — and it is the claim a model
-  reads first. Every TOP-LEVEL description
+  unconditionally is a claim the tool contradicts — and a model reads it first. Every TOP-LEVEL description
   that mentions a resume token says "when the stop point can be named", and none
   names the wrong absent case ("reached the peer's last page" was the stale one:
   a TRUNCATED walk by definition never reaches it). `cherry_read` states the
@@ -579,7 +579,7 @@ The constraint that failed in the field is the **MCP output boundary**: it does
 not care which tool produced an oversized answer ("value is not lossless JSON"
 loses the verdict *along with* the content). One budget, one reason word; what
 differs between the faces is the **message ceiling**, not the cost of a message.
-A second byte value would drift silently.
+A second value would drift silently.
 
 The budget is checked only **between** messages and the first message is always
 taken before any check: the **newest message is always returned whole**, and a
@@ -967,4 +967,10 @@ faces:
 | 2.1.8: v3 pairing QR (`bc570d2b9`, PR #21387) — `pairingQrSchema` v2|v3 with custom host/port/security `endpoints`, tightened IPv6; paged message summaries (`54736dc9`/`8bf2fe28d`, PR #21992) advertised by the `agentMessageSummariesVersion` hello capability; server `PAGE_ITEM_BYTES = 62_279` per-item budget | Pairing consumes the published union (#124); summaries are consumed behind the hello capability (#105); a byte-budgeted page may come back SHORTER, which our walk already follows |
 | 2.1.9/2.1.10: **only** `RemoteConnection.send()`'s write chain changed (`16d9487a9`, PR #22593) — `this.writes` keeps its links resolved, so one rejected send no longer makes every later send skip `channel.write`; every other remote-access file and both protocol packages are byte-identical to 2.1.8 | No client change: our answers never depend on the notification stream (list snapshots are the authority), and our own serialized queue (`SecondWindowRateLimiter`) cannot reject |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
+
+**Traps in the official app (a cautionary list, not a spec).**
+
+- Its scope layer honours `details.retryable: false`, but it has no adaptive
+  page size, so a byte-budget `RESOURCE_EXHAUSTED` never converges at a fixed
+  limit. Our answer is the byte-safe page **clamp**.
 
