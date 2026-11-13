@@ -251,11 +251,14 @@ this beside the cache).
   anything: device and count only, never a message id.
 - **A hit hands the PAGE out BY REFERENCE** — safe while projection only reads
   it; a mutator must copy first.
-- **A walk in flight is SHARED; the list is not (#365).** Two callers asking for
-  one `{ref}` join ONE walk; the entry drops when the walk SETTLES (so it is
-  de-duplication, never a cache), the gate slot is taken INSIDE the walk so a
-  joiner takes none, and a BUDGETED read never joins. `SessionSubscriptions.ensure`
-  follows the same rule: the peer refuses a second subscription for one session.
+- **A read in flight is SHARED; the list is not (#365, #367).** Two callers
+  asking for one `{ref}` join ONE read, keyed by the connection plus every ref
+  field the walk READS; the entry drops when it SETTLES (de-duplication, never a
+  cache). The gate slot is taken INSIDE it, so a joiner takes none, and the
+  DECODE happens inside too — the 3× above counts the decoded string. A BUDGETED
+  read never joins. `SessionSubscriptions.ensure` follows the same rule, but only
+  when the joiner wants no REPLAY or the same one: a wait's recovery re-ensures
+  from its cursor, and a checkpoint cannot answer that.
 - **Invalidation** rides `#forgetDevice` with the three session caches;
   `#watchConnection` routes `offline` / `identity-mismatch` there. An ordinary
   link loss also publishes `offline`, so a reconnect drops the cache — one
@@ -392,8 +395,9 @@ Three `truncationReason` values mean different things:
   itself: the content that was read is returned (with the token when one can be
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
-Collapsing `aggregate-bytes` into "raise `limit`" was a field defect: a caller
-paid every round trip and never saw the cut-off history.
+Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
+`limit`" was a field defect: a caller paid every round trip and still never saw
+the cut-off history.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -963,10 +967,4 @@ faces:
 | 2.1.8: v3 pairing QR (`bc570d2b9`, PR #21387) — `pairingQrSchema` v2|v3 with custom host/port/security `endpoints`, tightened IPv6; paged message summaries (`54736dc9`/`8bf2fe28d`, PR #21992) advertised by the `agentMessageSummariesVersion` hello capability; server `PAGE_ITEM_BYTES = 62_279` per-item budget | Pairing consumes the published union (#124); summaries are consumed behind the hello capability (#105); a byte-budgeted page may come back SHORTER, which our walk already follows |
 | 2.1.9/2.1.10: **only** `RemoteConnection.send()`'s write chain changed (`16d9487a9`, PR #22593) — `this.writes` keeps its links resolved, so one rejected send no longer makes every later send skip `channel.write`; every other remote-access file and both protocol packages are byte-identical to 2.1.8 | No client change: our answers never depend on the notification stream (list snapshots are the authority), and our own serialized queue (`SecondWindowRateLimiter`) cannot reject |
 | `5db8ab7` (agent runtime DSH → Pi, deleting `packages/dsh-bridge`) | The **opposite** bridge (Cherry driving DSH); unrelated to the remote-access face |
-
-**Traps in the official app (a cautionary list, not a spec).**
-
-- Its scope layer honours `details.retryable: false`, but it has no adaptive
-  page size, so a byte-budget `RESOURCE_EXHAUSTED` never converges at a fixed
-  limit. Our answer is the byte-safe page **clamp**.
 

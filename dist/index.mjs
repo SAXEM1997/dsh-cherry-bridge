@@ -5314,11 +5314,18 @@ var SessionSubscriptions = class {
 	* a subscribe is running now waits for THAT one: one peer subscription, and
 	* every caller sees the same verdict, including a rejection.
 	*
-	* Joining is by sessionId, not by cursor: the cursor only chooses the
-	* baseline of the subscription that is being created anyway, and the caller
-	* of `ensure` does not observe it. The entry is dropped the moment the
-	* subscribe settles, so a LATER `ensure` still takes the re-subscribe path
-	* (close the live subscription, then subscribe) exactly as before.
+	* Joining is by sessionId AND by cursor COMPATIBILITY, because the cursor is
+	* not free: it asks the peer to REPLAY from that position, and a subscribe
+	* opened without one answers a checkpoint. A caller that needs a replay —
+	* `#awaitRun`'s recovery, which re-ensures from the cursor it already holds —
+	* therefore cannot ride a subscribe another caller started cursorless: it
+	* would open a checkpoint, the replay would never arrive, and the wait would
+	* end in `timeout` for a run that had already settled. So a joiner rides the
+	* attempt in flight only when it wants no replay, or the same one.
+	*
+	* The entry is dropped the moment the subscribe settles, so a LATER `ensure`
+	* still takes the re-subscribe path (close the live subscription, then
+	* subscribe) exactly as before.
 	*/
 	#ensuring = /* @__PURE__ */ new Map();
 	/**
@@ -5460,14 +5467,34 @@ var SessionSubscriptions = class {
 	async ensure(sessionId, cursor) {
 		if (this.#closed) throw new Error("SessionSubscriptions disposed");
 		const inFlight = this.#ensuring.get(sessionId);
-		if (inFlight !== void 0) return inFlight;
+		if (inFlight !== void 0) {
+			if (this.#joinable(inFlight.cursor, cursor)) return inFlight.promise;
+			await inFlight.promise.catch(() => void 0);
+			return this.ensure(sessionId, cursor);
+		}
 		const run = this.#ensureOnce(sessionId, cursor);
-		this.#ensuring.set(sessionId, run);
+		const entry = {
+			cursor,
+			promise: run
+		};
+		this.#ensuring.set(sessionId, entry);
 		const forget = () => {
-			if (this.#ensuring.get(sessionId) === run) this.#ensuring.delete(sessionId);
+			if (this.#ensuring.get(sessionId) === entry) this.#ensuring.delete(sessionId);
 		};
 		run.then(forget, forget);
 		return run;
+	}
+	/**
+	* Can a caller asking for `wanted` ride a subscribe started from `started`?
+	*
+	* Only when it needs no replay (a checkpoint answers it), or when it needs
+	* exactly the one already on the wire. Anything else has to wait and ask
+	* again — see {@link SessionSubscriptions.#ensuring}.
+	*/
+	#joinable(started, wanted) {
+		if (wanted === void 0) return true;
+		if (started === void 0) return false;
+		return started.sessionId === wanted.sessionId && started.streamEpoch === wanted.streamEpoch && started.seq === wanted.seq;
 	}
 	/** {@link SessionSubscriptions.ensure} without the in-flight bookkeeping. */
 	async #ensureOnce(sessionId, cursor) {
@@ -8150,17 +8177,25 @@ var CherryToolEngine = class {
 	*/
 	#contentGate;
 	/**
-	* Content walks IN FLIGHT, keyed by the request they answer (#365).
+	* Content reads IN FLIGHT, keyed by the request they answer (#365).
 	*
 	* Two callers can ask for the same `{ref}` in the same step — two
 	* `cherry_read` calls over one session is a legal thing for a model to do —
 	* and without this each of them paginated the same 24 KiB slices again. A
-	* second caller now waits for the walk already running instead. It is a
-	* de-duplicator, NOT a cache: the entry is dropped the moment the walk
+	* second caller now waits for the read already running instead. It is a
+	* de-duplicator, NOT a cache: the entry is dropped the moment the read
 	* settles, so a later read re-walks and re-certifies (see
-	* {@link CherryToolEngine.#readRefBytes}).
+	* {@link CherryToolEngine.#readExternalized}).
+	*
+	* The value is the DECODED TEXT, not the bytes, and the outer key is the
+	* CONNECTION, not the device id (#367). Text because the decode belongs
+	* inside the gate's slot — see {@link CherryToolEngine.#walkExternalized} —
+	* and because a string is immutable, so a joiner cannot alter what another
+	* caller is about to read. The connection because a PATCH or a forget EVICTS
+	* the pooled one: a walk on the old socket must not answer a caller that is
+	* dialing the new one.
 	*/
-	#contentWalks = /* @__PURE__ */ new Map();
+	#contentWalks = /* @__PURE__ */ new WeakMap();
 	/**
 	* The `maxBytes` one `agent.content.read` slice asks for
 	* ({@link CONTENT_READ_MAX_BYTES} in production; injectable so a test can
@@ -9575,64 +9610,51 @@ var CherryToolEngine = class {
 	* reaches this decode.
 	*/
 	async #readExternalized(connection, sessionId, ref, deadline) {
-		const bytes = await this.#readRefBytes(connection, sessionId, ref, this.#externalizedByteCap, deadline);
-		try {
-			return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-		} catch {
-			throw new Error(`agent.content.read for ${String(ref["contentId"] ?? "")} returned bytes that are not valid UTF-8; not decoded`);
-		}
-	}
-	/**
-	* Read one `{ref}`'s certified bytes, SHARING a walk already in flight
-	* (#365).
-	*
-	* The key is the request the walk answers — device, session, contentId,
-	* revision — plus the byte budget, because those are the only things that
-	* decide what comes back: two callers that differ in ANY of them must not be
-	* handed one answer. `cherry_read` is the caller this exists for, and it
-	* always passes {@link MAX_EXTERNALIZED_BYTES}.
-	*
-	* A BUDGETED read never joins and is never joined. Its walk is bounded by an
-	* instant only its own caller owns — a wait answer's
-	* {@link AssemblyDeadline} — so sharing would spend one caller's window on
-	* another's content, and hand the joiner a stop its own clock never caused.
-	*
-	* The entry is dropped the moment the walk SETTLES, both arms, so this is
-	* de-duplication and never a cache: a later read walks again and certifies
-	* the bytes it gets. A remembered Buffer would outlive the revision it was
-	* read at, and the read cache above deliberately remembers only the parts
-	* LIST for exactly that reason.
-	*/
-	#readRefBytes(connection, sessionId, ref, byteCap, deadline) {
-		if (deadline !== void 0) return this.#walkRefBytes(connection, sessionId, ref, byteCap, deadline);
+		if (deadline !== void 0) return this.#walkExternalized(connection, sessionId, ref, deadline);
 		const key = [
-			connection.record.deviceId,
 			sessionId,
 			String(ref["contentId"] ?? ""),
 			String(ref["revision"] ?? ""),
-			String(byteCap)
+			String(declaredRefBytes(ref) ?? ""),
+			String(ref["sha256"] ?? ""),
+			String(this.#externalizedByteCap)
 		].join("\0");
-		const inFlight = this.#contentWalks.get(key);
+		let walks = this.#contentWalks.get(connection);
+		if (walks === void 0) {
+			walks = /* @__PURE__ */ new Map();
+			this.#contentWalks.set(connection, walks);
+		}
+		const inFlight = walks.get(key);
 		if (inFlight !== void 0) return inFlight;
-		const walk = this.#walkRefBytes(connection, sessionId, ref, byteCap, deadline);
-		this.#contentWalks.set(key, walk);
+		const walk = this.#walkExternalized(connection, sessionId, ref, deadline);
+		walks.set(key, walk);
 		const forget = () => {
-			if (this.#contentWalks.get(key) === walk) this.#contentWalks.delete(key);
+			if (walks.get(key) === walk) walks.delete(key);
 		};
 		walk.then(forget, forget);
 		return walk;
 	}
 	/**
-	* ONE content walk, holding the process-wide gate slot for its whole length
-	* (issue #39) — slices, digest, and the caller's decode that follows.
+	* ONE content walk AND its decode, holding the process-wide gate slot for
+	* both (issue #39) — slices, digest, and the decoded string.
 	*
-	* The slot lives HERE rather than at the call site so that a caller joining
-	* a walk already in flight takes no slot at all (#365).
+	* The slot lives HERE rather than at the call site so that a caller joining a
+	* walk already in flight takes no slot at all (#365). The DECODE lives here
+	* for the same reason the slot does: `ContentReadGate` exists to bound the
+	* assembly peak, and `src/AGENTS.md` counts the decoded string as the third
+	* copy (3 × the ref's size), so decoding after the slot was released would
+	* leave that third copy unbounded (#367). The coalesced value is therefore
+	* text: immutable, and already past the decode the joiner would repeat.
 	*/
-	async #walkRefBytes(connection, sessionId, ref, byteCap, deadline) {
+	async #walkExternalized(connection, sessionId, ref, deadline) {
 		const releaseSlot = await this.#contentGate.acquire(deadline?.instant);
 		try {
-			return await this.#readVerifiedBytes(connection, sessionId, ref, byteCap, deadline);
+			const bytes = await this.#readVerifiedBytes(connection, sessionId, ref, this.#externalizedByteCap, deadline);
+			try {
+				return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+			} catch {
+				throw new Error(`agent.content.read for ${String(ref["contentId"] ?? "")} returned bytes that are not valid UTF-8; not decoded`);
+			}
 		} finally {
 			releaseSlot();
 		}

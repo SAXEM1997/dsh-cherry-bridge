@@ -2,7 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-11-13
-- **Issues:** #365 (the code this records), #363 (the upstream survey that prompted it)
+- **Issues:** #363 (the upstream survey that prompted it), #365 (the first code to apply it)
 
 ## Context
 
@@ -85,7 +85,7 @@ reported about itself.
   changes the day a desktop ships the methods.
 - Whether a probe may be COALESCED across concurrent callers. That is a
   per-capability implementation detail; the pattern it would follow is the
-  in-flight de-duplication in `CherryToolEngine.#readRefBytes` (#365).
+  in-flight de-duplication in `CherryToolEngine.#readExternalized` (#365, #367).
 
 ## References
 
