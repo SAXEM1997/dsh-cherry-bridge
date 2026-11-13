@@ -262,6 +262,23 @@ export class SessionSubscriptions {
   readonly #unackedSource: number | (() => number | undefined) | undefined
   readonly #sessions = new Map<string, SessionState>()
   /**
+   * Subscribes IN FLIGHT, one per session (#365).
+   *
+   * The peer refuses a second subscription for one session on one connection
+   * (CONFLICT), so two callers that reach `ensure` in the same step — two tool
+   * calls, or a first-use ensure racing a re-ensure — used to make the second
+   * one fail for a reason the caller never caused. A caller that arrives while
+   * a subscribe is running now waits for THAT one: one peer subscription, and
+   * every caller sees the same verdict, including a rejection.
+   *
+   * Joining is by sessionId, not by cursor: the cursor only chooses the
+   * baseline of the subscription that is being created anyway, and the caller
+   * of `ensure` does not observe it. The entry is dropped the moment the
+   * subscribe settles, so a LATER `ensure` still takes the re-subscribe path
+   * (close the live subscription, then subscribe) exactly as before.
+   */
+  readonly #ensuring = new Map<string, Promise<void>>()
+  /**
    * Insertion order IS the eviction order, and it is SUBSCRIPTION recency, not
    * USE recency. Read that literally: only `ensure` (a re-subscribe re-inserts
    * the session at the MRU end) moves an entry. `read`, `ack`, `waitFor` and
@@ -405,6 +422,24 @@ export class SessionSubscriptions {
   async ensure(sessionId: string, cursor?: AgentCursor): Promise<void> {
     if (this.#closed) throw new Error('SessionSubscriptions disposed')
 
+    // ONE subscribe per session at a time (#365). Without this, two callers in
+    // the same step both find no subscription and both ask the peer, which
+    // refuses the second one.
+    const inFlight = this.#ensuring.get(sessionId)
+    if (inFlight !== undefined) return inFlight
+    const run = this.#ensureOnce(sessionId, cursor)
+    this.#ensuring.set(sessionId, run)
+    // Both arms, so a rejected subscribe is observed by this bookkeeping too
+    // and cannot become an unhandled rejection while the callers are attaching.
+    const forget = (): void => {
+      if (this.#ensuring.get(sessionId) === run) this.#ensuring.delete(sessionId)
+    }
+    run.then(forget, forget)
+    return run
+  }
+
+  /** {@link SessionSubscriptions.ensure} without the in-flight bookkeeping. */
+  async #ensureOnce(sessionId: string, cursor?: AgentCursor): Promise<void> {
     // Re-subscribe path: release the old subscription before asking again.
     const existing = this.#sessions.get(sessionId)
     if (existing !== undefined) {

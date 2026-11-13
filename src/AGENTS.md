@@ -192,9 +192,7 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   slices fixes the stride); any deviation DISCARDS it and finishes serially. A
   window is never awaited, only pre-observed: a sibling the peer never answers
   would otherwise hold a deadline-less read for the rpc default. Its EFFECTIVE
-  width is `min(8, reported / 2)`: the protocol default (`inFlightRequests`
-  16) admits 8, and a peer that reports none falls back to 8 → 4 — hence ㉙a's
-  32.
+  width is `min(8, reported / 2)`, so a peer reporting none falls back to 4.
 - **The gate's boundary with the deadline (issue #21).** While a caller is
   QUEUED it honours its budget: at the deadline it leaves the queue and fails
   (`ContentGateTimeoutError`, which the projection degrades to one part's
@@ -223,10 +221,8 @@ this beside the cache).
   key, and it covers parts RECORDS only: the cache inherits the peer's own
   `REVISION_EXPIRED` staleness class and adds none — and no more strength: the
   revision is a millisecond wall clock, so two writes inside one millisecond
-  can keep it equal while the parts differ — a hit would then serve the older
-  list for that revision's lifetime, and reproducing it needs a read between
-  the two same-millisecond writes (a shared property of the scheme, not one
-  the cache invented).
+  can keep it equal while the parts differ — a shared property of the scheme,
+  not one the cache invented.
 - **Never cached**: a row with an EMPTY revision (no fence — defensive only,
   `messageRevision` is a strict decimal, so no test drives it), a TRUNCATED
   parts page (a short list
@@ -255,6 +251,11 @@ this beside the cache).
   anything: device and count only, never a message id.
 - **A hit hands the PAGE out BY REFERENCE** — safe while projection only reads
   it; a mutator must copy first.
+- **A walk in flight is SHARED; the list is not (#365).** Two callers asking for
+  one `{ref}` join ONE walk; the entry drops when the walk SETTLES (so it is
+  de-duplication, never a cache), the gate slot is taken INSIDE the walk so a
+  joiner takes none, and a BUDGETED read never joins. `SessionSubscriptions.ensure`
+  follows the same rule: the peer refuses a second subscription for one session.
 - **Invalidation** rides `#forgetDevice` with the three session caches;
   `#watchConnection` routes `offline` / `identity-mismatch` there. An ordinary
   link loss also publishes `offline`, so a reconnect drops the cache — one
@@ -391,9 +392,8 @@ Three `truncationReason` values mean different things:
   itself: the content that was read is returned (with the token when one can be
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
-Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
-`limit`" was a field defect: a caller paid every round trip and still never saw
-the cut-off history.
+Collapsing `aggregate-bytes` into "raise `limit`" was a field defect: a caller
+paid every round trip and never saw the cut-off history.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -933,10 +933,10 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 - **`.scratch-csa`** (gitignored) — the official Cherry Studio **app**
   (`CherryHQ/cherry-studio-app`), the **same role we play** (protocol *client*).
   Its remote layer is `src/backend/services/remoteAgent/` — "what the official
-  client does" comes from there. v0.5.0–v0.5.4 were byte-identical there (tree `16e505fe…`);
-  **v0.5.5** moves the pins to 0.8.0 / 0.2.6, which ADD only `agent.tasks.*`
-  (transport 0.2.6 is 0.2.5 byte-for-byte) and no released desktop serves yet
-  — the wire WE use is unchanged. Diff the tree first.
+  client does" comes from there. v0.5.0–v0.5.4 were byte-identical there (tree
+  `16e505fe…`); **v0.5.5** moves the pins to 0.8.0 / 0.2.6 — additive
+  `agent.tasks.*` only, no released desktop serves it, our wire unchanged
+  (ADR-0001). Diff the tree first.
 - **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
   of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
   through `v2.1.10` (`c60cd41a6`). Diff TREES between tags; attribute a change
@@ -966,8 +966,7 @@ faces:
 
 **Traps in the official app (a cautionary list, not a spec).**
 
-- Its `RemoteAgentError` marks those four retryable, but its scope layer DOES
-  honour `details.retryable: false`; it has no adaptive page size, so a
-  byte-budget `RESOURCE_EXHAUSTED` still does not converge at a fixed limit. Our
-  answer is the byte-safe page **clamp**: never ask for a page that cannot fit.
+- Its scope layer honours `details.retryable: false`, but it has no adaptive
+  page size, so a byte-budget `RESOURCE_EXHAUSTED` never converges at a fixed
+  limit. Our answer is the byte-safe page **clamp**.
 
