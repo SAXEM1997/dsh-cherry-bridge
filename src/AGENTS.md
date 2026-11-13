@@ -767,6 +767,10 @@ selector, `cherry_pair` does not.
   (fail-closed), never a silent unconditional install.
 - A throwing condition would fail step PREPARATION
   (`TOOL_ACTIVATION_FAILED`), so it answers false; 14 calls/step ≈ 3 µs.
+- ONE generation token per judgement round, bumped by its start, `save()` and
+  `invalidateDerived()`: a losing round commits nothing (list, map, judgements
+  alike). `mount()` has an identity too — a second mount releases the first, a
+  stale disposer or late injection is inert, and release reports `pending`.
 - `cherry_subagent` is registered by the SUBAGENT subsystem, not this family; it
   carries its own step-time `visibleFor` gate over the same judgement, so it
   follows the document too.

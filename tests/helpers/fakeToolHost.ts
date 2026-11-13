@@ -51,7 +51,7 @@ export class FakeToolHost {
   #conditions = new Map<string, (context: { readonly agent: unknown }) => boolean | Promise<boolean>>()
   #live = new Map<string, FakeAgentRecord>()
   #effectDisposers: Array<() => void> = []
-  #injectionCallback: ((ctx: unknown) => void | (() => void)) | undefined
+  #injectionCallbacks: Array<(ctx: unknown) => void | (() => void)> = []
   #workspaces: FakeWorkspace[] = []
 
   injectedEffectRuns = 0
@@ -122,10 +122,18 @@ export class FakeToolHost {
     })
   }
 
-  /** Delivers a deferred injection callback. */
-  deliverInjection(): void {
-    const callback = this.#injectionCallback
-    this.#injectionCallback = undefined
+  /** How many deferred injection callbacks are still pending. */
+  injectionCount(): number {
+    return this.#injectionCallbacks.length
+  }
+
+  /**
+   * Delivers one deferred injection callback (the last by default). A stale
+   * mount's callback is addressed by its index.
+   */
+  deliverInjection(index = this.#injectionCallbacks.length - 1): void {
+    const callback = this.#injectionCallbacks[index]
+    this.#injectionCallbacks.splice(index, 1)
     callback?.(this.#injectedContext())
   }
 
@@ -154,7 +162,7 @@ export class FakeToolHost {
     this.injectKeyCalls.push(keys)
     if (this.#options.injectThrows === true) throw new Error('injection unavailable')
     if (this.#options.deferInjection === true) {
-      this.#injectionCallback = cb as (ctx: unknown) => void | (() => void)
+      this.#injectionCallbacks.push(cb as (ctx: unknown) => void | (() => void))
       return () => {}
     }
     cb(this.#injectedContext() as T)
