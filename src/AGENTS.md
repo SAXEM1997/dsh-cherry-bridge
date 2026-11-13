@@ -758,7 +758,7 @@ selector, `cherry_pair` does not.
   empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
   document lands on the stricter side).
 - **One host mode: step-time `when`.** `tools.resolve` is the contract (#345):
-  the family is ONE registration carrying one shared condition
+  the family is ONE registration pass — fourteen `register()` calls sharing one condition
   (`ToolScopeState.visibleForAgent`): `judgement(agent.id) ?? resolveNow(agent)`,
   fail-closed. There is no per-agent `restrict`, `guard`, `agent/created|disposed`
   subscription or recheck timer, and a save is visible on the **next step**.

@@ -511,6 +511,39 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     expect(state.workspaces().map((workspace) => workspace.id)).toEqual(['W'])
   })
 
+  it('⑦e a failed list read fail-closes the previous generation at once', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(
+      registryFixture([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }),
+      [{ id: 'a1', cwd: '/w' }],
+    )
+    expect(state.judgement('a1')?.visible).toBe(true)
+
+    // A round whose list read fails and parks in resolveByPath. Its list write
+    // fail-closes at once; so must the DERIVED state it supersedes, because
+    // this round can be discarded (a teardown) before its own commit, and a
+    // stale `visible` judgement must not survive that window (B16).
+    const gate = deferred<void>()
+    const broken: WorkspaceRegistryLike = {
+      list: () => {
+        throw new Error('registry gone')
+      },
+      async resolveByPath(path: string) {
+        await gate.promise
+        return { id: 'W', path: '/w', sessionIds: [path] }
+      },
+    }
+    const pending = state.rebuild(broken, [{ id: 'a1', cwd: '/w' }])
+
+    expect(state.workspaces()).toEqual([])
+    expect(state.judgement('a1')).toBeUndefined()
+    expect(state.visibleFor('a1')).toBe(false)
+
+    gate.resolve()
+    await pending
+    expect(state.judgement('a1')).toMatchObject({ status: 'unresolved', visible: false })
+  })
+
   it('⑦d a save during a round discards that round', async () => {
     const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
     const gate = deferred<void>()

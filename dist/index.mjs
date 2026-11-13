@@ -1601,6 +1601,8 @@ function toScopeWorkspace(raw) {
 		sessionIds: Array.isArray(raw.sessionIds) ? raw.sessionIds.map((value) => String(value)) : []
 	};
 }
+/** The one version-guard sentence the save refusal and the degraded note share. */
+const SCOPE_VERSION_GUARD = "作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1";
 /** The normalized form `setWorkspaces` stores, computed without mutating state. */
 function normalizeWorkspaceList(list) {
 	return list.map((raw) => toScopeWorkspace(raw)).filter((workspace) => workspace !== void 0);
@@ -1945,6 +1947,11 @@ var ToolScopeState = class {
 			this.#warn("工作区注册表 list() 抛出，按 B16 视为列表不可用（判定 fail-closed，写侧拒绝）", error);
 		}
 		this.setWorkspaces(listed);
+		if (!listAvailable) {
+			this.#pathMap = /* @__PURE__ */ new Map();
+			this.#judgements = /* @__PURE__ */ new Map();
+			this.#pathUnmatched = [];
+		}
 		const workspaces = this.#workspaces;
 		const pathMap = /* @__PURE__ */ new Map();
 		const resolveByPath = registry.resolveByPath;
@@ -2106,7 +2113,7 @@ var ToolScopeState = class {
 			ok: false,
 			status: 503,
 			error: "scope-version-unsupported",
-			message: "作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1，文档版本高于本插件支持或低于本插件支持，不能覆写该文档；已存内容一位不动"
+			message: `${SCOPE_VERSION_GUARD}，不能覆写该文档；已存内容一位不动`
 		};
 		if (this.#listState === "unavailable") return {
 			ok: false,
@@ -2267,7 +2274,7 @@ var ToolScopeState = class {
 			this.#versionUnsupported = true;
 			this.noteDegraded({
 				source: "scope-version",
-				reason: "作用域文档版本与本插件支持的不一致（高于或低于皆同一条守卫）：本插件支持 version 1，文档版本高于本插件支持或低于本插件支持；已只读降级并拒绝写入，避免覆写不同格式的文档"
+				reason: `${SCOPE_VERSION_GUARD}；已只读降级并拒绝写入，避免覆写不同格式的文档`
 			});
 		}
 	}

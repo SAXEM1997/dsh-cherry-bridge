@@ -152,8 +152,6 @@ interface FixtureOptions {
   seed?: string
   /** Records the injection callback without arriving it: the host stays `pending` (D9). */
   deferInjection?: boolean
-  /** Holds `resolveByPath` until `openGate()`: keeps one recompute round verifiably in flight. */
-  gate?: boolean
   /** Makes the injected registry's `list()` THROW — B16's read failure. */
   listThrows?: boolean
 }
@@ -168,7 +166,6 @@ interface ScopeHttpFixture {
   refreshCalls: number
   /** `save` / `refresh` / the microtask queued inside `save`, in execution order. */
   order: string[]
-  openGate(): void
   dispose(): void
 }
 
@@ -189,16 +186,11 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
   fake.setWorkspaces(options.workspaces ?? [])
   for (const agent of options.agents ?? []) fake.addAgent(agent)
 
-  let release: () => void = () => {}
-  const gate = new Promise<void>((resolve) => {
-    release = resolve
-  })
-
-  // The two seams `FakeToolHost` does not own, wrapped onto the very ctx the
+  // The one seam `FakeToolHost` does not own, wrapped onto the very ctx the
   // scope host's injection callback receives: a `list()` that really throws
-  // (B16's read failure) and a `resolveByPath` the test can park.
+  // (B16's read failure).
   const inject = fake.root.inject?.bind(fake.root)
-  if (inject !== undefined && (options.gate === true || options.listThrows === true)) {
+  if (inject !== undefined && options.listThrows === true) {
     fake.root.inject = ((keys: readonly string[], cb: (ctx: ScopeInjectedContext) => void | (() => void)) =>
       inject(keys, (wctx: ScopeInjectedContext) => {
         const registry = wctx.workspaceRegistry
@@ -208,10 +200,6 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
           list: () => {
             if (options.listThrows === true) throw new Error('registry list() is unavailable')
             return registry.list()
-          },
-          resolveByPath: async (path: string) => {
-            if (options.gate === true) await gate
-            return registry.resolveByPath?.call(registry, path)
           },
         }
         return cb({ ...wctx, workspaceRegistry: wrapped })
@@ -287,7 +275,6 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
       return refreshCalls
     },
     order,
-    openGate: () => release(),
     dispose: () => {
       unmount()
       disposeRoutes()
