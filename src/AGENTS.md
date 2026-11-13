@@ -930,22 +930,20 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 
 ## Upstream references
 
-Neither reference is published with this repository.
-
 - **`.scratch-csa`** (gitignored) — the official Cherry Studio **app**
   (`CherryHQ/cherry-studio-app`), the **same role we play** (protocol *client*).
-  Its remote layer is
-  `src/backend/services/remoteAgent/`; "what the official client does" comes
-  from there. v0.5.0–v0.5.4 changed NOTHING on that face — the tree hash is
-  `16e505fe…` at every tag, and the pins are still 0.7.0 / 0.2.5. Check that
-  tree hash before believing a new app version changed the wire.
+  Its remote layer is `src/backend/services/remoteAgent/` — "what the official
+  client does" comes from there. v0.5.0–v0.5.4 were byte-identical there (tree `16e505fe…`);
+  **v0.5.5** moves the pins to 0.8.0 / 0.2.6, which ADD only `agent.tasks.*`
+  (transport 0.2.6 is 0.2.5 byte-for-byte) and no released desktop serves yet
+  — the wire WE use is unchanged. Diff the tree first.
 - **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
   of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
   through `v2.1.10` (`c60cd41a6`). Diff TREES between tags; attribute a change
   with the GitHub API, not `git log` (the graft hides the range). The faces we
   depend on are `src/main/services/remoteAccess/` and
   `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries both
-  rate lines. Gitignored; treated as read-only research.
+  rate lines. Read-only research.
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
