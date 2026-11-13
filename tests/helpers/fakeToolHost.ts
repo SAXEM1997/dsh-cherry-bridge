@@ -52,6 +52,9 @@ export class FakeToolHost {
   #live = new Map<string, FakeAgentRecord>()
   #effectDisposers: Array<() => void> = []
   #injectionCallbacks: Array<(ctx: unknown) => void | (() => void)> = []
+  #lastInjectionCallback: ((ctx: unknown) => void | (() => void)) | undefined
+  #registrationCalls = 0
+  #duplicateRegistrations = 0
   #workspaces: FakeWorkspace[] = []
 
   injectedEffectRuns = 0
@@ -122,6 +125,27 @@ export class FakeToolHost {
     })
   }
 
+  /** Total `register()` calls, including ones a later mount replaced. */
+  registrationCalls(): number {
+    return this.#registrationCalls
+  }
+
+  /** Registrations that landed while a name was ALREADY live (a leaked mount). */
+  duplicateRegistrations(): number {
+    return this.#duplicateRegistrations
+  }
+
+  /** Re-runs the LAST injection callback: a dependency re-injection. */
+  redeliverInjection(): void {
+    this.#lastInjectionCallback?.(this.#injectedContext())
+  }
+
+  /** Releases one recorded effect disposer (the last by default). */
+  releaseEffect(index = this.#effectDisposers.length - 1): void {
+    const [dispose] = this.#effectDisposers.splice(index, 1)
+    dispose?.()
+  }
+
   /** How many deferred injection callbacks are still pending. */
   injectionCount(): number {
     return this.#injectionCallbacks.length
@@ -162,7 +186,8 @@ export class FakeToolHost {
     this.injectKeyCalls.push(keys)
     if (this.#options.injectThrows === true) throw new Error('injection unavailable')
     if (this.#options.deferInjection === true) {
-      this.#injectionCallbacks.push(cb as (ctx: unknown) => void | (() => void))
+      this.#lastInjectionCallback = cb as (ctx: unknown) => void | (() => void)
+      this.#injectionCallbacks.push(this.#lastInjectionCallback)
       return () => {}
     }
     cb(this.#injectedContext() as T)
@@ -175,6 +200,8 @@ export class FakeToolHost {
       when?(context: { readonly agent: unknown; readonly signal?: AbortSignal }): boolean | Promise<boolean>
     },
   ): () => void {
+    this.#registrationCalls += 1
+    if (this.#names.has(definition.name)) this.#duplicateRegistrations += 1
     const when = options?.when
     if (when === undefined) this.#conditions.delete(definition.name)
     else this.#conditions.set(definition.name, when)

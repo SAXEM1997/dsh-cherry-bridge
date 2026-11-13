@@ -525,7 +525,9 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     await pending
 
     expect(state.judgement('a1')).toBeUndefined()
-    expect(state.workspaces()).toEqual([])
+    // The LIST is read, not derived from the document: it commits with the read
+    // and survives the save; only the judgement is discarded.
+    expect(state.workspaces().map((workspace) => workspace.id)).toEqual(['W'])
   })
 })
 

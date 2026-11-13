@@ -581,9 +581,12 @@ export class ToolScopeState {
     // R9: the items go to `setWorkspaces` AS-IS. A non-empty list whose items
     // are individually unusable is still an authoritative read — the stricter
     // alternative would answer 503 and refuse the very save that clears the ids
-    // this plugin itself just reported as stale. The commit is DEFERRED with
-    // the rest of the generation: a late round must not overwrite it.
-    const workspaces = listAvailable && listed !== undefined ? normalizeWorkspaceList(listed) : []
+    // this plugin itself just reported as stale. The LIST is committed HERE,
+    // synchronously with the read, so `GET /scope` never serves an empty list
+    // for the length of the round; only the derived maps/judgements wait for
+    // the generation check below.
+    this.setWorkspaces(listed)
+    const workspaces = this.#workspaces
 
     const pathMap = new Map<string, string>()
     const resolveByPath = registry.resolveByPath
@@ -639,8 +642,7 @@ export class ToolScopeState {
       return { listAvailable, agents: agents.length, resolved: 0, unresolved: 0, pathUnmatched: 0 }
     }
 
-    // One assignment: the generation switches whole.
-    this.setWorkspaces(listed)
+    // One assignment: the judgement generation switches whole.
     this.#pathMap = pathMap
     this.#judgements = judgements
     this.#pathUnmatched = pathUnmatched

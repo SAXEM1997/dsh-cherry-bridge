@@ -196,6 +196,9 @@ describe('mount: capability probe and the injection gate', () => {
     const fixture = makeFixture()
     const unmountFirst = fixture.mount()
     const unmountSecond = fixture.mount()
+    // A leaked first mount registers the same 14 names on top of live ones; the
+    // NAME set alone cannot see it, the duplicate counter can.
+    expect(fixture.fake.duplicateRegistrations()).toBe(0)
     expect(fixture.fake.registeredNames()).toHaveLength(14)
     expect(fixture.state.host()).toMatchObject({ state: 'ready', capable: true })
 
@@ -234,5 +237,22 @@ describe('mount: capability probe and the injection gate', () => {
     unmount()
     expect(fixture.fake.registeredNames()).toEqual([])
     expect(fixture.state.host()).toMatchObject({ state: 'pending', capable: false })
+  })
+
+  it('⑫ a re-injected effect run cannot unload the live family', () => {
+    const fixture = makeFixture({ deferInjection: true })
+    fixture.mount()
+    fixture.fake.deliverInjection(0)
+    expect(fixture.fake.registeredNames()).toHaveLength(14)
+
+    // The host re-runs the injection callback: a NEW effect run for the SAME
+    // mount. Its disposer must be inert, not the live family's teardown.
+    fixture.fake.redeliverInjection()
+    fixture.fake.releaseEffect()
+
+    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.state.host().state).toBe('ready')
+    fixture.fake.releaseEffect()
+    expect(fixture.fake.registeredNames()).toEqual([])
   })
 })
