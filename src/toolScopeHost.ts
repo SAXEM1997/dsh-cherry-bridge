@@ -347,9 +347,12 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     }
     // The judgement generation belongs to the mount that built it: after a
     // release, `visibleForAgent` must not answer from the previous mount's
-    // workspace list (the fail-closed direction).
-    scope.invalidateDerived()
-    if (current === state) current = undefined
+    // workspace list (the fail-closed direction). A STALE disposer must not
+    // wipe the generation a newer mount is already serving.
+    if (current === state) {
+      current = undefined
+      scope.invalidateDerived()
+    }
   }
 
   return {
