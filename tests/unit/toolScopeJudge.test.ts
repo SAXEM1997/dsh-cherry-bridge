@@ -684,7 +684,7 @@ describe('⑪ one bad item does not affect the others or any judgement (R9)', ()
       pathUnmatched: 1,
     })
     expect(first.log).toHaveBeenCalledTimes(1)
-    // Not a degradation: the five-value enum has no member for "one item's path
+    // Not a degradation: the three-value enum has no member for "one item's path
     // could not be resolved".
     expect(first.state.degraded()).toEqual([])
     expect(first.state.workspaces().map((workspace) => workspace.id)).toEqual(['A', 'B', 'C'])
@@ -723,10 +723,9 @@ describe('⑪ one bad item does not affect the others or any judgement (R9)', ()
  * `judgement()?.visible ?? false` hides the tool from every agent under `global`,
  * `?? true` leaks it under `selected`.
  *
- * Why it exists at all: on a host without `tools.restrict`, the scope subsystem
- * registers NOTHING (fail-closed) and therefore never installs a deny layer, so
- * without this predicate the delegation tool stayed visible in every workspace —
- * including the ones the operator excluded.
+ * Why it exists at all: the delegation tool is registered by the SUBAGENT
+ * subsystem, so without this predicate it would stay visible in every workspace
+ * — including the ones the operator excluded.
  */
 describe('⑫ the step-time visibility predicate is late-bound and per agent', () => {
   it('⑫a `global` keeps an agent with NO judgement visible — the fallback is not fail-closed there', () => {

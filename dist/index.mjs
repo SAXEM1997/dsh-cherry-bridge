@@ -1606,7 +1606,7 @@ function toScopeWorkspace(raw) {
 * the visibility layer, diagnostics, the settings page and the tests share.
 *
 * `global` is visible for any id — including `undefined`, which is why a
-* `global` document never installs a deny layer even when no judgement exists.
+* `global` document never denies an agent for lack of a judgement.
 * `selected` is fail-closed: a hit is visible, and a miss, `undefined`, or an
 * empty list is not. Both sides of the comparison are normalized through
 * {@link normalizeWorkspaceId} first; normalizing still unequal means "not a
@@ -1639,9 +1639,9 @@ function judged(doc, agent, status, workspaceId, reason) {
 }
 /**
 * A workspace as a `reason` fragment: the title when the registry supplied one,
-* and always the id. Task 5 writes this reason into the installed-layer record
-* and `guard` echoes it back, so it has to name a workspace a reader can resolve
-* — the tuple is what makes that true for a titleless item (B6).
+* and always the id. This reason travels to the settings page, so it has to name
+* a workspace a reader can resolve — the tuple is what makes that true for a
+* titleless item (B6).
 */
 function describeWorkspace(workspace) {
 	return workspace.title === "" ? `工作区 ${workspace.id}` : `工作区「${workspace.title}」(${workspace.id})`;
@@ -1996,16 +1996,16 @@ var ToolScopeState = class {
 	* which is the documented fail-closed reading — `global` answers `true` for
 	* any id including that one, `selected` answers `false`. That fallback is the
 	* whole reason this is a method instead of `judgement()?.visible`: an agent
-	* the cache has never seen is exactly the case a host without
-	* `tools.restrict` is stuck in, because its scope subsystem registers nothing
-	* and therefore never builds a generation.
+	* the cache has never seen is exactly the window before the first judgement
+	* lands, and that step must fail closed rather than throw.
 	*
 	* LATE-BOUND BY CONSTRUCTION: the caller captures the closure once, at
 	* assembly, and the host calls it per step. Nothing here is cached, so a
 	* config save or a `rebuild()` changes the answer for the very next step.
 	*
-	* ONE DELIBERATE DIVERGENCE from the layer install, which composes
-	* `judgement(agent.id) ?? resolveNow(agent)`: this reads the GENERATION ONLY.
+	* ONE DELIBERATE DIVERGENCE from the fourteen tools' condition, which
+	* composes `judgement(agent.id) ?? resolveNow(agent)`: this reads the
+	* GENERATION ONLY.
 	* So a brand-new agent in a permitted workspace answers `false` until the
 	* async round that judges it lands — the other fourteen tools are offered on
 	* its first step and this one is not. It self-heals on the next round, and it
@@ -2023,8 +2023,7 @@ var ToolScopeState = class {
 	* The same question answered with the AGENT in hand (#343) — the predicate the
 	* fourteen tools are registered with when the host supports step-time `when`.
 	*
-	* It composes the cached judgement with {@link resolveNow}, which is exactly
-	* what the layer-install window does; the difference is that `when` HAS the
+	* It composes the cached judgement with {@link resolveNow}: `when` HAS the
 	* agent (and therefore its `cwd`), so a brand-new agent is judged on its first
 	* step instead of waiting for the async generation. A genuinely unresolved
 	* `cwd` (only realpath can decide) still answers fail-closed until the next
@@ -2512,7 +2511,7 @@ function hostStateOr(raw) {
 	return raw === "ready" || raw === "unsupported" || raw === "pending" ? raw : "pending";
 }
 /**
-* The five degradation sources as a VALUE, and the reason the projection can
+* The three degradation sources as a VALUE, and the reason the projection can
 * reject a hand-stuffed one without a second list that could drift: `Record<
 * DegradedSource, true>` makes TypeScript refuse a missing member when the union
 * grows, which a plain array literal could not.
@@ -2522,7 +2521,7 @@ const DEGRADED_SOURCES = {
 	"scope-version": true,
 	"path-normalization": true
 };
-/** Narrows an unknown value to one of the closed five-source set. */
+/** Narrows an unknown value to one of the closed three-source set. */
 function isDegradedSource(value) {
 	return typeof value === "string" && Object.prototype.hasOwnProperty.call(DEGRADED_SOURCES, value);
 }
@@ -7871,10 +7870,9 @@ const CHERRY_TOOL_NAMES = [
 * switch is on — so folding it into the first list would make that bidirectional
 * assertion describe a registration that never happens.
 *
-* Scope hides and guards **by name**, not by ownership (`toolScopeHost`'s
-* `targetDeny` intersects this list with the registry's live `schemas()`, and
-* its dispatch guard rejects a listed name outright), so a tool registered
-* elsewhere in the assembly is still governed here. That is the whole reason
+* Scope governs **by name**, not by ownership: every family tool carries the
+* step-time condition, and a tool registered elsewhere in the assembly carries
+* its own over the same judgement — so it is still governed here. That is why
 * the delegation tool defaults to `cherry_subagent`: an operator who excludes a
 * workspace from the bridge is not offered a way around it by the experiment.
 *
@@ -13242,9 +13240,7 @@ function registerAtomically(ctx, register) {
 	} catch (error) {
 		for (const release of releases.splice(0)) try {
 			release();
-		} catch (releaseError) {
-			console.warn("[cherry-remote] 释放部分注册失败", releaseError);
-		}
+		} catch {}
 		throw error;
 	}
 }
@@ -13379,6 +13375,7 @@ function createToolScopeHost(deps) {
 		} catch (error) {
 			log("[cherry-remote] 释放 cherry_* 工具注册失败", error);
 		}
+		scope.invalidateDerived();
 		if (current === state) current = void 0;
 	}
 	return {

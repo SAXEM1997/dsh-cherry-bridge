@@ -1535,6 +1535,12 @@ describe('③ release configuration', () => {
     // bare `<0.3.0` would wave 0.3.0-rc.1 through. Widening either end is a
     // compat decision that must pass review, not an edit that slips in.
     expect(manifest.engines?.dsh).toBe('>=0.2.2-rc.1 <0.3.0-0')
+    // The lockfile carries its own copy of the root manifest; a `npm install`
+    // that is never re-run would otherwise leave it on the old floor.
+    const lock = JSON.parse(readFileSync(join(repoRoot, 'package-lock.json'), 'utf8')) as {
+      packages?: Record<string, { engines?: { dsh?: string } }>
+    }
+    expect(lock.packages?.['']?.engines?.dsh).toBe(manifest.engines?.dsh)
   })
 
   it('keeps `client` and `bundle` as BOTH keys of ONE dsh object', () => {

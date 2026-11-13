@@ -347,7 +347,7 @@ const zh: Dict = {
 /**
  * The English dictionary — written to the plugin's English voice: plain,
  * declarative, second-person imperative; no exclamation marks. Technical tokens
- * (`cherry_*`, `tools.guard`, `install`, `revision`, `cwd`, `DSH`,
+ * (`cherry_*`, `revision`, `cwd`, `DSH`,
  * `EventSource`, `Cherry Studio`, …) keep their exact spelling, and interpolated
  * DATA — file paths, workspace names, revision numbers, error codes — is passed
  * through untranslated because translating it would make it unverifiable.

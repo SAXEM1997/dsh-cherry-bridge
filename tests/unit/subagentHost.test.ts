@@ -701,13 +701,11 @@ describe('the model-facing tool is registered beside the provider (SUB-04/06)', 
 /**
  * ⑥ — the STEP-TIME activation condition (`ctx.tools.register(definition, { when })`).
  *
- * Why the tool needs one at all: the scope subsystem hides tools with
- * `tools.restrict`, but on a host that lacks `restrict` it registers NOTHING
- * (fail-closed) and therefore never installs a deny layer — so the delegation
- * tool stayed visible in every workspace, including the ones the operator
- * excluded. `when` is the one gate that does not depend on that capability: the
- * host consults it per step and drops the tool from both the declaration list
- * and dispatch.
+ * Why the tool needs one at all: the delegation tool is registered by the
+ * SUBAGENT subsystem, not by the shared family registration, so without its own
+ * condition it would stay visible in every workspace, including the ones the
+ * operator excluded. The host consults `when` per step and drops the tool from
+ * both the declaration list and dispatch.
  *
  * Three things about the host contract shape the code below, and each has its
  * own case because each is a way to get it wrong silently:
@@ -822,8 +820,8 @@ describe('the tool is gated per step by the scope judgement (SUB-04)', () => {
  *
  * The condition is only a leak fix on a host that HONOURS it. `ctx.tools.resolve`
  * is the resolver that evaluates the conditions, so it ships with the option and
- * not before — our own host snapshot for `0.2.0-rc.2` (the LOW end of the
- * advertised `dsh` range) records `register(definition): () => void` with no
+ * not before — our own host snapshot for `0.2.0-rc.2` (a host BELOW the
+ * advertised floor) records `register(definition): () => void` with no
  * options object at all.
  *
  * What makes this worth its own cases rather than a comment: such a host IGNORES

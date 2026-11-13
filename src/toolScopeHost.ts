@@ -137,10 +137,9 @@ export function registerAtomically(
     for (const release of releases.splice(0)) {
       try {
         release()
-      } catch (releaseError) {
+      } catch {
         // The original failure is the one worth reporting; a second throw from a
         // partial release must not replace it.
-        console.warn('[cherry-remote] 释放部分注册失败', releaseError)
       }
     }
     throw error
@@ -196,7 +195,6 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   const names: readonly string[] = deps.names
   const log = deps.log ?? ((message: string, error?: unknown) => console.warn(message, error))
 
-  let root: ScopeHostContext | undefined
   let staticCapable = false
   let mountTornDown = false
   /** The effect run currently holding the registration, if any. */
@@ -347,12 +345,15 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     } catch (error) {
       log('[cherry-remote] 释放 cherry_* 工具注册失败', error)
     }
+    // The judgement generation belongs to the mount that built it: after a
+    // release, `visibleForAgent` must not answer from the previous mount's
+    // workspace list (the fail-closed direction).
+    scope.invalidateDerived()
     if (current === state) current = undefined
   }
 
   return {
     mount(ctx: ScopeHostContext): () => void {
-      root = ctx
       mountTornDown = false
 
       const probed = probe(ctx.tools)

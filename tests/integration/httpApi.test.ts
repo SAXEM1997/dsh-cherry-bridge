@@ -2685,17 +2685,13 @@ describe('plugin assembly (index.ts apply)', () => {
      */
     injectedEffects: Array<() => void>
     /**
-     * The host's tool registry face, complete enough for the capability
-     * tri-state to reach `ready` (register + restrict + schemas) — without it
-     * the assembly's registration gate would be unsupported and every
-     * registration assertion would pass vacuously.
+     * The host's tool registry face: `register` alone. This fixture has no
+     * `resolve`, so the scope subsystem stays `unsupported` — the cases that
+     * need a READY host build their own.
      */
     tools: {
       definitions: Array<{ name: string; description: string }>
       register(definition: { name: string; description: string }): () => void
-      restrict(filter: { allow?: readonly string[]; deny?: readonly string[] }): () => void
-      guard(guard: (execution: { name: string; agent?: { id: string } }) => string | undefined): () => void
-      schemas(scope?: unknown): ReadonlyArray<{ name: string; description: string; parameters?: unknown }>
     }
     dataDir: string
     injectable: boolean
@@ -2733,15 +2729,6 @@ describe('plugin assembly (index.ts apply)', () => {
             const index = definitions.indexOf(definition)
             if (index >= 0) definitions.splice(index, 1)
           }
-        },
-        restrict() {
-          throw new Error('tools.restrict() requires a scoped context (agent.ctx)')
-        },
-        guard() {
-          return () => {}
-        },
-        schemas() {
-          return definitions.map((definition) => ({ ...definition }))
         },
       },
       dataDir,

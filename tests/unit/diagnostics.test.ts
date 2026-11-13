@@ -290,7 +290,7 @@ describe('Task 9③: the scope segment is a whitelist, and `cwd` is passed throu
   const LONG_CWD = `/${'deeply/nested/'.repeat(30)}project`
 
   /**
-   * A `source` OUTSIDE the closed five-value set, beside the reasons it must not
+   * A `source` OUTSIDE the closed three-value set, beside the reasons it must not
    * leak. The input is a loose bag (`sanitizeDiagnostics` takes `scope: unknown`
    * on purpose), so an unknown source is a real arrival — a peer or a plugin
    * version on the other side of the wire, a hand-assembled report — and
