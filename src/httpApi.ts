@@ -1313,7 +1313,7 @@ function scopeProjection(
 }
 
 /**
- * `PUT /cherry-remote/api/scope`: validate and commit, then refresh.
+ * `PUT /cherry-remote/api/scope`: validate and commit, then recompute.
  *
  * The shape exists for the ONE await-free critical section at its end. `save()`
  * validates the base revision, prunes, bumps the revision by exactly one, writes
@@ -1322,7 +1322,7 @@ function scopeProjection(
  * between the two would let two concurrent saves both pass the revision check,
  * after which the later write silently overwrites the earlier one.
  *
- * The refresh is NOT awaited and its summary is NOT published (R24): that
+ * The recompute is NOT awaited and its summary is NOT published (R24): that
  * summary describes the synchronous pass the call itself ran, while convergence
  * — the recompute round it triggers plus the catch-up pass the coalescing gate
  * owes it — rides behind the response. What the caller gets back is the

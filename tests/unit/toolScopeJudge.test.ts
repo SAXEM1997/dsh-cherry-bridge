@@ -293,26 +293,6 @@ describe('③ the old host without resolveByPath degrades honestly (D14)', () =>
       { agentId: 'case', cwd: '/W/REAL' },
     ])
   })
-
-  it('⑪b pathUnmatched hands out a copy, like workspaces() and host()', async () => {
-    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
-    await state.rebuild(
-      registryFixture(
-        [{ id: 'W', title: 'Work', path: '/w/real' }],
-        { '/w/real': { id: 'W', path: '/w/real' }, '/w/elsewhere': undefined },
-      ),
-      [{ id: 'agent-x', cwd: '/w/elsewhere' }],
-    )
-
-    const first = state.pathUnmatched()
-    expect(first).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
-    // Every other synchronous read copies (`workspaces()`, `host()`); this one
-    // feeds the HTTP body and the settings panel, and a caller that sorts or
-    // truncates what it was handed must not reorder the state's own array
-    // behind the other readers.
-    ;(first as Array<{ agentId: string; cwd: string }>).length = 0
-    expect(state.pathUnmatched()).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
-  })
 })
 
 describe('④ the four resolution states, and `visible` from `isVisible` alone', () => {
@@ -513,8 +493,9 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     expect(state.judgement('a1')).toBeUndefined()
     // The LIST is part of the same generation; a late round must not restore it.
     expect(state.workspaces()).toEqual([])
-    // "Discarded" is its own answer: every counter is 0 because nothing
-    // committed, not because everything failed to resolve (#356).
+    // "Discarded" is its own answer: every OUTCOME counter is 0 because
+    // nothing committed, not because everything failed to resolve (#356).
+    // `agents` still reports what the round read.
     expect(summary.discarded).toBe(true)
   })
 
@@ -833,6 +814,26 @@ describe('⑪ one bad item does not affect the others or any judgement (R9)', ()
     }
     expect(first.state.pathUnmatched()).toEqual(second.state.pathUnmatched())
   })
+
+  it('⑪b pathUnmatched hands out a copy, like workspaces() and host()', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(
+      registryFixture(
+        [{ id: 'W', title: 'Work', path: '/w/real' }],
+        { '/w/real': { id: 'W', path: '/w/real' }, '/w/elsewhere': undefined },
+      ),
+      [{ id: 'agent-x', cwd: '/w/elsewhere' }],
+    )
+
+    const first = state.pathUnmatched()
+    expect(first).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
+    // Every other synchronous read copies (`workspaces()`, `host()`); this one
+    // feeds the HTTP body and the settings panel, and a caller that sorts or
+    // truncates what it was handed must not reorder the state's own array
+    // behind the other readers.
+    ;(first as Array<{ agentId: string; cwd: string }>).length = 0
+    expect(state.pathUnmatched()).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
+  })
 })
 
 /**
@@ -900,8 +901,8 @@ describe('⑫ the step-time visibility predicate is late-bound and per agent', (
   })
 })
 
-describe('⑫ the two entries share their rules (#356)', () => {
-  it('⑫b both entries answer rule one and no-cwd with the SAME bytes', async () => {
+describe('⑬ the two entries share their rules (#356)', () => {
+  it('⑬a both entries answer rule one and no-cwd with the SAME bytes', async () => {
     const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
     await state.rebuild(
       registryFixture(
@@ -921,5 +922,27 @@ describe('⑫ the two entries share their rules (#356)', () => {
       expect(window.reason).toBe(committed.reason)
       expect(window.visible).toBe(committed.visible)
     }
+  })
+
+  it('⑬b the synchronous window is a READ: it never adds a path-mismatch record', async () => {
+    // The two entries share their rules but not their side effects: only the
+    // async round records a resolved-but-unowned cwd as a diagnostic (§6.1).
+    // If `resolveNow` ever grew that write, the next `GET /scope` would report
+    // a mismatch the operator's save never produced.
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(
+      registryFixture(
+        [{ id: 'W', title: 'Work', path: '/w/real' }],
+        { '/w/real': { id: 'W', path: '/w/real' }, '/w/elsewhere': undefined },
+      ),
+      [{ id: 'agent-x', cwd: '/w/elsewhere' }],
+    )
+    const before = state.pathUnmatched()
+
+    for (let round = 0; round < 3; round += 1) {
+      expect(state.resolveNow({ id: 'agent-x', cwd: '/w/elsewhere' })?.status).toBe('no-match')
+    }
+
+    expect(state.pathUnmatched()).toEqual(before)
   })
 })
