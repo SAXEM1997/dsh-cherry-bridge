@@ -28,6 +28,8 @@ const PENDING_REASON = '等待宿主注入 agents / workspaceRegistry'
 
 /** `ready` for the step-time path: `register` + `resolve` are the whole contract. */
 const WHEN_READY_REASON = '宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性'
+/** Reported after a released mount: neutral, never a stale `ready`. */
+const RELEASED_REASON = '作用域挂载已释放'
 
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS: readonly string[] = ['agents', 'workspaceRegistry']
@@ -196,7 +198,9 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
   const log = deps.log ?? ((message: string, error?: unknown) => console.warn(message, error))
 
   let staticCapable = false
-  let mountTornDown = false
+  /** Increments per `mount()` and per call of its disposer: callbacks from an
+   *  older mount (a late injection, a stale disposer) must be inert. */
+  let mountGeneration = 0
   /** The effect run currently holding the registration, if any. */
   let current: EffectState | undefined
 
@@ -272,10 +276,13 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
    * improve the answer — the gate itself reads `judgement ?? resolveNow(agent)`
    * synchronously and fails closed.
    */
-  function setupWhen(agentCtx: ScopeInjectedContext): () => void {
+  function setupWhen(agentCtx: ScopeInjectedContext, mountId: number): () => void {
     // A late arrival on an unsupported host must not promote it: the static
-    // failure was decided at mount time and wins (B7①).
-    if (!staticCapable || mountTornDown) return () => {}
+    // failure was decided at mount time and wins (B7①). A callback from an
+    // older mount must not take `current` either.
+    if (!staticCapable || mountId !== mountGeneration) return () => {}
+    // Re-entry for the SAME mount is idempotent: registrations are already live.
+    if (current !== undefined && !current.tornDown) return current.teardown
     scope.setHost({ state: 'ready', capable: true, reason: WHEN_READY_REASON })
     const state: EffectState = {
       tornDown: false,
@@ -329,7 +336,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
 
   function refresh(): void {
     const state = current
-    if (state === undefined || state.tornDown || mountTornDown || !staticCapable) return
+    if (state === undefined || state.tornDown || !staticCapable) return
     // Nothing to install: the next step's condition reads the saved document.
     // The async generation only refines realpath judgements and the report.
     rebuildJudgements(state)
@@ -352,13 +359,18 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     if (current === state) {
       current = undefined
       scope.invalidateDerived()
+      // A released mount must not keep reporting the old `ready`: the next
+      // reader sees the neutral, registration-free state.
+      scope.setHost({ state: 'pending', capable: false, reason: RELEASED_REASON })
     }
   }
 
   return {
     mount(ctx: ScopeHostContext): () => void {
-      mountTornDown = false
-
+      const mountId = ++mountGeneration
+      // A second mount replaces the first: its registrations and callbacks
+      // belong to the old token and are released before the new probe.
+      current?.teardown()
       const probed = probe(ctx.tools)
       staticCapable = probed.capable
       if (!staticCapable) {
@@ -373,9 +385,13 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
 
       try {
         ctx.inject?.(INJECT_KEYS, (agentCtx: ScopeInjectedContext) => {
+          if (mountId !== mountGeneration) return
           // The fibre handle is ignored on purpose; `mount()`'s disposer is the
           // only release path this subsystem owns.
-          agentCtx.effect?.(() => setupWhen(agentCtx), EFFECT_LABEL)
+          agentCtx.effect?.(() => {
+            if (mountId !== mountGeneration) return () => {}
+            return setupWhen(agentCtx, mountId)
+          }, EFFECT_LABEL)
         })
       } catch (error) {
         // 宿主服务未就绪: `mount()` must stay alive (the HTTP half still has to
@@ -385,9 +401,11 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       }
 
       return () => {
-        mountTornDown = true
-        const teardown = current?.teardown
-        teardown?.()
+        // Identity first: a disposer from an older mount must not tear down the
+        // live one, and bumping the token makes any late callback inert.
+        if (mountId !== mountGeneration) return
+        mountGeneration += 1
+        current?.teardown()
       }
     },
 

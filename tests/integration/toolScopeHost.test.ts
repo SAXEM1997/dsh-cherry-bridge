@@ -191,4 +191,48 @@ describe('mount: capability probe and the injection gate', () => {
 
     expect(fixture.state.judgement('agent-a')).toBeUndefined()
   })
+
+  it('⑨ a second mount replaces the first, and the first disposer is inert', () => {
+    const fixture = makeFixture()
+    const unmountFirst = fixture.mount()
+    const unmountSecond = fixture.mount()
+    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.state.host()).toMatchObject({ state: 'ready', capable: true })
+
+    unmountFirst()
+    // The stale disposer must not touch the generation mount #2 is serving.
+    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.state.host().state).toBe('ready')
+
+    unmountSecond()
+    expect(fixture.fake.registeredNames()).toEqual([])
+    expect(fixture.state.host()).toMatchObject({ state: 'pending', capable: false })
+  })
+
+  it('⑩ a late callback from an unmounted mount cannot take the live one', () => {
+    const fixture = makeFixture({ deferInjection: true })
+    const unmountFirst = fixture.mount()
+    unmountFirst()
+    const unmountSecond = fixture.mount()
+    expect(fixture.fake.injectionCount()).toBe(2)
+
+    // The FIRST mount's callback arrives late: it must be inert.
+    fixture.fake.deliverInjection(0)
+    expect(fixture.fake.registeredNames()).toEqual([])
+    expect(fixture.state.host().state).toBe('pending')
+
+    fixture.fake.deliverInjection(0)
+    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.state.host().state).toBe('ready')
+    unmountSecond()
+  })
+
+  it('⑪ a released ready mount reports pending, not a stale ready', () => {
+    const fixture = makeFixture()
+    const unmount = fixture.mount()
+    expect(fixture.state.host().state).toBe('ready')
+    unmount()
+    expect(fixture.fake.registeredNames()).toEqual([])
+    expect(fixture.state.host()).toMatchObject({ state: 'pending', capable: false })
+  })
 })

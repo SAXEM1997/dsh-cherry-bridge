@@ -471,6 +471,43 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
       { ok: true, pruned: [] },
     )
   })
+
+  it('⑦b a round that lands after invalidateDerived is discarded whole', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    const gate = deferred<void>()
+    const pending = state.rebuild(
+      gatedRegistry([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }, gate.promise),
+      [{ id: 'a1', cwd: '/w' }],
+    )
+    state.invalidateDerived()
+    gate.resolve()
+    const summary = await pending
+
+    expect(state.judgement('a1')).toBeUndefined()
+    // The LIST is part of the same generation; a late round must not restore it.
+    expect(state.workspaces()).toEqual([])
+    expect(summary.resolved).toBe(0)
+  })
+
+  it('⑦c an OLDER overlapping round cannot overwrite the newer one', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    const gate = deferred<void>()
+    const first = state.rebuild(
+      gatedRegistry([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }, gate.promise),
+      [{ id: 'a1', cwd: '/w' }],
+    )
+    const second = state.rebuild(
+      registryFixture([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }),
+      [{ id: 'a1', cwd: '/w' }],
+    )
+    await second
+    expect(state.judgement('a1')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
+
+    gate.resolve()
+    await first
+    expect(state.judgement('a1')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
+    expect(state.workspaces()).toHaveLength(1)
+  })
 })
 
 describe('⑧⑨ the list is unreadable: fail-closed for selected, never for global (B16)', () => {
@@ -495,7 +532,7 @@ describe('⑧⑨ the list is unreadable: fail-closed for selected, never for glo
       pathUnmatched: 0,
     })
     expect(sourcesOf(state)).toContain('workspace-list')
-    // "This resolution failed" is exactly the state D14's bounded recheck starts from.
+    // "This resolution failed" is exactly the state the next round retries.
     expect(state.judgement('with-cwd')).toMatchObject({ status: 'unresolved', visible: false })
     // No cwd is not a resolution failure: it stays `no-cwd` (and never rechecks).
     expect(state.judgement('no-cwd')).toMatchObject({ status: 'no-cwd', visible: false })

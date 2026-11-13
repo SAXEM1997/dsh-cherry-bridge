@@ -109,8 +109,8 @@ export interface ScopeHostState {
 /**
  * The four resolution states of one session → workspace judgement (§6.1/D14):
  * a canonical-path hit, a failed resolution (registry not ready, a directory
- * that is momentarily unreachable, a realpath failure — the ONLY state D14's
- * bounded recheck starts from), a session header without a `cwd`, and a
+ * that is momentarily unreachable, a realpath failure — the state the next
+ * `rebuild()` retries), a session header without a `cwd`, and a
  * resolution that succeeded but belongs to no registered workspace.
  */
 export type ResolutionStatus = 'resolved' | 'unresolved' | 'no-cwd' | 'no-match'
@@ -201,6 +201,13 @@ export function toScopeWorkspace(raw: unknown): ScopeWorkspace | undefined {
     path,
     sessionIds: Array.isArray(raw.sessionIds) ? raw.sessionIds.map((value) => String(value)) : [],
   }
+}
+
+/** The normalized form `setWorkspaces` stores, computed without mutating state. */
+function normalizeWorkspaceList(list: readonly unknown[]): ScopeWorkspace[] {
+  return list
+    .map((raw) => toScopeWorkspace(raw))
+    .filter((workspace): workspace is ScopeWorkspace => workspace !== undefined)
 }
 
 /**
@@ -412,6 +419,12 @@ export class ToolScopeState {
   readonly #log: ((message: string, error?: unknown) => void) | undefined
 
   #loaded = false
+  /**
+   * Bumped by every round START and by every writer that voids derived state
+   * (`save`, `invalidateDerived`). A round commits only while its token still
+   * matches: a late round must not restore a previous mount's judgements.
+   */
+  #generation = 0
   #doc: ScopeDoc = strictScope()
   /** Set when the on-disk document declared a version this build cannot use. */
   #versionUnsupported = false
@@ -503,9 +516,7 @@ export class ToolScopeState {
     // a note outliving its read failure would keep Task 8's save button
     // disabled while `save()` itself would accept the very same PUT.
     this.#clearDegraded('workspace-list')
-    this.#workspaces = list
-      .map((raw) => toScopeWorkspace(raw))
-      .filter((workspace): workspace is ScopeWorkspace => workspace !== undefined)
+    this.#workspaces = normalizeWorkspaceList(list)
   }
 
   /**
@@ -550,6 +561,7 @@ export class ToolScopeState {
     agents: readonly ScopeAgentLike[],
   ): Promise<RebuildSummary> {
     this.#ensureLoaded()
+    const generation = ++this.#generation
     // One document and one list per generation: an interleaved save or list
     // write must not be able to judge two agents of the same round differently.
     const doc = this.#doc
@@ -569,9 +581,9 @@ export class ToolScopeState {
     // R9: the items go to `setWorkspaces` AS-IS. A non-empty list whose items
     // are individually unusable is still an authoritative read — the stricter
     // alternative would answer 503 and refuse the very save that clears the ids
-    // this plugin itself just reported as stale.
-    this.setWorkspaces(listed)
-    const workspaces = this.#workspaces
+    // this plugin itself just reported as stale. The commit is DEFERRED with
+    // the rest of the generation: a late round must not overwrite it.
+    const workspaces = listAvailable && listed !== undefined ? normalizeWorkspaceList(listed) : []
 
     const pathMap = new Map<string, string>()
     const resolveByPath = registry.resolveByPath
@@ -615,13 +627,20 @@ export class ToolScopeState {
       const judgement = await this.#judge(doc, workspaces, agent, registry, pathMap, listAvailable)
       judgements.set(agent.id, judgement)
       // §6.1: a resolved cwd that belongs to no workspace is DIAGNOSTIC, never a
-      // degradation — and it is one of the two states D14 refuses to recheck.
+      // degradation — and it is one of the two states the next round re-resolves.
       if (judgement.status === 'no-match' && judgement.cwd !== undefined) {
         pathUnmatched.push({ agentId: judgement.agentId, cwd: judgement.cwd })
       }
     }
 
+    // A round that lost the race is DISCARDED whole: no list, no map, no
+    // judgements. The newer round (or `invalidateDerived`) owns the state.
+    if (generation !== this.#generation) {
+      return { listAvailable, agents: agents.length, resolved: 0, unresolved: 0, pathUnmatched: 0 }
+    }
+
     // One assignment: the generation switches whole.
+    this.setWorkspaces(listed)
     this.#pathMap = pathMap
     this.#judgements = judgements
     this.#pathUnmatched = pathUnmatched
@@ -730,7 +749,7 @@ export class ToolScopeState {
         agent,
         'no-cwd',
         undefined,
-        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）',
+        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）',
       )
     }
 
@@ -842,6 +861,8 @@ export class ToolScopeState {
 
     writeFileAtomicSync(this.#file, serializeScope(doc))
     this.#doc = doc
+    // A round that read the OLD document must not commit its judgements.
+    this.#generation += 1
     return { ok: true, doc, pruned }
   }
 
@@ -866,6 +887,7 @@ export class ToolScopeState {
    * `[]` for the same reason.
    */
   invalidateDerived(): void {
+    this.#generation += 1
     this.#pathMap = new Map()
     this.#judgements = new Map()
     this.#pathUnmatched = []
@@ -903,19 +925,19 @@ export class ToolScopeState {
         agent,
         'no-cwd',
         undefined,
-        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）',
+        '会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）',
       )
     }
 
     if (!listAvailable) {
       // ⑧/B16: "the list could not be read" is "this resolution failed" — the
-      // state D14's bounded recheck is defined to start from.
+      // state the next round starts from.
       return judged(
         doc,
         agent,
         'unresolved',
         undefined,
-        `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（D14 的有界复检只对该状态启动）`,
+        `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（下一次 rebuild 会重新解析）`,
       )
     }
 
@@ -939,7 +961,7 @@ export class ToolScopeState {
       entity = await resolveByPath.call(registry, agent.cwd)
     } catch (error) {
       this.#warn(
-        `cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（D14 的有界复检只对该状态启动）`,
+        `cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`,
         error,
       )
       return judged(

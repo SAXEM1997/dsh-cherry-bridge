@@ -1601,6 +1601,10 @@ function toScopeWorkspace(raw) {
 		sessionIds: Array.isArray(raw.sessionIds) ? raw.sessionIds.map((value) => String(value)) : []
 	};
 }
+/** The normalized form `setWorkspaces` stores, computed without mutating state. */
+function normalizeWorkspaceList(list) {
+	return list.map((raw) => toScopeWorkspace(raw)).filter((workspace) => workspace !== void 0);
+}
 /**
 * The visibility strictness order (B9), and the single implementation of it that
 * the visibility layer, diagnostics, the settings page and the tests share.
@@ -1806,6 +1810,12 @@ var ToolScopeState = class {
 	#file;
 	#log;
 	#loaded = false;
+	/**
+	* Bumped by every round START and by every writer that voids derived state
+	* (`save`, `invalidateDerived`). A round commits only while its token still
+	* matches: a late round must not restore a previous mount's judgements.
+	*/
+	#generation = 0;
 	#doc = strictScope();
 	/** Set when the on-disk document declared a version this build cannot use. */
 	#versionUnsupported = false;
@@ -1879,7 +1889,7 @@ var ToolScopeState = class {
 		}
 		this.#listState = "read";
 		this.#clearDegraded("workspace-list");
-		this.#workspaces = list.map((raw) => toScopeWorkspace(raw)).filter((workspace) => workspace !== void 0);
+		this.#workspaces = normalizeWorkspaceList(list);
 	}
 	/**
 	* The normalized registry list; `[]` for both 未读 and 读失败.
@@ -1921,6 +1931,7 @@ var ToolScopeState = class {
 	*/
 	async rebuild(registry, agents) {
 		this.#ensureLoaded();
+		const generation = ++this.#generation;
 		const doc = this.#doc;
 		let listed;
 		let listAvailable = false;
@@ -1933,8 +1944,7 @@ var ToolScopeState = class {
 		} catch (error) {
 			this.#warn("工作区注册表 list() 抛出，按 B16 视为列表不可用（判定 fail-closed，写侧拒绝）", error);
 		}
-		this.setWorkspaces(listed);
-		const workspaces = this.#workspaces;
+		const workspaces = listAvailable && listed !== void 0 ? normalizeWorkspaceList(listed) : [];
 		const pathMap = /* @__PURE__ */ new Map();
 		const resolveByPath = registry.resolveByPath;
 		if (typeof resolveByPath === "function") for (const workspace of workspaces) {
@@ -1966,6 +1976,14 @@ var ToolScopeState = class {
 				cwd: judgement.cwd
 			});
 		}
+		if (generation !== this.#generation) return {
+			listAvailable,
+			agents: agents.length,
+			resolved: 0,
+			unresolved: 0,
+			pathUnmatched: 0
+		};
+		this.setWorkspaces(listed);
 		this.#pathMap = pathMap;
 		this.#judgements = judgements;
 		this.#pathUnmatched = pathUnmatched;
@@ -2054,7 +2072,7 @@ var ToolScopeState = class {
 		const doc = this.#doc;
 		const member = this.#workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
 		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
-		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）");
+		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）");
 		const workspaceId = this.#pathMap.get(agent.cwd);
 		return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 在本窗口的规范路径表里没有匹配项（本窗口可能尚无路径表——invalidateDerived() 之后它是空的，重建期间它还是上一代的——也无法 await resolveByPath 的 realpath；异步轮次会给出权威判定）`) : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(this.#workspaces, workspaceId)}`);
 	}
@@ -2130,6 +2148,7 @@ var ToolScopeState = class {
 		});
 		writeFileAtomicSync(this.#file, serializeScope(doc));
 		this.#doc = doc;
+		this.#generation += 1;
 		return {
 			ok: true,
 			doc,
@@ -2157,6 +2176,7 @@ var ToolScopeState = class {
 	* `[]` for the same reason.
 	*/
 	invalidateDerived() {
+		this.#generation += 1;
 		this.#pathMap = /* @__PURE__ */ new Map();
 		this.#judgements = /* @__PURE__ */ new Map();
 		this.#pathUnmatched = [];
@@ -2175,8 +2195,8 @@ var ToolScopeState = class {
 	async #judge(doc, workspaces, agent, registry, pathMap, listAvailable) {
 		const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
 		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
-		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；该状态不启动复检）");
-		if (!listAvailable) return judged(doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（D14 的有界复检只对该状态启动）`);
+		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）");
+		if (!listAvailable) return judged(doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（下一次 rebuild 会重新解析）`);
 		const resolveByPath = registry.resolveByPath;
 		if (typeof resolveByPath !== "function") {
 			const workspaceId = pathMap.get(agent.cwd);
@@ -2186,7 +2206,7 @@ var ToolScopeState = class {
 		try {
 			entity = await resolveByPath.call(registry, agent.cwd);
 		} catch (error) {
-			this.#warn(`cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（D14 的有界复检只对该状态启动）`, error);
+			this.#warn(`cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`, error);
 			return judged(doc, agent, "unresolved", void 0, `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
 		}
 		if (entity === void 0) return judged(doc, agent, "no-match", void 0, `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
@@ -13208,6 +13228,8 @@ const EFFECT_LABEL = "cherry-remote.tool-scope()";
 const PENDING_REASON = "等待宿主注入 agents / workspaceRegistry";
 /** `ready` for the step-time path: `register` + `resolve` are the whole contract. */
 const WHEN_READY_REASON = "宿主支持步骤级 when（tools.resolve）；按每个模型步骤判定可见性";
+/** Reported after a released mount: neutral, never a stale `ready`. */
+const RELEASED_REASON = "作用域挂载已释放";
 /** The two dependency keys this subsystem gates on. They enter ONE `inject` call. */
 const INJECT_KEYS = ["agents", "workspaceRegistry"];
 /**
@@ -13252,7 +13274,9 @@ function createToolScopeHost(deps) {
 	const names = deps.names;
 	const log = deps.log ?? ((message, error) => console.warn(message, error));
 	let staticCapable = false;
-	let mountTornDown = false;
+	/** Increments per `mount()` and per call of its disposer: callbacks from an
+	*  older mount (a late injection, a stale disposer) must be inert. */
+	let mountGeneration = 0;
 	/** The effect run currently holding the registration, if any. */
 	let current;
 	function probe(tools) {
@@ -13310,8 +13334,9 @@ function createToolScopeHost(deps) {
 	* improve the answer — the gate itself reads `judgement ?? resolveNow(agent)`
 	* synchronously and fails closed.
 	*/
-	function setupWhen(agentCtx) {
-		if (!staticCapable || mountTornDown) return () => {};
+	function setupWhen(agentCtx, mountId) {
+		if (!staticCapable || mountId !== mountGeneration) return () => {};
+		if (current !== void 0 && !current.tornDown) return current.teardown;
 		scope.setHost({
 			state: "ready",
 			capable: true,
@@ -13362,7 +13387,7 @@ function createToolScopeHost(deps) {
 	}
 	function refresh() {
 		const state = current;
-		if (state === void 0 || state.tornDown || mountTornDown || !staticCapable) return;
+		if (state === void 0 || state.tornDown || !staticCapable) return;
 		rebuildJudgements(state);
 	}
 	function teardownEffect(state) {
@@ -13378,11 +13403,17 @@ function createToolScopeHost(deps) {
 		if (current === state) {
 			current = void 0;
 			scope.invalidateDerived();
+			scope.setHost({
+				state: "pending",
+				capable: false,
+				reason: RELEASED_REASON
+			});
 		}
 	}
 	return {
 		mount(ctx) {
-			mountTornDown = false;
+			const mountId = ++mountGeneration;
+			current?.teardown();
 			const probed = probe(ctx.tools);
 			staticCapable = probed.capable;
 			if (!staticCapable) {
@@ -13399,7 +13430,11 @@ function createToolScopeHost(deps) {
 			});
 			try {
 				ctx.inject?.(INJECT_KEYS, (agentCtx) => {
-					agentCtx.effect?.(() => setupWhen(agentCtx), EFFECT_LABEL);
+					if (mountId !== mountGeneration) return;
+					agentCtx.effect?.(() => {
+						if (mountId !== mountGeneration) return () => {};
+						return setupWhen(agentCtx, mountId);
+					}, EFFECT_LABEL);
 				});
 			} catch (error) {
 				log("[cherry-remote] agents / workspaceRegistry 注入不可用；作用域子系统保持 pending", error);
@@ -13410,9 +13445,9 @@ function createToolScopeHost(deps) {
 				});
 			}
 			return () => {
-				mountTornDown = true;
-				const teardown = current?.teardown;
-				teardown?.();
+				if (mountId !== mountGeneration) return;
+				mountGeneration += 1;
+				current?.teardown();
 			};
 		},
 		refresh,
