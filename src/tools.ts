@@ -2764,9 +2764,9 @@ export class CherryToolEngine {
    * CONNECTION, not the device id (#367). Text because the decode belongs
    * inside the gate's slot — see {@link CherryToolEngine.#walkExternalized} —
    * and because a string is immutable, so a joiner cannot alter what another
-   * caller is about to read. The connection because a PATCH or a forget EVICTS
-   * the pooled one: a walk on the old socket must not answer a caller that is
-   * dialing the new one.
+   * caller is about to read. The connection because a PATCH that changes the
+   * address or `enabled` — and a forget or a remember — EVICTS the pooled one:
+   * a walk on the old socket must not answer a caller dialing the new one.
    */
   readonly #contentWalks = new WeakMap<DeviceConnection, Map<string, Promise<string>>>()
   /**
@@ -4870,16 +4870,16 @@ export class CherryToolEngine {
    * Paginate `agent.content.read` over one `{ref}`, verify its sha256, and
    * decode the certified bytes as legal UTF-8.
    *
-   * The decode is the TEXT face's rule, not the walk's: a digest certifies
-   * bytes, not text, and a lenient decode would rewrite every illegal sequence
-   * to U+FFFD and hand the model substitution characters as though they were
-   * the part's content. So it is FATAL — content that is not legal UTF-8 fails
-   * like any other unreadable content (degradable, per part) rather than being
-   * silently mangled. The decoder also applies the standard encoding rule of
-   * DROPPING a leading U+FEFF — what the official reducer's decode does too,
-   * and what keeps an invisible zero-width character out of the model's
-   * context. The image face (#307) deliberately stops at the bytes and never
-   * reaches this decode.
+   * The decode is the TEXT face's rule, and it runs INSIDE the gated walk
+   * (#367): a digest certifies bytes, not text, and a lenient decode would
+   * rewrite every illegal sequence to U+FFFD and hand the model substitution
+   * characters as though they were the part's content. So it is FATAL — content
+   * that is not legal UTF-8 fails like any other unreadable content
+   * (degradable, per part) rather than being silently mangled. The decoder also
+   * applies the standard encoding rule of DROPPING a leading U+FEFF — what the
+   * official reducer's decode does too, and what keeps an invisible zero-width
+   * character out of the model's context. The image face (#307) deliberately
+   * stops at the bytes and never reaches this decode.
    */
   async #readExternalized(
     connection: DeviceConnection,

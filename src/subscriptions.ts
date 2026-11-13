@@ -707,7 +707,7 @@ export class SessionSubscriptions {
         await this.#enforceLimitFor(sessionId)
         const descriptor = await this.#subscribe(sessionId, fromCursor)
         if (descriptor.mode === 'replay') {
-          this.#installReplay(sessionId, descriptor)
+          await this.#activateReplay(sessionId, descriptor, attemptsLeft)
           return
         }
         await this.#runCheckpointChain(sessionId, descriptor, attemptsLeft)
@@ -771,9 +771,58 @@ export class SessionSubscriptions {
   }
 
   /**
-   * Installs a replay subscription: the peer will push events after the
-   * requested cursor, so the buffer starts empty and the cursor is the
-   * high-watermark the peer confirmed.
+   * Commits a replay subscription, then installs it (#369).
+   *
+   * `agent.sessions.subscribe` answers `prepared` in BOTH modes: until
+   * `agent.subscriptions.activate` commits a cursor, the peer's pump sends
+   * nothing at all. And `activate` accepts only the cursor that was REQUESTED
+   * (`appliedCursor.seq === subscription.cursorSeq`), which is where the caller
+   * is — not the descriptor's `highWatermark`, which is where the PEER is.
+   *
+   * So the subscription resumes at `fromCursor`, and the suffix the peer then
+   * pumps (`eventsAfter(fromCursor)`) passes the seq gate. Installing the high
+   * watermark instead — which this did until #369 — both left the subscription
+   * unactivated and put the gate above the whole suffix, so a replay delivered
+   * nothing and a wait's recovery timed out for a run that had settled.
+   *
+   * A suffix the peer no longer retains (`RESET_REQUIRED`) or a lapsed lease
+   * (`CHECKPOINT_EXPIRED`) means no replay is possible: the prepared
+   * subscription is closed and the chain re-runs CURSORLESS, which is the
+   * checkpoint path that rebuilds the view from a projection. Every other
+   * refusal is surfaced.
+   */
+  async #activateReplay(
+    sessionId: string,
+    descriptor: Extract<SubscribeDescriptor, { mode: 'replay' }>,
+    attemptsLeft: number,
+  ): Promise<void> {
+    try {
+      await this.#rpc.request('agent.subscriptions.activate', {
+        subscriptionId: descriptor.subscriptionId,
+        // The cursor the CALLER holds — the one the subscribe request carried.
+        appliedCursor: descriptor.fromCursor,
+      })
+    } catch (error) {
+      // The peer keeps a prepared subscription on its books until the lease
+      // lapses, and it refuses a second one for the same session, so the dead
+      // attempt is released before anything else is tried.
+      await this.#closeSubscription(descriptor.subscriptionId)
+      const reason = failureReason(error)
+      const unreplayable = reason === 'RESET_REQUIRED' || reason === 'CHECKPOINT_EXPIRED'
+      if (!unreplayable || attemptsLeft <= 1) throw error
+      // The suffix is gone: only a fresh projection can still answer. Re-enter
+      // the TOP-level chain so the retry pays the same cap/resource handling as
+      // a first subscription, spending one shared attempt.
+      await this.#subscribeChain(sessionId, undefined, attemptsLeft - 1)
+      return
+    }
+    this.#installReplay(sessionId, descriptor)
+  }
+
+  /**
+   * Installs an ACTIVATED replay subscription: the peer pumps events after the
+   * cursor the caller applied, so the buffer starts empty and the session's
+   * cursor is that applied position.
    */
   #installReplay(sessionId: string, descriptor: Extract<SubscribeDescriptor, { mode: 'replay' }>): void {
     const previous = this.#sessions.get(sessionId)
@@ -785,7 +834,7 @@ export class SessionSubscriptions {
     // Re-inserting moves the session to the MRU end of the Map's order.
     this.#sessions.set(sessionId, {
       subscriptionId: descriptor.subscriptionId,
-      cursor: descriptor.highWatermark,
+      cursor: descriptor.fromCursor,
       buffer: [],
       bytes: 0,
       bytesSinceAck: 0,
@@ -797,7 +846,7 @@ export class SessionSubscriptions {
       ackRetryAt: 0,
       ackRetryDelay: AUTO_ACK_RETRY_MS,
       ackRetryTimer: undefined,
-      windowStart: Number(descriptor.highWatermark.seq),
+      windowStart: Number(descriptor.fromCursor.seq),
       // A fresh window: nothing has been dropped from it, so the baseline is a
       // position this layer may serve (issue #2).
       evicted: false,
@@ -809,7 +858,7 @@ export class SessionSubscriptions {
     // secret, but nothing here needs to be more verbose than this.
     console.info(
       `[cherry-remote] subscription established for session ${sessionId} (replay from seq ` +
-        `${descriptor.fromCursor.seq}, high watermark ${descriptor.highWatermark.seq})`,
+        `${descriptor.fromCursor.seq}, applied and active)`,
     )
   }
 

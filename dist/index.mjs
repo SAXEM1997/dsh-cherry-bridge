@@ -5667,7 +5667,7 @@ var SessionSubscriptions = class {
 			await this.#enforceLimitFor(sessionId);
 			const descriptor = await this.#subscribe(sessionId, fromCursor);
 			if (descriptor.mode === "replay") {
-				this.#installReplay(sessionId, descriptor);
+				await this.#activateReplay(sessionId, descriptor, attemptsLeft);
 				return;
 			}
 			await this.#runCheckpointChain(sessionId, descriptor, attemptsLeft);
@@ -5721,9 +5721,45 @@ var SessionSubscriptions = class {
 		};
 	}
 	/**
-	* Installs a replay subscription: the peer will push events after the
-	* requested cursor, so the buffer starts empty and the cursor is the
-	* high-watermark the peer confirmed.
+	* Commits a replay subscription, then installs it (#369).
+	*
+	* `agent.sessions.subscribe` answers `prepared` in BOTH modes: until
+	* `agent.subscriptions.activate` commits a cursor, the peer's pump sends
+	* nothing at all. And `activate` accepts only the cursor that was REQUESTED
+	* (`appliedCursor.seq === subscription.cursorSeq`), which is where the caller
+	* is — not the descriptor's `highWatermark`, which is where the PEER is.
+	*
+	* So the subscription resumes at `fromCursor`, and the suffix the peer then
+	* pumps (`eventsAfter(fromCursor)`) passes the seq gate. Installing the high
+	* watermark instead — which this did until #369 — both left the subscription
+	* unactivated and put the gate above the whole suffix, so a replay delivered
+	* nothing and a wait's recovery timed out for a run that had settled.
+	*
+	* A suffix the peer no longer retains (`RESET_REQUIRED`) or a lapsed lease
+	* (`CHECKPOINT_EXPIRED`) means no replay is possible: the prepared
+	* subscription is closed and the chain re-runs CURSORLESS, which is the
+	* checkpoint path that rebuilds the view from a projection. Every other
+	* refusal is surfaced.
+	*/
+	async #activateReplay(sessionId, descriptor, attemptsLeft) {
+		try {
+			await this.#rpc.request("agent.subscriptions.activate", {
+				subscriptionId: descriptor.subscriptionId,
+				appliedCursor: descriptor.fromCursor
+			});
+		} catch (error) {
+			await this.#closeSubscription(descriptor.subscriptionId);
+			const reason = failureReason(error);
+			if (!(reason === "RESET_REQUIRED" || reason === "CHECKPOINT_EXPIRED") || attemptsLeft <= 1) throw error;
+			await this.#subscribeChain(sessionId, void 0, attemptsLeft - 1);
+			return;
+		}
+		this.#installReplay(sessionId, descriptor);
+	}
+	/**
+	* Installs an ACTIVATED replay subscription: the peer pumps events after the
+	* cursor the caller applied, so the buffer starts empty and the session's
+	* cursor is that applied position.
 	*/
 	#installReplay(sessionId, descriptor) {
 		const previous = this.#sessions.get(sessionId);
@@ -5734,7 +5770,7 @@ var SessionSubscriptions = class {
 		this.#sessions.delete(sessionId);
 		this.#sessions.set(sessionId, {
 			subscriptionId: descriptor.subscriptionId,
-			cursor: descriptor.highWatermark,
+			cursor: descriptor.fromCursor,
 			buffer: [],
 			bytes: 0,
 			bytesSinceAck: 0,
@@ -5744,12 +5780,12 @@ var SessionSubscriptions = class {
 			ackRetryAt: 0,
 			ackRetryDelay: AUTO_ACK_RETRY_MS,
 			ackRetryTimer: void 0,
-			windowStart: Number(descriptor.highWatermark.seq),
+			windowStart: Number(descriptor.fromCursor.seq),
 			evicted: false,
 			waiters: [],
 			projection: []
 		});
-		console.info(`[cherry-remote] subscription established for session ${sessionId} (replay from seq ${descriptor.fromCursor.seq}, high watermark ${descriptor.highWatermark.seq})`);
+		console.info(`[cherry-remote] subscription established for session ${sessionId} (replay from seq ${descriptor.fromCursor.seq}, applied and active)`);
 	}
 	/**
 	* The complete checkpoint recovery chain, run INSIDE the prepared lease the
@@ -8191,9 +8227,9 @@ var CherryToolEngine = class {
 	* CONNECTION, not the device id (#367). Text because the decode belongs
 	* inside the gate's slot — see {@link CherryToolEngine.#walkExternalized} —
 	* and because a string is immutable, so a joiner cannot alter what another
-	* caller is about to read. The connection because a PATCH or a forget EVICTS
-	* the pooled one: a walk on the old socket must not answer a caller that is
-	* dialing the new one.
+	* caller is about to read. The connection because a PATCH that changes the
+	* address or `enabled` — and a forget or a remember — EVICTS the pooled one:
+	* a walk on the old socket must not answer a caller dialing the new one.
 	*/
 	#contentWalks = /* @__PURE__ */ new WeakMap();
 	/**
@@ -9598,16 +9634,16 @@ var CherryToolEngine = class {
 	* Paginate `agent.content.read` over one `{ref}`, verify its sha256, and
 	* decode the certified bytes as legal UTF-8.
 	*
-	* The decode is the TEXT face's rule, not the walk's: a digest certifies
-	* bytes, not text, and a lenient decode would rewrite every illegal sequence
-	* to U+FFFD and hand the model substitution characters as though they were
-	* the part's content. So it is FATAL — content that is not legal UTF-8 fails
-	* like any other unreadable content (degradable, per part) rather than being
-	* silently mangled. The decoder also applies the standard encoding rule of
-	* DROPPING a leading U+FEFF — what the official reducer's decode does too,
-	* and what keeps an invisible zero-width character out of the model's
-	* context. The image face (#307) deliberately stops at the bytes and never
-	* reaches this decode.
+	* The decode is the TEXT face's rule, and it runs INSIDE the gated walk
+	* (#367): a digest certifies bytes, not text, and a lenient decode would
+	* rewrite every illegal sequence to U+FFFD and hand the model substitution
+	* characters as though they were the part's content. So it is FATAL — content
+	* that is not legal UTF-8 fails like any other unreadable content
+	* (degradable, per part) rather than being silently mangled. The decoder also
+	* applies the standard encoding rule of DROPPING a leading U+FEFF — what the
+	* official reducer's decode does too, and what keeps an invisible zero-width
+	* character out of the model's context. The image face (#307) deliberately
+	* stops at the bytes and never reaches this decode.
 	*/
 	async #readExternalized(connection, sessionId, ref, deadline) {
 		if (deadline !== void 0) return this.#walkExternalized(connection, sessionId, ref, deadline);

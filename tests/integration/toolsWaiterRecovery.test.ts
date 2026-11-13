@@ -197,6 +197,14 @@ const TERMINAL_MESSAGE: FakeMessageRecord = {
   parts: [{ kind: 'text', text: 'the run reply' }],
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 3_000, label = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
 describe('R3-F2: a waiter recovers when its subscription disappears mid-wait', () => {
   it('F2-2a resetRequired mid-wait re-ensures and converges on the run\'s REAL terminal instead of timing out', async () => {
     const rig = await makeRig({
@@ -316,5 +324,63 @@ describe('R3-F2: a waiter recovers when its subscription disappears mid-wait', (
     expect(calls).toHaveLength(2)
     expect(calls[1]!.cursor).toEqual(cursor)
     expect(calls[1]!.mode).toBe('replay')
+  })
+
+  it('F2-2e a replay subscription is ACTIVATED at the REQUESTED cursor, so the suffix it is owed arrives', async () => {
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], terminalMessage: TERMINAL_MESSAGE },
+    })
+    const layer = rig.subs('dev-A')
+
+    // The caller holds this position; ONE event lands after it while nothing is
+    // subscribed, so it exists only in the peer's journal and the replay suffix
+    // is the only route to it.
+    const held = rig.fake.cursorFor('s-1')
+    const landed = rig.fake.pushEvent('s-1', { kind: 'message.created', payload: { messageId: 'm-2' } })
+
+    await layer.ensure('s-1', held)
+
+    // 1. ACTIVATION. `agent.sessions.subscribe` answers `prepared` in BOTH
+    //    modes: until the caller activates, the peer pumps nothing at all, so a
+    //    replay subscription that is never activated delivers no replay and no
+    //    live traffic either.
+    const activations = rig.fake.activateCalls.filter((call) => call.ok)
+    expect(activations).toHaveLength(1)
+    // 2. THE CURSOR. `activate` accepts only the cursor that was REQUESTED. The
+    //    descriptor's `highWatermark` is where the PEER is, not where this
+    //    caller is, and installing it would put the seq gate above the whole
+    //    suffix the replay exists to deliver.
+    expect(activations[0]!.appliedCursor).toEqual(held)
+    expect(layer.cursorOf('s-1')).toEqual(held)
+
+    const events = (): number => {
+      const result = layer.read('s-1')
+      return 'events' in result ? result.events.length : -1
+    }
+    await waitFor(() => events() === 1, 3_000, 'the replay suffix')
+    const result = layer.read('s-1')
+    if (!('events' in result)) throw new Error('the replay subscription should be readable')
+    expect(result.events[0]!.seq).toBe(landed.seq)
+  })
+
+  it('F2-2f an ACTIVATE the peer cannot honour falls back to a cursorless checkpoint subscribe', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: TERMINAL_MESSAGE,
+        // The suffix the caller asked for is no longer retained: the peer
+        // refuses the activation with RESET_REQUIRED.
+        failNextCheckpointCall: { reason: 'RESET_REQUIRED', message: 'Replay suffix is no longer retained' },
+      },
+    })
+    const layer = rig.subs('dev-A')
+    await layer.ensure('s-1', rig.fake.cursorFor('s-1'))
+
+    // A projection is the only honest rebuild once the suffix is gone, so the
+    // dead replay attempt is CLOSED and the chain re-runs cursorless.
+    expect(rig.fake.subscribeCalls.map((call) => call.mode)).toEqual(['replay', 'checkpoint'])
+    expect(rig.fake.activateCalls.map((call) => call.ok)).toEqual([false, true])
+    expect(layer.activeSessions()).toContain('s-1')
   })
 })

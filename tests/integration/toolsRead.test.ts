@@ -4008,6 +4008,26 @@ describe('issue #365: concurrent reads of one ref share a single walk', () => {
     expect(TEXT.length).toBeGreaterThan(2 * SLICE)
   })
 
+  it('㉚d a BUDGETED read never joins an unbudgeted one of the same ref (#369)', async () => {
+    const rig = await rigWithLongText()
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    const before = rig.fake.contentReadsServed()
+
+    // One walk is in flight, unbudgeted. A wait answer's aggregate then projects
+    // the SAME ref under an `AssemblyDeadline`, which is a clock only that
+    // caller owns: joining would spend its window on another caller's content,
+    // and let a stop its own budget never caused end its read. So it takes its
+    // own walk, and the count says so.
+    rig.fake.delayContentReadAt('0', 400)
+    const plain = rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    await waitFor(() => rig.fake.contentReadsInFlight() === 1, 3_000, 'the unbudgeted walk')
+    const budgeted = rig.call('cherry_wait', { device: 'dev-A', sessionId: 's-1' })
+    await Promise.all([plain, budgeted])
+
+    // 6 = two walks of three slices. 3 = the budgeted read joined.
+    expect(rig.fake.contentReadsServed() - before).toBe(6)
+  })
+
   it('㉚b a read that starts AFTER the first settled walks again', async () => {
     const rig = await rigWithLongText()
     await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })

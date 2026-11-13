@@ -3239,16 +3239,27 @@ export class FakeCherry {
               : undefined
 
     if (cursor !== undefined && reason === undefined) {
+      // PREPARED, like the checkpoint arm and like the real peer: `subscribe`
+      // never activates. Until `agent.subscriptions.activate` commits the
+      // cursor the caller applied, the pump sends nothing — and what it sends
+      // afterwards is `eventsAfter(cursorSeq)`, the suffix between the REQUESTED
+      // cursor and the watermark. A client that installs the descriptor's
+      // high watermark therefore never sees that suffix at all.
       const record: FakeSubscriptionRecord = {
         subscriptionId,
         sessionId,
-        phase: 'active',
+        phase: 'prepared',
         cursorSeq: Number(cursor.seq),
         lastAck: Number(cursor.seq),
         delivered: [],
       }
       this.#subscriptions.set(subscriptionId, record)
-      this.#subscriptionPhases.push('active')
+      this.#leaseDeadlines.set(
+        subscriptionId,
+        Date.now() + (this.#agent().checkpointMs ?? remoteLimits.checkpointMs),
+      )
+      this.#checkpointCursorBySubscription.set(subscriptionId, cursor)
+      this.#subscriptionPhases.push('prepared')
       this.#subscribeCalls.push({ sessionId, cursor, mode: 'replay', subscriptionId })
       return {
         subscriptionId,
@@ -3389,7 +3400,14 @@ export class FakeCherry {
   #handleActivate(params: Record<string, unknown>): Record<string, unknown> {
     const subscriptionId = params['subscriptionId'] as string
     const appliedCursor = params['appliedCursor'] as AgentCursor
-    this.#consumeInjectedCheckpointFailure()
+    try {
+      this.#consumeInjectedCheckpointFailure()
+    } catch (error) {
+      // The injected refusal is an ATTEMPT like any other: record it, so a test
+      // can tell "the client never asked" from "the peer refused".
+      this.#activateCalls.push({ subscriptionId, appliedCursor, ok: false })
+      throw error
+    }
     const subscription = this.#subscriptions.get(subscriptionId)
     if (subscription === undefined) {
       this.#activateCalls.push({ subscriptionId, appliedCursor, ok: false })
@@ -3420,7 +3438,35 @@ export class FakeCherry {
     subscription.lastAck = Number(prepared.seq)
     this.#subscriptionPhases.push('active')
     this.#activateCalls.push({ subscriptionId, appliedCursor, ok: true })
+    this.#pumpJournal(subscription)
     return { subscriptionId, status: 'active' }
+  }
+
+  /**
+   * Delivers the journal suffix a just-activated subscription is owed —
+   * `eventsAfter(cursorSeq)`, which is exactly what the peer's pump sends.
+   *
+   * Deferred one turn on purpose: the real peer's `commit()` runs AFTER the
+   * activate reply is on the wire, so a client that installs its state when the
+   * reply arrives must not be beaten by the events it just ordered. A turn
+   * later also lets the reply's own microtasks settle first.
+   */
+  #pumpJournal(subscription: FakeSubscriptionRecord): void {
+    const suffix = (this.#journals.get(subscription.sessionId) ?? []).filter(
+      (entry) => entry.seq > subscription.cursorSeq,
+    )
+    if (suffix.length === 0) return
+    setTimeout(() => {
+      const live = this.#subscriptions.get(subscription.subscriptionId)
+      if (live === undefined || live.phase !== 'active') return
+      for (const entry of suffix) live.delivered.push({ seq: entry.seq, bytes: JSON.stringify(entry.payload).length })
+      this.#notify('agent.events', {
+        subscriptionId: subscription.subscriptionId,
+        sessionId: subscription.sessionId,
+        streamEpoch: this.#journalEpoch,
+        events: suffix.map((entry) => ({ kind: entry.kind, seq: String(entry.seq), payload: entry.payload })),
+      })
+    }, 0)
   }
 
   /**
