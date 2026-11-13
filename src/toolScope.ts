@@ -410,9 +410,9 @@ function serializeScope(doc: ScopeDoc): string {
  *
  * From Task 3 on this class also owns the judgement: `rebuild()` is the only
  * asynchronous method here and the only caller of `setWorkspaces`; it builds one
- * whole generation — the canonical path map, the per-agent judgements and the
- * `pathUnmatched` diagnostics — and swaps it in at once, while `judgement()` and
- * `pathUnmatched()` are synchronous reads of that generation.
+ * whole generation — the registry list, the canonical path map, the per-agent
+ * judgements and the `pathUnmatched` diagnostics — and swaps it in at once,
+ * while `judgement()` and `pathUnmatched()` are synchronous reads of it.
  */
 export class ToolScopeState {
   readonly #file: string

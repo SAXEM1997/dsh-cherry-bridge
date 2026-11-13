@@ -429,9 +429,8 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     )
 
     // Mid-rebuild: the previous generation, object-identical, and never a
-    // half-built one. (The LIST is written first by design — the brief fixes the
-    // build order as list ⇒ map ⇒ judgements — but the judgement generation
-    // switches in one assignment.)
+    // half-built one. The LIST commits with the generation too; the judgement
+    // switches in one assignment.
     expect(state.judgement('a1')).toBe(first)
 
     gate.resolve()
@@ -492,8 +491,11 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
   it('⑦c an OLDER overlapping round cannot overwrite the newer one', async () => {
     const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
     const gate = deferred<void>()
+    // The two rounds must produce DIFFERENT answers, or a late commit is
+    // indistinguishable from the newer one: the gated round knows only X (the
+    // agent's /w is a no-match), the newer round knows W (a resolved hit).
     const first = state.rebuild(
-      gatedRegistry([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }, gate.promise),
+      gatedRegistry([{ id: 'X', path: '/x' }], { '/x': { id: 'X', path: '/x' } }, gate.promise),
       [{ id: 'a1', cwd: '/w' }],
     )
     const second = state.rebuild(
@@ -506,7 +508,24 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     gate.resolve()
     await first
     expect(state.judgement('a1')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
-    expect(state.workspaces()).toHaveLength(1)
+    expect(state.workspaces().map((workspace) => workspace.id)).toEqual(['W'])
+  })
+
+  it('⑦d a save during a round discards that round', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    const gate = deferred<void>()
+    const pending = state.rebuild(
+      gatedRegistry([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }, gate.promise),
+      [{ id: 'a1', cwd: '/w' }],
+    )
+    // The round captured the OLD document; a save must void it, not let its
+    // pre-save judgement land after the write.
+    expect(state.save({ mode: 'selected', workspaceIds: ['W'] }, state.doc().revision).ok).toBe(true)
+    gate.resolve()
+    await pending
+
+    expect(state.judgement('a1')).toBeUndefined()
+    expect(state.workspaces()).toEqual([])
   })
 })
 
