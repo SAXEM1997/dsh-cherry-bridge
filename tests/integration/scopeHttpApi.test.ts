@@ -144,9 +144,9 @@ const FAMILY = ['cherry_status', 'cherry_devices', 'cherry_pair']
 interface FixtureOptions {
   workspaces?: readonly FakeWorkspace[]
   agents?: readonly FakeAgentSeed[]
-  /** Capabilities REMOVED from the plugin root's tools face (`guard` ⇒ 仅可见性). */
+  /** Capabilities REMOVED from the plugin root's tools face. */
   without?: readonly FakeCapability[]
-  /** The global names this fixture registers; `run_code` is the one name the fake host refuses in a deny set. */
+  /** The global names this fixture registers. */
   names?: readonly string[]
   /** Raw document text written to the scope file BEFORE the state reads it. */
   seed?: string
@@ -168,10 +168,6 @@ interface ScopeHttpFixture {
   refreshCalls: number
   /** `save` / `refresh` / the microtask queued inside `save`, in execution order. */
   order: string[]
-  /** One `rebuild()` per recompute pass. */
-  rebuilds: number
-  /** The highest number of judgement passes that ever ran at the same time. */
-  roundsInFlight: number
   openGate(): void
   dispose(): void
 }
@@ -225,9 +221,6 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
   const logs: string[] = []
   const order: string[] = []
   let refreshCalls = 0
-  let rebuilds = 0
-  let running = 0
-  let roundsInFlight = 0
 
   const state = new ToolScopeState({ file: scopeFile, log: (message) => logs.push(message) })
 
@@ -259,18 +252,6 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
     queueMicrotask(() => order.push('save-microtask'))
     return result
   })
-  const realRebuild = state.rebuild.bind(state)
-  vi.spyOn(state, 'rebuild').mockImplementation(async (registry, agents) => {
-    rebuilds += 1
-    running += 1
-    roundsInFlight = Math.max(roundsInFlight, running)
-    try {
-      return await realRebuild(registry, agents)
-    } finally {
-      running -= 1
-    }
-  })
-
   const deps: CherryHttpDeps = {
     store: new DeviceStore(join(dir, 'devices.json')),
     scope: state,
@@ -306,12 +287,6 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
       return refreshCalls
     },
     order,
-    get rebuilds() {
-      return rebuilds
-    },
-    get roundsInFlight() {
-      return roundsInFlight
-    },
     openGate: () => release(),
     dispose: () => {
       unmount()

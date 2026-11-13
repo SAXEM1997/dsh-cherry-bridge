@@ -281,8 +281,10 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     // failure was decided at mount time and wins (B7①). A callback from an
     // older mount must not take `current` either.
     if (!staticCapable || mountId !== mountGeneration) return () => {}
-    // Re-entry for the SAME mount is idempotent: registrations are already live.
-    if (current !== undefined && !current.tornDown) return current.teardown
+    // Re-entry for the SAME mount is inert: the live registration set belongs to
+    // the FIRST effect run, and handing its teardown to a later run would let a
+    // dependency re-injection unload the family with nothing to re-register it.
+    if (current !== undefined && !current.tornDown) return () => {}
     scope.setHost({ state: 'ready', capable: true, reason: WHEN_READY_REASON })
     const state: EffectState = {
       tornDown: false,

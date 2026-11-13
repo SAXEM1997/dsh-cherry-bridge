@@ -1802,9 +1802,9 @@ function serializeScope(doc) {
 *
 * From Task 3 on this class also owns the judgement: `rebuild()` is the only
 * asynchronous method here and the only caller of `setWorkspaces`; it builds one
-* whole generation — the canonical path map, the per-agent judgements and the
-* `pathUnmatched` diagnostics — and swaps it in at once, while `judgement()` and
-* `pathUnmatched()` are synchronous reads of that generation.
+* whole generation — the registry list, the canonical path map, the per-agent
+* judgements and the `pathUnmatched` diagnostics — and swaps it in at once,
+* while `judgement()` and `pathUnmatched()` are synchronous reads of it.
 */
 var ToolScopeState = class {
 	#file;
@@ -1944,7 +1944,8 @@ var ToolScopeState = class {
 		} catch (error) {
 			this.#warn("工作区注册表 list() 抛出，按 B16 视为列表不可用（判定 fail-closed，写侧拒绝）", error);
 		}
-		const workspaces = listAvailable && listed !== void 0 ? normalizeWorkspaceList(listed) : [];
+		this.setWorkspaces(listed);
+		const workspaces = this.#workspaces;
 		const pathMap = /* @__PURE__ */ new Map();
 		const resolveByPath = registry.resolveByPath;
 		if (typeof resolveByPath === "function") for (const workspace of workspaces) {
@@ -1983,7 +1984,6 @@ var ToolScopeState = class {
 			unresolved: 0,
 			pathUnmatched: 0
 		};
-		this.setWorkspaces(listed);
 		this.#pathMap = pathMap;
 		this.#judgements = judgements;
 		this.#pathUnmatched = pathUnmatched;
@@ -13336,7 +13336,7 @@ function createToolScopeHost(deps) {
 	*/
 	function setupWhen(agentCtx, mountId) {
 		if (!staticCapable || mountId !== mountGeneration) return () => {};
-		if (current !== void 0 && !current.tornDown) return current.teardown;
+		if (current !== void 0 && !current.tornDown) return () => {};
 		scope.setHost({
 			state: "ready",
 			capable: true,
