@@ -184,7 +184,7 @@ describe('mount: capability probe and the injection gate', () => {
     // Make a stale generation OBSERVABLE: with W1 selected the old answer is
     // `visible: true`, so a surviving cache would hand the next mount a grant.
     expect(fixture.state.save({ mode: 'selected', workspaceIds: ['w1'] }, 0).ok).toBe(true)
-    fixture.host.refresh()
+    fixture.host.recompute()
     await vi.waitFor(() => expect(fixture.state.judgement('agent-a')?.visible).toBe(true))
 
     unmount()

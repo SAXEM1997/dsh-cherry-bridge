@@ -286,6 +286,26 @@ describe('③ the old host without resolveByPath degrades honestly (D14)', () =>
       { agentId: 'case', cwd: '/W/REAL' },
     ])
   })
+
+  it('⑪b pathUnmatched hands out a copy, like workspaces() and host()', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(
+      registryFixture(
+        [{ id: 'W', title: 'Work', path: '/w/real' }],
+        { '/w/real': { id: 'W', path: '/w/real' }, '/w/elsewhere': undefined },
+      ),
+      [{ id: 'agent-x', cwd: '/w/elsewhere' }],
+    )
+
+    const first = state.pathUnmatched()
+    expect(first).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
+    // Every other synchronous read copies (`workspaces()`, `host()`); this one
+    // feeds the HTTP body and the settings panel, and a caller that sorts or
+    // truncates what it was handed must not reorder the state's own array
+    // behind the other readers.
+    ;(first as Array<{ agentId: string; cwd: string }>).length = 0
+    expect(state.pathUnmatched()).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
+  })
 })
 
 describe('④ the four resolution states, and `visible` from `isVisible` alone', () => {

@@ -110,7 +110,7 @@ interface ScopeHttpFixture {
   host: ToolScopeHost
   server: FakeWebServer
   scopeFile: string
-  /** How many times `refreshScope()` ran. */
+  /** How many times `recomputeScope()` ran. */
   refreshCalls: number
   /** `save` / `refresh` / the microtask queued inside `save`, in execution order. */
   order: string[]
@@ -184,16 +184,16 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
     const result = realSave(body, expectedRevision)
     order.push('save')
     // A microtask queued INSIDE the save: if the route awaits anything before
-    // calling `refreshScope()`, this runs first and `order` shows it.
+    // calling `recomputeScope()`, this runs first and `order` shows it.
     queueMicrotask(() => order.push('save-microtask'))
     return result
   })
   const deps: CherryHttpDeps = {
     store: new DeviceStore(join(dir, 'devices.json')),
     scope: state,
-    refreshScope: () => {
+    recomputeScope: () => {
       order.push('refresh')
-      host.refresh()
+      host.recompute()
       refreshCalls += 1
     },
     pair: async () => {
@@ -218,7 +218,7 @@ function makeFixture(options: FixtureOptions = {}): ScopeHttpFixture {
     host,
     server,
     scopeFile,
-    // A GETTER, not a snapshot: `refreshScope` mutates the closure variable.
+    // A GETTER, not a snapshot: `recomputeScope` mutates the closure variable.
     get refreshCalls() {
       return refreshCalls
     },
@@ -361,9 +361,9 @@ describe('PUT /cherry-remote/api/scope', () => {
     expect(fixture.state.doc().mode).toBe('selected')
     expect(fixture.state.doc().workspaceIds).toEqual(['w1'])
 
-    // §6.3's hard constraint: `save` completed, then `refreshScope()` was called
+    // §6.3's hard constraint: `save` completed, then `recomputeScope()` was called
     // with NO await between them — the microtask queued inside `save` is still
-    // BEHIND the refresh call. `refreshScope()` returns nothing; the call
+    // BEHIND the refresh call. `recomputeScope()` returns nothing; the call
     // count is the observable.
     expect(fixture.order.indexOf('save')).toBeLessThan(fixture.order.indexOf('refresh'))
     expect(fixture.order.indexOf('save-microtask')).toBeGreaterThan(fixture.order.indexOf('refresh'))

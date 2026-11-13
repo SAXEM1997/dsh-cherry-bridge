@@ -153,6 +153,21 @@ export interface WorkspaceRegistryLike {
   resolveByPath?(path: string): Promise<unknown | undefined>
 }
 
+/**
+ * The generation snapshot ONE `rebuild()` round judges against.
+ *
+ * Bundled rather than passed positionally so a call site cannot pair round A's
+ * document with round B's list or path map: two agents of one generation must
+ * never be judged differently, and two generations must never be mixed.
+ */
+interface RoundInputs {
+  doc: ScopeDoc
+  workspaces: readonly ScopeWorkspace[]
+  registry: WorkspaceRegistryLike
+  pathMap: ReadonlyMap<string, string>
+  listAvailable: boolean
+}
+
 /** What one `rebuild()` produced, for the host layer's logging and diagnostics. */
 export interface RebuildSummary {
   listAvailable: boolean
@@ -333,9 +348,12 @@ export function normalizeScope(input: unknown): {
   }
 }
 
-/** A fresh strict-side document (never the shared `DEFAULT_SCOPE` object). */
+/**
+ * A fresh strict-side document: {@link DEFAULT_SCOPE}'s fields with its own
+ * `workspaceIds` array, so a caller can never mutate the shared constant.
+ */
 function strictScope(): ScopeDoc {
-  return { version: SCOPE_DOC_VERSION, revision: 0, mode: 'selected', workspaceIds: [] }
+  return { ...DEFAULT_SCOPE, workspaceIds: [] }
 }
 
 /** `JSON.parse` for text input; any other value is taken as already parsed. */
@@ -640,7 +658,10 @@ export class ToolScopeState {
     const judgements = new Map<string, AgentJudgement>()
     const pathUnmatched: Array<{ agentId: string; cwd: string }> = []
     for (const agent of agents) {
-      const judgement = await this.#judge(doc, workspaces, agent, registry, pathMap, listAvailable)
+      const judgement = await this.#judge(
+        { doc, workspaces, registry, pathMap, listAvailable },
+        agent,
+      )
       judgements.set(agent.id, judgement)
       // §6.1: a resolved cwd that belongs to no workspace is DIAGNOSTIC, never a
       // degradation — and it is one of the two states the next round re-resolves.
@@ -786,7 +807,10 @@ export class ToolScopeState {
    * carries this, so "勾了却无工具" can be told apart from a degraded read.
    */
   pathUnmatched(): ReadonlyArray<{ agentId: string; cwd: string }> {
-    return this.#pathUnmatched
+    // A COPY, like every other synchronous read (`workspaces()`, `host()`):
+    // this list feeds the HTTP body and the settings panel, and a caller that
+    // sorts or truncates what it was handed must not reach the state.
+    return this.#pathUnmatched.map((entry) => ({ ...entry }))
   }
 
   /**
@@ -918,24 +942,17 @@ export class ToolScopeState {
    * round, so two agents of one generation can never be judged against two
    * different documents or lists.
    */
-  async #judge(
-    doc: ScopeDoc,
-    workspaces: readonly ScopeWorkspace[],
-    agent: ScopeAgentLike,
-    registry: WorkspaceRegistryLike,
-    pathMap: ReadonlyMap<string, string>,
-    listAvailable: boolean,
-  ): Promise<AgentJudgement> {
+  async #judge(round: RoundInputs, agent: ScopeAgentLike): Promise<AgentJudgement> {
     // Rule one.
-    const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
+    const member = round.workspaces.find((workspace) => workspace.sessionIds.includes(agent.id))
     if (member !== undefined) {
-      return judged(doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`)
+      return judged(round.doc, agent, 'resolved', member.id, `会话成员命中 ${describeWorkspace(member)}`)
     }
 
     // Rule two.
     if (agent.cwd === undefined) {
       return judged(
-        doc,
+        round.doc,
         agent,
         'no-cwd',
         undefined,
@@ -943,11 +960,11 @@ export class ToolScopeState {
       )
     }
 
-    if (!listAvailable) {
+    if (!round.listAvailable) {
       // ⑧/B16: "the list could not be read" is "this resolution failed" — the
       // state the next round starts from.
       return judged(
-        doc,
+        round.doc,
         agent,
         'unresolved',
         undefined,
@@ -955,31 +972,31 @@ export class ToolScopeState {
       )
     }
 
-    const resolveByPath = registry.resolveByPath
+    const resolveByPath = round.registry.resolveByPath
     if (typeof resolveByPath !== 'function') {
       // Old host (D14): case-sensitive string equality against the item paths.
-      const workspaceId = pathMap.get(agent.cwd)
+      const workspaceId = round.pathMap.get(agent.cwd)
       return workspaceId === undefined
         ? judged(
-            doc,
+            round.doc,
             agent,
             'no-match',
             undefined,
             `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`,
           )
-        : judged(doc, agent, 'resolved', workspaceId, `路径字符串等价命中 ${this.#label(workspaces, workspaceId)}`)
+        : judged(round.doc, agent, 'resolved', workspaceId, `路径字符串等价命中 ${this.#label(round.workspaces, workspaceId)}`)
     }
 
     let entity: unknown
     try {
-      entity = await resolveByPath.call(registry, agent.cwd)
+      entity = await resolveByPath.call(round.registry, agent.cwd)
     } catch (error) {
       this.#warn(
         `cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`,
         error,
       )
       return judged(
-        doc,
+        round.doc,
         agent,
         'unresolved',
         undefined,
@@ -989,7 +1006,7 @@ export class ToolScopeState {
 
     if (entity === undefined) {
       return judged(
-        doc,
+        round.doc,
         agent,
         'no-match',
         undefined,
@@ -1001,17 +1018,17 @@ export class ToolScopeState {
     // comparison in this module. An entity outside it is `no-match`, not a hit
     // on the entity's own id.
     const resolved = toScopeWorkspace(entity)
-    const workspaceId = resolved === undefined ? undefined : pathMap.get(resolved.path)
+    const workspaceId = resolved === undefined ? undefined : round.pathMap.get(resolved.path)
     if (workspaceId === undefined) {
       return judged(
-        doc,
+        round.doc,
         agent,
         'no-match',
         undefined,
         `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`,
       )
     }
-    return judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`)
+    return judged(round.doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(round.workspaces, workspaceId)}`)
   }
 
   /** The workspace id, plus its title when this generation's list carries one. */

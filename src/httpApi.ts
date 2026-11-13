@@ -193,11 +193,11 @@ export interface CherryHttpDeps {
   scope: ToolScopeState
   /**
    * The scope subsystem's recompute entry (spec §6.2): "save ⇒ immediate
-   * effect" is an await-free `save → refreshScope()` call. It rebuilds the next
+   * effect" is an await-free `save → recomputeScope()` call. It rebuilds the next
    * judgement generation and returns nothing; absent capability
    * (pending/unsupported) or a torn-down mount simply does nothing.
    */
-  refreshScope: () => void
+  recomputeScope: () => void
   /**
    * The experiment's document, the decision THIS apply made from it, and the
    * subsystem's live verdict (#233).
@@ -206,7 +206,7 @@ export interface CherryHttpDeps {
    * own fixtures — still gets every other route; `GET`/`PUT /subagent` answer
    * 404 rather than inventing a switch nothing reads.
    *
-   * Every member is a LAZY accessor for the reason `refreshScope` is one: the
+   * Every member is a LAZY accessor for the reason `recomputeScope` is one: the
    * deps object is built BEFORE the subsystem mounts, so a value captured here
    * would be the one from before the mount.
    */
@@ -1318,7 +1318,7 @@ function scopeProjection(
  * The shape exists for the ONE await-free critical section at its end. `save()`
  * validates the base revision, prunes, bumps the revision by exactly one, writes
  * the file and swaps the in-memory authority — all synchronously — and
- * `refreshScope()` is called in the very next statement. An `await` anywhere
+ * `recomputeScope()` is called in the very next statement. An `await` anywhere
  * between the two would let two concurrent saves both pass the revision check,
  * after which the later write silently overwrites the earlier one.
  *
@@ -1357,7 +1357,7 @@ async function saveScopeDocument(
   }
 
   // NO `await` between the save above and this call (§6.3's hard constraint).
-  route.deps.refreshScope()
+  route.deps.recomputeScope()
   writeJson(res, 200, { scope: scopeProjection(result.doc), pruned: [...result.pruned] })
 }
 

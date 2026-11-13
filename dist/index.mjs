@@ -1723,12 +1723,13 @@ function normalizeScope(input) {
 		workspaceIds: fields.workspaceIds
 	} };
 }
-/** A fresh strict-side document (never the shared `DEFAULT_SCOPE` object). */
+/**
+* A fresh strict-side document: {@link DEFAULT_SCOPE}'s fields with its own
+* `workspaceIds` array, so a caller can never mutate the shared constant.
+*/
 function strictScope() {
 	return {
-		version: 1,
-		revision: 0,
-		mode: "selected",
+		...DEFAULT_SCOPE,
 		workspaceIds: []
 	};
 }
@@ -1977,7 +1978,13 @@ var ToolScopeState = class {
 		const judgements = /* @__PURE__ */ new Map();
 		const pathUnmatched = [];
 		for (const agent of agents) {
-			const judgement = await this.#judge(doc, workspaces, agent, registry, pathMap, listAvailable);
+			const judgement = await this.#judge({
+				doc,
+				workspaces,
+				registry,
+				pathMap,
+				listAvailable
+			}, agent);
 			judgements.set(agent.id, judgement);
 			if (judgement.status === "no-match" && judgement.cwd !== void 0) pathUnmatched.push({
 				agentId: judgement.agentId,
@@ -2089,7 +2096,7 @@ var ToolScopeState = class {
 	* carries this, so "勾了却无工具" can be told apart from a degraded read.
 	*/
 	pathUnmatched() {
-		return this.#pathUnmatched;
+		return this.#pathUnmatched.map((entry) => ({ ...entry }));
 	}
 	/**
 	* Validates and commits one write, synchronously (no `await` anywhere in the
@@ -2199,28 +2206,28 @@ var ToolScopeState = class {
 	* round, so two agents of one generation can never be judged against two
 	* different documents or lists.
 	*/
-	async #judge(doc, workspaces, agent, registry, pathMap, listAvailable) {
-		const member = workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
-		if (member !== void 0) return judged(doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
-		if (agent.cwd === void 0) return judged(doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）");
-		if (!listAvailable) return judged(doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（下一次 rebuild 会重新解析）`);
-		const resolveByPath = registry.resolveByPath;
+	async #judge(round, agent) {
+		const member = round.workspaces.find((workspace) => workspace.sessionIds.includes(agent.id));
+		if (member !== void 0) return judged(round.doc, agent, "resolved", member.id, `会话成员命中 ${describeWorkspace(member)}`);
+		if (agent.cwd === void 0) return judged(round.doc, agent, "no-cwd", void 0, "会话 header 无 cwd，路径规则无法判定（D7：仅 selected 下不可见；下一次判定会重新解析）");
+		if (!round.listAvailable) return judged(round.doc, agent, "unresolved", void 0, `工作区列表不可用，cwd ${agent.cwd} 本次无法解析（下一次 rebuild 会重新解析）`);
+		const resolveByPath = round.registry.resolveByPath;
 		if (typeof resolveByPath !== "function") {
-			const workspaceId = pathMap.get(agent.cwd);
-			return workspaceId === void 0 ? judged(doc, agent, "no-match", void 0, `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`) : judged(doc, agent, "resolved", workspaceId, `路径字符串等价命中 ${this.#label(workspaces, workspaceId)}`);
+			const workspaceId = round.pathMap.get(agent.cwd);
+			return workspaceId === void 0 ? judged(round.doc, agent, "no-match", void 0, `宿主无 resolveByPath，cwd ${agent.cwd} 与任何注册表项都不大小写敏感相等（D7：无工作区）`) : judged(round.doc, agent, "resolved", workspaceId, `路径字符串等价命中 ${this.#label(round.workspaces, workspaceId)}`);
 		}
 		let entity;
 		try {
-			entity = await resolveByPath.call(registry, agent.cwd);
+			entity = await resolveByPath.call(round.registry, agent.cwd);
 		} catch (error) {
 			this.#warn(`cwd ${agent.cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`, error);
-			return judged(doc, agent, "unresolved", void 0, `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
+			return judged(round.doc, agent, "unresolved", void 0, `cwd ${agent.cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
 		}
-		if (entity === void 0) return judged(doc, agent, "no-match", void 0, `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
+		if (entity === void 0) return judged(round.doc, agent, "no-match", void 0, `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
 		const resolved = toScopeWorkspace(entity);
-		const workspaceId = resolved === void 0 ? void 0 : pathMap.get(resolved.path);
-		if (workspaceId === void 0) return judged(doc, agent, "no-match", void 0, `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`);
-		return judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`);
+		const workspaceId = resolved === void 0 ? void 0 : round.pathMap.get(resolved.path);
+		if (workspaceId === void 0) return judged(round.doc, agent, "no-match", void 0, `cwd ${agent.cwd} 解析成功但不属任何已注册工作区（D7）`);
+		return judged(round.doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(round.workspaces, workspaceId)}`);
 	}
 	/** The workspace id, plus its title when this generation's list carries one. */
 	#label(workspaces, workspaceId) {
@@ -13304,8 +13311,8 @@ function createToolScopeHost(deps) {
 			reason: WHEN_READY_REASON
 		};
 	}
-	function UNSUPPORTED_REASON(...missing) {
-		return `宿主缺 ${missing.join(" / ")}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上步骤级条件；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`;
+	function UNSUPPORTED_REASON(missing) {
+		return `宿主缺 ${missing}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上步骤级条件；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`;
 	}
 	function projectAgent(raw) {
 		if (typeof raw !== "object" || raw === null) return void 0;
@@ -13392,7 +13399,7 @@ function createToolScopeHost(deps) {
 			log("[cherry-remote] 作用域判定重建失败（保留上一代判定）", error);
 		});
 	}
-	function refresh() {
+	function recompute() {
 		const state = current;
 		if (state === void 0 || state.tornDown || !staticCapable) return;
 		rebuildJudgements(state);
@@ -13457,7 +13464,7 @@ function createToolScopeHost(deps) {
 				current?.teardown();
 			};
 		},
-		refresh,
+		recompute,
 		state() {
 			return scope.host();
 		}
@@ -14272,7 +14279,7 @@ function scopeProjection(doc) {
 * The shape exists for the ONE await-free critical section at its end. `save()`
 * validates the base revision, prunes, bumps the revision by exactly one, writes
 * the file and swaps the in-memory authority — all synchronously — and
-* `refreshScope()` is called in the very next statement. An `await` anywhere
+* `recomputeScope()` is called in the very next statement. An `await` anywhere
 * between the two would let two concurrent saves both pass the revision check,
 * after which the later write silently overwrites the earlier one.
 *
@@ -14296,7 +14303,7 @@ async function saveScopeDocument(req, res, route) {
 		writeError(res, result.status, result.error, result.message);
 		return;
 	}
-	route.deps.refreshScope();
+	route.deps.recomputeScope();
 	writeJson(res, 200, {
 		scope: scopeProjection(result.doc),
 		pruned: [...result.pruned]
@@ -15070,7 +15077,7 @@ function noteError(entry) {
 const state = {
 	store: new DeviceStore(join(tmpdirFallback(), "devices.json")),
 	scope: new ToolScopeState({ file: join(tmpdirFallback(), "scope.json") }),
-	refreshScope: () => void 0,
+	recomputeScope: () => void 0,
 	subagentConfig: createSubagentConfigDocument({
 		file: join(tmpdirFallback(), "subagent.json"),
 		seed: void 0
@@ -15322,7 +15329,7 @@ function assemblyDeps(ctx) {
 	return {
 		store: state.store,
 		scope: state.scope,
-		refreshScope: () => state.refreshScope(),
+		recomputeScope: () => state.recomputeScope(),
 		/**
 		* The experiment's two faces (#233) — the document the settings page edits
 		* and the verdict the assembly reached from it.
@@ -15477,7 +15484,7 @@ function apply(ctx, config = {}) {
 	const scope = new ToolScopeState({ file: join(dataDir, "scope.json") });
 	scope.load();
 	state.scope = scope;
-	state.refreshScope = () => host.refresh();
+	state.recomputeScope = () => host.recompute();
 	state.subagentConfig = createSubagentConfigDocument({
 		file: join(dataDir, "subagent.json"),
 		seed: config.subagent,

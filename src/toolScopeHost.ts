@@ -19,7 +19,12 @@
  * of the document or the judgement generation; the shared condition reads them
  * through `visibleForAgent`.
  */
-import type { ScopeHostState, ToolScopeState, WorkspaceRegistryLike } from './toolScope.js'
+import type {
+  ScopeAgentLike,
+  ScopeHostState,
+  ToolScopeState,
+  WorkspaceRegistryLike,
+} from './toolScope.js'
 
 const EFFECT_LABEL = 'cherry-remote.tool-scope()'
 
@@ -172,15 +177,9 @@ export interface ScopeHostDeps {
 export interface ToolScopeHost {
   /** Instantiates nothing on its own: this is the assembly point. */
   mount(ctx: ScopeHostContext): () => void
-  /** Re-reads the document for the next step; inert while `pending` / torn down. */
-  refresh(): void
+  /** Recomputes the derived view for the next step; inert while `pending` / torn down. */
+  recompute(): void
   state(): ScopeHostState
-}
-
-/** One live agent, as this layer needs it. */
-interface HostAgent {
-  id: string
-  cwd?: string
 }
 
 /** One effect run's state: the two services it was injected with, its registration, its flag. */
@@ -225,15 +224,15 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     return { capable: true, reason: WHEN_READY_REASON }
   }
 
-  function UNSUPPORTED_REASON(...missing: string[]): string {
-    return `宿主缺 ${missing.join(' / ')}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上步骤级条件；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`
+  function UNSUPPORTED_REASON(missing: string): string {
+    return `宿主缺 ${missing}，无法做到“注册即可隐藏” ⇒ scope 子系统不注册任何工具（fail-closed），这 ${names.length} 个受治理的名字装不上步骤级条件；实验性委托工具由子智能体子系统注册，其可见性由它自己的步骤级闸门决定`
   }
 
   // -------------------------------------------------------------------------
   // Agent projection
   // -------------------------------------------------------------------------
 
-  function projectAgent(raw: unknown): HostAgent | undefined {
+  function projectAgent(raw: unknown): ScopeAgentLike | undefined {
     if (typeof raw !== 'object' || raw === null) return undefined
     const value = raw as {
       id?: unknown
@@ -249,7 +248,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     return { id, ...(cwd === undefined ? {} : { cwd }) }
   }
 
-  function liveAgents(state: EffectState): HostAgent[] {
+  function liveAgents(state: EffectState): ScopeAgentLike[] {
     const service = state.agents
     const list = service?.list
     if (typeof list !== 'function') return []
@@ -261,7 +260,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       return []
     }
     if (!Array.isArray(raw)) return []
-    return raw.map((entry) => projectAgent(entry)).filter((agent): agent is HostAgent => agent !== undefined)
+    return raw.map((entry) => projectAgent(entry)).filter((agent): agent is ScopeAgentLike => agent !== undefined)
   }
 
   // -------------------------------------------------------------------------
@@ -336,7 +335,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
     })
   }
 
-  function refresh(): void {
+  function recompute(): void {
     const state = current
     if (state === undefined || state.tornDown || !staticCapable) return
     // Nothing to install: the next step's condition reads the saved document.
@@ -411,7 +410,7 @@ export function createToolScopeHost(deps: ScopeHostDeps): ToolScopeHost {
       }
     },
 
-    refresh,
+    recompute,
 
     state(): ScopeHostState {
       return scope.host()
