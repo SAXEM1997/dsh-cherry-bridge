@@ -2750,17 +2750,25 @@ export class CherryToolEngine {
    */
   readonly #contentGate: ContentReadGate
   /**
-   * Content walks IN FLIGHT, keyed by the request they answer (#365).
+   * Content reads IN FLIGHT, keyed by the request they answer (#365).
    *
    * Two callers can ask for the same `{ref}` in the same step — two
    * `cherry_read` calls over one session is a legal thing for a model to do —
    * and without this each of them paginated the same 24 KiB slices again. A
-   * second caller now waits for the walk already running instead. It is a
-   * de-duplicator, NOT a cache: the entry is dropped the moment the walk
+   * second caller now waits for the read already running instead. It is a
+   * de-duplicator, NOT a cache: the entry is dropped the moment the read
    * settles, so a later read re-walks and re-certifies (see
-   * {@link CherryToolEngine.#readRefBytes}).
+   * {@link CherryToolEngine.#readExternalized}).
+   *
+   * The value is the DECODED TEXT, not the bytes, and the outer key is the
+   * CONNECTION, not the device id (#367). Text because the decode belongs
+   * inside the gate's slot — see {@link CherryToolEngine.#walkExternalized} —
+   * and because a string is immutable, so a joiner cannot alter what another
+   * caller is about to read. The connection because a PATCH or a forget EVICTS
+   * the pooled one: a walk on the old socket must not answer a caller that is
+   * dialing the new one.
    */
-  readonly #contentWalks = new Map<string, Promise<Buffer>>()
+  readonly #contentWalks = new WeakMap<DeviceConnection, Map<string, Promise<string>>>()
   /**
    * The `maxBytes` one `agent.content.read` slice asks for
    * ({@link CONTENT_READ_MAX_BYTES} in production; injectable so a test can
@@ -4879,95 +4887,78 @@ export class CherryToolEngine {
     ref: Record<string, unknown>,
     deadline?: AssemblyDeadline,
   ): Promise<string> {
-    // The caller's pre-flight (see `#externalizedRefusal`) has already refused
-    // a declared size above this cap before a gate slot was taken; the walk
-    // checks it again so the invariant holds for any caller that reaches it
-    // directly.
-    const bytes = await this.#readRefBytes(
-      connection,
-      sessionId,
-      ref,
-      this.#externalizedByteCap,
-      deadline,
-    )
-    try {
-      return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-    } catch {
-      throw new Error(
-        `agent.content.read for ${String(ref['contentId'] ?? '')} returned bytes that are not valid UTF-8; not decoded`,
-      )
-    }
-  }
+    // A BUDGETED read never joins and is never joined (#365). Its walk is
+    // bounded by an instant only its own caller owns — a wait answer's
+    // {@link AssemblyDeadline} — so sharing would spend one caller's window on
+    // another's content, and hand the joiner a stop its own clock never caused.
+    if (deadline !== undefined) return this.#walkExternalized(connection, sessionId, ref, deadline)
 
-  /**
-   * Read one `{ref}`'s certified bytes, SHARING a walk already in flight
-   * (#365).
-   *
-   * The key is the request the walk answers — device, session, contentId,
-   * revision — plus the byte budget, because those are the only things that
-   * decide what comes back: two callers that differ in ANY of them must not be
-   * handed one answer. `cherry_read` is the caller this exists for, and it
-   * always passes {@link MAX_EXTERNALIZED_BYTES}.
-   *
-   * A BUDGETED read never joins and is never joined. Its walk is bounded by an
-   * instant only its own caller owns — a wait answer's
-   * {@link AssemblyDeadline} — so sharing would spend one caller's window on
-   * another's content, and hand the joiner a stop its own clock never caused.
-   *
-   * The entry is dropped the moment the walk SETTLES, both arms, so this is
-   * de-duplication and never a cache: a later read walks again and certifies
-   * the bytes it gets. A remembered Buffer would outlive the revision it was
-   * read at, and the read cache above deliberately remembers only the parts
-   * LIST for exactly that reason.
-   */
-  #readRefBytes(
-    connection: DeviceConnection,
-    sessionId: string,
-    ref: Record<string, unknown>,
-    byteCap: number,
-    deadline?: AssemblyDeadline,
-  ): Promise<Buffer> {
-    if (deadline !== undefined) {
-      return this.#walkRefBytes(connection, sessionId, ref, byteCap, deadline)
-    }
+    // The key is the request the walk answers: every field of the ref the walk
+    // READS (`contentRefSchema` is contentId/revision/byteLength/sha256, plus a
+    // mediaType that never changes the bytes), the session, and the cap. The
+    // CONNECTION is the outer key rather than its device id — see the field's
+    // docblock (#367).
     const key = [
-      connection.record.deviceId,
       sessionId,
       String(ref['contentId'] ?? ''),
       String(ref['revision'] ?? ''),
-      String(byteCap),
+      String(declaredRefBytes(ref) ?? ''),
+      String(ref['sha256'] ?? ''),
+      String(this.#externalizedByteCap),
     ].join('\0')
-    const inFlight = this.#contentWalks.get(key)
+    let walks = this.#contentWalks.get(connection)
+    if (walks === undefined) {
+      walks = new Map<string, Promise<string>>()
+      this.#contentWalks.set(connection, walks)
+    }
+    const inFlight = walks.get(key)
     if (inFlight !== undefined) return inFlight
-    const walk = this.#walkRefBytes(connection, sessionId, ref, byteCap, deadline)
-    this.#contentWalks.set(key, walk)
+    const walk = this.#walkExternalized(connection, sessionId, ref, deadline)
+    walks.set(key, walk)
     // PRE-OBSERVE, like the upload window and the slice window: the callers
     // attach a moment later, and Node reports a rejection with no handler in
     // the same turn as unhandled.
     const forget = (): void => {
-      if (this.#contentWalks.get(key) === walk) this.#contentWalks.delete(key)
+      if (walks.get(key) === walk) walks.delete(key)
     }
     walk.then(forget, forget)
     return walk
   }
 
   /**
-   * ONE content walk, holding the process-wide gate slot for its whole length
-   * (issue #39) — slices, digest, and the caller's decode that follows.
+   * ONE content walk AND its decode, holding the process-wide gate slot for
+   * both (issue #39) — slices, digest, and the decoded string.
    *
-   * The slot lives HERE rather than at the call site so that a caller joining
-   * a walk already in flight takes no slot at all (#365).
+   * The slot lives HERE rather than at the call site so that a caller joining a
+   * walk already in flight takes no slot at all (#365). The DECODE lives here
+   * for the same reason the slot does: `ContentReadGate` exists to bound the
+   * assembly peak, and `src/AGENTS.md` counts the decoded string as the third
+   * copy (3 × the ref's size), so decoding after the slot was released would
+   * leave that third copy unbounded (#367). The coalesced value is therefore
+   * text: immutable, and already past the decode the joiner would repeat.
    */
-  async #walkRefBytes(
+  async #walkExternalized(
     connection: DeviceConnection,
     sessionId: string,
     ref: Record<string, unknown>,
-    byteCap: number,
     deadline?: AssemblyDeadline,
-  ): Promise<Buffer> {
+  ): Promise<string> {
     const releaseSlot = await this.#contentGate.acquire(deadline?.instant)
     try {
-      return await this.#readVerifiedBytes(connection, sessionId, ref, byteCap, deadline)
+      const bytes = await this.#readVerifiedBytes(
+        connection,
+        sessionId,
+        ref,
+        this.#externalizedByteCap,
+        deadline,
+      )
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+      } catch {
+        throw new Error(
+          `agent.content.read for ${String(ref['contentId'] ?? '')} returned bytes that are not valid UTF-8; not decoded`,
+        )
+      }
     } finally {
       releaseSlot()
     }

@@ -271,13 +271,20 @@ export class SessionSubscriptions {
    * a subscribe is running now waits for THAT one: one peer subscription, and
    * every caller sees the same verdict, including a rejection.
    *
-   * Joining is by sessionId, not by cursor: the cursor only chooses the
-   * baseline of the subscription that is being created anyway, and the caller
-   * of `ensure` does not observe it. The entry is dropped the moment the
-   * subscribe settles, so a LATER `ensure` still takes the re-subscribe path
-   * (close the live subscription, then subscribe) exactly as before.
+   * Joining is by sessionId AND by cursor COMPATIBILITY, because the cursor is
+   * not free: it asks the peer to REPLAY from that position, and a subscribe
+   * opened without one answers a checkpoint. A caller that needs a replay —
+   * `#awaitRun`'s recovery, which re-ensures from the cursor it already holds —
+   * therefore cannot ride a subscribe another caller started cursorless: it
+   * would open a checkpoint, the replay would never arrive, and the wait would
+   * end in `timeout` for a run that had already settled. So a joiner rides the
+   * attempt in flight only when it wants no replay, or the same one.
+   *
+   * The entry is dropped the moment the subscribe settles, so a LATER `ensure`
+   * still takes the re-subscribe path (close the live subscription, then
+   * subscribe) exactly as before.
    */
-  readonly #ensuring = new Map<string, Promise<void>>()
+  readonly #ensuring = new Map<string, { cursor: AgentCursor | undefined; promise: Promise<void> }>()
   /**
    * Insertion order IS the eviction order, and it is SUBSCRIPTION recency, not
    * USE recency. Read that literally: only `ensure` (a re-subscribe re-inserts
@@ -426,16 +433,40 @@ export class SessionSubscriptions {
     // the same step both find no subscription and both ask the peer, which
     // refuses the second one.
     const inFlight = this.#ensuring.get(sessionId)
-    if (inFlight !== undefined) return inFlight
+    if (inFlight !== undefined) {
+      if (this.#joinable(inFlight.cursor, cursor)) return inFlight.promise
+      // Wait for the attempt in flight, then take this caller's OWN path: its
+      // replay cannot be served by a subscribe already on the wire.
+      await inFlight.promise.catch(() => undefined)
+      return this.ensure(sessionId, cursor)
+    }
     const run = this.#ensureOnce(sessionId, cursor)
-    this.#ensuring.set(sessionId, run)
+    const entry = { cursor, promise: run }
+    this.#ensuring.set(sessionId, entry)
     // Both arms, so a rejected subscribe is observed by this bookkeeping too
     // and cannot become an unhandled rejection while the callers are attaching.
     const forget = (): void => {
-      if (this.#ensuring.get(sessionId) === run) this.#ensuring.delete(sessionId)
+      if (this.#ensuring.get(sessionId) === entry) this.#ensuring.delete(sessionId)
     }
     run.then(forget, forget)
     return run
+  }
+
+  /**
+   * Can a caller asking for `wanted` ride a subscribe started from `started`?
+   *
+   * Only when it needs no replay (a checkpoint answers it), or when it needs
+   * exactly the one already on the wire. Anything else has to wait and ask
+   * again — see {@link SessionSubscriptions.#ensuring}.
+   */
+  #joinable(started: AgentCursor | undefined, wanted: AgentCursor | undefined): boolean {
+    if (wanted === undefined) return true
+    if (started === undefined) return false
+    return (
+      started.sessionId === wanted.sessionId &&
+      started.streamEpoch === wanted.streamEpoch &&
+      started.seq === wanted.seq
+    )
   }
 
   /** {@link SessionSubscriptions.ensure} without the in-flight bookkeeping. */

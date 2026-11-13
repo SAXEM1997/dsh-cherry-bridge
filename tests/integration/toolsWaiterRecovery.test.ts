@@ -63,6 +63,8 @@ interface Rig {
   store: DeviceStore
   tmp: string
   call(name: string, args?: Record<string, unknown>): Promise<unknown>
+  /** The per-device subscription layer, so a case can drive `ensure` directly. */
+  subs(deviceId: string): SessionSubscriptions
   stop(): Promise<void>
 }
 
@@ -161,6 +163,7 @@ async function makeRig(options: FakeCherryOptions = {}, rigOptions: RigOptions =
       if (found === undefined) throw new Error(`tool ${name} is not registered`)
       return found.execute(args)
     },
+    subs,
     stop: async () => {
       for (const created of subscriptions.values()) await created.dispose()
       for (const connection of connections.values()) await connection.close()
@@ -287,5 +290,31 @@ describe('R3-F2: a waiter recovers when its subscription disappears mid-wait', (
     expect(String(result['guidance'] ?? '')).toMatch(/re-?subscribe|subscription/i)
     // The run's own id is still reported, so the caller can re-wait on it.
     expect(result['executionId']).toBeDefined()
+  })
+
+  it('F2-2d a re-ensure that needs a REPLAY does not ride a subscribe started without one', async () => {
+    const rig = await makeRig({
+      agent: { agents: [AGENT], sessions: [SESSION], terminalMessage: TERMINAL_MESSAGE },
+    })
+    const layer = rig.subs('dev-A')
+    const cursor = rig.fake.cursorFor('s-1')
+
+    // Two callers reach `ensure` in the same tick, which is ordinary: every read
+    // tool ensures cursorless, and a wait's recovery ensures WITH the cursor it
+    // already holds. The peer is not awaited in between, so the first subscribe
+    // is provably still in flight when the second call arrives.
+    const cursorless = layer.ensure('s-1')
+    const replay = layer.ensure('s-1', cursor)
+    await Promise.all([cursorless, replay])
+
+    const calls = rig.fake.subscribeCalls.filter((call) => call.sessionId === 's-1')
+    // Joining the cursorless attempt would open a CHECKPOINT, and the replay the
+    // waiter asked for would never arrive — its buffer would stay empty, every
+    // pass would poll an empty stream, and the wait would report `timeout` for a
+    // run that settled. So the replaying caller waits for that attempt and then
+    // takes its own re-subscribe path.
+    expect(calls).toHaveLength(2)
+    expect(calls[1]!.cursor).toEqual(cursor)
+    expect(calls[1]!.mode).toBe('replay')
   })
 })

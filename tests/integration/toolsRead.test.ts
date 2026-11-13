@@ -3983,19 +3983,28 @@ describe('issue #365: concurrent reads of one ref share a single walk', () => {
 
   it('㉚a two reads of the same ref in flight walk it ONCE', async () => {
     const rig = await rigWithLongText()
-    // The FIRST offset is held for 100 ms, so the second call is guaranteed to
-    // arrive while the first walk is still standing there. Without a hold, a
-    // three-slice content can settle between the two calls and the count would
-    // prove nothing either way.
-    rig.fake.delayContentReadAt('0', 100)
+    // Warm the parts cache first: the concurrent pair then measures the CONTENT
+    // walk alone, instead of racing the session/parts round trips of a cold
+    // read against the hold.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    const before = rig.fake.contentReadsServed()
+
+    // The FIRST offset is held, and the second call starts only once the first
+    // walk is OBSERVABLY in flight. A fixed hold alone would be a race dressed
+    // as a test: a three-slice content can settle between the two calls, and
+    // then the count proves nothing either way (tests/AGENTS.md: wait on a
+    // predicate). The hold only has to outlast the microtask hops.
+    rig.fake.delayContentReadAt('0', 800)
+    const firstCall = rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    await waitFor(() => rig.fake.contentReadsInFlight() === 1, 3_000, 'the first walk to be in flight')
     const [first, second] = await Promise.all([
-      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
+      firstCall,
       rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
     ])
     expect(textOf(first)).toBe(TEXT)
     expect(textOf(second)).toBe(TEXT)
     // 3 = one walk. 6 = both walked, which is what this case exists to refuse.
-    expect(rig.fake.contentReadsServed()).toBe(3)
+    expect(rig.fake.contentReadsServed() - before).toBe(3)
     expect(TEXT.length).toBeGreaterThan(2 * SLICE)
   })
 
@@ -4013,13 +4022,27 @@ describe('issue #365: concurrent reads of one ref share a single walk', () => {
     // RATE_LIMITED is the one RPC refusal that does NOT degrade to an
     // `unavailable` part, so it reaches both callers instead of being absorbed
     // by one of them.
-    rig.fake.delayContentReadAt('0', 60)
+    // Same shape as ㉚a, and the same warm-up: the failing slice is held until
+    // the second caller has joined, so "both rejected" cannot be satisfied by
+    // two independent walks.
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    const before = rig.fake.contentReadsServed()
+    rig.fake.delayContentReadAt('0', 800)
     rig.fake.failContentReadAt('0', { reason: 'RATE_LIMITED', message: 'shared walk is gone' })
+    const firstCall = rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
+    await waitFor(() => rig.fake.contentReadsInFlight() === 1, 3_000, 'the walk to be in flight')
     const settled = await Promise.allSettled([
-      rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
+      firstCall,
       rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' }),
     ])
     expect(settled.map((entry) => entry.status)).toEqual(['rejected', 'rejected'])
+    // ONE walk, and the count proves it. The shared walk asks for its first
+    // slice once and the connection replays that ONE `RATE_LIMITED` refusal
+    // (`#replayAfterRateLimit`), so a shared walk is 2 requests; two walks would
+    // be 4. Without this assertion the case proves only that both CALLS reject —
+    // a per-caller walk hits the same failing offset and rejects with the same
+    // words, so it would pass a broken implementation.
+    expect(rig.fake.contentReadsServed() - before).toBe(2)
     for (const entry of settled) {
       expect((entry as PromiseRejectedResult).reason).toMatchObject({ message: expect.stringMatching(/shared walk is gone/i) })
     }
