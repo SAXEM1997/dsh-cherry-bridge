@@ -177,9 +177,11 @@ export interface RebuildSummary {
   pathUnmatched: number
   /**
    * True when a NEWER generation superseded this round before it could commit
-   * (`save`, `invalidateDerived`, a teardown). The counters below are then all
-   * `0` because nothing was written — which is NOT the same answer as a round
-   * that committed and resolved nothing, and only this flag can tell them apart.
+   * (`save`, `invalidateDerived`, a teardown). Every OUTCOME counter is then
+   * `0` — `resolved`, `unresolved`, `pathUnmatched` — because nothing was
+   * written, while `agents` and `listAvailable` still describe what the round
+   * READ. That is NOT the same answer as a round that committed and resolved
+   * nothing, and only this flag can tell them apart.
    */
   discarded: boolean
 }
@@ -928,15 +930,6 @@ export class ToolScopeState {
   }
 
   /**
-   * One agent's judgement against the generation being built, following §4's
-   * two rules in order: the header-validated `sessionIds` projection wins, and
-   * the canonical path map is the only path comparison there is.
-   *
-   * `doc` and `workspaces` are the snapshots `rebuild()` took for this whole
-   * round, so two agents of one generation can never be judged against two
-   * different documents or lists.
-   */
-  /**
    * Rules one and two, in the ONE place both entries read them (#356).
    *
    * `#judge` and {@link resolveNow} used to carry byte-identical copies of the
@@ -992,6 +985,16 @@ export class ToolScopeState {
       : judged(doc, agent, 'resolved', workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`)
   }
 
+  /**
+   * One agent's judgement against the generation being built, following §4's
+   * two rules in order: the header-validated `sessionIds` projection wins, and
+   * the canonical path map is the only path comparison there is.
+   *
+   * The `round` is the snapshot `rebuild()` took for this WHOLE round, so two
+   * agents of one generation can never be judged against two different
+   * documents or lists — and a caller cannot pair round A's document with
+   * round B's list.
+   */
   async #judge(round: RoundInputs, agent: ScopeAgentLike): Promise<AgentJudgement> {
     const shared = this.#sharedRule(round.doc, round.workspaces, agent)
     if ('judgement' in shared) return shared.judgement
@@ -1047,7 +1050,7 @@ export class ToolScopeState {
         agent,
         'no-match',
         undefined,
-        `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`,
+        `宿主不拥有目录 ${cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`,
       )
     }
 

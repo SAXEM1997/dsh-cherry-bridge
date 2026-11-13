@@ -2198,15 +2198,6 @@ var ToolScopeState = class {
 		this.#workspaces = [];
 	}
 	/**
-	* One agent's judgement against the generation being built, following §4's
-	* two rules in order: the header-validated `sessionIds` projection wins, and
-	* the canonical path map is the only path comparison there is.
-	*
-	* `doc` and `workspaces` are the snapshots `rebuild()` took for this whole
-	* round, so two agents of one generation can never be judged against two
-	* different documents or lists.
-	*/
-	/**
 	* Rules one and two, in the ONE place both entries read them (#356).
 	*
 	* `#judge` and {@link resolveNow} used to carry byte-identical copies of the
@@ -2233,6 +2224,16 @@ var ToolScopeState = class {
 		const workspaceId = pathMap.get(cwd);
 		return workspaceId === void 0 ? void 0 : judged(doc, agent, "resolved", workspaceId, `规范化路径命中 ${this.#label(workspaces, workspaceId)}`);
 	}
+	/**
+	* One agent's judgement against the generation being built, following §4's
+	* two rules in order: the header-validated `sessionIds` projection wins, and
+	* the canonical path map is the only path comparison there is.
+	*
+	* The `round` is the snapshot `rebuild()` took for this WHOLE round, so two
+	* agents of one generation can never be judged against two different
+	* documents or lists — and a caller cannot pair round A's document with
+	* round B's list.
+	*/
 	async #judge(round, agent) {
 		const shared = this.#sharedRule(round.doc, round.workspaces, agent);
 		if ("judgement" in shared) return shared.judgement;
@@ -2250,7 +2251,7 @@ var ToolScopeState = class {
 			this.#warn(`cwd ${cwd} 的 resolveByPath 调用失败；判定为 unresolved（下一次 rebuild 会重新解析）`, error);
 			return judged(round.doc, agent, "unresolved", void 0, `cwd ${cwd} 本次解析失败（注册表未就绪或 realpath 失败）`);
 		}
-		if (entity === void 0) return judged(round.doc, agent, "no-match", void 0, `宿主不拥有目录 ${agent.cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
+		if (entity === void 0) return judged(round.doc, agent, "no-match", void 0, `宿主不拥有目录 ${cwd}（resolveByPath 返回 undefined），不属任何已注册工作区（D7）`);
 		const resolved = toScopeWorkspace(entity);
 		return (resolved === void 0 ? void 0 : this.#byCanonicalPath(round.doc, round.workspaces, agent, resolved.path, round.pathMap)) ?? judged(round.doc, agent, "no-match", void 0, `cwd ${cwd} 解析成功但不属任何已注册工作区（D7）`);
 	}
@@ -14299,7 +14300,7 @@ function scopeProjection(doc) {
 	};
 }
 /**
-* `PUT /cherry-remote/api/scope`: validate and commit, then refresh.
+* `PUT /cherry-remote/api/scope`: validate and commit, then recompute.
 *
 * The shape exists for the ONE await-free critical section at its end. `save()`
 * validates the base revision, prunes, bumps the revision by exactly one, writes
@@ -14308,7 +14309,7 @@ function scopeProjection(doc) {
 * between the two would let two concurrent saves both pass the revision check,
 * after which the later write silently overwrites the earlier one.
 *
-* The refresh is NOT awaited and its summary is NOT published (R24): that
+* The recompute is NOT awaited and its summary is NOT published (R24): that
 * summary describes the synchronous pass the call itself ran, while convergence
 * — the recompute round it triggers plus the catch-up pass the coalescing gate
 * owes it — rides behind the response. What the caller gets back is the
