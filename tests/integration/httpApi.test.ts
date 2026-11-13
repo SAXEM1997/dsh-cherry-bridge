@@ -256,7 +256,7 @@ function mount(overrides: Partial<CherryHttpDeps> = {}): FakeCtx {
     // dereferences this object field by field, so an `as never` here would turn
     // the existing `/diagnostics` cases into 500s.
     scope: new ToolScopeState({ file: join(dataDir, 'scope.json') }),
-    refreshScope: () => undefined,
+    recomputeScope: () => undefined,
     pair: (opts) => pairImpl(opts),
     identity: () => new Uint8Array([1, 2, 3]),
     connect: () => fakeConnection() as never,
@@ -1751,7 +1751,7 @@ describe('⑥ lifecycle', () => {
     const result = registerHttpApi(headless as unknown as CherryHttpContext, {
       store: new DeviceStore(join(dataDir, 'devices.json')),
       scope: new ToolScopeState({ file: join(dataDir, 'scope.json') }),
-      refreshScope: () => undefined,
+      recomputeScope: () => undefined,
       pair: (opts) => pairImpl(opts),
       identity: () => new Uint8Array([1]),
       connect: () => fakeConnection() as never,
@@ -1796,7 +1796,7 @@ describe('⑥ lifecycle', () => {
     return {
       store: new DeviceStore(join(dataDir, 'devices.json')),
       scope: new ToolScopeState({ file: join(dataDir, 'scope.json') }),
-      refreshScope: () => undefined,
+      recomputeScope: () => undefined,
       pair: (opts) => pairImpl(opts),
       identity: () => new Uint8Array([1]),
       connect: () => fakeConnection() as never,

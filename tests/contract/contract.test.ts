@@ -1218,7 +1218,7 @@ function mountHttpApi(overrides: Partial<CherryHttpDeps> = {}): {
     // dereferences this object field by field, so an `as never` here would turn
     // the `/diagnostics` contract cases into 500s.
     scope: new ToolScopeState({ file: join(dir, 'scope.json') }),
-    refreshScope: () => undefined,
+    recomputeScope: () => undefined,
     pair: async () => {
       throw new Error('diagnostics does not pair')
     },

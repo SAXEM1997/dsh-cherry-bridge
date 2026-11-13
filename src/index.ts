@@ -361,7 +361,7 @@ interface AssemblyState {
    * captured by `assemblyDeps()`, so a re-apply moves the HTTP face onto the
    * NEW host's entry point instead of the previous one's.
    */
-  refreshScope: () => void
+  recomputeScope: () => void
   /** Resolved once the identity load settles; pairing reads it lazily. */
   identity: Uint8Array | undefined
   /**
@@ -463,9 +463,9 @@ export function noteError(entry: DiagnosticsError): void {
 const state: AssemblyState = {
   store: new DeviceStore(join(tmpdirFallback(), 'devices.json')),
   // Placeholders, exactly like `store`: `apply` replaces both before any face
-  // can read them, and `refreshScope` has no round to run until it does.
+  // can read them, and `recomputeScope` has no round to run until it does.
   scope: new ToolScopeState({ file: join(tmpdirFallback(), 'scope.json') }),
-  refreshScope: () => undefined,
+  recomputeScope: () => undefined,
   subagentConfig: createSubagentConfigDocument({
     file: join(tmpdirFallback(), 'subagent.json'),
     seed: undefined,
@@ -861,7 +861,7 @@ function assemblyDeps(ctx: CherryBridgeContext): CherryHttpDeps & CherryToolsDep
     // assembly state exactly like `store`/`identity`: a re-apply rebinds both on
     // the state, and this one dep object follows it without a second writer.
     scope: state.scope,
-    refreshScope: () => state.refreshScope(),
+    recomputeScope: () => state.recomputeScope(),
     /**
      * The experiment's two faces (#233) — the document the settings page edits
      * and the verdict the assembly reached from it.
@@ -1095,12 +1095,12 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
 
   // The scope document's authority for THIS apply, plus the recompute entry the
   // HTTP face will call. Both are written onto the state BEFORE `assemblyDeps()`
-  // reads them: `refreshScope` is a lazy closure, so it only has to exist by the
+  // reads them: `recomputeScope` is a lazy closure, so it only has to exist by the
   // time a request arrives (the host is created further down).
   const scope = new ToolScopeState({ file: join(dataDir, 'scope.json') })
   scope.load()
   state.scope = scope
-  state.refreshScope = () => host.refresh()
+  state.recomputeScope = () => host.recompute()
 
   // The experiment's document (#233), bound to THIS apply's data directory
   // before any face reads it. The profile's `subagent` key rides in as the SEED:

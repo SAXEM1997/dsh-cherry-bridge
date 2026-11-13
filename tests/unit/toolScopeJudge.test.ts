@@ -176,7 +176,14 @@ describe('① rule one — the membership projection wins (§4)', () => {
     // installed-layer record and `guard` echoes it back (B6).
     expect(judgement.reason).toContain('Work')
     expect(judgement.reason).toContain('W')
-    expect(summary).toEqual({ listAvailable: true, agents: 1, resolved: 1, unresolved: 0, pathUnmatched: 0 })
+    expect(summary).toEqual({
+      listAvailable: true,
+      agents: 1,
+      resolved: 1,
+      unresolved: 0,
+      pathUnmatched: 0,
+      discarded: false,
+    })
     // A membership hit is a workspace, so no path-mismatch record — even though
     // the cwd on its own would not have matched.
     expect(state.pathUnmatched()).toEqual([])
@@ -286,6 +293,26 @@ describe('③ the old host without resolveByPath degrades honestly (D14)', () =>
       { agentId: 'case', cwd: '/W/REAL' },
     ])
   })
+
+  it('⑪b pathUnmatched hands out a copy, like workspaces() and host()', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(
+      registryFixture(
+        [{ id: 'W', title: 'Work', path: '/w/real' }],
+        { '/w/real': { id: 'W', path: '/w/real' }, '/w/elsewhere': undefined },
+      ),
+      [{ id: 'agent-x', cwd: '/w/elsewhere' }],
+    )
+
+    const first = state.pathUnmatched()
+    expect(first).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
+    // Every other synchronous read copies (`workspaces()`, `host()`); this one
+    // feeds the HTTP body and the settings panel, and a caller that sorts or
+    // truncates what it was handed must not reorder the state's own array
+    // behind the other readers.
+    ;(first as Array<{ agentId: string; cwd: string }>).length = 0
+    expect(state.pathUnmatched()).toEqual([{ agentId: 'agent-x', cwd: '/w/elsewhere' }])
+  })
 })
 
 describe('④ the four resolution states, and `visible` from `isVisible` alone', () => {
@@ -320,6 +347,7 @@ describe('④ the four resolution states, and `visible` from `isVisible` alone',
       resolved: 1,
       unresolved: 1,
       pathUnmatched: 2,
+      discarded: false,
     })
     expect(statusOf(state, 'agent-no-cwd')).toBe('no-cwd')
     expect(statusOf(state, 'agent-unresolved')).toBe('unresolved')
@@ -485,6 +513,9 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
     expect(state.judgement('a1')).toBeUndefined()
     // The LIST is part of the same generation; a late round must not restore it.
     expect(state.workspaces()).toEqual([])
+    // "Discarded" is its own answer: every counter is 0 because nothing
+    // committed, not because everything failed to resolve (#356).
+    expect(summary.discarded).toBe(true)
   })
 
   it('⑦c an OLDER overlapping round cannot overwrite the newer one', async () => {
@@ -501,7 +532,8 @@ describe('⑤⑥⑦ the synchronous read contract and the atomic generation swap
       registryFixture([{ id: 'W', path: '/w' }], { '/w': { id: 'W', path: '/w' } }),
       [{ id: 'a1', cwd: '/w' }],
     )
-    await second
+    const secondSummary = await second
+    expect(secondSummary.discarded).toBe(false)
     expect(state.judgement('a1')).toMatchObject({ status: 'resolved', workspaceId: 'W' })
 
     gate.resolve()
@@ -583,6 +615,7 @@ describe('⑧⑨ the list is unreadable: fail-closed for selected, never for glo
       resolved: 0,
       unresolved: 1,
       pathUnmatched: 0,
+      discarded: false,
     })
     expect(sourcesOf(state)).toContain('workspace-list')
     // "This resolution failed" is exactly the state the next round retries.
@@ -772,6 +805,7 @@ describe('⑪ one bad item does not affect the others or any judgement (R9)', ()
       resolved: 2,
       unresolved: 0,
       pathUnmatched: 1,
+      discarded: false,
     })
     expect(first.log).toHaveBeenCalledTimes(1)
     // Not a degradation: the three-value enum has no member for "one item's path
@@ -863,5 +897,29 @@ describe('⑫ the step-time visibility predicate is late-bound and per agent', (
       [{ id: 'a1', cwd: '/w/in' }],
     )
     expect(predicate('a1')).toBe(true)
+  })
+})
+
+describe('⑫ the two entries share their rules (#356)', () => {
+  it('⑫b both entries answer rule one and no-cwd with the SAME bytes', async () => {
+    const { state } = makeState({ mode: 'selected', workspaceIds: ['W'] })
+    await state.rebuild(
+      registryFixture(
+        [{ id: 'W', title: 'Work', path: '/w/real', sessionIds: ['by-id'] }],
+        { '/w/real': { id: 'W', path: '/w/real' } },
+      ),
+      [{ id: 'by-id', cwd: '/elsewhere' }, { id: 'no-cwd' }],
+    )
+
+    for (const agent of [{ id: 'by-id', cwd: '/elsewhere' }, { id: 'no-cwd' }]) {
+      const committed = state.judgement(agent.id)!
+      const window = state.resolveNow(agent)!
+      // The REASON is the half that travels to the settings page, so it is the
+      // half that must not drift: `#sharedRule` is the one home for both.
+      expect(window.status).toBe(committed.status)
+      expect(window.workspaceId).toBe(committed.workspaceId)
+      expect(window.reason).toBe(committed.reason)
+      expect(window.visible).toBe(committed.visible)
+    }
   })
 })
