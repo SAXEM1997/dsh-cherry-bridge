@@ -30,11 +30,15 @@ is visible in two places:
   on every call — but a RECONNECT gets a fresh chance, because the desktop may
   have been upgraded in between.
 
-The app is not a spec, and this ADR is not a plan to add `agent.tasks.*`: no
-released desktop serves it (v2.1.10, v2.2.0 and v2.2.1 all pin protocol 0.7.0),
-so a `cherry_tasks` today would be a tool that can only ever answer
-`unsupported`. What it records is the policy any FUTURE optional capability
-follows, so the first one does not have to rediscover it.
+The app is not a spec, and this ADR is not a plan to add `agent.tasks.*`: when
+it was written no released desktop SERVED it (v2.1.10 and v2.2.0 register no
+task handler, and both pin protocol 0.7.0). That changed with **v2.2.1**, which
+registers the five handlers while still pinning 0.7.0 — a desktop can serve a
+method before the package that TYPES it is published, and v2.2.2 is what finally
+stamps 0.8.0. So the probe below is the rule that made `cherry_tasks` (#381)
+possible, not a rule about a hypothetical future: what this ADR records is the
+policy any optional capability follows, so the next one does not have to
+rediscover it.
 
 ## Decision
 

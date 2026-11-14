@@ -196,7 +196,7 @@ describe('mount: capability probe and the injection gate', () => {
     const fixture = makeFixture()
     const unmountFirst = fixture.mount()
     const unmountSecond = fixture.mount()
-    // A leaked first mount registers the same 14 names on top of live ones; the
+    // A leaked first mount registers the same 15 names on top of live ones; the
     // NAME set alone cannot see it, the counters can.
     // Cumulative: both mounts registered once each; the leak discriminator is
     // the name-collision counter (0 here, 15 with the second-mount release deleted).

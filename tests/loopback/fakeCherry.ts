@@ -333,8 +333,9 @@ export interface FakeAgentOptions {
   /** Run history served by `agent.tasks.runs.*` (#381). */
   taskRuns?: FakeTaskRunRecord[]
   /**
-   * Answer every `agent.tasks.*` with `NOT_FOUND`, like a desktop older than
-   * 2.2.1 whose handler table has no such method (#381).
+   * Answer every `agent.tasks.*` with JSON-RPC `-32601` / `Method not found` and
+   * NO `data`, like a desktop older than 2.2.1 whose handler table has no such
+   * method — that absence is what the real server emits (#381, #383).
    */
   withoutTaskMethods?: boolean
   /**
@@ -2901,7 +2902,11 @@ export class FakeCherry {
       case 'agent.attachments.present':
         return this.#handleAttachmentsPresent(params)
       default:
-        throw new FakeRpcError({ reason: 'NOT_FOUND', message: `unknown method ${method}` })
+        // A method this peer never REGISTERED answers `-32601` with no `data`
+        // (`json-rpc-2.0`'s `createMethodNotFoundResponse`) — NOT a classified
+        // `NOT_FOUND`, which carries a `reason` a client could mistake for a
+        // capability verdict about something else (#383).
+        throw new FakeMethodNotFoundError(method)
     }
   }
 

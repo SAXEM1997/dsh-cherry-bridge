@@ -35,7 +35,7 @@ flowchart TB
 
 - Package: `dsh-cherry-bridge`, plugin id: `cherry-remote`
 - Transport: `ws://` + Noise XX by default (encryption lives in the Noise record layer); a desktop behind a TLS front is reached over `wss://`, with `wsTls` supplying the private-CA trust
-- Tool face: 15 `cherry_*` tools — the fifteenth, `cherry_subagent`, is the **experimental, off-by-default** cross-desktop delegation (see [Experimental subagent](#experimental-subagent)) — enabled **per workspace**, and by default **nobody has them** (see “Scope”)
+- Tool face: 15 `cherry_*` tools plus the sixteenth, `cherry_subagent` — the **experimental, off-by-default** cross-desktop delegation (see [Experimental subagent](#experimental-subagent)) — enabled **per workspace**, and by default **nobody has them** (see “Scope”)
 - Settings page and HTTP face: the same-origin prefix `/cherry-remote/api` on the host web server
 
 ## Install
@@ -290,7 +290,7 @@ same-origin SSE feed (`/cherry-remote/api/events`).
 
 The 15 tools appear **per workspace**, by **hiding, not refusing** (in an
 out-of-scope session they never enter the tool table, saving context). The
-fifteenth, `cherry_subagent`, has stricter terms for existing at all: the
+sixteenth, `cherry_subagent`, has stricter terms for existing at all: the
 experiment on, its configuration usable, the host providing a subagent service,
 **and that service able to honour the tool** — no `startActivation`, or no
 `tools.resolve` while the scope gate is installed, and it is not registered
