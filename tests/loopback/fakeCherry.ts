@@ -3459,7 +3459,8 @@ export class FakeCherry {
     setTimeout(() => {
       const live = this.#subscriptions.get(subscription.subscriptionId)
       if (live === undefined || live.phase !== 'active') return
-      for (const entry of suffix) live.delivered.push({ seq: entry.seq, bytes: JSON.stringify(entry.payload).length })
+      // `#notify` → `#deliverEvents` owns the ledger AND the unacked window:
+      // counting here as well would double every replayed event.
       this.#notify('agent.events', {
         subscriptionId: subscription.subscriptionId,
         sessionId: subscription.sessionId,
