@@ -10,13 +10,60 @@ surface change.
 Every release section states the Cherry Studio **desktop** range it was verified
 against; the range for the current tree is **2.1.4 – 2.2.2** (the `v3` pairing QR
 needs 2.1.8+, the `v2` QR works from 2.1.4). 2.2.2 is covered by the 0.4.0 smoke in
-`docs/e2e-checklist.md`, not by a full walk. The newest generation whose protocol
-packages this project pins is 2.1.8 — 2.1.9 and 2.1.10 ship the same
-`0.7.0` / `0.2.5` pair and differ from 2.1.8 on the remote-access face by one
-robustness fix in the desktop's write chain (PR #22593), smoke-tested here on a
-real 2.1.10. Sections written before this
+`docs/e2e-checklist.md`, not by a full walk. This tree pins
+`@cherrystudio/remote-protocol` **0.8.0** with the transport at **0.2.5**: desktop
+2.2.2 ships 0.8.0 / 0.2.6, 2.1.8–2.1.10 ship 0.7.0 / 0.2.5, and 0.8.0 only ADDS
+`agent.tasks.*` while transport 0.2.6 differs by its licence header alone, so the
+wire this plugin uses is identical across the range. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
+
+## v0.4.1 (2026-11-14)
+
+**中文**
+
+本版新增一个可选工具面并把它修到可信：`cherry_tasks` 读取桌面端的计划任务（列表、详情、运行历史、
+单次运行），协议 pin 因此从 `0.7.0` 升到 `0.8.0`（transport 保持 `0.2.5`，0.2.6 只改许可证头）。
+这个面没有能力位，所以支持与否靠探测并按连接锁存：桌面端从 2.2.1 起注册这五个方法，更老的端会以
+JSON-RPC `-32601` 回答，锁存在链路断开时重置。其余改动是仓库卫生：`npm pack` 与发布字节一致、
+记录 0.4.0 的真机走查与 2.2.2 的上游事实、把「工具数量」这类陈旧说法变成一条会变红的测试。
+配置形状未变，工具面从 14 个增到 15 个（另有默认关闭的 `cherry_subagent`，注册表共 16 个名字）。
+按本文件开头的规则，新增能力本应进 minor 位；版本号定为 0.4.1 是维护者的选择，此处如实记录这一
+差异，而不是让版本号暗示这是一次纯修补。
+
+**新增与改进**
+
+- #379 记录 0.4.0 的真机走查结果与 Cherry Studio 2.2.2 的上游事实（`agent.tasks.*` 自 2.2.1 起已被服务）。
+- #380 `repository.url` 改用 npm 的归一化形式，`npm pack` 的字节与发布出去的字节一致。
+- #382 `cherry_tasks`：可选、按连接探测并锁存的计划任务面，协议 pin 提到 0.8.0。
+- #384 任务面的「不支持」判定在真实老桌面（`-32601`）上生效，锁存随链路断开重置。
+- #386 删掉与代码相反的锁存说明，补回 `NOT_FOUND` 分支的正向测试。
+- #388 带 cursor 的拒绝规则与 `-32601` 规则分开陈述，假对端的默认分支被钉住。
+- #390 工具数量的陈旧说法（英文数量词、位次词、中文数字总量）变成一条会变红的测试。
+
+**English**
+
+This release adds one optional tool face and makes it trustworthy: `cherry_tasks` reads the desktop's
+scheduled tasks (list, detail, run history, single run), which moves the protocol pin from `0.7.0` to
+`0.8.0` (the transport stays at `0.2.5`; 0.2.6 changes only its licence header). The face has no
+capability bit, so support is probed and latched per connection: the desktop registers the five methods
+from 2.2.1 onward, an older one answers JSON-RPC `-32601`, and the latch resets when the link drops. The
+rest is repository hygiene: `npm pack` now matches the published bytes, the 0.4.0 real-desktop walk and
+the 2.2.2 upstream facts are recorded, and a stale statement about the tool count is a test that turns
+red. The configuration shape is unchanged; the tool family moves from 14 to 15 names (plus the
+off-by-default `cherry_subagent`, so the registry holds 16). By the rule at the top of this file a new
+capability belongs in the minor digit; the version is 0.4.1 by the maintainer's choice, recorded here
+rather than left for the version number to imply this was a pure fix.
+
+**Added and improved**
+
+- #379 Record the 0.4.0 real-desktop walk and the Cherry Studio 2.2.2 upstream facts (`agent.tasks.*` has been served since 2.2.1).
+- #380 Hold `repository.url` in npm's normalised form, so `npm pack` produces the bytes that get published.
+- #382 `cherry_tasks`: an optional, probed, per-connection-latched face for scheduled tasks; protocol pin to 0.8.0.
+- #384 The task face's "unsupported" verdict now works against a real old desktop (`-32601`), and the latch resets when the link drops.
+- #386 Remove the latch comment that contradicted the code, and restore a positive test for the `NOT_FOUND` arm.
+- #388 State the cursor rule and the `-32601` rule separately, and pin the fake peer's default arm.
+- #390 Turn a stale tool count (English number words, ordinals, Chinese digit totals) into a test that turns red.
 
 ## v0.4.0 (2026-11-14)
 
