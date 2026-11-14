@@ -4005,9 +4005,11 @@ export class CherryToolEngine {
    * see `isMethodNotFound`). Either one answers `unsupported` until this
    * connection reports `offline` / `identity-mismatch` — the pool REUSES the
    * instance across a reconnect, so the reset is explicit in `#watchConnection`,
-   * not a side effect of a new object (#383). A refusal carrying a cursor is NOT
-   * a probe verdict — a stale position on a peer that does serve tasks answers
-   * the same code — so it stays an ordinary failure.
+   * not a side effect of a new object (#383). A `NOT_FOUND` carrying a cursor is
+   * NOT a probe verdict — a stale position on a peer that does serve tasks
+   * answers the same code — so it stays an ordinary failure; `-32601` latches on
+   * ANY page, because a method that was never registered is absent at every
+   * offset.
    *
    * The prompt of a task is returned as the peer stored it: `{text}` inline, or
    * a `{ref}` this face does NOT resolve — the protocol serves its bytes through
@@ -4197,11 +4199,12 @@ export class CherryToolEngine {
    * all.
    *
    * `UPGRADE_REQUIRED` is read HERE and nowhere else. On `get` / `runs` / `run` it
-   * is a refusal of that call — the app's own `RemoteAgentScope.ts:530` shows a
-   * task method can answer it while the face works — so turning it into
+   * is a refusal of that call — the App's own `RemoteAgentScope.ts:530` (v0.5.5)
+   * shows a task method can answer it while the face works — so turning it into
    * `unsupported` there would hide a serving peer. The five handlers are
-   * registered in ONE block on the desktop (`agentHandlers.ts:72-76`), which is
-   * why `-32601` from any of them is a verdict about the whole face.
+   * registered in ONE block on the desktop (`agentHandlers.ts:71-79`, v2.2.2),
+   * which is why `-32601` from any of them is a verdict about the whole face.
+   * Both citations name their tag because neither clone sits on it.
    */
   #tasksProbeVerdict(
     connection: DeviceConnection,

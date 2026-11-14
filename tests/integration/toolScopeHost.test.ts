@@ -251,7 +251,7 @@ describe('mount: capability probe and the injection gate', () => {
     // The host re-runs the injection callback: a NEW effect run for the SAME
     // mount. Its disposer must be inert, not the live family's teardown.
     fixture.fake.redeliverInjection()
-    // Re-entry registers NOTHING: the count stays at the first run's 14.
+    // Re-entry registers NOTHING: the count stays at the first run's 15.
     expect(fixture.fake.registrationCalls()).toBe(15)
     fixture.fake.releaseEffect()
 

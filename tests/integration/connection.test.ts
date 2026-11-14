@@ -906,8 +906,8 @@ describe('DeviceConnection over a real loopback channel', () => {
     // fast tier.
     //
     // The observable face of the rule without waiting on a real pace: the fake
-    // ANSWERS (`NOT_FOUND` for an unknown method, `NOT_FOUND` for an unexplored
-    // checkpoint) only after the admission was granted. So the WAIT is the
+    // ANSWERS (`-32601` for a method it does not register, `NOT_FOUND` for an
+    // unexplored checkpoint) only after the admission was granted. So the WAIT is the
     // measurement — a probed method that waits out the shared tier's gap is on
     // the shared tier, and one admitted at once is on the content tier.
     const identity = await createDeviceIdentity()
@@ -945,7 +945,8 @@ describe('DeviceConnection over a real loopback channel', () => {
     // The exact-match rule is one character away from a family rule: a
     // `startsWith('agent.content.')` would send this name to the 256/s tier.
     // The fake has no handler for it, but it still COUNTS the arrival and
-    // answers `NOT_FOUND` — after the admission, which is what is measured.
+    // answers `-32601` (an unregistered method, exactly as the real server
+    // does) — after the admission, which is what is measured.
     const identity = await createDeviceIdentity()
     const fakeInfo = await makeFake({ hello: { heartbeatMs: 60_000 } })
     const shared = 2
@@ -961,12 +962,21 @@ describe('DeviceConnection over a real loopback channel', () => {
     )
 
     const lookalikeStarted = Date.now()
-    await connection.rpc.request('agent.content.write', { sessionId: 's-1', contentId: 'c-x' }).catch(() => undefined)
+    const lookalikeRefusal = await connection.rpc
+      .request('agent.content.write', { sessionId: 's-1', contentId: 'c-x' })
+      .then(() => undefined, (error: unknown) => error)
     // The look-alike waited on the SHARED tier...
     expect(Date.now() - lookalikeStarted).toBeGreaterThanOrEqual(400)
     // ...and it really reached the peer (the wait was an admission, not a
     // local rejection that happened to be slow).
     expect(fakeInfo.fake.methodCount('agent.content.write')).toBe(1)
+    // The refusal is the peer's own `-32601` with NO `data`: the fake's default
+    // arm models an unregistered method the way `json-rpc-2.0` answers one, and
+    // this is the only case that reaches that arm — so it is also the pin that
+    // stops the model drifting back to a classified `NOT_FOUND` (#383, #385).
+    expect(lookalikeRefusal).toBeInstanceOf(JsonRpcRequestError)
+    expect((lookalikeRefusal as JsonRpcRequestError).code).toBe(-32601)
+    expect((lookalikeRefusal as JsonRpcRequestError).data).toBeUndefined()
 
     // The genuine content read still takes the (now empty) CONTENT tier at
     // once: the look-alike did not spend a content admission.
