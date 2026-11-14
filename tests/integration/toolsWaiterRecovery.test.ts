@@ -351,7 +351,11 @@ describe('R3-F2: a waiter recovers when its subscription disappears mid-wait', (
     //    caller is, and installing it would put the seq gate above the whole
     //    suffix the replay exists to deliver.
     expect(activations[0]!.appliedCursor).toEqual(held)
-    expect(layer.cursorOf('s-1')).toEqual(held)
+    // NOT `cursorOf()` here: delivery advances the session cursor, and the pump
+    // is only deferred by one turn of the loop, so whether the suffix has landed
+    // by this line is a property of the machine, not of the fix. A cursor
+    // installed at the high watermark would instead REFUSE the suffix at the seq
+    // gate, which the delivery assertion below catches.
 
     // Read WITH the cursor the caller holds, never without one: a cursorless
     // read skips the window check entirely, and `windowStart` is the third half
@@ -365,6 +369,9 @@ describe('R3-F2: a waiter recovers when its subscription disappears mid-wait', (
     const result = layer.read('s-1', held)
     if (!('events' in result)) throw new Error('the replay subscription should be readable')
     expect(result.events[0]!.seq).toBe(landed.seq)
+    // The session followed the event it accepted: the gate let `landed` through
+    // because the installed cursor was BEHIND it.
+    expect(layer.cursorOf('s-1')).toEqual(landed)
   })
 
   it('F2-2g an ACTIVATE refused for any OTHER reason is surfaced, not retried', async () => {
