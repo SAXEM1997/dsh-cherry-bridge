@@ -373,7 +373,10 @@ describe('issue #381 ㉛: cherry_tasks', () => {
 
   it('㉛o an identity mismatch clears the latch as well as a dropped link', async () => {
     // `#watchConnection` resets on `offline` OR `identity-mismatch`; only the
-    // first was exercised, so the second arm could rot unnoticed.
+    // first was exercised, so the second arm could rot unnoticed. It is defence
+    // in depth rather than a path a caller can take today: an identity mismatch
+    // is terminal for the instance (the pool drops it) and `#resolve` answers
+    // `device-unavailable` first — so only this rig can drive the branch.
     const rig = await makeRig({ tasks: tasks(1), withoutTaskMethods: true })
     expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
     rig.fake.setAgentOptions({ withoutTaskMethods: false })

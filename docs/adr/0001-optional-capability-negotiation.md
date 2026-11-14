@@ -65,7 +65,7 @@ it is an answer to a different question.
 The rule is about the PEER. The host has the same shape one level up: a
 deployment without an attachments service answers
 `cherry_read(includeImages: true)` with `{error: 'unsupported'}` and leaves the
-fourteen tools registered and working. Same principle — a missing capability is
+fifteen tools registered and working. Same principle — a missing capability is
 reported about itself.
 
 ## Consequences

@@ -662,12 +662,12 @@ rule 2: probe, latch, never widen `degraded`).
   and the connection is latched.
 - **A method never REGISTERED is the same verdict from ANY action.**
   `json-rpc-2.0` answers `-32601` with no `data` (`isMethodNotFound`), so `list`,
-  `get`, `runs` and `run` all latch on it.
-- **The latch is a `WeakSet<DeviceConnection>`, cleared when that connection goes
-  offline.** A reconnect reuses the pooled instance (`connectionFor`), so
-  `#watchConnection` resets it explicitly — else the verdict outlives the upgrade.
-- **A failure carrying a CURSOR does not latch.** A stale position on a serving
-  peer answers `NOT_FOUND` too, so only the first, cursorless request probes.
+  `get`, `runs` and `run` all latch on it, on any page.
+- **The latch is a `WeakSet<DeviceConnection>`, cleared when that connection
+  reports `offline` or `identity-mismatch`.** A reconnect reuses the pooled
+  instance (`connectionFor`), so `#watchConnection` resets it explicitly.
+- **A `NOT_FOUND` carrying a CURSOR does not latch.** A stale position on a
+  serving peer answers it too, so only the first, cursorless request probes.
   `get` / `run` never latch on `NOT_FOUND` (`㉛h`); only `-32601` does.
 - A task's prompt comes back as stored — `{text}`, or a `{ref}` this face does NOT
   fetch (no tool exposes `agent.tasks.content.read`).
