@@ -1689,9 +1689,14 @@ describe('③ release configuration', () => {
       repository?: { type?: string; url?: string }
       publishConfig?: { access?: string; registry?: string }
     }
+    // #377: npm REWRITES this field while packing — `https://github.com/x/y`
+    // becomes `git+https://github.com/x/y.git` — so a manifest holding the
+    // browsable form makes `npm pack` a different byte stream from the
+    // published tarball (0.4.0: local sha1 `e9bfb1cb…`, registry `9564881b…`).
+    // The manifest holds the NORMALISED form, so packing is a no-op.
     expect(pkg.repository).toEqual({
       type: 'git',
-      url: 'https://github.com/SAXEM1997/dsh-cherry-bridge',
+      url: 'git+https://github.com/SAXEM1997/dsh-cherry-bridge.git',
     })
     // E1-2: `access` alone leaves the TARGET registry to whichever mirror the
     // publishing machine happens to have configured — the lockfile pins
