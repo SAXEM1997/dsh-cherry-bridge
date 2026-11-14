@@ -353,14 +353,44 @@ describe('R3-F2: a waiter recovers when its subscription disappears mid-wait', (
     expect(activations[0]!.appliedCursor).toEqual(held)
     expect(layer.cursorOf('s-1')).toEqual(held)
 
+    // Read WITH the cursor the caller holds, never without one: a cursorless
+    // read skips the window check entirely, and `windowStart` is the third half
+    // of the fix — installing the high watermark there puts the caller BELOW
+    // the window, so every later resume is refused as `cursor-out-of-window`.
     const events = (): number => {
-      const result = layer.read('s-1')
+      const result = layer.read('s-1', held)
       return 'events' in result ? result.events.length : -1
     }
     await waitFor(() => events() === 1, 3_000, 'the replay suffix')
-    const result = layer.read('s-1')
+    const result = layer.read('s-1', held)
     if (!('events' in result)) throw new Error('the replay subscription should be readable')
     expect(result.events[0]!.seq).toBe(landed.seq)
+  })
+
+  it('F2-2g an ACTIVATE refused for any OTHER reason is surfaced, not retried', async () => {
+    const rig = await makeRig({
+      agent: {
+        agents: [AGENT],
+        sessions: [SESSION],
+        terminalMessage: TERMINAL_MESSAGE,
+        // A cursor the peer will not accept (CONFLICT) is NOT a lost suffix:
+        // a checkpoint would hide the disagreement, and the next pass would
+        // meet it again.
+        failNextCheckpointCall: { reason: 'CONFLICT', message: 'Applied cursor does not match the prepared cursor' },
+      },
+    })
+    const layer = rig.subs('dev-A')
+
+    await expect(layer.ensure('s-1', rig.fake.cursorFor('s-1'))).rejects.toThrow(/Applied cursor does not match/)
+
+    // ONE subscribe: no fallback was entered...
+    expect(rig.fake.subscribeCalls.map((call) => call.mode)).toEqual(['replay'])
+    expect(rig.fake.activateCalls.map((call) => call.ok)).toEqual([false])
+    // ...and the prepared attempt was still released, so it cannot hold the
+    // session's only slot while the caller decides what to do.
+    expect(rig.fake.closeCalls.map((call) => call.subscriptionId)).toEqual([
+      rig.fake.subscribeCalls[0]!.subscriptionId,
+    ])
   })
 
   it('F2-2f an ACTIVATE the peer cannot honour falls back to a cursorless checkpoint subscribe', async () => {

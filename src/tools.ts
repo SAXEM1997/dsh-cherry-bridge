@@ -8269,6 +8269,11 @@ export class CherryToolEngine {
       // round trip, and the caller would still never get an answer. Failing that
       // one attempt ends the wait with a structured verdict rather than burning
       // the rest of the window on a stream nobody is feeding.
+      //
+      // #369 widened the absent window: a session is missing from the layer for
+      // BOTH round trips now (subscribe, then activate), so a pass that lands
+      // inside a replacement spends this one attempt on work already in flight
+      // and leaves none for a later, genuine loss.
       if (!subscriptions.activeSessions().includes(sessionId)) {
         if (reEnsureAttempted) {
           return this.#subscriptionLostResult(sessionId, latestExecutionId, options.commandId, reEnsureFailure)

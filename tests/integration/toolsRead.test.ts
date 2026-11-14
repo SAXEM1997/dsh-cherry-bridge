@@ -4008,7 +4008,10 @@ describe('issue #365: concurrent reads of one ref share a single walk', () => {
     expect(TEXT.length).toBeGreaterThan(2 * SLICE)
   })
 
-  it('㉚d a BUDGETED read never joins an unbudgeted one of the same ref (#369)', async () => {
+  // A PIN, not a #369 regression test: the exclusion it locks was added by #365
+  // and only ever asserted in a comment until now. It sits beside ㉚a because it
+  // is the same claim seen from the other side (what must NOT share a walk).
+  it('㉚d a BUDGETED read never joins an unbudgeted one of the same ref (#365)', async () => {
     const rig = await rigWithLongText()
     await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1' })
     const before = rig.fake.contentReadsServed()

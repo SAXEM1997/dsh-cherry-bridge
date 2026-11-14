@@ -104,6 +104,7 @@ type SubscribeDescriptor =
       mode: 'replay'
       subscriptionId: string
       fromCursor: AgentCursor
+      /** Where the PEER is. Validated as part of the replay shape, never consumed (#369). */
       highWatermark: AgentCursor
       leaseExpiresAt: string
     }
