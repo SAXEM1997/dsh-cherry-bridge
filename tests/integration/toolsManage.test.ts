@@ -810,7 +810,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       const body = JSON.parse(response.body) as { host: { reason: string; capable: boolean } }
       expect(body.host.capable).toBe(true)
       expect(body.host.reason).toContain('when')
-      // Every one of the fourteen is registered WITH the shared condition; a
+      // Every one of the fifteen is registered WITH the shared condition; a
       // single unconditional registration would be visible in every workspace.
       expect([...ctx.tools.registerOptions.keys()].sort()).toEqual([...CHERRY_TOOL_NAMES].sort())
       for (const options of ctx.tools.registerOptions.values()) {

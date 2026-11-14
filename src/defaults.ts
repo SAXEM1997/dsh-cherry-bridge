@@ -269,7 +269,7 @@ export const CHERRY_SUBAGENT_PROVIDER_DEFAULT = 'cherry'
 /**
  * The tool name a delegation is exposed to the model under.
  *
- * `cherry_subagent`, not `subagent_cherry`: it has to read as the fifteenth
+ * `cherry_subagent`, not `subagent_cherry`: it has to read as the sixteenth
  * `cherry_*` tool so it falls inside the scope subsystem's governed-name list
  * without a second convention.
  */

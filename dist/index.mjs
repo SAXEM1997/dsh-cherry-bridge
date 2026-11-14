@@ -2967,7 +2967,7 @@ const MAX_RESUME_TOKEN_CHARS = 4096;
 /**
 * The tool name a delegation is exposed to the model under.
 *
-* `cherry_subagent`, not `subagent_cherry`: it has to read as the fifteenth
+* `cherry_subagent`, not `subagent_cherry`: it has to read as the sixteenth
 * `cherry_*` tool so it falls inside the scope subsystem's governed-name list
 * without a second convention.
 */
