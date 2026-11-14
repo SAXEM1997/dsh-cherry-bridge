@@ -17,6 +17,101 @@ real 2.1.10. Sections written before this
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.4.0 (2026-11-14)
+
+**中文**
+
+本版把三条路径收成可用形状：工具可见性交给宿主的 step-time `when`（删掉旧的 restrict 路径，宿主门槛提到
+`dsh >= 0.2.2-rc.1`）；上传在链路中断后从已提交偏移续传，失败回执统一带 peer 原码；内容读取按分片校验
+回显、按有界窗口并发，同一内容在途时只走一次且解码发生在闸门内，重放订阅在被应用的光标上激活。工具数量
+仍是 15，配置形状未变，协议 pin 仍是 `0.7.0` / `0.2.5`，桌面端兼容范围仍是 **2.1.4 – 2.1.10**。唯一的
+兼容性变化是宿主门槛从 `>=0.2.0-rc.2` 提到 `>=0.2.2-rc.1`：低于它的宿主不再加载本插件。证据边界如实
+说明：新路径的覆盖来自环回对端与假宿主，`docs/e2e-checklist.md` 里 §D 的重连判别点、§F 的两种宿主模式、
+§H 的上传续传与附件真机勾选都保持未勾，需要在真桌面补走。
+
+**新增与改进**
+
+- #331 上传在链路中断后从 `agent.uploads.resume` 的已提交偏移续传，不再从零重传。
+- #332 同一内容的读取改走有界并发窗口，按分片顺序拼接，窗口取对端 `inFlightRequests` 的一半（上限 8）。
+- #337 上传链路丢失有独立原因（`LINK_LOST`），不再与 peer 的业务失败混在一个 `upload-failed` 里。
+- #344 工具可见性改为宿主 step-time 的 `when`：每次装配求值一次，切换工作区后下一步生效。
+- #366 同一 ref 的并发读取共享一次在途遍历，同一会话的并发订阅只建一条；解码在内容闸门内完成。
+
+**修复**
+
+- #330 每个内容分片都校验回显的 `offset`/`contentId`/`revision`，错位不再静默拼接。
+- #335 关闭 #327–#329 评审提出的分片窗口、续传与回显问题。
+- #340 本地上传失败不再冒用 peer 的 `reason`，避免把本地错误说成对端原因。
+- #348 卸载时作废判断代际，避免卸载后仍写出可见结论。
+- #352 丢弃与新一轮竞争的重建结果，并给每次挂载一个身份，旧挂载的回调不再生效。
+- #358 工作区列表读取失败时清空派生的判断与路径表，改为 fail-closed。
+- #362 恢复 #356 重构带走的契约：JSDoc 归位、`discarded` 语义、共享规则只留一处。
+- #368 把解码收回内容闸门的槽内，并让加入者只在游标兼容时才共享在途遍历。
+- #370 重放订阅在 `agent.subscriptions.activate` 上以**被应用**的游标激活，并在该游标处安装窗口起点。
+
+**重构与测试**
+
+- #346 删除旧的 restrict 路径（约 4,900 行），只保留 step-time `when` 一种宿主模式。
+- #350、#354、#359、#373 补齐并加强范围层与订阅层的用例：卸载后的可见性、竞态轮次、挂载身份、失败列表的 fail-closed、重放窗口起点与非回退式拒绝。
+- #360 范围层每个概念一种形状、每条规则一个出处。
+- #364 记录 Cherry Studio App 0.5.5 的 pin 变动与「我方线路未变」的核对结果。
+
+**文档**
+
+- #324、#325 真机清单补记工具开关与 0.3.2 附件走查。
+- #326 合并后同时在两个远端删除分支。
+- #338、#342 更正评审发现的失实表述：本地上传失败不带原因。
+- #371 重连步骤增加判别点：断连期间跑完的那一轮必须答出真实终态。
+
+**English**
+
+This release settles three paths into usable shape: tool visibility is decided by the host's
+step-time `when` (the old restrict path is deleted and the host floor moves to
+`dsh >= 0.2.2-rc.1`); an upload resumes from its committed offset after the link drops, and a
+failed upload carries the peer's own reason; content reads verify every slice's echo, walk through
+a bounded window, share one in-flight walk per content with the decode inside the gate, and a
+replay subscription is activated at the applied cursor. The tool count stays at 15, the config
+shape is unchanged, the protocol pins remain `0.7.0` / `0.2.5`, and the verified desktop range is
+still **2.1.4 – 2.1.10**. The one compatibility change is the host floor, from `>=0.2.0-rc.2` to
+`>=0.2.2-rc.1`: a host below it no longer loads the plugin. Evidence boundary, stated plainly: the
+new paths are covered by the loopback peer and a fake host, and the real-desktop boxes in
+`docs/e2e-checklist.md` for the reconnect discriminator (§D), the two host modes (§F) and upload
+resume (§H) stay unticked until walked on hardware.
+
+**Added and improved**
+
+- #331 An interrupted upload resumes from the committed offset of `agent.uploads.resume` instead of restarting at zero.
+- #332 Reading one content walks its slices through a bounded concurrent window, concatenated in order, sized at half the peer's `inFlightRequests` (ceiling 8).
+- #337 A lost upload link has its own reason (`LINK_LOST`) instead of sharing one `upload-failed` with peer-side failures.
+- #344 Tool visibility uses the host's step-time `when`: evaluated once per assembly, taking effect on the next step after a workspace switch.
+- #366 Concurrent reads of one ref share a single in-flight walk, one session gets one subscription, and the decode runs inside the content gate.
+
+**Fixes**
+
+- #330 Every content slice's echoed `offset`/`contentId`/`revision` is checked, so a misaligned slice can no longer be concatenated silently.
+- #335 Closes the slice-window, resume and echo findings from the #327–#329 review.
+- #340 A local upload failure no longer borrows the peer's `reason`.
+- #348 Unmounting voids the judgement generation, so a torn-down mount cannot publish a visible verdict.
+- #352 A rebuild that lost the race is discarded and each mount gets an identity, so a stale callback cannot act on the live one.
+- #358 A failed workspace-list read clears the derived judgements and path map: fail-closed.
+- #362 Restores the contracts the #356 refactor left behind: JSDoc back on its method, `discarded` semantics, one home per shared rule.
+- #368 Puts the decode back inside the gate's slot and lets a joiner share an in-flight walk only when its cursor is compatible.
+- #370 A replay subscription is activated at the **applied** cursor and installs that cursor as its window start.
+
+**Refactors and tests**
+
+- #346 Deletes the legacy restrict path (~4,900 lines), leaving step-time `when` as the only host mode.
+- #350, #354, #359, #373 Strengthen the scope and subscription cases: visibility after unmount, racing rounds, mount identity, fail-closed on a failed list read, the replay window start and the non-fallback refusal.
+- #360 One shape per concept and one home per rule in the scope layer.
+- #364 Records the Cherry Studio App 0.5.5 pin bump and the check that our wire did not move.
+
+**Docs**
+
+- #324, #325 Real-desktop notes for the tool switch and the 0.3.2 attachment walk.
+- #326 Delete the branch on both remotes after a merge.
+- #338, #342 Correct claims the reviews found false: a local upload failure carries no reason.
+- #371 The reconnect step gains a discriminator: a run that finished while disconnected must answer its real terminal.
+
 ## v0.3.2 (2026-11-11)
 
 **中文**
