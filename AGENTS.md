@@ -64,9 +64,9 @@ what loads it.
   `artifactFreshness` is the exception: it matters when source comments or
   build config changed.
 - **`npm run test:fast` is the daily lane, `npm test` is the gate.** The fast
-  lane runs `tests/unit` + `tests/contract` — 42 files, 757 tests, ~30 s — and
+  lane runs `tests/unit` + `tests/contract` — 43 files, 776 tests, ~30 s — and
   covers pure logic, every contract invariant, and `artifactFreshness`. It does
-  NOT cover `tests/integration` (28 files, ~700 tests, ~120 s), which is where
+  NOT cover `tests/integration` (30 files, ~700 tests, ~120 s), which is where
   sockets, timers and the loopback peer live; a change that touches
   `src/connection.ts`, `src/rpc/**`, the fake peer, or anything timing-related
   has to go through the full suite before merge, not the fast one.

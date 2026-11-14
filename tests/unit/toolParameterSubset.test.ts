@@ -34,8 +34,8 @@ import { properties, registerAll, toolOf } from '../helpers/cherryRegistry.js'
  * The transcription was CROSS-CHECKED against the real function once
  * (2026-11-05), because a transcription can only be as right as its reading:
  * driving `assertSupportedJsonSchema` from the installed
- * `@deepseek-ai/dsh-tools@0.2.2-rc.1` over this branch's fourteen schemas
- * accepts 14/14, and over `main`'s it rejects the same EIGHT tools with the
+ * `@deepseek-ai/dsh-tools@0.2.2-rc.1` over this branch's schemas as they stood
+ * that day (14 of them) accepts 14/14, and over `main`'s it rejects the same EIGHT tools with the
  * same NINETEEN keyword paths this file reports. That check needs the host
  * package on disk, so it is deliberately not part of the suite; the
  * transcription is the arm that runs everywhere.
@@ -232,7 +232,7 @@ function subsetViolations(schema: unknown, path = 'parameters'): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * The FIFTEENTH tool: `cherry_subagent`, registered by the subagent subsystem
+ * The SIXTEENTH tool: `cherry_subagent`, registered by the subagent subsystem
  * rather than by `registerCherryTools` (issue #232).
  *
  * It is checked here because the subset is a property of the host, not of which
