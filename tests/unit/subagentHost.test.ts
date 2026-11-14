@@ -297,7 +297,7 @@ describe('a host without the service says so, and the rest of the plugin lives (
 
   it('②d a THROWING proxy ctx mounts without a throw (the cordis get-trap hazard)', () => {
     // The regression this pins: `ctx.subagents` as a PROPERTY READ throws on a
-    // real host, so `apply` died and took the fourteen tools and the settings
+    // real host, so `apply` died and took the fifteen tools and the settings
     // page with it. A plain object fake passes against both implementations —
     // only a proxy whose get trap refuses undeclared keys can tell them apart.
     const service = fakeService()
@@ -488,7 +488,7 @@ describe('a complete configuration registers exactly one provider (SUB-04/06)', 
   })
 
   it('④e a refused registration fails the SUBSYSTEM, never the assembly', () => {
-    // A duplicate provider name throws `DUPLICATE_PROVIDER`. The fourteen tools,
+    // A duplicate provider name throws `DUPLICATE_PROVIDER`. The fifteen tools,
     // the settings page and the HTTP face have nothing to do with it.
     const service = fakeService({ refuse: new Error('DUPLICATE_PROVIDER: cherry') })
     const host = createSubagentHost({ resolution: resolveSubagentConfig(READY_CONFIG), run: RUN })

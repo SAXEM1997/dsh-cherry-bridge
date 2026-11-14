@@ -10,7 +10,7 @@ import { properties, registerAll, toolOf } from '../helpers/cherryRegistry.js'
  *
  * Task 8 pinned the six read-only tools by SELECTING them out of a registry
  * Task 9 had already widened. Task 10④ owns the full-set assertion, so the file
- * now states the COMPLETE 14-tool contract in one place — the brief's §7-1
+ * now states the COMPLETE 15-tool contract in one place — the brief's §7-1
  * 「工具参数 schema 校验」 — including the three parameters a caller cannot get
  * wrong without the peer refusing the call: `cherry_respond`'s required
  * `interactionId` with its `decision|response` exclusivity, `cherry_cancel`'s
@@ -26,7 +26,7 @@ const READ_TOOLS = [
   'cherry_events',
 ] as const
 
-/** The interactive face (Task 9). */
+/** The interactive face (Task 9), plus the read-only task face (#381). */
 const INTERACTIVE_TOOLS = [
   'cherry_create',
   'cherry_send',
@@ -249,7 +249,7 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
 })
 
 // ---------------------------------------------------------------------------
-// Task 10④: the full 14-tool set
+// Task 10④: the full 15-tool set
 // ---------------------------------------------------------------------------
 
 describe('tool parameter schemas: the complete 15-tool registry (Task 10④)', () => {

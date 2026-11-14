@@ -1047,6 +1047,23 @@ class FakeRpcError extends Error {
 }
 
 /**
+ * The refusal a peer gives a method it NEVER REGISTERED: JSON-RPC `-32601`,
+ * with no `data` at all.
+ *
+ * A separate channel from {@link FakeRpcError} because the absence of
+ * `data.reason` is the whole point. A desktop older than 2.2.1 has no
+ * `agent.tasks.*` handler, so its `json-rpc-2.0` server answers
+ * `createMethodNotFoundResponse` — `{code: -32601, message: 'Method not
+ * found'}` — and a client that only looks for a structured `reason` sees
+ * nothing (#381).
+ */
+class FakeMethodNotFoundError extends Error {
+  constructor(method: string) {
+    super(`Method not found: ${method}`)
+  }
+}
+
+/**
  * A loopback stand-in for the Cherry Studio desktop: a real `ws` server whose
  * connections are upgraded with `acceptSecureChannel` (real Noise XX, real
  * prelude negotiation) and then serve a minimal hello/authenticate/refresh/ping
@@ -1166,6 +1183,9 @@ export class FakeCherry {
   /** Parts-list calls served, and the one-shot refusal after N of them (#310). */
   #partsListCalls = 0
   #partsListFailureAfter: { count: number; failure: FakeFailure } | undefined
+  /** `agent.tasks.list` pages served, and the one-shot refusal after N (#381). */
+  #taskListCalls = 0
+  #taskListFailureAfter: { count: number; failure: FakeFailure } | undefined
   #nextVerificationFailure: string | undefined
   /** One-shot hooks that fire AFTER the next successful read of a method. */
   #afterReadOnce = new Map<string, () => void>()
@@ -1832,7 +1852,6 @@ export class FakeCherry {
   // Read-face observation (Task 8)
   // -------------------------------------------------------------------------
 
-  /** Every read-face call in arrival order, with its params verbatim. */
   /**
    * Merge options into the `agent` fixture at RUNTIME (#381).
    *
@@ -1845,6 +1864,7 @@ export class FakeCherry {
     this.#options.agent = { ...this.#options.agent, ...patch }
   }
 
+  /** Every read-face call in arrival order, with its params verbatim. */
   get readCalls(): readonly { method: string; params: Record<string, unknown> }[] {
     return this.#readCalls
   }
@@ -2039,6 +2059,17 @@ export class FakeCherry {
   /** Refuses the `agent.parts.list` after `count` successes, once (#310). */
   failPartsListAfter(count: number, failure: FakeFailure): void {
     this.#partsListFailureAfter = { count, failure }
+  }
+
+  /**
+   * Refuses the `agent.tasks.list` after `count` successes, once (#381).
+   *
+   * A cursor refusal on page TWO is the case that must NOT latch — the peer
+   * serves the face and is complaining about a position — so the test needs a
+   * walk that gets a first page and then a refusal.
+   */
+  failTaskListAfter(count: number, failure: FakeFailure): void {
+    this.#taskListFailureAfter = { count, failure }
   }
 
   /** The NEXT `agent.uploads.complete` verifies as failed with this code (#312). */
@@ -2752,6 +2783,10 @@ export class FakeCherry {
         }
         await this.#reply(live, frame.id, result)
       } catch (error) {
+        if (error instanceof FakeMethodNotFoundError) {
+          await this.#replyMethodNotFound(live, frame.id)
+          return
+        }
         const failure =
           error instanceof FakeRpcError ? error.failure : { reason: 'INTERNAL', message: String(error) }
         await this.#reply(live, frame.id, undefined, failure)
@@ -3673,13 +3708,20 @@ export class FakeCherry {
       this.#readFailNext.delete(method)
       throw new FakeRpcError(once)
     }
-    // The task face is OPTIONAL (#381): a desktop older than 2.2.1 has no
-    // handler for it, and the real one answers method-not-found. Modelled here
-    // so the client's latch has something honest to latch on.
+    // The task face is OPTIONAL (#381): a desktop older than 2.2.1 never
+    // REGISTERS these methods, so its JSON-RPC server answers `-32601` with no
+    // `data` — not a structured `NOT_FOUND`. Modelled exactly, because the
+    // difference is what the client's probe has to recognise.
     if (method.startsWith('agent.tasks.') && this.#agent().withoutTaskMethods === true) {
-      throw new FakeRpcError({ reason: 'NOT_FOUND', message: `unknown method ${method}` })
+      throw new FakeMethodNotFoundError(method)
     }
     if (method === 'agent.tasks.list') {
+      const after = this.#taskListFailureAfter
+      if (after !== undefined && this.#taskListCalls >= after.count) {
+        this.#taskListFailureAfter = undefined
+        throw new FakeRpcError(after.failure)
+      }
+      this.#taskListCalls += 1
       const agentId = params['agentId'] as string | undefined
       const statuses = params['statuses'] as string[] | undefined
       const items = (this.#agent().tasks ?? []).filter(
@@ -4796,6 +4838,22 @@ export class FakeCherry {
       }
     }
     throw new FakeRpcError(failure)
+  }
+
+  /**
+   * The JSON-RPC-level refusal for a method this peer never registered:
+   * `-32601`, and NO `data`.
+   *
+   * Deliberately not `#reply` with a failure: a `FakeFailure` always travels
+   * inside `data`, and the point of this arm is that there is nothing there for
+   * `failureReason` to read (#381).
+   */
+  async #replyMethodNotFound(live: LiveConnection, id: unknown): Promise<void> {
+    try {
+      await live.channel.write({ jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } })
+    } catch {
+      // The client vanished mid-reply; nothing to do.
+    }
   }
 
   async #reply(

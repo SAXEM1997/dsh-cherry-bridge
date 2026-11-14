@@ -29,7 +29,7 @@ import {
   MAX_RESUME_TOKEN_CHARS,
   PARTS_LIST_PAGE_CLAMP,
 } from './defaults.js'
-import { failureReason, JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
+import { failureReason, isMethodNotFound, JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { ContentReadGate } from './contentGate.js'
 import { truncateErrorMessage } from './diagnostics.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
@@ -40,8 +40,9 @@ import type { AgentCursor } from '@cherrystudio/remote-protocol/agent'
 
 /**
  * The plugin's tool face: the complete fifteen-tool `cherry_*` family — six
- * READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9) and two MANAGEMENT
- * ones (Task 10) — plus the registration framework they all share.
+ * READ-ONLY tools (Task 8), the read-only scheduled-task face (#381), six
+ * INTERACTIVE ones (Task 9) and two MANAGEMENT ones (Task 10) — plus the
+ * registration framework they all share.
  *
  * Three disciplines run through every tool:
  *
@@ -2060,7 +2061,16 @@ export function withRateLimitHint(error: unknown): unknown {
   return error
 }
 
-/** The `statuses` filter of `cherry_tasks`, or `'invalid'` when a value is not a task state. */
+/**
+ * The `statuses` filter of `cherry_tasks`, or `'invalid'` when a value is not a
+ * task state.
+ *
+ * An EMPTY array is `'invalid'`, not "no filter": the protocol schema requires
+ * at least one entry (`Too small: expected array to have >=1 items`), so
+ * forwarding it would spend a round trip on a request the peer refuses — and
+ * collapsing it to `undefined` would answer EVERY task to a caller who named
+ * none, the opposite of what was asked (#381 review).
+ */
 function statusListArgument(value: unknown): string[] | undefined | 'invalid' {
   if (value === undefined) return undefined
   if (!Array.isArray(value)) return 'invalid'
@@ -2070,7 +2080,7 @@ function statusListArgument(value: unknown): string[] | undefined | 'invalid' {
     if (typeof entry !== 'string' || !(allowed as readonly string[]).includes(entry)) return 'invalid'
     if (!statuses.includes(entry)) statuses.push(entry)
   }
-  return statuses.length === 0 ? undefined : statuses
+  return statuses.length === 0 ? 'invalid' : statuses
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -2676,16 +2686,18 @@ export class RunAbortedError extends Error {
 }
 /**
  * The six read tools — and, below them, the WHOLE fifteen-tool `cherry_*`
- * family THIS CLASS defines: the six READ-ONLY tools (Task 8), six INTERACTIVE
- * ones (Task 9), and
- * two MANAGEMENT ones (Task 10), plus the registration framework they all
- * share. Kept as one class (rather than per-face closures) so the per-session
- * and per-device state the later faces add has an obvious home.
+ * family THIS CLASS defines: six READ-ONLY tools (Task 8), the read-only
+ * scheduled-task face (#381), six INTERACTIVE ones (Task 9) and two MANAGEMENT
+ * ones (Task 10), plus the registration framework they all share. Kept as one
+ * class (rather than per-face closures) so the per-session and per-device state
+ * the later faces add has an obvious home.
  *
- * FOURTEEN is the count for THIS CLASS, not for the plugin: `cherry_subagent`
- * is the fifteenth governed name and is defined in `subagentTool.ts`, outside
- * this class. Raising this number because the plugin gained a tool would make
- * the sentence describe a list the code below does not build.
+ * FIFTEEN is the count for THIS CLASS, not for the plugin: `cherry_subagent` is
+ * the sixteenth governed name and is defined in `subagentTool.ts`, outside this
+ * class. Keep the two numbers apart — the family list in
+ * {@link CHERRY_TOOL_NAMES} and the governed list in {@link cherryScopeToolNames}
+ * are asserted against each other, and a header that counts one as the other
+ * describes a list the code below does not build.
  */
 
 export class CherryToolEngine {
@@ -2787,11 +2799,12 @@ export class CherryToolEngine {
   /**
    * Connections whose peer refused the `agent.tasks.*` probe (#381).
    *
-   * Keyed by the CONNECTION, not the deviceId: the latch is per connection
-   * GENERATION (ADR-0001 rule 2), and a reconnect builds a new
-   * `DeviceConnection`, so an upgraded desktop is re-probed without any reset
-   * path of its own. A WeakSet, because a dropped connection must not be kept
-   * alive by the answer it once gave.
+   * Keyed by the CONNECTION INSTANCE and cleared when that connection goes
+   * offline: the latch is per connection GENERATION (ADR-0001 rule 2), and a
+   * reconnect does NOT build a new object — `connectionFor` is a pool and
+   * `#tryEstablish` recurses on the same instance — so the reset has to be
+   * explicit (see `#watchConnection`). A WeakSet, because a dropped connection
+   * must not be kept alive by the answer it once gave.
    */
   readonly #tasksUnsupported = new WeakSet<DeviceConnection>()
   /**
@@ -2966,7 +2979,8 @@ export class CherryToolEngine {
       this.#sessionsTool(),
       this.#readTool(),
       this.#eventsTool(),
-      // The interactive face (Task 9).
+      // The interactive face (Task 9), and the read-only task face, which is
+      // grouped here because it also requires a device selector.
       this.#createTool(),
       this.#sendTool(),
       this.#waitTool(),
@@ -3993,9 +4007,10 @@ export class CherryToolEngine {
    * does serve tasks answers the same code — so it stays an ordinary failure.
    *
    * The prompt of a task is returned as the peer stored it: `{text}` inline, or
-   * a `{ref}` the caller can read through `cherry_read`'s machinery if it ever
-   * needs the bytes. Fetching it here would put a second content walk behind a
-   * read-only listing, which this face deliberately does not do.
+   * a `{ref}` this face does NOT resolve — the protocol serves its bytes through
+   * `agent.tasks.content.read`, which no tool exposes, and putting a second
+   * content walk behind a read-only listing is exactly what this face avoids.
+   * The ref is still the honest answer: it names what the peer holds.
    */
   #tasksTool(): CherryToolDefinition {
     return defineCherryTool({
@@ -4052,33 +4067,52 @@ export class CherryToolEngine {
         if (resolved.link === undefined) return resolved.verdict
         const { connection, record } = resolved.link
         if (this.#tasksUnsupported.has(connection)) return this.#tasksUnsupportedVerdict()
-        if (action === 'list') return await this.#tasksList(connection, record.deviceId, args)
-        const taskId = optionalString(args['taskId'])
-        if (taskId === undefined) {
-          return {
-            error: 'task-required',
-            message: `\`action\` "${action}" needs \`taskId\`: the task to read`,
-          } satisfies Record<string, unknown>
+        try {
+          return await this.#tasksAction(connection, record.deviceId, action, args)
+        } catch (error) {
+          // A method the peer never REGISTERED is a capability verdict whatever
+          // action asked for it: `json-rpc-2.0` answers `-32601` with no `data`,
+          // so no `reason` exists for the probe below to read (#381 review).
+          if (!isMethodNotFound(error)) throw error
+          this.#tasksUnsupported.add(connection)
+          return this.#tasksUnsupportedVerdict()
         }
-        if (action === 'get') {
-          const answer = (await connection.rpc.request('agent.tasks.get', { taskId })) as Record<string, unknown>
-          return { action: 'get', task: answer['task'] }
-        }
-        if (action === 'runs') return await this.#tasksRuns(connection, record.deviceId, taskId, args)
-        const runId = optionalString(args['runId'])
-        if (runId === undefined) {
-          return {
-            error: 'run-required',
-            message: '`action` "run" needs `runId`: the run to read',
-          } satisfies Record<string, unknown>
-        }
-        const answer = (await connection.rpc.request('agent.tasks.runs.get', { taskId, runId })) as Record<
-          string,
-          unknown
-        >
-        return { action: 'run', run: answer['run'] }
       },
     })
+  }
+
+  /** The four actions, with the capability verdict already ruled out. */
+  async #tasksAction(
+    connection: DeviceConnection,
+    deviceId: string,
+    action: string,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    if (action === 'list') return await this.#tasksList(connection, deviceId, args)
+    const taskId = optionalString(args['taskId'])
+    if (taskId === undefined) {
+      return {
+        error: 'task-required',
+        message: `\`action\` "${action}" needs \`taskId\`: the task to read`,
+      } satisfies Record<string, unknown>
+    }
+    if (action === 'get') {
+      const answer = (await connection.rpc.request('agent.tasks.get', { taskId })) as Record<string, unknown>
+      return { action: 'get', task: answer['task'] }
+    }
+    if (action === 'runs') return await this.#tasksRuns(connection, deviceId, taskId, args)
+    const runId = optionalString(args['runId'])
+    if (runId === undefined) {
+      return {
+        error: 'run-required',
+        message: '`action` "run" needs `runId`: the run to read',
+      } satisfies Record<string, unknown>
+    }
+    const answer = (await connection.rpc.request('agent.tasks.runs.get', { taskId, runId })) as Record<
+      string,
+      unknown
+    >
+    return { action: 'run', run: answer['run'] }
   }
 
   /** `action: "list"` — the probe, its latch, and the paged walk. */
@@ -4101,20 +4135,28 @@ export class CherryToolEngine {
     }
     const binding: ListResumeBinding = { method: 'agent.tasks.list', deviceId, params }
     const resume = this.#listResume(args['cursor'], binding)
+    // Pages this walk has actually COLLECTED. The mapper runs once per served
+    // page, so a failure with `pages === 0` is the walk's FIRST request — the
+    // only one whose cursor is ours rather than the peer's.
+    let pages = 0
     try {
       const page = await this.#aggregate(
         connection,
         'agent.tasks.list',
         params,
-        (result) => ({ ...arrayOf(result['items']), nextCursor: result['nextCursor'] }),
+        (result) => {
+          pages += 1
+          return { ...arrayOf(result['items']), nextCursor: result['nextCursor'] }
+        },
         { limit: aggregateLimit(args['limit']), ...(resume === undefined ? {} : { resume }) },
       )
       return { action: 'list', ...this.#listPage(page, binding) }
     } catch (error) {
-      // Only a CURSORLESS first page is a capability probe: a stale position on
-      // a peer that does serve tasks answers NOT_FOUND too, and latching there
-      // would hide a working face for the rest of the connection.
-      const verdict = this.#tasksProbeVerdict(connection, error, resume === undefined)
+      // Only a CURSORLESS FIRST page is a capability probe. A refusal carrying a
+      // cursor — the caller's, or the peer's on page two — is about the
+      // POSITION: a serving peer answers NOT_FOUND for a stale one, and latching
+      // there would hide a working face for the rest of the connection.
+      const verdict = this.#tasksProbeVerdict(connection, error, resume === undefined && pages === 0)
       if (verdict !== undefined) return verdict
       throw error
     }
@@ -4141,15 +4183,20 @@ export class CherryToolEngine {
   }
 
   /**
-   * The probe's verdict: latch `unsupported` when a CURSORLESS `agent.tasks.list`
-   * is refused as missing, else `undefined` so the caller rethrows.
+   * The probe's verdict: latch `unsupported` when a CURSORLESS, FIRST-page
+   * `agent.tasks.list` is refused as missing, else `undefined` so the caller
+   * rethrows.
+   *
+   * The `-32601` arm is handled one level up, in the action wrapper: a peer that
+   * never registered the method says so for EVERY action, and with no `data` at
+   * all.
    */
   #tasksProbeVerdict(
     connection: DeviceConnection,
     error: unknown,
-    cursorless: boolean,
+    probeable: boolean,
   ): Record<string, unknown> | undefined {
-    if (!cursorless) return undefined
+    if (!probeable) return undefined
     const reason = failureReason(error)
     if (reason !== 'NOT_FOUND' && reason !== 'UPGRADE_REQUIRED') return undefined
     this.#tasksUnsupported.add(connection)
@@ -7909,6 +7956,10 @@ export class CherryToolEngine {
     this.#watchedConnections.add(connection)
     watch(deviceId, (state) => {
       if (state !== 'offline' && state !== 'identity-mismatch') return
+      // A dropped link is a new chance to probe an OPTIONAL face: the latch is
+      // per connection GENERATION, and the reconnect reuses this very instance,
+      // so nothing else would ever clear it (#381 review).
+      this.#tasksUnsupported.delete(connection)
       // A plain `offline` keeps the remembered command bodies: see `#forgetDevice`.
       this.#forgetDevice(deviceId, { dropCommandBodies: state === 'identity-mismatch' })
     })
