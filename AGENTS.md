@@ -257,6 +257,13 @@ that is already out. That comparison is meaningful only because
 (`git+https://….git`): npm rewrites the browsable form while packing, which is
 how 0.4.0's local sha1 and registry shasum diverged (#377).
 
+A mismatch is not proof the CONTENT differs. Compare the two tarballs' entry
+listings before believing it — `diff <(tar tzvf local.tgz) <(tar tzvf
+published.tgz)` — because a file MODE rides in the tar header: 0.4.1's local
+pack differed from the registry by one `0600` file whose git mode is `100644`,
+and `chmod 644` made the shasums agree byte for byte. Git tracks only the
+exec bit, so a clone with a tight umask can reproduce the same ghost.
+
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
 ruling`, `UltraReview` — point at internal SDD process records under
 `docs/superpowers/**`, **not published** with the package; they stay
