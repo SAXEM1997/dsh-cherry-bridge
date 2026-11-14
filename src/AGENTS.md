@@ -653,22 +653,24 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
 
 ### `cherry_tasks`: an optional face discovered by PROBING (#381)
 
-`agent.tasks.*` is declared by protocol 0.8.0 and SERVED by the desktop from
-2.2.1, but **no hello bit advertises it**, so support cannot be negotiated — only
-discovered. ADR-0001 rule 2 applies: probe, latch, and never widen `degraded`.
+`agent.tasks.*` is declared by 0.8.0 and SERVED from desktop 2.2.1, but **no
+hello bit advertises it**, so support is discovered, not negotiated (ADR-0001
+rule 2: probe, latch, never widen `degraded`).
 
-- **The probe is the work.** A CURSORLESS `agent.tasks.list` answering
-  `NOT_FOUND` / `UPGRADE_REQUIRED` means this peer has no task face: the answer is
-  `{"error":"unsupported"}` and the connection is latched — no extra request.
-- **The latch is a `WeakSet<DeviceConnection>`**, keyed by the CONNECTION: a
-  reconnect builds a new one, so an upgraded desktop is re-probed with no reset
-  path, and a dropped connection is not kept alive by its verdict.
-- **Only a cursorless failure latches.** A refusal carrying the caller's cursor is
-  about the POSITION (a stale one on a serving peer answers the same code). The
-  residual risk — a peer that serves tasks yet refuses a cursorless list — is
-  cleared by the next reconnect. `get` / `run` refusals NEVER latch (`㉛h`).
-- A task's prompt comes back as stored — `{text}` or a `{ref}` this face does NOT
-  fetch: a listing must not put a content walk behind it.
+- **The probe is the work.** A CURSORLESS, FIRST-page `agent.tasks.list` answering
+  `NOT_FOUND` / `UPGRADE_REQUIRED` means no task face: `{"error":"unsupported"}`,
+  and the connection is latched.
+- **A method never REGISTERED is the same verdict from ANY action.**
+  `json-rpc-2.0` answers `-32601` with no `data` (`isMethodNotFound`), so `list`,
+  `get`, `runs` and `run` all latch on it.
+- **The latch is a `WeakSet<DeviceConnection>`, cleared when that connection goes
+  offline.** A reconnect reuses the pooled instance (`connectionFor`), so
+  `#watchConnection` resets it explicitly — else the verdict outlives the upgrade.
+- **A failure carrying a CURSOR does not latch.** A stale position on a serving
+  peer answers `NOT_FOUND` too, so only the first, cursorless request probes.
+  `get` / `run` never latch on `NOT_FOUND` (`㉛h`); only `-32601` does.
+- A task's prompt comes back as stored — `{text}`, or a `{ref}` this face does NOT
+  fetch (no tool exposes `agent.tasks.content.read`).
 
 ### Device archive: scheme+port per host
 

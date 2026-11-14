@@ -256,8 +256,8 @@ describe('issue #219: the host-enforced JSON Schema subset', () => {
   it('#219a: every one of the sixteen parameter schemas is inside the subset', () => {
     const definitions = [...registerAll(), subagentTool()]
     // Anchor: the loop must actually walk the whole registry, so a silently
-    // emptied fixture cannot pass this by having nothing to check. Fifteen, not
-    // fourteen: the delegation tool's schema is judged by the same host.
+    // emptied fixture cannot pass this by having nothing to check. Sixteen, not
+    // fifteen: the delegation tool's schema is judged by the same host.
     expect(definitions).toHaveLength(16)
     // One flat assertion, not one per tool: a red run then names EVERY offending
     // tool at once, which is the whole point of the pin (they fail together).

@@ -307,7 +307,7 @@ experiment on, its configuration usable, the host providing a subagent service,
 - **Scope governs tools only**: the settings page and `/cherry-remote/api` are
   never scope-gated, so an excluded workspace can rescue itself.
 - **No pretending**: on `pending` / `unsupported` host capability the panel says
-  so and the fourteen stay **unregistered** (fail-closed). The fifteenth,
+  so and the fifteen stay **unregistered** (fail-closed). The sixteenth,
   `cherry_subagent`, is the one exception — it is registered by the subagent
   subsystem on its own switch, so a scope degradation does not remove it; it
   carries a **per-step** visibility condition instead, so the degradation does

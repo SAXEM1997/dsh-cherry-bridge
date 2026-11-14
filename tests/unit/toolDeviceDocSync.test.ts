@@ -63,7 +63,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 /**
  * The 14 tools that TAKE a device selector. `cherry_pair` is the one member of
- * the 14-tool registry without a `device` parameter — it receives pairing
+ * the 15-tool registry without a `device` parameter — it receives pairing
  * information, not a target — so it is excluded by name rather than folded in.
  */
 const SELECTOR_TOOLS = [

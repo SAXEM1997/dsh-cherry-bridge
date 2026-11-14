@@ -199,7 +199,7 @@ describe('mount: capability probe and the injection gate', () => {
     // A leaked first mount registers the same 14 names on top of live ones; the
     // NAME set alone cannot see it, the counters can.
     // Cumulative: both mounts registered once each; the leak discriminator is
-    // the name-collision counter (0 here, 14 with the second-mount release deleted).
+    // the name-collision counter (0 here, 15 with the second-mount release deleted).
     expect(fixture.fake.registrationCalls()).toBe(30)
     expect(fixture.fake.duplicateRegistrations()).toBe(0)
     expect(fixture.fake.registeredNames()).toHaveLength(15)

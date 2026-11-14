@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
 import { DeviceConnection } from '../../src/connection.js'
+import type { DeviceState } from '../../src/connection.js'
 import { SessionSubscriptions } from '../../src/subscriptions.js'
 import { registerCherryTools } from '../../src/tools.js'
 import type { CherryToolDefinition, CherryToolsContext, CherryToolsDeps } from '../../src/tools.js'
@@ -72,6 +73,19 @@ interface Rig {
   call(args?: Record<string, unknown>): Promise<unknown>
   /** Drop the pooled connection; the next call builds (and probes) a new one. */
   reconnect(): Promise<void>
+  /**
+   * Publish a device-state transition to the engine's watchers WITHOUT touching
+   * the pooled connection (#381).
+   *
+   * This is the only way to prove the latch reset: a reconnect REUSES the same
+   * `DeviceConnection` (`connectionFor` is a pool and `#tryEstablish` recurses on
+   * the same instance), so `reconnect()` builds a new object that a real
+   * reconnect never would — and a latch keyed by the instance would look correct
+   * while never resetting in production.
+   */
+  setState(state: 'ready' | 'offline' | 'identity-mismatch'): void
+  /** The connection the engine currently uses, so a test can prove it is the SAME one. */
+  currentConnection(): DeviceConnection
   stop(): Promise<void>
 }
 
@@ -127,6 +141,7 @@ async function makeRig(agent: FakeAgentOptions = {}): Promise<Rig> {
   }
 
   const ctx = makeCtx()
+  const watchers: Array<(state: DeviceState) => void> = []
   const deps: CherryToolsDeps = {
     store,
     connect,
@@ -139,6 +154,9 @@ async function makeRig(agent: FakeAgentOptions = {}): Promise<Rig> {
     },
     evict: () => {
       throw new Error('the tasks suite never evicts')
+    },
+    watchDeviceState: (deviceId, cb) => {
+      if (deviceId === 'dev-A') watchers.push(cb)
     },
   }
   registerCherryTools(ctx, deps, {})
@@ -157,6 +175,13 @@ async function makeRig(agent: FakeAgentOptions = {}): Promise<Rig> {
       subscriptions = undefined
       await connect().connect()
     },
+    setState: (next) => {
+      // The rig speaks the TOOL's vocabulary ('ready'); the dep speaks
+      // `DeviceState`, where a live connection is 'connected'.
+      const state: DeviceState = next === 'ready' ? 'connected' : next
+      for (const cb of watchers) cb(state)
+    },
+    currentConnection: () => connect(),
     stop: async () => {
       await subscriptions?.dispose()
       await connection?.close()
@@ -255,17 +280,60 @@ describe('issue #381 ㉛: cherry_tasks', () => {
     expect(taskCalls(rig.fake).length).toBe(1)
   })
 
-  it('㉛g a RECONNECT re-probes, so an upgraded desktop is discovered without a restart', async () => {
+  it('㉛g a dropped link clears the latch, so an upgraded desktop is discovered without a restart', async () => {
     const rig = await makeRig({ tasks: tasks(1), withoutTaskMethods: true })
     expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
+    const connection = rig.currentConnection()
 
-    // Same peer, task face turned on, NEW connection: the latch must not survive.
-    rig.fake.setAgentOptions({ tasks: tasks(1), withoutTaskMethods: false })
-    await rig.reconnect()
+    // Same peer, task face turned on, SAME connection: only a link drop
+    // intervenes. `reconnect()` would build a new DeviceConnection, which a real
+    // reconnect never does — `connectionFor` is a pool and `#tryEstablish`
+    // recurses on the same instance — so it could not prove the reset at all.
+    rig.fake.setAgentOptions({ withoutTaskMethods: false })
+    rig.setState('offline')
     const answer = (await rig.call()) as Record<string, unknown>
-    expect(answer).toMatchObject({ action: 'list' })
     expect(answer['action']).toBe('list')
     expect((answer['items'] as Array<Record<string, unknown>>).length).toBe(1)
+    expect(rig.currentConnection()).toBe(connection)
+  })
+
+  it('㉛j an action OTHER than `list` also discovers the missing face', async () => {
+    const rig = await makeRig({ tasks: tasks(1), withoutTaskMethods: true })
+    // No list has run, so nothing is latched yet: this is the first call, and it
+    // must answer the capability verdict rather than the peer's method error.
+    const answer = (await rig.call({ action: 'get', taskId: 'task-00' })) as Record<string, unknown>
+    expect(answer['error']).toBe('unsupported')
+    expect(taskCalls(rig.fake).length).toBe(1)
+  })
+
+  it('㉛k a cursor refused on page TWO is not a capability verdict', async () => {
+    const rig = await makeRig({ tasks: tasks(45) })
+    rig.fake.failTaskListAfter(1, { reason: 'NOT_FOUND', message: 'Invalid task page cursor' })
+    await expect(rig.call()).rejects.toThrow(/Invalid task page cursor/)
+    expect(taskCalls(rig.fake).length).toBe(2)
+
+    // Nothing latched: the peer serves the face and only disliked a position, so
+    // the next call probes (and pages) again.
+    const answer = (await rig.call()) as Record<string, unknown>
+    expect(answer['action']).toBe('list')
+    expect(taskCalls(rig.fake).length).toBeGreaterThan(2)
+  })
+
+  it('㉛l an UPGRADE_REQUIRED on a cursorless list is a capability verdict, and latches', async () => {
+    const rig = await makeRig({ tasks: tasks(1) })
+    rig.fake.failTaskListAfter(0, { reason: 'UPGRADE_REQUIRED', message: 'Task methods need a newer desktop' })
+    expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
+    expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
+    expect(taskCalls(rig.fake).length).toBe(1)
+  })
+
+  it('㉛m an empty `statuses` list is refused locally, because the schema forbids it', async () => {
+    const rig = await makeRig({ tasks: tasks(4) })
+    // The protocol requires at least one entry, so forwarding it would spend a
+    // round trip on a request the peer refuses; collapsing it to "no filter"
+    // would answer every task to a caller who named none.
+    expect(((await rig.call({ statuses: [] })) as Record<string, unknown>)['error']).toBe('invalid-statuses')
+    expect(taskCalls(rig.fake).length).toBe(0)
   })
 
   it('㉛h a NOT_FOUND on `get` is NOT a capability verdict', async () => {

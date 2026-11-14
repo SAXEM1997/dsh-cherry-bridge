@@ -1106,6 +1106,10 @@ function failureReason(error) {
 	const reason = data["reason"];
 	return typeof reason === "string" ? reason : void 0;
 }
+/** Whether the peer refused the METHOD itself, rather than anything about the call. */
+function isMethodNotFound(error) {
+	return error instanceof JsonRpcRequestError && error.code === -32601;
+}
 /** Serialises a frame for the channel; the channel itself carries objects. */
 function encodeFrame(value) {
 	return JSON.parse(JSON.stringify(value));
@@ -7749,7 +7753,16 @@ function withRateLimitHint(error) {
 	error.message = `${error.message} — ${advice.join(". ")}.`;
 	return error;
 }
-/** The `statuses` filter of `cherry_tasks`, or `'invalid'` when a value is not a task state. */
+/**
+* The `statuses` filter of `cherry_tasks`, or `'invalid'` when a value is not a
+* task state.
+*
+* An EMPTY array is `'invalid'`, not "no filter": the protocol schema requires
+* at least one entry (`Too small: expected array to have >=1 items`), so
+* forwarding it would spend a round trip on a request the peer refuses — and
+* collapsing it to `undefined` would answer EVERY task to a caller who named
+* none, the opposite of what was asked (#381 review).
+*/
 function statusListArgument(value) {
 	if (value === void 0) return void 0;
 	if (!Array.isArray(value)) return "invalid";
@@ -7764,7 +7777,7 @@ function statusListArgument(value) {
 		if (typeof entry !== "string" || !allowed.includes(entry)) return "invalid";
 		if (!statuses.includes(entry)) statuses.push(entry);
 	}
-	return statuses.length === 0 ? void 0 : statuses;
+	return statuses.length === 0 ? "invalid" : statuses;
 }
 function optionalString(value) {
 	return typeof value === "string" && value !== "" ? value : void 0;
@@ -8147,16 +8160,18 @@ var RunAbortedError = class extends Error {
 };
 /**
 * The six read tools — and, below them, the WHOLE fifteen-tool `cherry_*`
-* family THIS CLASS defines: the six READ-ONLY tools (Task 8), six INTERACTIVE
-* ones (Task 9), and
-* two MANAGEMENT ones (Task 10), plus the registration framework they all
-* share. Kept as one class (rather than per-face closures) so the per-session
-* and per-device state the later faces add has an obvious home.
+* family THIS CLASS defines: six READ-ONLY tools (Task 8), the read-only
+* scheduled-task face (#381), six INTERACTIVE ones (Task 9) and two MANAGEMENT
+* ones (Task 10), plus the registration framework they all share. Kept as one
+* class (rather than per-face closures) so the per-session and per-device state
+* the later faces add has an obvious home.
 *
-* FOURTEEN is the count for THIS CLASS, not for the plugin: `cherry_subagent`
-* is the fifteenth governed name and is defined in `subagentTool.ts`, outside
-* this class. Raising this number because the plugin gained a tool would make
-* the sentence describe a list the code below does not build.
+* FIFTEEN is the count for THIS CLASS, not for the plugin: `cherry_subagent` is
+* the sixteenth governed name and is defined in `subagentTool.ts`, outside this
+* class. Keep the two numbers apart — the family list in
+* {@link CHERRY_TOOL_NAMES} and the governed list in {@link cherryScopeToolNames}
+* are asserted against each other, and a header that counts one as the other
+* describes a list the code below does not build.
 */
 var CherryToolEngine = class {
 	#deps;
@@ -8253,11 +8268,12 @@ var CherryToolEngine = class {
 	/**
 	* Connections whose peer refused the `agent.tasks.*` probe (#381).
 	*
-	* Keyed by the CONNECTION, not the deviceId: the latch is per connection
-	* GENERATION (ADR-0001 rule 2), and a reconnect builds a new
-	* `DeviceConnection`, so an upgraded desktop is re-probed without any reset
-	* path of its own. A WeakSet, because a dropped connection must not be kept
-	* alive by the answer it once gave.
+	* Keyed by the CONNECTION INSTANCE and cleared when that connection goes
+	* offline: the latch is per connection GENERATION (ADR-0001 rule 2), and a
+	* reconnect does NOT build a new object — `connectionFor` is a pool and
+	* `#tryEstablish` recurses on the same instance — so the reset has to be
+	* explicit (see `#watchConnection`). A WeakSet, because a dropped connection
+	* must not be kept alive by the answer it once gave.
 	*/
 	#tasksUnsupported = /* @__PURE__ */ new WeakSet();
 	/**
@@ -9102,9 +9118,10 @@ var CherryToolEngine = class {
 	* does serve tasks answers the same code — so it stays an ordinary failure.
 	*
 	* The prompt of a task is returned as the peer stored it: `{text}` inline, or
-	* a `{ref}` the caller can read through `cherry_read`'s machinery if it ever
-	* needs the bytes. Fetching it here would put a second content walk behind a
-	* read-only listing, which this face deliberately does not do.
+	* a `{ref}` this face does NOT resolve — the protocol serves its bytes through
+	* `agent.tasks.content.read`, which no tool exposes, and putting a second
+	* content walk behind a read-only listing is exactly what this face avoids.
+	* The ref is still the honest answer: it names what the peer holds.
 	*/
 	#tasksTool() {
 		return defineCherryTool({
@@ -9171,31 +9188,41 @@ var CherryToolEngine = class {
 				if (resolved.link === void 0) return resolved.verdict;
 				const { connection, record } = resolved.link;
 				if (this.#tasksUnsupported.has(connection)) return this.#tasksUnsupportedVerdict();
-				if (action === "list") return await this.#tasksList(connection, record.deviceId, args);
-				const taskId = optionalString(args["taskId"]);
-				if (taskId === void 0) return {
-					error: "task-required",
-					message: `\`action\` "${action}" needs \`taskId\`: the task to read`
-				};
-				if (action === "get") return {
-					action: "get",
-					task: (await connection.rpc.request("agent.tasks.get", { taskId }))["task"]
-				};
-				if (action === "runs") return await this.#tasksRuns(connection, record.deviceId, taskId, args);
-				const runId = optionalString(args["runId"]);
-				if (runId === void 0) return {
-					error: "run-required",
-					message: "`action` \"run\" needs `runId`: the run to read"
-				};
-				return {
-					action: "run",
-					run: (await connection.rpc.request("agent.tasks.runs.get", {
-						taskId,
-						runId
-					}))["run"]
-				};
+				try {
+					return await this.#tasksAction(connection, record.deviceId, action, args);
+				} catch (error) {
+					if (!isMethodNotFound(error)) throw error;
+					this.#tasksUnsupported.add(connection);
+					return this.#tasksUnsupportedVerdict();
+				}
 			}
 		});
+	}
+	/** The four actions, with the capability verdict already ruled out. */
+	async #tasksAction(connection, deviceId, action, args) {
+		if (action === "list") return await this.#tasksList(connection, deviceId, args);
+		const taskId = optionalString(args["taskId"]);
+		if (taskId === void 0) return {
+			error: "task-required",
+			message: `\`action\` "${action}" needs \`taskId\`: the task to read`
+		};
+		if (action === "get") return {
+			action: "get",
+			task: (await connection.rpc.request("agent.tasks.get", { taskId }))["task"]
+		};
+		if (action === "runs") return await this.#tasksRuns(connection, deviceId, taskId, args);
+		const runId = optionalString(args["runId"]);
+		if (runId === void 0) return {
+			error: "run-required",
+			message: "`action` \"run\" needs `runId`: the run to read"
+		};
+		return {
+			action: "run",
+			run: (await connection.rpc.request("agent.tasks.runs.get", {
+				taskId,
+				runId
+			}))["run"]
+		};
 	}
 	/** `action: "list"` — the probe, its latch, and the paged walk. */
 	async #tasksList(connection, deviceId, args) {
@@ -9215,11 +9242,15 @@ var CherryToolEngine = class {
 			params
 		};
 		const resume = this.#listResume(args["cursor"], binding);
+		let pages = 0;
 		try {
-			const page = await this.#aggregate(connection, "agent.tasks.list", params, (result) => ({
-				...arrayOf(result["items"]),
-				nextCursor: result["nextCursor"]
-			}), {
+			const page = await this.#aggregate(connection, "agent.tasks.list", params, (result) => {
+				pages += 1;
+				return {
+					...arrayOf(result["items"]),
+					nextCursor: result["nextCursor"]
+				};
+			}, {
 				limit: aggregateLimit(args["limit"]),
 				...resume === void 0 ? {} : { resume }
 			});
@@ -9228,7 +9259,7 @@ var CherryToolEngine = class {
 				...this.#listPage(page, binding)
 			};
 		} catch (error) {
-			const verdict = this.#tasksProbeVerdict(connection, error, resume === void 0);
+			const verdict = this.#tasksProbeVerdict(connection, error, resume === void 0 && pages === 0);
 			if (verdict !== void 0) return verdict;
 			throw error;
 		}
@@ -9256,11 +9287,16 @@ var CherryToolEngine = class {
 		};
 	}
 	/**
-	* The probe's verdict: latch `unsupported` when a CURSORLESS `agent.tasks.list`
-	* is refused as missing, else `undefined` so the caller rethrows.
+	* The probe's verdict: latch `unsupported` when a CURSORLESS, FIRST-page
+	* `agent.tasks.list` is refused as missing, else `undefined` so the caller
+	* rethrows.
+	*
+	* The `-32601` arm is handled one level up, in the action wrapper: a peer that
+	* never registered the method says so for EVERY action, and with no `data` at
+	* all.
 	*/
-	#tasksProbeVerdict(connection, error, cursorless) {
-		if (!cursorless) return void 0;
+	#tasksProbeVerdict(connection, error, probeable) {
+		if (!probeable) return void 0;
 		const reason = failureReason(error);
 		if (reason !== "NOT_FOUND" && reason !== "UPGRADE_REQUIRED") return void 0;
 		this.#tasksUnsupported.add(connection);
@@ -11564,6 +11600,7 @@ var CherryToolEngine = class {
 		this.#watchedConnections.add(connection);
 		watch(deviceId, (state) => {
 			if (state !== "offline" && state !== "identity-mismatch") return;
+			this.#tasksUnsupported.delete(connection);
 			this.#forgetDevice(deviceId, { dropCommandBodies: state === "identity-mismatch" });
 		});
 	}

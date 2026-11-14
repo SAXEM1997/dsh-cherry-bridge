@@ -76,8 +76,9 @@ interface SubagentConfig {
 //#region src/tools.d.ts
 /**
  * The plugin's tool face: the complete fifteen-tool `cherry_*` family — six
- * READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9) and two MANAGEMENT
- * ones (Task 10) — plus the registration framework they all share.
+ * READ-ONLY tools (Task 8), the read-only scheduled-task face (#381), six
+ * INTERACTIVE ones (Task 9) and two MANAGEMENT ones (Task 10) — plus the
+ * registration framework they all share.
  *
  * Three disciplines run through every tool:
  *

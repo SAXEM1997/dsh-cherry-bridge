@@ -170,6 +170,23 @@ export function failureReason(error: unknown): string | undefined {
 }
 
 /**
+ * The JSON-RPC code a server answers when it has no handler for a method:
+ * `-32601`, `Method not found`.
+ *
+ * It arrives with NO `data`, so {@link failureReason} answers `undefined` for it
+ * — which is the whole reason this predicate exists rather than a `reason`
+ * comparison. A peer older than the method simply never registered it
+ * (`json-rpc-2.0`'s `createMethodNotFoundResponse`), and that absence is a
+ * CAPABILITY verdict for a face the protocol made optional (#381).
+ */
+export const JSONRPC_METHOD_NOT_FOUND = -32601
+
+/** Whether the peer refused the METHOD itself, rather than anything about the call. */
+export function isMethodNotFound(error: unknown): boolean {
+  return error instanceof JsonRpcRequestError && error.code === JSONRPC_METHOD_NOT_FOUND
+}
+
+/**
  * Per-request options. Shared by this client and by the connection facade, which
  * forwards them after its own lifecycle handling (`#businessRequest`).
  */
