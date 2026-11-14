@@ -1146,7 +1146,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // back on SUCCESS: without the ledger, a registration that throws half-way
   // would leave the definitions it already registered with no owner at all.
   // THE ENGINE IS BUILT HERE, not inside the tool host's injection callback.
-  // Two subsystems need it: the fourteen tools (through the host below) and the
+  // Two subsystems need it: the fifteen tools (through the host below) and the
   // subagent provider (through `runSubagentDelegation`). Building it in the
   // callback would tie the delegation to the SCOPE subsystem's decision — and the
   // scope default is "no workspace has the tools", so a delegation would fail
@@ -1185,7 +1185,7 @@ export function apply(ctx: CherryBridgeContext, config: CherryBridgeConfig = {})
   // THE EXPERIMENT (spec §6.4). Its own `inject(['subagents'])`, deliberately
   // NOT a key on the root `inject = ['tools']`: a plugin whose root injection
   // names a service the composition lacks stays pending forever, taking the
-  // fourteen tools down with it.
+  // fifteen tools down with it.
   const subagents = createSubagentHost({
     resolution: subagentResolution,
     // THE STEP-TIME SCOPE GATE (spec §5.7 SUB-04). `cherry_subagent` is

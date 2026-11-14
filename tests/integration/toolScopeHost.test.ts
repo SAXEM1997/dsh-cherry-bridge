@@ -95,15 +95,15 @@ describe('mount: capability probe and the injection gate', () => {
     }
   })
 
-  it('③ ready: the 14 registrations share ONE condition and answer per step', async () => {
+  it('③ ready: the 15 registrations share ONE condition and answer per step', async () => {
     const fixture = makeFixture()
     fixture.fake.setWorkspaces([W1])
     fixture.fake.addAgent({ id: 'agent-a', cwd: '/work/w1' })
     fixture.fake.addAgent({ id: 'agent-b', cwd: '/work/elsewhere' })
     const unmount = fixture.mount()
     expect(fixture.state.host()).toMatchObject({ state: 'ready', capable: true })
-    expect(fixture.fake.registeredNames()).toHaveLength(14)
-    expect(fixture.fake.whenConditions()).toBe(14)
+    expect(fixture.fake.registeredNames()).toHaveLength(15)
+    expect(fixture.fake.whenConditions()).toBe(15)
 
     // Default document: selected + no workspace ⇒ nobody.
     expect(await fixture.fake.resolvedView('agent-a')).toEqual([])
@@ -200,14 +200,14 @@ describe('mount: capability probe and the injection gate', () => {
     // NAME set alone cannot see it, the counters can.
     // Cumulative: both mounts registered once each; the leak discriminator is
     // the name-collision counter (0 here, 14 with the second-mount release deleted).
-    expect(fixture.fake.registrationCalls()).toBe(28)
+    expect(fixture.fake.registrationCalls()).toBe(30)
     expect(fixture.fake.duplicateRegistrations()).toBe(0)
-    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.fake.registeredNames()).toHaveLength(15)
     expect(fixture.state.host()).toMatchObject({ state: 'ready', capable: true })
 
     unmountFirst()
     // The stale disposer must not touch the generation mount #2 is serving.
-    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.fake.registeredNames()).toHaveLength(15)
     expect(fixture.state.host().state).toBe('ready')
 
     unmountSecond()
@@ -228,7 +228,7 @@ describe('mount: capability probe and the injection gate', () => {
     expect(fixture.state.host().state).toBe('pending')
 
     fixture.fake.deliverInjection(0)
-    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.fake.registeredNames()).toHaveLength(15)
     expect(fixture.state.host().state).toBe('ready')
     unmountSecond()
   })
@@ -246,17 +246,17 @@ describe('mount: capability probe and the injection gate', () => {
     const fixture = makeFixture({ deferInjection: true })
     fixture.mount()
     fixture.fake.deliverInjection(0)
-    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.fake.registeredNames()).toHaveLength(15)
 
     // The host re-runs the injection callback: a NEW effect run for the SAME
     // mount. Its disposer must be inert, not the live family's teardown.
     fixture.fake.redeliverInjection()
     // Re-entry registers NOTHING: the count stays at the first run's 14.
-    expect(fixture.fake.registrationCalls()).toBe(14)
+    expect(fixture.fake.registrationCalls()).toBe(15)
     fixture.fake.releaseEffect()
 
-    expect(fixture.fake.registrationCalls()).toBe(14)
-    expect(fixture.fake.registeredNames()).toHaveLength(14)
+    expect(fixture.fake.registrationCalls()).toBe(15)
+    expect(fixture.fake.registeredNames()).toHaveLength(15)
     expect(fixture.state.host().state).toBe('ready')
     fixture.fake.releaseEffect()
     expect(fixture.fake.registeredNames()).toEqual([])

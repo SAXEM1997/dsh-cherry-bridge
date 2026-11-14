@@ -351,7 +351,7 @@ describe('② the status is rendered from CODES, and the two failures differ', (
     // workspace list) is invisible from this status at all, so it is stated.
     expect(
       screen.getByText(
-        '它和其余 14 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
+        '它和其余 15 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
       ),
     ).toBeDefined()
   })

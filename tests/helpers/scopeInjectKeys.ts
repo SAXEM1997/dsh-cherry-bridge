@@ -6,7 +6,7 @@
  * deps.includes('workspaceRegistry')`). Under `||` a misspelled key is
  * invisible: the fixture still delivers the scope-capable ctx, every suite stays
  * green, and in production that fibre waits for a service that never arrives —
- * the plugin registers NONE of its 14 tools and nothing turns red.
+ * the plugin registers NONE of its 15 tools and nothing turns red.
  *
  * So the gate is exact: BOTH scope keys present is the scope injection, the
  * web-only call's OWN set (`WEB_INJECT_KEYS`) is the web-only injection, and

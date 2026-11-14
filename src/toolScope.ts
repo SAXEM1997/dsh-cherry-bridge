@@ -27,7 +27,7 @@ import { writeFileAtomicSync } from './atomicFile.js'
  *     single `await`, so the HTTP critical section (§6.3) cannot be interleaved.
  *
  * Ownership: this module owns the scope document, the `degraded` set, the
- * canonical path map and the per-agent judgement cache. The fourteen tools read
+ * canonical path map and the per-agent judgement cache. The fifteen tools read
  * the answer through ONE step-time predicate ({@link ToolScopeState.visibleForAgent});
  * no layer is installed or released any more (#345). No other module may keep a
  * copy of any of it.
@@ -730,11 +730,11 @@ export class ToolScopeState {
    * assembly, and the host calls it per step. Nothing here is cached, so a
    * config save or a `rebuild()` changes the answer for the very next step.
    *
-   * ONE DELIBERATE DIVERGENCE from the fourteen tools' condition, which
+   * ONE DELIBERATE DIVERGENCE from the fifteen tools' condition, which
    * composes `judgement(agent.id) ?? resolveNow(agent)`: this reads the
    * GENERATION ONLY.
    * So a brand-new agent in a permitted workspace answers `false` until the
-   * async round that judges it lands — the other fourteen tools are offered on
+   * async round that judges it lands — the other fifteen tools are offered on
    * its first step and this one is not. It self-heals on the next round, and it
    * fails on the STRICTER side, which is the only direction this is allowed to
    * diverge in: `when` is consulted inside step preparation, where an
@@ -749,7 +749,7 @@ export class ToolScopeState {
 
   /**
    * The same question answered with the AGENT in hand (#343) — the predicate the
-   * fourteen tools are registered with when the host supports step-time `when`.
+   * fifteen tools are registered with when the host supports step-time `when`.
    *
    * It composes the cached judgement with {@link resolveNow}: `when` HAS the
    * agent (and therefore its `cwd`), so a brand-new agent is judged on its first

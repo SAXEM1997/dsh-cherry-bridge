@@ -14,7 +14,7 @@ import { registerAll } from '../helpers/cherryRegistry.js'
  * prefixes and display-name prefixes, and answering with 0 / 1 / many matches
  * yields `{notFound:true}` / the record / `{ambiguous:[...]}`. Before #19 the
  * tools documented only a display-name prefix, and v0.1.3's UltraReview found
- * 13 of the 14 tool schemas still saying so while `cherry_devices` (the one
+ * 14 of the 15 tool schemas still saying so while `cherry_devices` (the one
  * #19 had already updated) said the new thing. A doc that under-describes the
  * selector is not cosmetic: a caller holding a truncated `deviceId` is told
  * its selector is unsupported, and a caller holding a display name is told it
@@ -57,12 +57,12 @@ const RETIRED_SENTENCE = 'exact deviceId, or a unique display-name prefix'
  * parameter descriptions + `cherry_devices` + the unpair top-level clause.
  * See the file comment for the counting method (literal occurrences).
  */
-const CANONICAL_OCCURRENCES_IN_SOURCE = 14
+const CANONICAL_OCCURRENCES_IN_SOURCE = 15
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 /**
- * The 13 tools that TAKE a device selector. `cherry_pair` is the one member of
+ * The 14 tools that TAKE a device selector. `cherry_pair` is the one member of
  * the 14-tool registry without a `device` parameter — it receives pairing
  * information, not a target — so it is excluded by name rather than folded in.
  */
@@ -77,6 +77,7 @@ const SELECTOR_TOOLS = [
   'cherry_send',
   'cherry_wait',
   'cherry_interactions',
+  'cherry_tasks',
   'cherry_respond',
   'cherry_cancel',
   'cherry_unpair',
@@ -106,7 +107,7 @@ describe('the device selector is documented as DeviceStore.resolve actually beha
   it('every selector tool describes the full selector, and no other tool has one', () => {
     const definitions = registerAll()
     // The registry arm is worthless if it silently matched nothing.
-    expect(definitions.length).toBeGreaterThanOrEqual(14)
+    expect(definitions.length).toBeGreaterThanOrEqual(15)
     // Filter on the PARAMETER'S PRESENCE, not on its description: a
     // `device: { type: 'string' }` with no description would slip past a
     // description-based filter as "a tool without a selector" and its missing
@@ -135,7 +136,7 @@ describe('the device selector is documented as DeviceStore.resolve actually beha
     expect(offenders.map((definition) => definition.name)).toEqual([])
   })
 
-  it('src/tools.ts carries the retired sentence zero times and the canonical clause 14 times', () => {
+  it('src/tools.ts carries the retired sentence zero times and the canonical clause 15 times', () => {
     const source = sourceText()
     expect(countOf(source, RETIRED_SENTENCE)).toBe(0)
     expect(countOf(source, CANONICAL_CLAUSE)).toBe(CANONICAL_OCCURRENCES_IN_SOURCE)

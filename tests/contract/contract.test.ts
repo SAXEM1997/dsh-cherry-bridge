@@ -325,7 +325,7 @@ const SESSION = {
 const AGENT = { agentId: 'agent-1', name: 'Agent One' }
 
 /**
- * The 14 tools the plugin registers (spec §9), taken from the plugin itself
+ * The 15 tools the plugin registers (spec §9), taken from the plugin itself
  * rather than copied here: the README's per-name assertion, the rig's
  * registration assertion and the drift assertion in `③ release configuration`
  * all read this ONE constant. With no second copy to compare against, a
@@ -843,7 +843,11 @@ describe('⑤ the pinned protocol versions', () => {
     const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
       dependencies?: Record<string, string>
     }
-    expect(manifest.dependencies?.['@cherrystudio/remote-protocol']).toBe('0.7.0')
+    // 0.8.0 is the first protocol that DECLARES the five `agent.tasks.*`
+    // methods (#381). The transport stays at 0.2.5 on purpose: 0.2.6 differs
+    // only in its licence header, and this package never speaks a frame 0.2.5
+    // cannot (verified byte-identical `dist`).
+    expect(manifest.dependencies?.['@cherrystudio/remote-protocol']).toBe('0.8.0')
     expect(manifest.dependencies?.['@cherrystudio/remote-transport']).toBe('0.2.5')
     for (const name of ['@cherrystudio/remote-protocol', '@cherrystudio/remote-transport']) {
       const declared = manifest.dependencies![name]!
@@ -930,7 +934,7 @@ describe('⑤ the pinned protocol versions', () => {
 
   it('the INSTALLED packages really are those versions (the pin is not aspirational)', async () => {
     for (const [name, version] of [
-      ['@cherrystudio/remote-protocol', '0.7.0'],
+      ['@cherrystudio/remote-protocol', '0.8.0'],
       ['@cherrystudio/remote-transport', '0.2.5'],
     ] as const) {
       const manifest = JSON.parse(
@@ -1807,17 +1811,17 @@ describe('③ release configuration', () => {
     }
   })
 
-  it('declares the 14 cherry_* tool names once, as CHERRY_TOOL_NAMES', () => {
-    // ② The exported list is well-formed: 14 names, none repeated, all in the
+  it('declares the 15 cherry_* tool names once, as CHERRY_TOOL_NAMES', () => {
+    // ② The exported list is well-formed: 15 names, none repeated, all in the
     // family. Tasks 5/6/7 intersect and guard against this list, so a
     // duplicated or foreign name has to fail HERE rather than skew a later
     // `deny` set or a guard's scope.
-    expect(CHERRY_TOOL_NAMES).toHaveLength(14)
-    expect(new Set(CHERRY_TOOL_NAMES).size).toBe(14)
+    expect(CHERRY_TOOL_NAMES).toHaveLength(15)
+    expect(new Set(CHERRY_TOOL_NAMES).size).toBe(15)
     expect(CHERRY_TOOL_NAMES.every((name) => name.startsWith('cherry_'))).toBe(true)
   })
 
-  it('declares the 15 names the SCOPE governs as the 14 tools plus the delegation tool', () => {
+  it('declares the 16 names the SCOPE governs as the 15 tools plus the delegation tool', () => {
     // ②b Two lists, two claims. `CHERRY_TOOL_NAMES` says what
     // `registerCherryTools` registers (asserted in both directions just below);
     // this one says what an operator can be EXCLUDED from, and the difference is
@@ -1828,15 +1832,15 @@ describe('③ release configuration', () => {
     // renaming the tool cannot leave the scope list hiding a name that is never
     // registered (which would look like protection and be none).
     const governed = cherryScopeToolNames()
-    expect(governed).toHaveLength(15)
-    expect(new Set(governed).size).toBe(15)
+    expect(governed).toHaveLength(16)
+    expect(new Set(governed).size).toBe(16)
     expect(governed.every((name) => name.startsWith('cherry_'))).toBe(true)
     expect([...governed].sort()).toEqual([...CHERRY_TOOL_NAMES, CHERRY_SUBAGENT_TOOL_DEFAULT].sort())
     // It is a FUNCTION because `subagent.toolName` is configurable: the assembly
     // builds the governed list from the resolved config, so a rename moves both
     // the registration and the scope list. A constant would have left the scope
     // list hiding a name nobody registers.
-    expect(cherryScopeToolNames('custom_delegate')).toHaveLength(15)
+    expect(cherryScopeToolNames('custom_delegate')).toHaveLength(16)
     expect(cherryScopeToolNames('custom_delegate')).toContain('custom_delegate')
     expect(cherryScopeToolNames('custom_delegate')).not.toContain(CHERRY_SUBAGENT_TOOL_DEFAULT)
   })
@@ -1884,11 +1888,11 @@ describe('③ release configuration', () => {
     }
   })
 
-  it('registers exactly the 14 documented tools', async () => {
+  it('registers exactly the 15 documented tools', async () => {
     const rig = await makeRig()
     const registered = rig.definitions.map((definition) => definition.name).sort()
     expect(registered).toEqual([...TOOL_NAMES].sort())
-    expect(registered).toHaveLength(14)
+    expect(registered).toHaveLength(15)
   }, 20_000)
 })
 

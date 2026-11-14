@@ -253,12 +253,12 @@ function subagentTool(): CherryToolDefinition {
 // ---------------------------------------------------------------------------
 
 describe('issue #219: the host-enforced JSON Schema subset', () => {
-  it('#219a: every one of the fifteen parameter schemas is inside the subset', () => {
+  it('#219a: every one of the sixteen parameter schemas is inside the subset', () => {
     const definitions = [...registerAll(), subagentTool()]
     // Anchor: the loop must actually walk the whole registry, so a silently
     // emptied fixture cannot pass this by having nothing to check. Fifteen, not
     // fourteen: the delegation tool's schema is judged by the same host.
-    expect(definitions).toHaveLength(15)
+    expect(definitions).toHaveLength(16)
     // One flat assertion, not one per tool: a red run then names EVERY offending
     // tool at once, which is the whole point of the pin (they fail together).
     const violations = definitions.flatMap((definition) =>
@@ -267,7 +267,7 @@ describe('issue #219: the host-enforced JSON Schema subset', () => {
     expect(violations).toEqual([])
   })
 
-  it('#219d: every one of the fifteen OUTPUT schemas is inside the subset too', () => {
+  it('#219d: every one of the sixteen OUTPUT schemas is inside the subset too', () => {
     // The host asserts `output.schema` through the SAME checker, at the SAME
     // call site (`ctx.tools.register`, `lib/index.js:437`) — and it does so
     // BEFORE `parameters` is ever looked at. Issue #232 shipped a tool whose
@@ -276,7 +276,7 @@ describe('issue #219: the host-enforced JSON Schema subset', () => {
     // registration outright: the tool never existed, and every test was green
     // because no fixture validates. This is the interceptor.
     const definitions = [...registerAll(), subagentTool()]
-    expect(definitions).toHaveLength(15)
+    expect(definitions).toHaveLength(16)
     const violations = definitions.flatMap((definition) =>
       subsetViolations(definition.output.schema, `${definition.name}.output.schema`),
     )

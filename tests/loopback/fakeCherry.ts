@@ -288,6 +288,39 @@ export interface FakeConfigurationExportOptions {
  * agentSubscriptions.ts` + `agentJournal.ts`), so a test only states the one
  * dimension it is moving.
  */
+/** One scheduled task, as `agent.tasks.list` / `agent.tasks.get` serve it (#381). */
+export interface FakeTaskRecord {
+  taskId: string
+  agentId: string
+  name: string
+  status: 'active' | 'paused' | 'completed' | 'missed'
+  trigger: Record<string, unknown>
+  nextRunAt: string | null
+  createdAt: string
+  updatedAt: string
+  /** Detail-only fields: `agent.tasks.get` returns them, `list` does not. */
+  prompt?: Record<string, unknown>
+  timeoutMinutes?: number
+  workspace?: Record<string, unknown>
+  reuse?: Record<string, unknown>
+}
+
+/** One run of a scheduled task, as `agent.tasks.runs.*` serve it (#381). */
+export interface FakeTaskRunRecord {
+  runId: string
+  taskId: string
+  createdAt: string
+  scheduledAt: string
+  summary: string | null
+  resultLocation: Record<string, unknown>
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled'
+  startedAt: string | null
+  finishedAt?: string | null
+  cancelRequested?: boolean
+  outcome?: 'executed' | 'skipped' | 'unknown'
+  failure?: Record<string, unknown>
+}
+
 export interface FakeAgentOptions {
   /**
    * Peer subscription cap enforced by `agent.sessions.subscribe` (default
@@ -295,6 +328,15 @@ export interface FakeAgentOptions {
    * answered `RESOURCE_EXHAUSTED` — the peer-side dimension Task 7⑨ anchors.
    */
   subscriptionLimit?: number
+  /** Scheduled tasks served by `agent.tasks.*` (#381). */
+  tasks?: FakeTaskRecord[]
+  /** Run history served by `agent.tasks.runs.*` (#381). */
+  taskRuns?: FakeTaskRunRecord[]
+  /**
+   * Answer every `agent.tasks.*` with `NOT_FOUND`, like a desktop older than
+   * 2.2.1 whose handler table has no such method (#381).
+   */
+  withoutTaskMethods?: boolean
   /**
    * Prepared-lease window in ms (default `remoteLimits.checkpointMs` = 300_000).
    * Test ⑧/⑩ inject a small value so an expired lease needs no real wait.
@@ -1791,6 +1833,18 @@ export class FakeCherry {
   // -------------------------------------------------------------------------
 
   /** Every read-face call in arrival order, with its params verbatim. */
+  /**
+   * Merge options into the `agent` fixture at RUNTIME (#381).
+   *
+   * Exists for the capability-latch tests: proving that a latch resets on
+   * RECONNECT needs the same peer to start refusing and then start serving, and
+   * building a second peer would also build a second connection — the one thing
+   * the test is trying to hold constant.
+   */
+  setAgentOptions(patch: Partial<FakeAgentOptions>): void {
+    this.#options.agent = { ...this.#options.agent, ...patch }
+  }
+
   get readCalls(): readonly { method: string; params: Record<string, unknown> }[] {
     return this.#readCalls
   }
@@ -2771,6 +2825,10 @@ export class FakeCherry {
       case 'agent.messages.list':
       case 'agent.parts.list':
       case 'agent.content.read':
+      case 'agent.tasks.list':
+      case 'agent.tasks.get':
+      case 'agent.tasks.runs.list':
+      case 'agent.tasks.runs.get':
         return await this.#handleRead(method, params)
       case 'agent.sessions.create':
       case 'agent.messages.send':
@@ -3615,6 +3673,39 @@ export class FakeCherry {
       this.#readFailNext.delete(method)
       throw new FakeRpcError(once)
     }
+    // The task face is OPTIONAL (#381): a desktop older than 2.2.1 has no
+    // handler for it, and the real one answers method-not-found. Modelled here
+    // so the client's latch has something honest to latch on.
+    if (method.startsWith('agent.tasks.') && this.#agent().withoutTaskMethods === true) {
+      throw new FakeRpcError({ reason: 'NOT_FOUND', message: `unknown method ${method}` })
+    }
+    if (method === 'agent.tasks.list') {
+      const agentId = params['agentId'] as string | undefined
+      const statuses = params['statuses'] as string[] | undefined
+      const items = (this.#agent().tasks ?? []).filter(
+        (task) =>
+          (agentId === undefined || task.agentId === agentId) &&
+          (statuses === undefined || statuses.includes(task.status)),
+      )
+      return this.#page(method, items.map((task) => this.#taskSummary(task)), params)
+    }
+    if (method === 'agent.tasks.get') {
+      const task = this.#requireTask(String(params['taskId'] ?? ''))
+      return { task: this.#taskDetail(task) }
+    }
+    if (method === 'agent.tasks.runs.list') {
+      const taskId = String(params['taskId'] ?? '')
+      this.#requireTask(taskId)
+      const items = (this.#agent().taskRuns ?? []).filter((run) => run.taskId === taskId)
+      return this.#page(method, items, params)
+    }
+    if (method === 'agent.tasks.runs.get') {
+      const taskId = String(params['taskId'] ?? '')
+      const runId = String(params['runId'] ?? '')
+      const run = (this.#agent().taskRuns ?? []).find((entry) => entry.taskId === taskId && entry.runId === runId)
+      if (run === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Task run not found' })
+      return { run }
+    }
     // `agent.content.read` is a walk over slices, not a list page, so its
     // scripted entries are never wrapped in an `items` envelope.
     if (method === 'agent.content.read') {
@@ -3937,6 +4028,37 @@ export class FakeCherry {
       // hand — that is exactly what makes a mutation detectable.
       sha256: this.#contentDigests.get(`${contentId}:${revision}`) ?? sha256Hex(bytes),
     }
+  }
+
+  /** One task row as `agent.tasks.list` serves it: the summary, never the detail fields. */
+  #taskSummary(task: FakeTaskRecord): Record<string, unknown> {
+    return {
+      taskId: task.taskId,
+      agentId: task.agentId,
+      name: task.name,
+      status: task.status,
+      trigger: task.trigger,
+      nextRunAt: task.nextRunAt,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+    }
+  }
+
+  /** The same row plus the detail-only fields `agent.tasks.get` returns. */
+  #taskDetail(task: FakeTaskRecord): Record<string, unknown> {
+    return {
+      ...this.#taskSummary(task),
+      prompt: task.prompt ?? { text: '' },
+      timeoutMinutes: task.timeoutMinutes ?? 30,
+      workspace: task.workspace ?? { kind: 'system' },
+      reuse: task.reuse ?? { kind: 'fresh' },
+    }
+  }
+
+  #requireTask(taskId: string): FakeTaskRecord {
+    const task = (this.#agent().tasks ?? []).find((entry) => entry.taskId === taskId)
+    if (task === undefined) throw new FakeRpcError({ reason: 'NOT_FOUND', message: 'Task not found' })
+    return task
   }
 
   /**
