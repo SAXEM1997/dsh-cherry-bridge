@@ -939,11 +939,13 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
   Its remote layer is `src/backend/services/remoteAgent/` — "what the official
   client does" comes from there. v0.5.0–v0.5.4 were byte-identical there (tree
   `16e505fe…`); **v0.5.5** moves the pins to 0.8.0 / 0.2.6 — additive
-  `agent.tasks.*` only, no released desktop serves it, our wire unchanged
-  (ADR-0001). Diff the tree first.
+  `agent.tasks.*` only, and our wire unchanged (ADR-0001). Those methods are
+  SERVED now: desktop **2.2.1** is the first release whose `agentHandlers.ts`
+  registers all five (it still stamped protocol 0.7.0), and **2.2.2** stamps
+  0.8.0 / 0.2.6 with no source change behind it. Diff the tree first.
 - **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
   of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
-  through `v2.1.10` (`c60cd41a6`). Diff TREES between tags; attribute a change
+  through `v2.2.2`. Diff TREES between tags; attribute a change
   with the GitHub API, not `git log` (the graft hides the range). The faces we
   depend on are `src/main/services/remoteAccess/` and
   `packages/remote-{protocol,transport}`; `RemoteAccessService.ts` carries both
@@ -951,9 +953,10 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 - `node_modules/@cherrystudio/remote-protocol` / `remote-transport` are the
   protocol schema source of truth for what we send and decode.
 
-**Verified desktop range: 2.1.4 → 2.1.10.** mDNS, protocol versions (`[1]`) and
-Noise saw **zero changes**; pairing only ADDED the v3 QR arm (below). Notable
-faces:
+**Verified desktop range: 2.1.4 → 2.2.2.** mDNS, protocol versions (`[1]`) and
+Noise saw **zero changes**; 2.2.1 is the first release to REGISTER the five
+`agent.tasks.*` handlers and 2.2.2 only stamps 0.8.0 / 0.2.6 behind them;
+pairing only ADDED the v3 QR arm (below). Notable faces:
 
 | Upstream change | Impact |
 | --- | --- |
