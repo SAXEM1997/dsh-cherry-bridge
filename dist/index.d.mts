@@ -75,7 +75,7 @@ interface SubagentConfig {
 //#endregion
 //#region src/tools.d.ts
 /**
- * The plugin's tool face: the complete fourteen-tool `cherry_*` family — six
+ * The plugin's tool face: the complete fifteen-tool `cherry_*` family — six
  * READ-ONLY tools (Task 8), six INTERACTIVE ones (Task 9) and two MANAGEMENT
  * ones (Task 10) — plus the registration framework they all share.
  *
@@ -126,7 +126,7 @@ type ToolContentBlock = {
  * without a delegating agent (a nested/PTC dispatch, a headless run), and
  * `signal` is the caller's required cancellation.
  *
- * `agent` stays `unknown` on purpose: the fourteen `cherry_*` tools address the
+ * `agent` stays `unknown` on purpose: the fifteen `cherry_*` tools address the
  * PEER and never the calling agent, so nothing in this file should be tempted to
  * reach into the host's `Agent` shape. The one tool that does need it
  * (`cherry_subagent`) only forwards it to the seam.
@@ -152,7 +152,7 @@ interface CherryToolDefinition {
    */
   isConcurrencySafe?(args: unknown): boolean;
   /**
-   * `exec` is optional because the fourteen peer tools ignore it entirely: they
+   * `exec` is optional because the fifteen peer tools ignore it entirely: they
    * take their cancellation from the host's own rpc timeouts, not from the
    * caller's signal. A tool that DOES need the calling agent (`cherry_subagent`)
    * declares it required-by-contract in its own body and throws when absent.

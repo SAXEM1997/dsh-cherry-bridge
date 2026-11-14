@@ -1,7 +1,7 @@
 # AGENTS.md — `src/`
 
 The server half of the bridge: the connection pool, the JSON-RPC client, pairing,
-the fourteen tools, the HTTP face and the settings bundle's API.
+the fifteen tools, the HTTP face and the settings bundle's API.
 
 Loaded automatically when a file tool touches `src/**` (a `bash`-only turn does
 not load it). It holds the CONTRACTS — the protocol basis, the invariants each
@@ -16,12 +16,14 @@ Pinned at **exact versions**, no `^`, with contract assertions on the pins:
 
 | Package | Version |
 | --- | --- |
-| `@cherrystudio/remote-protocol` | `0.7.0` |
+| `@cherrystudio/remote-protocol` | `0.8.0` |
 | `@cherrystudio/remote-transport` | `0.2.5` |
 | `ws` | `8.22.0` |
 | `zod` | `4.3.4` |
 
-Desktop 2.1.8–2.1.10 ship these.
+Desktop 2.2.2 ships 0.8.0 / 0.2.6; 2.1.8–2.1.10 ship 0.7.0 / 0.2.5, and the wire
+we use is identical in both — 0.8.0 only ADDS `agent.tasks.*`, and transport
+0.2.6 differs by its licence header alone (#381 keeps the transport pin).
 Upgrading either protocol package means re-running
 `tests/contract/contract.test.ts` against schema drift — the suite models the
 **six behavioral differences** between our loopback fake peer and a real
@@ -450,7 +452,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
 
     list:v2:<tool>:<device12>:<filters8>:<checksum8>:<peer position>
 
-- One character per tool (`a`/`w`/`s`/`i`) instead of the method name, a 12-hex
+- One character per tool (`a`/`w`/`s`/`i`/`t`/`r`) instead of the method name, a 12-hex
   **digest** of the deviceId instead of the 36-character UUID, an 8-hex filter
   fingerprint, and an 8-hex checksum. The peer position goes **last and
   verbatim** (it may contain the delimiter — the desktop's session cursor is
@@ -460,15 +462,13 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   stated in the parameter's DESCRIPTION, never as a `maxLength` keyword: the
   host's enforced parameter subset has none (issue #219).
 - **The checksum is the load-bearing half of that change, not the length.** The
-  position is the one field no structural check can validate: measured over
-  20,000 random single-character corruptions of the old base64-JSON token,
-  **28.7% were accepted with a different position** — and the desktop's cursor
-  decoders (`decodePinnedListCursor`, `decodeListCursor`) warn and fall back to
-  the FIRST page for a position they cannot parse, so "continue from here"
-  silently became the newest page presented as older history. Every
-  single-character corruption is now refused locally (a test walks every
-  position of a real token), and the token is 225 → ~100 characters on the
-  sessions worst case, ~150 → ~44 on the numeric faces.
+  position is the one field no structural check can validate: over 20,000 random
+  single-character corruptions of the old base64-JSON token, **28.7% were
+  accepted with a different position**, and the desktop's decoders
+  (`decodePinnedListCursor`, `decodeListCursor`) fall back to the FIRST page for
+  a position they cannot parse — "continue from here" became the newest page
+  presented as older history. Every single-character corruption is now refused
+  locally, and the token is 225 → ~100 characters on the sessions worst case.
 - **Two faces, two prefixes (issue #72).** The message face owns `cursor:` /
   `after:`; the list face owns `list:`. They must stay disjoint: while they
   shared one prefix, a list token replayed as `messagesResumeCursor` was a legal
@@ -502,13 +502,10 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   detector, so applying it there would be the same bug mirrored: refusing to name
   a token the parser takes.
   **The round trip itself is a test, not a promise.** `parseMessageResume` is
-  exported for one property: every token these emitters NAME is one it ACCEPTS.
-  It is asserted over a varied probe table (numeric, keyset, unicode, interior
-  space, base64url-shaped, the retired v1 payload) rather than per-clause, so a
-  refusal added to the parser WITHOUT mirroring it here turns red for any probe
-  that reaches it — the compensations: a clause no probe reaches still slips
-  through, and over-refusal (naming less than the parser takes) is allowed — it
-  costs resumability, not correctness.
+  exported for one property: every token these emitters NAME is one it ACCEPTS,
+  asserted over a varied probe table rather than per-clause. Compensations: a
+  clause no probe reaches still slips through, and over-refusal costs
+  resumability, not correctness.
   The failure mode: an emitted stop point the same tool refuses — a useless
   token whose refusal surfaces at resume, not at the answer. A
   refused remainder yields no token at all — `truncated` already says the
@@ -537,20 +534,14 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   well-behaved peer is far below it (the protocol's own `opaqueId` caps a cursor
   at 256 characters).
 - **The `after:` arm's LENGTH case is pinned on the function; its CONTENT case
-  runs through the tool.** An anchor is a message ID, and projecting that
-  message sends the same id to `agent.parts.list`, whose `messageId` is an
-  `opaqueId`. A peer item carrying an id above the token ceiling therefore
-  fails its parts walk and is never RETURNED, so the over-long state is
-  unreachable through the protocol, not merely untested; that arm is pinned by
-  driving `messageResumeToken` directly (`tests/unit/resumeTokenEmit.test.ts`,
-  both arms, both sides of the boundary), and the guard stays regardless,
-  because the emitter must never mint what the parser refuses, whatever the
-  peer's cap becomes. The CONTENT refusal IS reachable: `opaqueId` allows
-  padding, so the parts walk for `' m-0 '` succeeds and that message becomes
-  the anchor — `tests/integration/toolsReadResume.test.ts` ⑭d/⑭e/⑭f drive both
-  arms through the tools. The `cursor:` arm and the list face keep their
-  end-to-end tests as well (`toolsReadResume.test.ts` ⑭a/⑭b,
-  `toolsRead.test.ts` ⑦h), which is why that helper is exported.
+  runs through the tool.** Projecting the anchor message sends the same id to
+  `agent.parts.list`, so an id above the token ceiling fails its parts walk and
+  is never RETURNED — that arm is pinned by driving `messageResumeToken`
+  directly (`tests/unit/resumeTokenEmit.test.ts`). The CONTENT refusal IS
+  reachable (`opaqueId` allows padding): `tests/integration/toolsReadResume.test.ts`
+  ⑭d/⑭e/⑭f. The `cursor:` arm and the list face keep theirs
+  (`toolsReadResume.test.ts` ⑭a/⑭b, `toolsRead.test.ts` ⑦h), which is why that
+  helper is exported.
 - **The tool DESCRIPTION is part of the contract, and it is pinned.** The guards
   above bound what a tool ACCEPTS and NAMES, so a description promising a token
   unconditionally is a claim the tool contradicts — and a model reads it first. Every TOP-LEVEL description
@@ -561,7 +552,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   a promise that the next guard will falsify.
   `tests/unit/toolSchemas.test.ts` asserts the clause on every description that
   mentions the token (naming the tools would let a future one slip in) and the
-  retired wording across all fourteen, so reverting one to the old text is a red
+  retired wording across all fifteen, so reverting one to the old text is a red
   test rather than a review catch.
 
 ### `AGGREGATE_BYTES`: one budget, two faces
@@ -651,15 +642,33 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   withheld.
 - Attachments — `kind: 'file'`, and legacy `data` named `file` whose
   `{mediaType, filename}` is JSON in `content.text` — report `name`/`mediaType`
-  (`byteLength` from a ref only), no `unavailable` unless `includeImages`
-  asked and the image could not be fetched or saved, and `content` **empty**
-  unless the record has a key we skip. `includeImages` is the exception: an accepted
-  `file` image is fetched, verified and saved via `saveImage` under our
-  4-image / 8 MiB per-call cap (`imagesOmitted: 'cap'` when over); the route
-  must declare `image` input, and `includeImages` without an attachments
-  service answers `unsupported`. Legacy `data` never qualifies.
+  (`byteLength` from a ref only), `unavailable` only when `includeImages` asked
+  and the image could not be fetched or saved, and `content` **empty** unless
+  the record has a key we skip. `includeImages` fetches, verifies and saves an
+  accepted `file` image via `saveImage` under our 4-image / 8 MiB per-call cap
+  (`imagesOmitted: 'cap'`); the route must declare `image` input, and no
+  attachments service answers `unsupported`. Legacy `data` never qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict — the status stands; guidance points at `cherry_read`.
+
+### `cherry_tasks`: an optional face discovered by PROBING (#381)
+
+`agent.tasks.*` is declared by protocol 0.8.0 and SERVED by the desktop from
+2.2.1, but **no hello bit advertises it**, so support cannot be negotiated — only
+discovered. ADR-0001 rule 2 applies: probe, latch, and never widen `degraded`.
+
+- **The probe is the work.** A CURSORLESS `agent.tasks.list` answering
+  `NOT_FOUND` / `UPGRADE_REQUIRED` means this peer has no task face: the answer is
+  `{"error":"unsupported"}` and the connection is latched — no extra request.
+- **The latch is a `WeakSet<DeviceConnection>`**, keyed by the CONNECTION: a
+  reconnect builds a new one, so an upgraded desktop is re-probed with no reset
+  path, and a dropped connection is not kept alive by its verdict.
+- **Only a cursorless failure latches.** A refusal carrying the caller's cursor is
+  about the POSITION (a stale one on a serving peer answers the same code). The
+  residual risk — a peer that serves tasks yet refuses a cursorless list — is
+  cleared by the next reconnect. `get` / `run` refusals NEVER latch (`㉛h`).
+- A task's prompt comes back as stored — `{text}` or a `{ref}` this face does NOT
+  fetch: a listing must not put a content walk behind it.
 
 ### Device archive: scheme+port per host
 
@@ -753,16 +762,16 @@ and display-name prefixes (one filter, store order, deduplicated by `deviceId`)
 `candidates`). `cherry_devices` returns either verdict as a structured result;
 every other tool **throws** when nothing matches. A quarantined archive
 (`archive-quarantined`) outranks all of this. `tests/unit/toolDeviceDocSync.test.ts`
-pins the selector clause in every tool schema — 13 tools take a `device`
+pins the selector clause in every tool schema — 14 tools take a `device`
 selector, `cherry_pair` does not.
 
 ### Scope: hiding, not refusing
 
-- The 14 tools are decided **per workspace**; the default is `selected` + an
+- The 15 tools are decided **per workspace**; the default is `selected` + an
   empty list, so **nobody** has them (fail-closed: a corrupt/invalid/unreadable
   document lands on the stricter side).
 - **One host mode: step-time `when`.** `tools.resolve` is the contract (#345):
-  the family is ONE registration pass — fourteen `register()` calls sharing one condition
+  the family is ONE registration pass — fifteen `register()` calls sharing one condition
   (`ToolScopeState.visibleForAgent`): `judgement(agent.id) ?? resolveNow(agent)`,
   fail-closed. There is no per-agent `restrict`, `guard`, `agent/created|disposed`
   subscription or recheck timer, and a save is visible on the **next step**.
@@ -770,7 +779,7 @@ selector, `cherry_pair` does not.
   `>=0.2.2-rc.1`; a host without it is `unsupported` and gets NO registrations
   (fail-closed), never a silent unconditional install.
 - A throwing condition would fail step PREPARATION
-  (`TOOL_ACTIVATION_FAILED`), so it answers false; 14 calls/step ≈ 3 µs.
+  (`TOOL_ACTIVATION_FAILED`), so it answers false; 15 calls/step ≈ 3 µs.
 - ONE generation token per judgement round, bumped by its start, `save()` and
   `invalidateDerived()`: a losing round commits nothing (list, map, judgements
   alike). `mount()` has an identity too — a second mount releases the first, a
@@ -782,7 +791,7 @@ selector, `cherry_pair` does not.
   never scope-gated.
 - Capability missing is never papered over: `pending` is a neutral wait,
   `unsupported` is a read-only warning with the real cause and save disabled;
-  under both the fourteen stay **unregistered**.
+  under both the fifteen stay **unregistered**.
 - The scope document lives at `<dataDir>/scope.json` (0600, atomic, monotonic
   `revision`), **not** in profile YAML. A document that fails to parse or has
   invalid fields is rebuilt on the stricter side with `revision` reset to 0,
@@ -939,10 +948,8 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
   Its remote layer is `src/backend/services/remoteAgent/` — "what the official
   client does" comes from there. v0.5.0–v0.5.4 were byte-identical there (tree
   `16e505fe…`); **v0.5.5** moves the pins to 0.8.0 / 0.2.6 — additive
-  `agent.tasks.*` only, and our wire unchanged (ADR-0001). Those methods are
-  SERVED now: desktop **2.2.1** is the first release whose `agentHandlers.ts`
-  registers all five (it still stamped protocol 0.7.0), and **2.2.2** stamps
-  0.8.0 / 0.2.6 with no source change behind it. Diff the tree first.
+  `agent.tasks.*` only, and our wire unchanged (ADR-0001) — SERVED since desktop
+  **2.2.1** (see the range note below). Diff the tree first.
 - **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
   of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
   through `v2.2.2`. Diff TREES between tags; attribute a change

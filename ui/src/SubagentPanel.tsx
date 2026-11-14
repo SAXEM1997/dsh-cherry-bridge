@@ -882,7 +882,7 @@ export function SubagentPanel({ client = defaultSubagentClient, devices = [] }: 
           <p className="cherry-hint">
             {data.source === 'file' ? t('subagent.source.file') : t('subagent.source.config')}
           </p>
-          {/* The experiment is scope-gated exactly like the other fourteen
+          {/* The experiment is scope-gated exactly like the other fifteen
               tools, and the degraded arm is invisible from here: under
               `selected` with an unreadable workspace list NO workspace sees the
               tool, while the status still says `ready`. Saying so is the

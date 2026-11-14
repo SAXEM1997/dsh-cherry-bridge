@@ -289,7 +289,7 @@ const zh: Dict = {
     '保存被拒绝：请求缺少基准 expectedRevision，请重新读取后再保存。',
   'subagent.saveFailure.invalid-request': '保存被拒绝：请求体格式不对。',
   'subagent.scopeNote':
-    '它和其余 14 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
+    '它和其余 15 个工具一样受「启用范围」约束：被排除的工作区看不到它。启用范围为「仅选定工作区」而工作区列表读不到时，任何工作区都看不到它。',
   'subagent.status.heading': '当前状态',
   // #273: the verdict describes the RUNNING assembly, so when a restart is owed
   // the heading has to say which document it is judging.
@@ -569,7 +569,7 @@ const en: Dict = {
     'The save was refused: the request carried no expectedRevision baseline. Read the document again before saving.',
   'subagent.saveFailure.invalid-request': 'The save was refused: the request body is malformed.',
   'subagent.scopeNote':
-    'Like the other fourteen tools, it obeys the enabled scope: an excluded workspace does not see it. Under “selected” with an unreadable workspace list, no workspace sees it.',
+    'Like the other fifteen tools, it obeys the enabled scope: an excluded workspace does not see it. Under “selected” with an unreadable workspace list, no workspace sees it.',
   'subagent.status.heading': 'Current state',
   'subagent.status.heading.pending': 'Current state (the running configuration)',
   'subagent.status.disabled': 'Not enabled (off by default).',

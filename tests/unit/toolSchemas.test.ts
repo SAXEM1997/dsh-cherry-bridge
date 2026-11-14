@@ -32,6 +32,7 @@ const INTERACTIVE_TOOLS = [
   'cherry_send',
   'cherry_wait',
   'cherry_interactions',
+  'cherry_tasks',
   'cherry_respond',
   'cherry_cancel',
 ] as const
@@ -113,8 +114,14 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
     expect(Object.keys(cursor['properties'] as object).sort()).toEqual(['seq', 'sessionId', 'streamEpoch'])
   })
 
-  it('issue #65: exactly the four list tools declare a resumable `cursor`', () => {
-    const listTools = ['cherry_agents', 'cherry_workspaces', 'cherry_sessions', 'cherry_interactions']
+  it('issue #65: exactly the five list tools declare a resumable `cursor`', () => {
+    const listTools = [
+      'cherry_agents',
+      'cherry_workspaces',
+      'cherry_sessions',
+      'cherry_interactions',
+      'cherry_tasks',
+    ]
     for (const definition of registerAll()) {
       const keys = Object.keys(properties(definition))
       // The raw peer position is internal: it must not be an INPUT anywhere.
@@ -200,7 +207,7 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
         expect(description, `${definition.name} keeps a retired claim`).not.toMatch(retired)
       }
     }
-    // Anchor: the six descriptions that speak about tokens in a RESULT are the
+    // Anchor: the seven descriptions that speak about tokens in a RESULT are the
     // ones the positive half above must have covered — assert the count so a
     // silently narrowed regex cannot pass by matching nothing.
     const mentioning = registerAll().filter((definition) =>
@@ -212,6 +219,7 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
       'cherry_read',
       'cherry_send',
       'cherry_sessions',
+      'cherry_tasks',
       'cherry_workspaces',
     ])
   })
@@ -244,12 +252,12 @@ describe('tool parameter schemas: the six read-only tools', () => {  it('registe
 // Task 10④: the full 14-tool set
 // ---------------------------------------------------------------------------
 
-describe('tool parameter schemas: the complete 14-tool registry (Task 10④)', () => {
-  it('registers exactly the fourteen `cherry_*` tools, in the order M3 documents them', () => {
+describe('tool parameter schemas: the complete 15-tool registry (Task 10④)', () => {
+  it('registers exactly the fifteen `cherry_*` tools, in the order M3 documents them', () => {
     expect(registerAll().map((definition) => definition.name)).toEqual([...ALL_TOOLS])
   })
 
-  it('every one of the fourteen declares a literal, closed, object-root schema with a description', () => {
+  it('every one of the fifteen declares a literal, closed, object-root schema with a description', () => {
     for (const definition of registerAll()) {
       expect(definition.parameters.type).toBe('object')
       expect(definition.parameters.additionalProperties).toBe(false)

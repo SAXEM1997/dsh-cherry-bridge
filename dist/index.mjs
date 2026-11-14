@@ -2037,11 +2037,11 @@ var ToolScopeState = class {
 	* assembly, and the host calls it per step. Nothing here is cached, so a
 	* config save or a `rebuild()` changes the answer for the very next step.
 	*
-	* ONE DELIBERATE DIVERGENCE from the fourteen tools' condition, which
+	* ONE DELIBERATE DIVERGENCE from the fifteen tools' condition, which
 	* composes `judgement(agent.id) ?? resolveNow(agent)`: this reads the
 	* GENERATION ONLY.
 	* So a brand-new agent in a permitted workspace answers `false` until the
-	* async round that judges it lands — the other fourteen tools are offered on
+	* async round that judges it lands — the other fifteen tools are offered on
 	* its first step and this one is not. It self-heals on the next round, and it
 	* fails on the STRICTER side, which is the only direction this is allowed to
 	* diverge in: `when` is consulted inside step preparation, where an
@@ -2055,7 +2055,7 @@ var ToolScopeState = class {
 	}
 	/**
 	* The same question answered with the AGENT in hand (#343) — the predicate the
-	* fourteen tools are registered with when the host supports step-time `when`.
+	* fifteen tools are registered with when the host supports step-time `when`.
 	*
 	* It composes the cached judgement with {@link resolveNow}: `when` HAS the
 	* agent (and therefore its `cwd`), so a brand-new agent is judged on its first
@@ -7749,6 +7749,23 @@ function withRateLimitHint(error) {
 	error.message = `${error.message} — ${advice.join(". ")}.`;
 	return error;
 }
+/** The `statuses` filter of `cherry_tasks`, or `'invalid'` when a value is not a task state. */
+function statusListArgument(value) {
+	if (value === void 0) return void 0;
+	if (!Array.isArray(value)) return "invalid";
+	const allowed = [
+		"active",
+		"paused",
+		"completed",
+		"missed"
+	];
+	const statuses = [];
+	for (const entry of value) {
+		if (typeof entry !== "string" || !allowed.includes(entry)) return "invalid";
+		if (!statuses.includes(entry)) statuses.push(entry);
+	}
+	return statuses.length === 0 ? void 0 : statuses;
+}
 function optionalString(value) {
 	return typeof value === "string" && value !== "" ? value : void 0;
 }
@@ -7979,7 +7996,7 @@ function readRender(_args, value) {
 * This is what {@link registerCherryTools} REGISTERS, and nothing else: the
 * contract suite asserts the two sets against each other in both directions. The
 * list the SCOPE subsystem governs is the wider {@link cherryScopeToolNames}
-* — the fourteen here plus the experimental delegation tool, which is registered
+* — the fifteen here plus the experimental delegation tool, which is registered
 * by the subagent subsystem instead. Keeping the two apart is what lets each
 * statement stay true.
 *
@@ -8005,13 +8022,14 @@ const CHERRY_TOOL_NAMES = [
 	"cherry_send",
 	"cherry_wait",
 	"cherry_interactions",
+	"cherry_tasks",
 	"cherry_respond",
 	"cherry_cancel",
 	"cherry_pair",
 	"cherry_unpair"
 ];
 /**
-* Every tool name the SCOPE subsystem governs — the fourteen above plus the
+* Every tool name the SCOPE subsystem governs — the fifteen above plus the
 * experimental delegation tool, whose name the operator can rename.
 *
 * Two lists rather than one, because they answer different questions:
@@ -8128,7 +8146,7 @@ var RunAbortedError = class extends Error {
 	}
 };
 /**
-* The six read tools — and, below them, the WHOLE fourteen-tool `cherry_*`
+* The six read tools — and, below them, the WHOLE fifteen-tool `cherry_*`
 * family THIS CLASS defines: the six READ-ONLY tools (Task 8), six INTERACTIVE
 * ones (Task 9), and
 * two MANAGEMENT ones (Task 10), plus the registration framework they all
@@ -8232,6 +8250,16 @@ var CherryToolEngine = class {
 	* a walk on the old socket must not answer a caller dialing the new one.
 	*/
 	#contentWalks = /* @__PURE__ */ new WeakMap();
+	/**
+	* Connections whose peer refused the `agent.tasks.*` probe (#381).
+	*
+	* Keyed by the CONNECTION, not the deviceId: the latch is per connection
+	* GENERATION (ADR-0001 rule 2), and a reconnect builds a new
+	* `DeviceConnection`, so an upgraded desktop is re-probed without any reset
+	* path of its own. A WeakSet, because a dropped connection must not be kept
+	* alive by the answer it once gave.
+	*/
+	#tasksUnsupported = /* @__PURE__ */ new WeakSet();
 	/**
 	* The `maxBytes` one `agent.content.read` slice asks for
 	* ({@link CONTENT_READ_MAX_BYTES} in production; injectable so a test can
@@ -8377,6 +8405,7 @@ var CherryToolEngine = class {
 			this.#sendTool(),
 			this.#waitTool(),
 			this.#interactionsTool(),
+			this.#tasksTool(),
 			this.#respondTool(),
 			this.#cancelTool(),
 			this.#pairTool(),
@@ -9058,6 +9087,190 @@ var CherryToolEngine = class {
 				return this.#listPage(page, binding);
 			}
 		});
+	}
+	/**
+	* The scheduled-task face: `list` / `get` / `runs` / `run`.
+	*
+	* The protocol declared `agent.tasks.*` in 0.8.0 and the desktop REGISTERS the
+	* five handlers from 2.2.1 onward, but there is no hello capability bit for
+	* them — so support cannot be negotiated, only discovered (ADR-0001). The
+	* discovery is the `agent.tasks.list` PROBE: a cursorless list answering
+	* `NOT_FOUND` / `UPGRADE_REQUIRED` means this peer has no task face, and the
+	* answer is `unsupported` for the rest of the CONNECTION's life (a reconnect
+	* builds a new `DeviceConnection`, so the latch resets with it). A refusal
+	* carrying a cursor is NOT a probe verdict — a stale position on a peer that
+	* does serve tasks answers the same code — so it stays an ordinary failure.
+	*
+	* The prompt of a task is returned as the peer stored it: `{text}` inline, or
+	* a `{ref}` the caller can read through `cherry_read`'s machinery if it ever
+	* needs the bytes. Fetching it here would put a second content walk behind a
+	* read-only listing, which this face deliberately does not do.
+	*/
+	#tasksTool() {
+		return defineCherryTool({
+			name: "cherry_tasks",
+			description: "Read a desktop's SCHEDULED TASKS (the agent task scheduler). `action` picks the face: `list` (the default) pages the tasks, `get` returns one task with its prompt, timeout, workspace and reuse rule, `runs` pages one task's run history, and `run` returns a single run. `list` accepts `agentId` and `statuses` filters, which pass straight through to the peer; both paged faces accept `limit` (the TOTAL across pages) and `cursor` (a `resumeCursor` a previous truncated answer returned, when the stop point can be named — replay it with the same tool, device and filters). The task face is OPTIONAL: it needs a desktop that serves `agent.tasks.*` (Cherry Studio 2.2.1 or newer), and an older one answers `{\"error\": \"unsupported\"}` without touching any other face. A task's prompt comes back as the peer stored it — `{text}` inline, or a `{ref}` whose bytes this tool does NOT fetch.",
+			parameters: {
+				type: "object",
+				properties: {
+					device: {
+						type: "string",
+						description: "Device selector: exact deviceId, or a unique prefix of a deviceId or display name."
+					},
+					action: {
+						type: "string",
+						enum: [
+							"list",
+							"get",
+							"runs",
+							"run"
+						],
+						description: "`list` (the default) pages the tasks; `get` needs `taskId`; `runs` needs `taskId`; `run` needs `taskId` and `runId`."
+					},
+					agentId: {
+						type: "string",
+						description: "For `action: \"list\"`: only tasks of this agent."
+					},
+					statuses: {
+						type: "array",
+						items: {
+							type: "string",
+							enum: [
+								"active",
+								"paused",
+								"completed",
+								"missed"
+							]
+						},
+						description: "For `action: \"list\"`: only tasks in one of these states."
+					},
+					taskId: {
+						type: "string",
+						description: "The task, for `get` / `runs` / `run`."
+					},
+					runId: {
+						type: "string",
+						description: "The run, for `action: \"run\"`."
+					},
+					limit: {
+						type: "integer",
+						description: `For the paged actions: maximum number of rows to return in total across pages ${AGGREGATE_LIMIT_BOUNDS}.`
+					},
+					cursor: LIST_CURSOR_PARAMETER
+				},
+				required: ["device"],
+				additionalProperties: false
+			},
+			execute: async (args) => {
+				const action = optionalString(args["action"]) ?? "list";
+				if (action !== "list" && action !== "get" && action !== "runs" && action !== "run") return {
+					error: "invalid-action",
+					message: "`action` accepts exactly \"list\", \"get\", \"runs\" or \"run\""
+				};
+				const resolved = await this.#linkOr(requiredString(args, "device"));
+				if (resolved.link === void 0) return resolved.verdict;
+				const { connection, record } = resolved.link;
+				if (this.#tasksUnsupported.has(connection)) return this.#tasksUnsupportedVerdict();
+				if (action === "list") return await this.#tasksList(connection, record.deviceId, args);
+				const taskId = optionalString(args["taskId"]);
+				if (taskId === void 0) return {
+					error: "task-required",
+					message: `\`action\` "${action}" needs \`taskId\`: the task to read`
+				};
+				if (action === "get") return {
+					action: "get",
+					task: (await connection.rpc.request("agent.tasks.get", { taskId }))["task"]
+				};
+				if (action === "runs") return await this.#tasksRuns(connection, record.deviceId, taskId, args);
+				const runId = optionalString(args["runId"]);
+				if (runId === void 0) return {
+					error: "run-required",
+					message: "`action` \"run\" needs `runId`: the run to read"
+				};
+				return {
+					action: "run",
+					run: (await connection.rpc.request("agent.tasks.runs.get", {
+						taskId,
+						runId
+					}))["run"]
+				};
+			}
+		});
+	}
+	/** `action: "list"` — the probe, its latch, and the paged walk. */
+	async #tasksList(connection, deviceId, args) {
+		const agentId = optionalString(args["agentId"]);
+		const statuses = statusListArgument(args["statuses"]);
+		if (statuses === "invalid") return {
+			error: "invalid-statuses",
+			message: "`statuses` accepts only \"active\", \"paused\", \"completed\" and \"missed\""
+		};
+		const params = {
+			...agentId === void 0 ? {} : { agentId },
+			...statuses === void 0 ? {} : { statuses }
+		};
+		const binding = {
+			method: "agent.tasks.list",
+			deviceId,
+			params
+		};
+		const resume = this.#listResume(args["cursor"], binding);
+		try {
+			const page = await this.#aggregate(connection, "agent.tasks.list", params, (result) => ({
+				...arrayOf(result["items"]),
+				nextCursor: result["nextCursor"]
+			}), {
+				limit: aggregateLimit(args["limit"]),
+				...resume === void 0 ? {} : { resume }
+			});
+			return {
+				action: "list",
+				...this.#listPage(page, binding)
+			};
+		} catch (error) {
+			const verdict = this.#tasksProbeVerdict(connection, error, resume === void 0);
+			if (verdict !== void 0) return verdict;
+			throw error;
+		}
+	}
+	/** `action: "runs"` — the same walk, bound to one task. */
+	async #tasksRuns(connection, deviceId, taskId, args) {
+		const params = { taskId };
+		const binding = {
+			method: "agent.tasks.runs.list",
+			deviceId,
+			params
+		};
+		const resume = this.#listResume(args["cursor"], binding);
+		const page = await this.#aggregate(connection, "agent.tasks.runs.list", params, (result) => ({
+			...arrayOf(result["items"]),
+			nextCursor: result["nextCursor"]
+		}), {
+			limit: aggregateLimit(args["limit"]),
+			...resume === void 0 ? {} : { resume }
+		});
+		return {
+			action: "runs",
+			taskId,
+			...this.#listPage(page, binding)
+		};
+	}
+	/**
+	* The probe's verdict: latch `unsupported` when a CURSORLESS `agent.tasks.list`
+	* is refused as missing, else `undefined` so the caller rethrows.
+	*/
+	#tasksProbeVerdict(connection, error, cursorless) {
+		if (!cursorless) return void 0;
+		const reason = failureReason(error);
+		if (reason !== "NOT_FOUND" && reason !== "UPGRADE_REQUIRED") return void 0;
+		this.#tasksUnsupported.add(connection);
+		return this.#tasksUnsupportedVerdict();
+	}
+	#tasksUnsupportedVerdict() {
+		return {
+			error: "unsupported",
+			message: "this desktop does not serve the scheduled-task methods (agent.tasks.*); they need Cherry Studio 2.2.1 or newer"
+		};
 	}
 	#readTool() {
 		return defineCherryTool({
@@ -12807,7 +13020,9 @@ const LIST_TOOL_CODES = {
 	"agent.agents.list": "a",
 	"agent.workspaces.list": "w",
 	"agent.sessions.list": "s",
-	"agent.interactions.list": "i"
+	"agent.interactions.list": "i",
+	"agent.tasks.list": "t",
+	"agent.tasks.runs.list": "r"
 };
 /** The inverse of {@link LIST_TOOL_CODES}, for {@link parseListResumeCursor}. */
 const LIST_CODE_METHODS = Object.fromEntries(Object.entries(LIST_TOOL_CODES).map(([method, code]) => [code, method]));

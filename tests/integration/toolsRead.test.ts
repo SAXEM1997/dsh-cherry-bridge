@@ -2013,7 +2013,7 @@ describe('read-only cherry tools: registration framework', () => {
     // Task 9 appends six INTERACTIVE tools and Task 10 two MANAGEMENT tools to
     // the same registry, so this task's claim is about the read-only PREFIX it
     // owns — its order and its exact membership — not about being the whole
-    // registry. The full 14-tool set assertion belongs to Task 10④.
+    // registry. The full 15-tool set assertion belongs to Task 10④.
     expect(rig.ctx.definitions.slice(0, READ_TOOL_NAMES.length).map((definition) => definition.name)).toEqual(
       READ_TOOL_NAMES,
     )
@@ -2023,6 +2023,7 @@ describe('read-only cherry tools: registration framework', () => {
       'cherry_send',
       'cherry_wait',
       'cherry_interactions',
+      'cherry_tasks',
       'cherry_respond',
       'cherry_cancel',
       'cherry_pair',

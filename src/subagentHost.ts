@@ -353,7 +353,7 @@ export function createSubagentHost(parts: {
         } catch (error) {
           // A duplicate name is the ordinary way this throws (`DUPLICATE_PROVIDER`),
           // and it must NOT take the assembly down: the rest of the plugin — the
-          // fourteen tools, the settings page, the HTTP face — has nothing to do
+          // fifteen tools, the settings page, the HTTP face — has nothing to do
           // with it.
           const message = error instanceof Error ? error.message : String(error)
           status = { state: 'failed', reason: { code: 'provider-refused', message } }

@@ -763,9 +763,9 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       await applyAssembly(ctx as never, { dataDir, subagent: SUBAGENT })
       const names = ctx.tools.definitions.map((definition) => definition.name)
       expect(names).toContain('cherry_subagent')
-      // Registered BESIDE the fourteen, not instead of one: the assembly's own
+      // Registered BESIDE the fifteen, not instead of one: the assembly's own
       // registration is untouched by the experiment.
-      expect(names).toHaveLength(15)
+      expect(names).toHaveLength(16)
       rmSync(dataDir, { recursive: true, force: true })
     })
 
@@ -791,7 +791,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       await applyAssembly(ctx as never, { dataDir, subagent: { ...SUBAGENT, enabled: false } })
       const names = ctx.tools.definitions.map((definition) => definition.name)
       expect(names).not.toContain('cherry_subagent')
-      expect(names).toHaveLength(14)
+      expect(names).toHaveLength(15)
       rmSync(dataDir, { recursive: true, force: true })
     })
 
@@ -976,7 +976,7 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     return line
   }
 
-  it('③a registers the full 14-tool family on first apply', async () => {
+  it('③a registers the full 15-tool family on first apply', async () => {
     const index = await import('../../src/index.js')
     const dataDir = await mkdtemp(join(tmpdir(), 'cherry-assembly-'))
     dirs.push(dataDir)
@@ -995,12 +995,13 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
       'cherry_send',
       'cherry_wait',
       'cherry_interactions',
+      'cherry_tasks',
       'cherry_respond',
       'cherry_cancel',
       'cherry_pair',
       'cherry_unpair',
     ])
-    expect(ctx.tools.registerCalls).toBe(14)
+    expect(ctx.tools.registerCalls).toBe(15)
 
     // `apply` starts the identity load and returns; the test owns the async
     // work it triggered, so it settles it before the data dir goes away.
@@ -1022,8 +1023,8 @@ describe('③ plugin assembly (index.ts apply): full M3 wiring', () => {
     await applyAssembly(ctx as never, { dataDir })
 
     const names = ctx.tools.definitions.map((definition) => definition.name)
-    expect(names).toHaveLength(14)
-    expect(new Set(names).size).toBe(14)
+    expect(names).toHaveLength(15)
+    expect(new Set(names).size).toBe(15)
     // The second pass REBOUND the names rather than merely adding to them: none
     // of the first pass's definition objects survives.
     expect(ctx.tools.definitions.some((definition) => firstPass.includes(definition))).toBe(false)
