@@ -397,6 +397,33 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
   环境里只有一台 2.2.2 桌面，且执行会话声明了 image 输入。
 - 第二部分其余小节（配对、交互应答、多设备、`/scope`、语言切换）没有重跑：不在 0.4.0 的改动面上。
 
+### 0.4.1（2026-11-15 · DSH profile `web` · 桌面端 ISV-ZYX 2.2.2）
+
+> 0.4.1 的改动面是**新增一个工具面**（`cherry_tasks`）加四处修复与一处文档守卫，所以本轮只走
+> 第一节的 I 小节，其余小节沿用 0.4.0 的记录。桌面端版本仍是维护者告知的 **2.2.2**（协议里没有
+> app 版本字段）；`agent.tasks.*` 能应答本身就证明它 ≥ 2.2.1。
+
+| 项 | 结果 | 观测 |
+| --- | --- | --- |
+| 装机生效 | 通过 | 安装目录为 `0.4.1`；`dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`、`locale/zh.json`、`locale/en.json`、`package.json` 与已发布 tarball **逐文件 sha256 全同**（`3033887e…` / `1ce7190b…` / `47b84614…` / `8fe01bf8…` / `a08bf83f…` / `88127684…`）；包 mtime `00:24` 早于宿主 PID 1 启动 `00:24:47` |
+| 离线设备的按需连接 | 通过 | `/diagnostics` 里该设备 `state: "offline"`；一次 `cherry_agents` 连上，返回 6 个 agent |
+| I-1 `cherry_tasks` 默认 `list` | 通过 | 1 个任务 `daily-briefing`：`status:"paused"`、`trigger:{kind:"cron", expr:"0 1 * * *"}`、`nextRunAt:null`、`agentId:15f007a3…`、`truncated:false` |
+| I-2 `get` 详情 | 通过 | 返回 `trigger` / `timeoutMinutes:2` / `workspace:{kind:"system"}` / `reuse:{kind:"fresh"}` / `createdAt` / `updatedAt`；`prompt` 是**内联** `{text}`（该任务提示词短于 4096 字符阈值，见「未覆盖」） |
+| I-2 `runs` | 通过 | 空列表（任务暂停、从未运行）；`truncated:false` |
+| I-2 `run` 缺 `runId` | 通过 | `{error:"run-required"}`，未发请求 |
+| I-5 未知 `taskId` 的 `get` | 通过 | `Error: Task not found`；**紧接着**一次 `list` 仍正常应答（`statuses:["active"]` → 空列表），说明 `get` 的 `NOT_FOUND` **没有**锁存成 `unsupported` |
+| 过滤器透传 | 通过 | `agentId` + `statuses:["paused"]` → 命中该任务；换一个 `agentId` → 空；`statuses:["active"]` → 空 |
+| 参数守卫（#383） | 通过 | `statuses: []` → `{error:"invalid-statuses"}`（本地拒绝，零往返）；`action:"bogus"` → `{error:"invalid-action"}` |
+
+**本轮未覆盖**（**不是通过**）：
+
+- **I-3 老桌面的 `unsupported` 与锁存**：需要一台 `<2.2.1` 桌面；环境里只有 2.2.2。
+- **I-4 重连后重新探测**：它的前提是先有一个锁存，因而随 I-3 一起缺席。
+- **I-6 跨过滤器重放 `resumeCursor` 被本地拒绝**：这台桌面只有 1 个任务，`limit` 永远不触发截断，
+  也就不会发出 `resumeCursor`。
+- **`{ref}` 形态的提示词**：该任务的提示词短到被对端内联，`agent.tasks.content.read` 那条路径本轮没走。
+- **§D 的重连判别点（#369）**、**§H 的上传续传（#327）**：仍没有构造出链路中断。
+
 ## 第三部分：诊断与发布核对
 
 - [ ] `GET /cherry-remote/api/diagnostics` 返回设备状态/连接统计/最近错误摘要，
