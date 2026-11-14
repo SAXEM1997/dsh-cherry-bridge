@@ -332,6 +332,34 @@ http://127.0.0.1:23023/cherry-remote/api/scope`（宿主换过端口就换端口
 
 ---
 
+### 0.4.0（2026-11-14 · DSH profile `web` · 桌面端 ISV-ZYX 2.2.2）
+
+> 本轮走查 0.4.0 的**主链路冒烟**：装机生效、按需连接、建会话、带附件发送、读回（含读图）。
+> 桌面端版本由维护者告知（**2.2.2**）；协议里没有 app 版本字段，`connection.hello` 只广告能力位，
+> 所以这一行是**转述**而非实测。0.4.0 的三处新路径（重连判别、上传续传、两种宿主模式）本轮
+> **没有**构造出对应的故障，见文末。
+
+| 项 | 结果 | 观测 |
+| --- | --- | --- |
+| 装机生效 | 通过 | 安装目录 `dsh-cherry-bridge` 为 `0.4.0`；`dist/index.mjs`、`dist/index.d.mts`、`lib/client.js`、`locale/zh.json`、`locale/en.json` 与 npm 已发布 tarball **逐文件 sha256 全同**（`a2402985…` / `7d0672a2…` / `34c46a65…` / `8fe01bf8…` / `a08bf83f…`）；包 mtime `11:33` 早于宿主 PID 1 启动 `17:58:46` |
+| 离线设备的按需连接 | 通过 | `GET /diagnostics` 里该设备 `state: "offline"`；随后一次 `cherry_agents` 把它连上，返回 6 个 agent |
+| `cherry_workspaces` | 通过 | 5 个注册工作区 + `systemWorkspace: true` |
+| `cherry_create`（注册工作区） | 通过 | `status: "applied"`，`sessionId: 94d0b270…`，`historyRevision: 1794655513385` |
+| `cherry_send` 带 1 个附件（77 B、**损坏**的 PNG） | 通过 | `status: "completed"`；回显 `{filename:"e2e-0.4.0.png", mediaType:"image/png", byteLength:77, uploadId:"4cd4f2ad…"}`；agent 回复「收到，共 1 个附件。」 |
+| 读回损坏图片（`includeImages: true`） | 通过（**降级臂**） | 该 part 保留 `kind:"file"` / `name` / `byteLength:"77"`，多出 `unavailable:"Unsupported or malformed image data."`，消息 `incomplete: true`、`unavailableParts: 1`；同消息的文本 part 完好 |
+| `cherry_send` 带 1 个有效 PNG（7,858 B / 64×64） | 通过 | `status: "completed"`；回显 `uploadId:"f7fa73ee…"`；agent 回复「图2 收到。」 |
+| 读回有效图片（`includeImages: true`） | 通过 | `image: {attachmentId:"sha256:ee57e9e9…", mediaType:"image/png", bytes:7858, width:64, height:64, name:"e2e-0.4.0-valid.png"}`；工具结果渲染为 1 个 image block，宿主对象 `/dsh-home/attachments/v1/objects/ee/ee57e9e9…` 可读 |
+
+**本轮未覆盖**（**不是通过**）：
+
+- **§D 的重连判别点（#369）**：需要「断连期间让一轮跑完」——本轮没有构造链路中断，而
+  `cherry_wait` 在快照能答时不会暴露重放是否生效。
+- **§H 的上传续传（#327）**：需要在上传途中切断链路；本轮上传在 1 秒内完成，没有窗口。
+- **§F 的两种宿主模式**：取决于宿主而非桌面端，属于本机 `tools.resolve` 能力的验证面。
+- **`<2.1.5` 桌面的 `unsupported`**、**桌面端本地粘贴（旧式 `data` part）**、**纯文本路由的读图拒绝**：
+  环境里只有一台 2.2.2 桌面，且执行会话声明了 image 输入。
+- 第二部分其余小节（配对、交互应答、多设备、`/scope`、语言切换）没有重跑：不在 0.4.0 的改动面上。
+
 ## 第三部分：诊断与发布核对
 
 - [ ] `GET /cherry-remote/api/diagnostics` 返回设备状态/连接统计/最近错误摘要，

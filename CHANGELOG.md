@@ -8,8 +8,9 @@ surface change.
 ## Compatibility
 
 Every release section states the Cherry Studio **desktop** range it was verified
-against; the range for the current tree is **2.1.4 – 2.1.10** (the `v3` pairing QR
-needs 2.1.8+, the `v2` QR works from 2.1.4). The newest generation whose protocol
+against; the range for the current tree is **2.1.4 – 2.2.2** (the `v3` pairing QR
+needs 2.1.8+, the `v2` QR works from 2.1.4). 2.2.2 is covered by the 0.4.0 smoke in
+`docs/e2e-checklist.md`, not by a full walk. The newest generation whose protocol
 packages this project pins is 2.1.8 — 2.1.9 and 2.1.10 ship the same
 `0.7.0` / `0.2.5` pair and differ from 2.1.8 on the remote-access face by one
 robustness fix in the desktop's write chain (PR #22593), smoke-tested here on a
