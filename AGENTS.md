@@ -252,7 +252,10 @@ id, `dist-tags`, the asset URL) — the silent failures above look like success
 from the terminal. A retry re-stages or re-attaches the SAME tarball: compare
 shas (`npm pack --dry-run` against the registry's `dist.shasum`) and stop on a
 mismatch, rather than rebuilding and publishing different bytes under a tag
-that is already out.
+that is already out. That comparison is meaningful only because
+`repository.url` in `package.json` holds npm's NORMALISED form
+(`git+https://….git`): npm rewrites the browsable form while packing, which is
+how 0.4.0's local sha1 and registry shasum diverged (#377).
 
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
 ruling`, `UltraReview` — point at internal SDD process records under
