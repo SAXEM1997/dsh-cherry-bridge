@@ -31,7 +31,7 @@ flowchart TB
 
 - 包名：`dsh-cherry-bridge`，插件 id：`cherry-remote`
 - 传输：默认 `ws://` + Noise XX（加密由 Noise 记录层提供）；桌面端位于 TLS 前置之后时拨 `wss://`，私有 CA 的信任由 `wsTls` 提供
-- 工具面：15 个 `cherry_*` 工具（第 15 个 `cherry_subagent` 是**实验性、默认关闭**的跨端委派，见[实验性子智能体](#实验性子智能体)），**按工作区**启用，默认**谁都没有**（见「启用范围」）
+- 工具面：15 个 `cherry_*` 工具，外加第 16 个 `cherry_subagent`（**实验性、默认关闭**的跨端委派，见[实验性子智能体](#实验性子智能体)），**按工作区**启用，默认**谁都没有**（见「启用范围」）
 - 设置页与 HTTP 面：宿主 Web 服务器上的同源前缀 `/cherry-remote/api`
 
 ## 安装
@@ -224,7 +224,7 @@ subagent:
 `/cherry-remote/api/events` SSE 推送的实时状态。
 
 15 个工具**按工作区**决定是否出现，机制是**隐藏而非拒绝**（不在范围的会话里不进工具表，省上下文）。
-第 15 个 `cherry_subagent` 的存在条件更严：实验开关打开、配置可用、宿主提供了子智能体服务，
+第 16 个 `cherry_subagent` 的存在条件更严：实验开关打开、配置可用、宿主提供了子智能体服务，
 **且该服务能承载这个工具**——缺 `startActivation`，或在装了启用范围门时缺 `tools.resolve`，
 都按 fail-closed 不注册，状态里会写明是哪一个（`ready-without-tool` 的 `problem`）。
 

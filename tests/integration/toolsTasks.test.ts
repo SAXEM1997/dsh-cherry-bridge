@@ -332,7 +332,9 @@ describe('issue #381 ㉛: cherry_tasks', () => {
     // The protocol requires at least one entry, so forwarding it would spend a
     // round trip on a request the peer refuses; collapsing it to "no filter"
     // would answer every task to a caller who named none.
-    expect(((await rig.call({ statuses: [] })) as Record<string, unknown>)['error']).toBe('invalid-statuses')
+    const refused = (await rig.call({ statuses: [] })) as Record<string, unknown>
+    expect(refused['error']).toBe('invalid-statuses')
+    expect(String(refused['message'])).toMatch(/non-empty/i)
     expect(taskCalls(rig.fake).length).toBe(0)
   })
 
@@ -352,5 +354,32 @@ describe('issue #381 ㉛: cherry_tasks', () => {
     )
     expect(((await rig.call({ action: 'nope' })) as Record<string, unknown>)['error']).toBe('invalid-action')
     expect(taskCalls(rig.fake).length).toBe(0)
+  })
+
+  it('㉛n a NOT_FOUND on the CURSORLESS first page is a capability verdict too', async () => {
+    // The `-32601` arm covers a peer that never registered the methods; this one
+    // covers a peer that has the methods but no task store behind them. Both are
+    // the same verdict, and BOTH arms need a case that fails without them: ㉛f
+    // moved to `-32601`, so deleting `'NOT_FOUND'` from the guard would otherwise
+    // leave the suite green (#383 review).
+    const rig = await makeRig({ tasks: tasks(1) })
+    rig.fake.failTaskListAfter(0, { reason: 'NOT_FOUND', message: 'Task store unavailable' })
+    expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
+    // Latched: the one-shot failure is spent, so a second call that re-probed
+    // would PAGE and answer a list instead.
+    expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
+    expect(taskCalls(rig.fake).length).toBe(1)
+  })
+
+  it('㉛o an identity mismatch clears the latch as well as a dropped link', async () => {
+    // `#watchConnection` resets on `offline` OR `identity-mismatch`; only the
+    // first was exercised, so the second arm could rot unnoticed.
+    const rig = await makeRig({ tasks: tasks(1), withoutTaskMethods: true })
+    expect(((await rig.call()) as Record<string, unknown>)['error']).toBe('unsupported')
+    rig.fake.setAgentOptions({ withoutTaskMethods: false })
+    rig.setState('identity-mismatch')
+    const answer = (await rig.call()) as Record<string, unknown>
+    expect(answer['action']).toBe('list')
+    expect((answer['items'] as Array<Record<string, unknown>>).length).toBe(1)
   })
 })

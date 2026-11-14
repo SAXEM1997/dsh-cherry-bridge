@@ -1106,9 +1106,20 @@ function failureReason(error) {
 	const reason = data["reason"];
 	return typeof reason === "string" ? reason : void 0;
 }
+/**
+* The JSON-RPC code a server answers when it has no handler for a method:
+* `-32601`, `Method not found`.
+*
+* It arrives with NO `data`, so {@link failureReason} answers `undefined` for it
+* — which is the whole reason this predicate exists rather than a `reason`
+* comparison. A peer older than the method simply never registered it
+* (`json-rpc-2.0`'s `createMethodNotFoundResponse`), and that absence is a
+* CAPABILITY verdict for a face the protocol made optional (#381).
+*/
+const JSONRPC_METHOD_NOT_FOUND = -32601;
 /** Whether the peer refused the METHOD itself, rather than anything about the call. */
 function isMethodNotFound(error) {
-	return error instanceof JsonRpcRequestError && error.code === -32601;
+	return error instanceof JsonRpcRequestError && error.code === JSONRPC_METHOD_NOT_FOUND;
 }
 /** Serialises a frame for the channel; the channel itself carries objects. */
 function encodeFrame(value) {
@@ -9109,13 +9120,16 @@ var CherryToolEngine = class {
 	*
 	* The protocol declared `agent.tasks.*` in 0.8.0 and the desktop REGISTERS the
 	* five handlers from 2.2.1 onward, but there is no hello capability bit for
-	* them — so support cannot be negotiated, only discovered (ADR-0001). The
-	* discovery is the `agent.tasks.list` PROBE: a cursorless list answering
-	* `NOT_FOUND` / `UPGRADE_REQUIRED` means this peer has no task face, and the
-	* answer is `unsupported` for the rest of the CONNECTION's life (a reconnect
-	* builds a new `DeviceConnection`, so the latch resets with it). A refusal
-	* carrying a cursor is NOT a probe verdict — a stale position on a peer that
-	* does serve tasks answers the same code — so it stays an ordinary failure.
+	* them — so support cannot be negotiated, only discovered (ADR-0001). Two
+	* shapes are that verdict: a cursorless, first-page `agent.tasks.list`
+	* answering `NOT_FOUND` / `UPGRADE_REQUIRED`, and `-32601` from ANY of the four
+	* actions (a peer that never registered the methods has no `data` to classify,
+	* see `isMethodNotFound`). Either one answers `unsupported` until this
+	* connection reports `offline` / `identity-mismatch` — the pool REUSES the
+	* instance across a reconnect, so the reset is explicit in `#watchConnection`,
+	* not a side effect of a new object (#383). A refusal carrying a cursor is NOT
+	* a probe verdict — a stale position on a peer that does serve tasks answers
+	* the same code — so it stays an ordinary failure.
 	*
 	* The prompt of a task is returned as the peer stored it: `{text}` inline, or
 	* a `{ref}` this face does NOT resolve — the protocol serves its bytes through
@@ -9230,7 +9244,7 @@ var CherryToolEngine = class {
 		const statuses = statusListArgument(args["statuses"]);
 		if (statuses === "invalid") return {
 			error: "invalid-statuses",
-			message: "`statuses` accepts only \"active\", \"paused\", \"completed\" and \"missed\""
+			message: "`statuses` must be a NON-EMPTY list of \"active\", \"paused\", \"completed\" or \"missed\" (the protocol forbids an empty one, so it is refused here rather than spent on a round trip)"
 		};
 		const params = {
 			...agentId === void 0 ? {} : { agentId },
@@ -9294,6 +9308,13 @@ var CherryToolEngine = class {
 	* The `-32601` arm is handled one level up, in the action wrapper: a peer that
 	* never registered the method says so for EVERY action, and with no `data` at
 	* all.
+	*
+	* `UPGRADE_REQUIRED` is read HERE and nowhere else. On `get` / `runs` / `run` it
+	* is a refusal of that call — the app's own `RemoteAgentScope.ts:530` shows a
+	* task method can answer it while the face works — so turning it into
+	* `unsupported` there would hide a serving peer. The five handlers are
+	* registered in ONE block on the desktop (`agentHandlers.ts:72-76`), which is
+	* why `-32601` from any of them is a verdict about the whole face.
 	*/
 	#tasksProbeVerdict(connection, error, probeable) {
 		if (!probeable) return void 0;

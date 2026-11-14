@@ -179,7 +179,7 @@ export function failureReason(error: unknown): string | undefined {
  * (`json-rpc-2.0`'s `createMethodNotFoundResponse`), and that absence is a
  * CAPABILITY verdict for a face the protocol made optional (#381).
  */
-export const JSONRPC_METHOD_NOT_FOUND = -32601
+const JSONRPC_METHOD_NOT_FOUND = -32601
 
 /** Whether the peer refused the METHOD itself, rather than anything about the call. */
 export function isMethodNotFound(error: unknown): boolean {
