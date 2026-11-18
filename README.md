@@ -38,17 +38,17 @@ flowchart TB
 
 > **DSH 版本需求**：`>=0.2.2-rc.1 <0.3.0-0`（由 `package.json` 的 `engines.dsh` 声明；不满足时 bundle 被跳过、设置页里该插件的行被禁用，确需在区间外使用可用 `dsh plugin allow-version` 精确豁免。0.3.0 需重新评估兼容性后再放开）。
 >
-> **Cherry Studio 兼容范围**：桌面端 **2.1.4 – 2.2.2 已核对**——`v3` 自定义地址二维码需 **2.1.8+**，2.1.4–2.1.7 的 `v2` 二维码同样可用。2.1.9/2.1.10 与 2.1.8 在 remote-access 面上只差桌面端发送链的一处健壮性修复（PR #22593，不影响客户端），并在 2.1.10 与 2.2.2 真机上跑过「建会话 → 发送（含附件上传）→ 等待 → 读取（含读图）」冒烟。区间外未经验证：握手只协商协议版本 `[1]`，不兼容时会以 `unreachable` 明确失败，不会静默出错。协议包钉在 `0.7.0` / `0.2.5`，2.1.10 携带的还是同一对版本。
+> **Cherry Studio 兼容范围**：桌面端 **2.1.4 – 2.2.2 已核对**——`v3` 自定义地址二维码需 **2.1.8+**，2.1.4–2.1.7 的 `v2` 二维码同样可用。2.1.9/2.1.10 与 2.1.8 在 remote-access 面上只差桌面端发送链的一处健壮性修复（PR #22593，不影响客户端），并在 2.1.10 与 2.2.2 真机上跑过「建会话 → 发送（含附件上传）→ 等待 → 读取（含读图）」冒烟。区间外未经验证：握手只协商协议版本 `[1]`，不兼容时会以 `unreachable` 明确失败，不会静默出错。协议包钉在 `0.8.0` / `0.2.5`：transport `0.2.6` 只改许可证头，`0.8.0` 相对 `0.7.0` 只新增 `agent.tasks.*`，所以 2.1.10 的 `0.7.0` / `0.2.5` 与 2.2.2 的 `0.8.0` / `0.2.6` 与我方使用的线路完全相同。
 
 ```bash
 # 从 npm 安装（推荐，钉住版本）
-npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.4.1
+npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge@0.4.2
 
 # 安装 npm 最新发布版
 npx @deepseek-ai/dsh plugin --profile web add dsh-cherry-bridge
 
 # 从 GitHub 源码安装（与 npm 发布同一提交）
-npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.4.1
+npx @deepseek-ai/dsh plugin --profile web add github:SAXEM1997/dsh-cherry-bridge#v0.4.2
 ```
 
 本包自带 `cordis.patch.yml`（`package.json` 的 `dsh.bundle.patch` 指向它），
