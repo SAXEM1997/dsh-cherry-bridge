@@ -3874,6 +3874,10 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
     expect(attachments.saved).toHaveLength(0)
     // The sniff read happened; nothing else did.
     expect(rig.fake.contentReadRequests()).toEqual([{ offset: '0', maxBytes: IMAGE_SNIFF_BYTES }])
+    // A failed guess must not cost the message its text.
+    const text = parts.find((part) => part['kind'] === 'text')
+    expect(text?.['content']).toBe('look at this')
+    expect(text?.['unavailable']).toBeUndefined()
   })
 
   it('㉜e a part the peer labels text/plain is believed without a sniff read', async () => {
@@ -3884,7 +3888,9 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
     await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', includeImages: true }, imageExec())
 
     // A label that NAMES a type is a claim about the bytes; only a label that
-    // says nothing earns a read.
+    // says nothing earns a read. The ticket asked for "not `image/*`" — this is
+    // the narrower rule, so that a history full of text files and PDFs does not
+    // cost one content read each.
     expect(rig.fake.contentReadRequests()).toEqual([])
     expect(attachments.saved).toHaveLength(0)
   })
@@ -3899,8 +3905,93 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
     // The store received the WHOLE content, not the 512-byte guess.
     expect(attachments.saved[0]?.data.length).toBe(bytes.length)
     expect(Buffer.from(attachments.saved[0]!.data)).toEqual(Buffer.from(bytes))
-    // And the sniff asked for one bounded slice at offset 0.
-    expect(rig.fake.contentReadRequests()[0]).toEqual({ offset: '0', maxBytes: IMAGE_SNIFF_BYTES })
+    // And the sniff asked for one bounded slice at offset 0 — bounded against
+    // the ticket's literal ceiling, not against the constant it came from.
+    expect(rig.fake.contentReadRequests()[0]?.offset).toBe('0')
+    expect(rig.fake.contentReadRequests()[0]!.maxBytes).toBeLessThanOrEqual(24 * 1024)
+  })
+
+  it('㉜g an unlabelled picture past the call budget is reported as omitted, not dropped', async () => {
+    const attachments = fakeAttachments()
+    const bytes = imageBytes(PNG_MAGIC)
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            { sessionId: 's-1', agentId: 'agent-1', workspaceId: 'ws-1', title: 'Cap', historyRevision: '1000' },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [
+                { kind: 'file', text: '', name: 'one', mediaType: 'image/png' },
+                { kind: 'file', text: '', name: 'two', mediaType: 'application/octet-stream' },
+                { kind: 'file', text: '', name: 'three', mediaType: 'application/octet-stream' },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        engine: { contentReadSliceBytes: TEST_SLICE_BYTES, readImagesPerCall: 1 },
+        attachments: attachments.service,
+        llm: fakeLlm(),
+      },
+    )
+    rig.fake.setContentBytes('m-1:0', '1001', bytes)
+    rig.fake.setContentBytes('m-1:1', '1001', bytes)
+    rig.fake.setContentBytes('m-1:2', '1001', bytes)
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const parts = result.messages.flatMap((message) => message.parts)
+    // The single image slot went to the DECLARED picture; the second part's
+    // bytes were still asked (a sniff costs no slot), found a picture, and the
+    // budget was already spent — so it must SAY so instead of vanishing with no
+    // marker, which is the silent loss #396 opened with.
+    expect(parts[0]?.['image']).toBeDefined()
+    expect(parts[1]?.['image']).toBeUndefined()
+    expect(parts[1]?.['imagesOmitted']).toBe('cap')
+    // The THIRD part is not even asked: the sniff budget is the per-call image
+    // count, so a message of `octet-stream` files cannot buy a read each.
+    expect(parts[2]?.['image']).toBeUndefined()
+    expect(parts[2]?.['imagesOmitted']).toBeUndefined()
+    expect(attachments.saved).toHaveLength(1)
+    expect(rig.fake.contentReadRequests()).toEqual([
+      { offset: '0', maxBytes: TEST_SLICE_BYTES },
+      { offset: String(TEST_SLICE_BYTES), maxBytes: TEST_SLICE_BYTES },
+      { offset: '0', maxBytes: IMAGE_SNIFF_BYTES },
+    ])
+  })
+  it('㉜h a sniff whose slice echoes another offset makes no claim', async () => {
+    const bytes = imageBytes(PNG_MAGIC)
+    const attachments = fakeAttachments()
+    const rig = await rigForFile('application/octet-stream', 'photo', bytes, attachments)
+    // The bytes are a perfect PNG; only the credential is wrong.
+    rig.fake.misEchoContentReadOffset('0')
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const parts = result.messages.flatMap((message) => message.parts)
+    const file = parts.find((part) => part['kind'] === 'file')
+    // The guess is discarded, and the part is not walked: a slice that does not
+    // echo the request is not evidence about THIS content.
+    expect(file?.['image']).toBeUndefined()
+    expect(file?.['unavailable']).toBeUndefined()
+    expect(attachments.saved).toHaveLength(0)
+    expect(rig.fake.contentReadRequests()).toEqual([{ offset: '0', maxBytes: IMAGE_SNIFF_BYTES }])
   })
 })
 
