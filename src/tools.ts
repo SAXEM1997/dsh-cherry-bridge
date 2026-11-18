@@ -7,6 +7,7 @@ import {
   MAX_SEND_ATTACHMENT_BYTES,
   MAX_SEND_MESSAGE_BYTES,
   IMAGE_SNIFF_BYTES,
+  SNIFF_ATTEMPTS_PER_IMAGE_SLOT,
   MESSAGE_TEXT_MAX_CHARS,
   SUBAGENT_TITLE_FALLBACK_CHARS,
 } from './defaults.js'
@@ -540,7 +541,9 @@ export interface CherryReadPart {
   /**
    * Why this attachment's IMAGE was not read even though `includeImages` asked
    * for it. `'cap'` means the per-call image count or byte budget (or the
-   * deployment's own image limits) had no room left. The part keeps its
+   * deployment's own image limits) had no room left, or an unlabelled part
+   * could not be probed within the per-call probe budget — it may hold a
+   * picture, so it is named rather than dropped silently. The part keeps its
    * metadata; the loss is per part, never a failed read.
    */
   imagesOmitted?: 'cap'
@@ -2470,14 +2473,16 @@ interface ReadImageBudget {
   images: number
   bytes: number
   /**
-   * Sniff reads spent so far (#396).
+   * Probe reads spent so far (#396, #401).
    *
-   * Bounded by the same `maxImages` the budget uses for pictures: a sniff is a
-   * round trip, and a message full of `octet-stream` files must not buy one per
-   * part. It is a SEPARATE counter from `images` because a sniff that finds no
-   * picture must not consume a picture's slot.
+   * Bounded by `maxSniffs`, NOT by the image count: a miss must not spend a
+   * picture's slot, so counting attempts against `maxImages` starved a picture
+   * behind a run of `octet-stream` text files. A sniff is still a round trip,
+   * so the bound exists — `SNIFF_ATTEMPTS_PER_IMAGE_SLOT` per slot.
    */
-  sniffs: number
+  sniffAttempts: number
+  /** Probe reads this call may spend: the image count times its per-slot allowance. */
+  maxSniffs: number
 }
 
 /**
@@ -4276,8 +4281,9 @@ export class CherryToolEngine {
         'requires the calling model route to declare image input and is refused before any content ' +
         'is read when it does not. A legacy `data` attachment (a desktop-local paste) carries no ' +
         'contentId, so its bytes are unreachable and it stays metadata-only. Non-image file parts ' +
-        'likewise keep their metadata. A part whose image was skipped for the per-call cap keeps its ' +
-        'metadata plus `imagesOmitted: "cap"`. Messages come NEWEST-first, so the ' +
+        'likewise keep their metadata. A part left unread by that budget — cap reached, or an ' +
+        'unlabelled part out of probe reads — keeps its metadata plus `imagesOmitted: "cap"`. ' +
+        'Messages come NEWEST-first, so the ' +
         'first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts ' +
         'inside a retained message\'s parts; a message whose own parts could not be fully read ' +
         'carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A ' +
@@ -4331,8 +4337,9 @@ export class CherryToolEngine {
               'spelling; `image.mediaType` is normalised). Requires the calling ' +
               'model route to declare image input; a route without it is refused before any content ' +
               'is read. Desktop-local pasted images (legacy `data` parts) carry no bytes and stay ' +
-              'metadata-only. At most a per-call image count/byte budget is read; a part over it keeps ' +
-              'its metadata with `imagesOmitted: "cap"`. Defaults to false.',
+              'metadata-only. At most a per-call image count/byte budget is read, with a probe budget ' +
+              'for unlabelled files; a part over either keeps its metadata with `imagesOmitted: "cap"`. ' +
+              'Defaults to false.',
           },
         },
         required: ['device', 'sessionId'],
@@ -4461,7 +4468,7 @@ export class CherryToolEngine {
     if (images !== undefined) {
       images.images = 0
       images.bytes = 0
-      images.sniffs = 0
+      images.sniffAttempts = 0
     }
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
       string,
@@ -4837,14 +4844,16 @@ export class CherryToolEngine {
     const limits = attachments.imageLimits
     const floor = (value: number): number =>
       Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
+    const maxImages = Math.min(this.#readImagesPerCall, floor(limits.maxImagesPerMessage))
     return {
       attachments,
-      maxImages: Math.min(this.#readImagesPerCall, floor(limits.maxImagesPerMessage)),
+      maxImages,
       maxBytes: Math.min(this.#readImageBytesPerCall, floor(limits.maxMessageImageBytes)),
       maxImageBytes: floor(limits.maxImageBytes),
       images: 0,
       bytes: 0,
-      sniffs: 0,
+      sniffAttempts: 0,
+      maxSniffs: maxImages * SNIFF_ATTEMPTS_PER_IMAGE_SLOT,
     }
   }
 
@@ -4959,7 +4968,8 @@ export class CherryToolEngine {
    *  - `image` — the peer's bytes were fetched through the verified walk, their
    *    sha256 matched, and the host attachment store committed them.
    *  - `omitted: true` — the call's image count/byte budget (or the deployment's
-   *    own per-image/message limits) had no room. The part keeps its metadata
+   *    own per-image/message limits) had no room, or the probe budget could not
+   *    tell whether the part held a picture at all. The part keeps its metadata
    *    and says `imagesOmitted: 'cap'`.
    *  - `unavailable` — the store refused the image (`AttachmentError`), or the
    *    peer could not serve the bytes (the degradable class). Same treatment as
@@ -5008,22 +5018,23 @@ export class CherryToolEngine {
       // avoid. The ticket's "not `image/*`" arm was written before that
       // trade-off was visible; this is the narrower rule, on purpose.
       //
-      // The budget counts PICTURES FOUND, not attempts: a sniff that finds
-      // nothing is refunded by construction (the counter moves only on a hit),
-      // so a run of `octet-stream` text files cannot starve a real picture
-      // later in the message — the silent loss #396 opened with, which the
-      // first cut of this guard reintroduced (#399 review).
+      // The probe budget counts READS, not pictures: a miss must not spend a
+      // picture's slot (that starved a picture behind a run of `octet-stream`
+      // text files, #401), but a message of a hundred such files must not buy a
+      // hundred reads either. `SNIFF_ATTEMPTS_PER_IMAGE_SLOT` reads are allowed
+      // per image slot; past them the part is `cap`, because the tool cannot
+      // rule out a picture and silence is the loss #396 exists to end.
       //
-      // Once the budget IS spent, `maxImages` pictures were already found this
-      // way, so the call is at its image cap whatever this part holds: it is
-      // reported `cap` like a declared one rather than vanishing unmarked.
-      // A sniffed type the deployment does not accept stays unmarked, exactly
-      // as a DECLARED type outside `mediaTypes` does — no picture was lost.
+      // The PICTURE budget is `images` — what the store actually KEPT — and it
+      // is judged once, below, after the sniff: a picture the store refused
+      // costs one `unavailable` part, not a slot, so the next picture may still
+      // be read. A sniffed type the deployment does not accept stays unmarked,
+      // exactly as a DECLARED type outside `mediaTypes` does.
       if (!isUnlabelled(declaredType)) return {}
-      if (images.sniffs >= images.maxImages) return { omitted: true }
+      if (images.sniffAttempts >= images.maxSniffs) return { omitted: true }
+      images.sniffAttempts += 1
       const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline)
       if (sniffed === undefined || !accepted.includes(sniffed)) return {}
-      images.sniffs += 1
       mediaType = sniffed
     }
 
