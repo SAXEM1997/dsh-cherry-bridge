@@ -18,6 +18,62 @@ wire this plugin uses is identical across the range. Sections written before thi
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.4.2 (2026-11-18)
+
+**中文**
+
+本版把 `cherry_read` 的图片路径修到自洽：对端把附件标成 `application/octet-stream` 时，改按文件头
+的前几个字节识别 PNG/JPEG/GIF/WebP/BMP，不再只信标签；探测读取有独立预算（每个图片槽位 4 次），
+图片预算只计真正存入附件库的图片，所以一串无标签文本不会饿死后面的图片，存储拒绝也不会白占槽位。
+另有两处文档：发布字节核对先比对 tarball 条目清单，以及 0.4.1 计划任务面的真机走查记录。配置形状、
+工具族（15 个，另有默认关闭的 `cherry_subagent`）与协议 pin（`0.8.0` / `0.2.5`）均未变，桌面端兼容
+范围仍是 **2.1.4 – 2.2.2**。按本文件开头规则，按字节识别图片属于新增能力，本应进 minor 位；版本号
+定为 0.4.2 是维护者的选择，此处如实记录，而不是让版本号暗示这是一次纯修补。
+
+**新增与改进**
+
+- #398 对端未给出图片类型时，按文件头字节识别 PNG/JPEG/GIF/WebP/BMP；已知前缀会覆盖保存时写错的标签。
+
+**修复**
+
+- #400 给图片嗅探加上每次调用的探测预算，校验探测分片回显的请求，预算耗尽时标 `cap` 而不是静默丢弃。
+- #402 探测预算改计「找到的图片」而非「发起的探测」，一串无标签文本不再饿死后面的图片。
+- #404 探测次数按每个图片槽位 4 次封顶，图片预算只在附件库真正收下字节后扣减；被存储拒绝的图片不再白占槽位。
+
+**文档**
+
+- #393 发布字节与 registry 不一致时，先比对两份 tarball 的条目清单再怀疑内容。
+- #395 记录 0.4.1 计划任务面的真机走查结果。
+
+**English**
+
+This release makes `cherry_read`'s image path self-consistent: when the peer labels an attachment
+`application/octet-stream`, the plugin now identifies PNG/JPEG/GIF/WebP/BMP by the leading bytes
+instead of the label alone; probe reads have their own budget (four per image slot), and the picture
+budget is charged only when the attachment store commits the bytes, so a run of unlabelled text cannot
+starve a later picture and a refused image cannot spend a slot. Two documentation changes: compare
+tarball entry listings before doubting a published shasum, and record the 0.4.1 real-desktop walk of the
+scheduled-task face. The configuration shape, the tool family (15 names, plus the off-by-default
+`cherry_subagent`) and the protocol pins (`0.8.0` / `0.2.5`) are unchanged; the verified desktop range
+remains **2.1.4 – 2.2.2**. By the rule at the top of this file, identifying images by their bytes is a
+new capability and would belong in the minor digit; the version is 0.4.2 by the maintainer's choice,
+recorded here rather than left for the version number to imply this was a pure fix.
+
+**Added and improved**
+
+- #398 Identify PNG/JPEG/GIF/WebP/BMP by their leading bytes when the peer gives no image type; a known prefix overrides a mislabelled type at save time.
+
+**Fixes**
+
+- #400 Give the image sniff a per-call probe budget, assert that a probe slice echoes its request, and mark a part `cap` when the budget is spent instead of dropping it silently.
+- #402 Make the probe budget count pictures FOUND rather than probes issued, so a run of unlabelled text cannot starve a later picture.
+- #404 Cap probes at four per image slot and charge the picture budget only when the store commits the bytes; an image the store refused no longer spends a slot.
+
+**Documentation**
+
+- #393 Compare two tarballs' entry listings before doubting the content when published bytes differ from the registry.
+- #395 Record the 0.4.1 real-desktop walk of the scheduled-task face.
+
 ## v0.4.1 (2026-11-14)
 
 **中文**
