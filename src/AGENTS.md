@@ -183,7 +183,9 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
   `4 × 3 × (the declared size)`.
   It bounds what is ASSEMBLED, not everything resident: the caller keeps the
-  finished content outside this product, plus the parts cache's 32 MiB.
+  finished content OUTSIDE this product (up to one whole message per concurrent
+  read — `AGGREGATE_BYTES` is judged only between messages), plus the parts
+  cache's 32 MiB per device.
 - **A slice window does not change that peak (#329).** Slices are decoded as
   they are CONSUMED, one at a time, so the 3× stands per content; the window
   costs at most 8 undecoded slices. It fills only by PREDICTION (a run of full
@@ -397,8 +399,9 @@ Three `truncationReason` values mean different things:
   itself: the content that was read is returned (with the token when one can be
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
-Keep this distinction in the README: collapsing `aggregate-bytes` into "raise
-`limit`" was a field defect.
+Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
+`limit`" was a field defect: the caller paid every round trip and never saw the
+cut-off history.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -422,9 +425,8 @@ comes back as the newest page presented as "continued history".
 **An anchor the walk cannot find is loud.** If the peer's terminal page arrives
 with the anchor still unfound, the read throws naming the message id (it is
 probably gone: deleted, or the session replaced), rather than an empty page that
-reads as "no older history" — the opposite of what happened. A scan
-past `MAX_ANCHOR_SCAN_PAGES` (500 pages) throws for the same reason: a session
-that deep is not one to chase.
+reads as "no older history". A scan
+past `MAX_ANCHOR_SCAN_PAGES` (500 pages) throws for the same reason.
 
 **Every existing guard stays in force during a scan** — the stuck-cursor check,
 the cursor-cycle `seen` set, the consecutive-empty-page run and
@@ -469,10 +471,9 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
 - **Two faces, two prefixes (issue #72).** The message face owns `cursor:` /
   `after:`; the list face owns `list:`. They must stay disjoint: while they
   shared one prefix, a list token replayed as `messagesResumeCursor` was a legal
-  message cursor and was forwarded to the desktop, which answers an unparseable
-  position by serving its FIRST page — the silent "newest page as older history"
-  again. Each face now refuses the other's prefix with a message naming the
-  mistake where the prefix identifies the other face (a bare `after:` on a list
+  message cursor and was forwarded to the desktop, which serves its FIRST page
+  for a position it cannot parse. Each face now refuses the other's prefix with
+  a message naming the mistake where the prefix identifies the other face (a bare `after:` on a list
   tool gets the generic "must be a `list:` token" verdict).
   The two exceptions are about OUR OWN retired formats, never about the peer's:
   a v1 list token is recognised by DECODING it (it lived under `cursor:` and its
@@ -526,7 +527,9 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   cut, and the remedy follows the reason as set out above. The comparison is
   `<=`, so exactly 4,096 characters is still emitted. The guard measures the
   string it is about to hand out, never a reconstruction of its length, so a
-  format change cannot leave it behind.
+  format change cannot leave it behind. This is about what the tool ACCEPTS; a
+  well-behaved peer is far below it (the protocol's own `opaqueId` caps a cursor
+  at 256 characters).
 - **The `after:` arm's LENGTH case is pinned on the function; its CONTENT case
   runs through the tool.** Projecting the anchor message sends the same id to
   `agent.parts.list`, so an id above the token ceiling fails its parts walk and
@@ -564,7 +567,7 @@ The constraint that failed in the field is the **MCP output boundary**: it does
 not care which tool produced an oversized answer ("value is not lossless JSON"
 loses the verdict *along with* the content). One budget, one reason word; what
 differs between the faces is the **message ceiling**, not the cost of a message.
-A second value would drift.
+A second value would drift silently.
 
 The budget is checked only **between** messages and the first message is always
 taken before any check: the **newest message is always returned whole**, and a
@@ -596,7 +599,7 @@ integer ≤ 32 MiB (`RESOURCE_UNAVAILABLE`). We are **more tolerant**: a missing
 unusable `byteLength` falls back to a slice bound (`DEFAULT_CONTENT_SLICE_BOUND`
 = 4,096 slices), and the **cumulative bytes-read arm** still caps the walk, so a
 peer that serves more than it declared is stopped by bytes actually read.
-Do not "align" it without a reason.
+A test covers it; do not "align" it without a reason.
 
 ### Integrity: what degrades, what is fatal
 
@@ -642,11 +645,10 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   accepted `file` image via `saveImage` under our 4-image / 8 MiB per-call cap
   (`imagesOmitted: 'cap'`); the route must declare `image` input, and no
   attachments service answers `unsupported`. The BYTES outrank the label: an
-  `octet-stream` file earns ONE 512-byte sniff (bounded by the per-call image
-  count) and a known prefix overrides a mislabelled type at save time. That
-  slice is UNVERIFIED — it decides only whether to read, never becoming the
-  content, the stored image or an `imagesOmitted` marker — and a part found
-  this way is `cap` like a declared one (#396). Legacy `data` never qualifies.
+  `octet-stream` file earns ONE 512-byte sniff, bounded by the image count —
+  UNVERIFIED, deciding only whether to read, never the content, the stored image
+  or a marker — and a known prefix overrides a mislabelled type at save time
+  (#396). Legacy `data` never qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict; guidance points at `cherry_read`.
 
@@ -950,7 +952,7 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
   client does" comes from there. v0.5.0–v0.5.4 were byte-identical (tree
   `16e505fe…`); **v0.5.5** moves the pins to 0.8.0 / 0.2.6 — additive
   `agent.tasks.*` only, and our wire unchanged (ADR-0001) — SERVED since desktop
-  **2.2.1** (see the range note below). Diff the tree first.
+  **2.2.1** (see the range note below).
 - **`_research/cherry-studio`** — the **desktop** source, the protocol **server**
   of record: a shallow `blob:none` clone carrying tags `v2.1.6` (`90b234e`)
   through `v2.2.2`. Diff TREES between tags; attribute a change
