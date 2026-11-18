@@ -2268,6 +2268,19 @@ const IMAGE_ROUTE_UNRESOLVED =
   'cannot read images from this session: the current model route could not be resolved'
 
 /**
+ * A media type that claims nothing about the bytes (#396).
+ *
+ * `undefined` is the peer saying nothing; `application/octet-stream` is the
+ * desktop's answer for a filename it could not map — which is exactly the case
+ * a picture with no extension lands in. Every other type is a claim that the
+ * bytes are something else, and believing it is what keeps a `cherry_read` from
+ * spending a content read on every PDF and text file in the history.
+ */
+function isUnlabelled(mediaType: string | undefined): boolean {
+  return mediaType === undefined || mediaType === 'application/octet-stream'
+}
+
+/**
  * A `{ref}`'s DECLARED byte length when it is a finite number, else `undefined`.
  *
  * The declaration is the peer's own claim and is only ever used to bound a walk
@@ -2275,18 +2288,6 @@ const IMAGE_ROUTE_UNRESOLVED =
  * measure. One helper, so the text pre-flight and the verified walk cannot drift
  * apart on what "usable" means.
  */
-/**
- * A media type that claims nothing about the bytes (#396).
- *
- * `undefined` is the peer saying nothing; `application/octet-stream` is the
- * desktop's answer for a filename it could not map — which is exactly the case
- * a picture with no extension lands in. Every other type is a claim that the
- * bytes are something else, and is believed without spending a read on it.
- */
-function isUnlabelled(mediaType: string | undefined): boolean {
-  return mediaType === undefined || mediaType === 'application/octet-stream'
-}
-
 function declaredRefBytes(ref: Record<string, unknown>): number | undefined {
   const value = Number(ref['byteLength'])
   return Number.isFinite(value) ? value : undefined
@@ -2468,6 +2469,15 @@ interface ReadImageBudget {
   readonly maxImageBytes: number
   images: number
   bytes: number
+  /**
+   * Sniff reads spent so far (#396).
+   *
+   * Bounded by the same `maxImages` the budget uses for pictures: a sniff is a
+   * round trip, and a message full of `octet-stream` files must not buy one per
+   * part. It is a SEPARATE counter from `images` because a sniff that finds no
+   * picture must not consume a picture's slot.
+   */
+  sniffs: number
 }
 
 /**
@@ -4451,6 +4461,7 @@ export class CherryToolEngine {
     if (images !== undefined) {
       images.images = 0
       images.bytes = 0
+      images.sniffs = 0
     }
     const sessionResult = (await connection.rpc.request('agent.sessions.get', { sessionId })) as Record<
       string,
@@ -4833,6 +4844,7 @@ export class CherryToolEngine {
       maxImageBytes: floor(limits.maxImageBytes),
       images: 0,
       bytes: 0,
+      sniffs: 0,
     }
   }
 
@@ -4878,6 +4890,62 @@ export class CherryToolEngine {
   }
 
   /**
+   * The first bytes of a ref, read ONLY to identify its format (#396).
+   *
+   * Unverified on purpose, and it must stay that way: a sniff decides whether a
+   * part is worth a full walk, so spending the walk's sha256 budget on it would
+   * defeat the point. The bytes it returns never leave this method — no caller
+   * stores them, returns them, or counts them as content — and the walk that
+   * follows re-reads the same prefix and certifies the whole.
+   *
+   * Every failure is `undefined`: a guess that cannot be made is not an error,
+   * and a part this face does not own must not turn into a failed read. It still
+   * takes a content-gate slot, because the request it makes is real.
+   */
+  async #sniffImageMediaType(
+    connection: DeviceConnection,
+    sessionId: string,
+    ref: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
+  ): Promise<string | undefined> {
+    const contentId = String(ref['contentId'] ?? '')
+    const revision = String(ref['revision'] ?? '')
+    // THE SLOT WAIT IS PART OF THE GUESS, not of the answer (#396). Acquiring
+    // inside the `try` is what keeps a spent budget from escaping: the gate
+    // raises `ContentGateTimeoutError` when a QUEUED caller's instant passes,
+    // and the walk's own acquire is caught by `#projectImagePart` and degraded
+    // to one part's `unavailable`. A sniff that threw it would fail the WHOLE
+    // read over a part nobody knows is an image — so here it is just another
+    // guess that could not be made.
+    let releaseSlot: (() => void) | undefined
+    try {
+      releaseSlot = await this.#contentGate.acquire(deadline?.instant)
+      const slice = (await connection.rpc.request(
+        'agent.content.read',
+        { sessionId, contentId, revision, offset: '0', maxBytes: IMAGE_SNIFF_BYTES },
+        deadline === undefined ? undefined : { deadline: deadline.instant },
+      )) as Record<string, unknown>
+      // THE SLICE MUST ECHO THE REQUEST (#396). The walk asserts all three
+      // before splicing bytes; a guess has no such check to inherit, and a peer
+      // that answers a different position would have us label these bytes with
+      // a type read from somewhere else. A mismatch is no claim, not a failure.
+      if (
+        String(slice['offset'] ?? '') !== '0' ||
+        String(slice['contentId'] ?? '') !== contentId ||
+        String(slice['revision'] ?? '') !== revision
+      ) {
+        return undefined
+      }
+      const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
+      return imageMediaTypeFromHeader(Buffer.from(data, 'base64'))
+    } catch {
+      return undefined
+    } finally {
+      releaseSlot?.()
+    }
+  }
+
+  /**
    * One `kind: 'file'` part's IMAGE, under the call's budget (#307).
    *
    * Three outcomes, none of which fails the read by itself:
@@ -4897,47 +4965,6 @@ export class CherryToolEngine {
    * Returns `{}` for a part this face does not own — a non-image, a media type
    * the deployment does not accept, or a `file` record with no ref.
    */
-  /**
-   * The first bytes of a ref, read ONLY to identify its format (#396).
-   *
-   * Unverified on purpose, and it must stay that way: a sniff decides whether a
-   * part is worth a full walk, so spending the walk's sha256 budget on it would
-   * defeat the point. The bytes it returns never leave this method — no caller
-   * stores them, returns them, or counts them as content — and the walk that
-   * follows re-reads the same prefix and certifies the whole.
-   *
-   * Every failure is `undefined`: a guess that cannot be made is not an error,
-   * and a part this face does not own must not turn into a failed read. It still
-   * takes a content-gate slot, because the request it makes is real.
-   */
-  async #sniffImageMediaType(
-    connection: DeviceConnection,
-    sessionId: string,
-    ref: Record<string, unknown>,
-    deadline?: AssemblyDeadline,
-  ): Promise<string | undefined> {
-    const releaseSlot = await this.#contentGate.acquire(deadline?.instant)
-    try {
-      const slice = (await connection.rpc.request(
-        'agent.content.read',
-        {
-          sessionId,
-          contentId: String(ref['contentId'] ?? ''),
-          revision: String(ref['revision'] ?? ''),
-          offset: '0',
-          maxBytes: IMAGE_SNIFF_BYTES,
-        },
-        deadline === undefined ? undefined : { deadline: deadline.instant },
-      )) as Record<string, unknown>
-      const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
-      return imageMediaTypeFromHeader(Buffer.from(data, 'base64'))
-    } catch {
-      return undefined
-    } finally {
-      releaseSlot()
-    }
-  }
-
   async #projectImagePart(
     connection: DeviceConnection,
     sessionId: string,
@@ -4969,15 +4996,28 @@ export class CherryToolEngine {
       // its filename, so a picture with no extension arrives as
       // `application/octet-stream` — the face used to drop it silently. Any
       // OTHER label (`text/plain`, `application/pdf`, …) is a claim that the
-      // bytes are not a picture, and is believed without a read.
+      // bytes are not a picture and is believed WITHOUT a read: sniffing every
+      // attachment would spend a content read on each text file and PDF in the
+      // history, which is the cost `#307`'s metadata-only default exists to
+      // avoid. The ticket's "not `image/*`" arm was written before that
+      // trade-off was visible; this is the narrower rule, on purpose.
+      //
+      // Bounded by the SAME per-call image count: a sniff is a round trip, so a
+      // message carrying a hundred `octet-stream` files must not buy a hundred
+      // of them. A separate counter from `images`, because a sniff that finds
+      // no picture must not consume a picture's slot.
       if (!isUnlabelled(declaredType)) return {}
-      if (images.images >= images.maxImages) return {}
+      if (images.sniffs >= images.maxImages) return {}
+      images.sniffs += 1
       const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline)
       if (sniffed === undefined || !accepted.includes(sniffed)) return {}
       mediaType = sniffed
     }
 
     const declared = declaredRefBytes(ref)
+    // Judged AFTER the sniff on purpose: a part whose bytes ARE a picture is
+    // reported as omitted (`imagesOmitted: 'cap'`), the same as a declared one,
+    // rather than vanishing with no marker — the silent loss #396 opened with.
     if (images.images >= images.maxImages) return { omitted: true }
     if (declared !== undefined) {
       // A single picture above the store's per-image ceiling can never be

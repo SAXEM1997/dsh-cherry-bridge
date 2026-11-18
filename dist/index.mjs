@@ -8006,6 +8006,18 @@ function uploadFailureReason(error) {
 /** The route gate's refusal when no provider/model pair can be read. */
 const IMAGE_ROUTE_UNRESOLVED = "cannot read images from this session: the current model route could not be resolved";
 /**
+* A media type that claims nothing about the bytes (#396).
+*
+* `undefined` is the peer saying nothing; `application/octet-stream` is the
+* desktop's answer for a filename it could not map — which is exactly the case
+* a picture with no extension lands in. Every other type is a claim that the
+* bytes are something else, and believing it is what keeps a `cherry_read` from
+* spending a content read on every PDF and text file in the history.
+*/
+function isUnlabelled(mediaType) {
+	return mediaType === void 0 || mediaType === "application/octet-stream";
+}
+/**
 * A `{ref}`'s DECLARED byte length when it is a finite number, else `undefined`.
 *
 * The declaration is the peer's own claim and is only ever used to bound a walk
@@ -8013,17 +8025,6 @@ const IMAGE_ROUTE_UNRESOLVED = "cannot read images from this session: the curren
 * measure. One helper, so the text pre-flight and the verified walk cannot drift
 * apart on what "usable" means.
 */
-/**
-* A media type that claims nothing about the bytes (#396).
-*
-* `undefined` is the peer saying nothing; `application/octet-stream` is the
-* desktop's answer for a filename it could not map — which is exactly the case
-* a picture with no extension lands in. Every other type is a claim that the
-* bytes are something else, and is believed without spending a read on it.
-*/
-function isUnlabelled(mediaType) {
-	return mediaType === void 0 || mediaType === "application/octet-stream";
-}
 function declaredRefBytes(ref) {
 	const value = Number(ref["byteLength"]);
 	return Number.isFinite(value) ? value : void 0;
@@ -9509,6 +9510,7 @@ var CherryToolEngine = class {
 		if (images !== void 0) {
 			images.images = 0;
 			images.bytes = 0;
+			images.sniffs = 0;
 		}
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
@@ -9712,7 +9714,8 @@ var CherryToolEngine = class {
 			maxBytes: Math.min(this.#readImageBytesPerCall, floor(limits.maxMessageImageBytes)),
 			maxImageBytes: floor(limits.maxImageBytes),
 			images: 0,
-			bytes: 0
+			bytes: 0,
+			sniffs: 0
 		};
 	}
 	/**
@@ -9747,6 +9750,41 @@ var CherryToolEngine = class {
 		if (active.inputModalities === void 0 || !active.inputModalities.includes("image")) throw new Error(`cannot read images from this session: model "${model}" does not declare image input; switch to an image-capable model to read images`);
 	}
 	/**
+	* The first bytes of a ref, read ONLY to identify its format (#396).
+	*
+	* Unverified on purpose, and it must stay that way: a sniff decides whether a
+	* part is worth a full walk, so spending the walk's sha256 budget on it would
+	* defeat the point. The bytes it returns never leave this method — no caller
+	* stores them, returns them, or counts them as content — and the walk that
+	* follows re-reads the same prefix and certifies the whole.
+	*
+	* Every failure is `undefined`: a guess that cannot be made is not an error,
+	* and a part this face does not own must not turn into a failed read. It still
+	* takes a content-gate slot, because the request it makes is real.
+	*/
+	async #sniffImageMediaType(connection, sessionId, ref, deadline) {
+		const contentId = String(ref["contentId"] ?? "");
+		const revision = String(ref["revision"] ?? "");
+		let releaseSlot;
+		try {
+			releaseSlot = await this.#contentGate.acquire(deadline?.instant);
+			const slice = await connection.rpc.request("agent.content.read", {
+				sessionId,
+				contentId,
+				revision,
+				offset: "0",
+				maxBytes: 512
+			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
+			if (String(slice["offset"] ?? "") !== "0" || String(slice["contentId"] ?? "") !== contentId || String(slice["revision"] ?? "") !== revision) return;
+			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
+			return imageMediaTypeFromHeader(Buffer.from(data, "base64"));
+		} catch {
+			return;
+		} finally {
+			releaseSlot?.();
+		}
+	}
+	/**
 	* One `kind: 'file'` part's IMAGE, under the call's budget (#307).
 	*
 	* Three outcomes, none of which fails the read by itself:
@@ -9766,37 +9804,6 @@ var CherryToolEngine = class {
 	* Returns `{}` for a part this face does not own — a non-image, a media type
 	* the deployment does not accept, or a `file` record with no ref.
 	*/
-	/**
-	* The first bytes of a ref, read ONLY to identify its format (#396).
-	*
-	* Unverified on purpose, and it must stay that way: a sniff decides whether a
-	* part is worth a full walk, so spending the walk's sha256 budget on it would
-	* defeat the point. The bytes it returns never leave this method — no caller
-	* stores them, returns them, or counts them as content — and the walk that
-	* follows re-reads the same prefix and certifies the whole.
-	*
-	* Every failure is `undefined`: a guess that cannot be made is not an error,
-	* and a part this face does not own must not turn into a failed read. It still
-	* takes a content-gate slot, because the request it makes is real.
-	*/
-	async #sniffImageMediaType(connection, sessionId, ref, deadline) {
-		const releaseSlot = await this.#contentGate.acquire(deadline?.instant);
-		try {
-			const slice = await connection.rpc.request("agent.content.read", {
-				sessionId,
-				contentId: String(ref["contentId"] ?? ""),
-				revision: String(ref["revision"] ?? ""),
-				offset: "0",
-				maxBytes: 512
-			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
-			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
-			return imageMediaTypeFromHeader(Buffer.from(data, "base64"));
-		} catch {
-			return;
-		} finally {
-			releaseSlot();
-		}
-	}
 	async #projectImagePart(connection, sessionId, raw, content, face, images, deadline) {
 		const ref = isRecord$1(raw["ref"]) ? raw["ref"] : isRecord$1(content["ref"]) ? content["ref"] : void 0;
 		const declaredType = face.mediaType?.toLowerCase();
@@ -9805,7 +9812,8 @@ var CherryToolEngine = class {
 		let mediaType = declaredType !== void 0 && declaredType.startsWith("image/") && accepted.includes(declaredType) ? declaredType : void 0;
 		if (mediaType === void 0) {
 			if (!isUnlabelled(declaredType)) return {};
-			if (images.images >= images.maxImages) return {};
+			if (images.sniffs >= images.maxImages) return {};
+			images.sniffs += 1;
 			const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline);
 			if (sniffed === void 0 || !accepted.includes(sniffed)) return {};
 			mediaType = sniffed;

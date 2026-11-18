@@ -1221,6 +1221,8 @@ export class FakeCherry {
   #contentReadsServed = 0
   /** Every `agent.content.read` this peer served, in order, as it was ASKED. */
   readonly #contentReadRequests: Array<{ offset: string; maxBytes: number }> = []
+  /** A single offset whose slice answers with a DIFFERENT offset (#396). */
+  #misEchoedContentOffset: string | undefined
   /** Per-offset slice delay, so answers can arrive OUT of request order (#329). */
   #contentReadDelays = new Map<string, number>()
   /** A delay on EVERY slice, so a client window is observable at all (#329). */
@@ -1673,6 +1675,17 @@ export class FakeCherry {
   /** Refuse ONE offset's slice, leaving the rest of the window intact (#329). */
   failContentReadAt(offset: string, failure: FakeFailure): void {
     this.#contentReadFailures.set(offset, failure)
+  }
+
+  /**
+   * Answer the slice at `offset` with a DIFFERENT echoed `offset` (#396).
+   *
+   * The bytes are the right ones; only the credential is wrong. That is the
+   * shape a splicing peer would produce, and the walk refuses it (#328). A
+   * GUESS has no such check to inherit, so it must drop the claim instead.
+   */
+  misEchoContentReadOffset(offset: string): void {
+    this.#misEchoedContentOffset = offset
   }
 
   /**
@@ -4079,7 +4092,10 @@ export class FakeCherry {
     return {
       contentId,
       revision,
-      offset: params['offset'],
+      offset:
+        this.#misEchoedContentOffset !== undefined && this.#misEchoedContentOffset === String(params['offset'])
+          ? '999'
+          : params['offset'],
       dataBase64: Buffer.from(slice).toString('base64'),
       nextOffset: String(start + slice.length),
       eof: start + slice.length === bytes.length,

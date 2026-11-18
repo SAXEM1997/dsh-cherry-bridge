@@ -183,9 +183,7 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
   `4 × 3 × (the declared size)`.
   It bounds what is ASSEMBLED, not everything resident: the caller keeps the
-  finished content OUTSIDE this product (up to one whole message per concurrent
-  read — `AGGREGATE_BYTES` is judged only between messages), plus the parts
-  cache's 32 MiB per device.
+  finished content outside this product, plus the parts cache's 32 MiB.
 - **A slice window does not change that peak (#329).** Slices are decoded as
   they are CONSUMED, one at a time, so the 3× stands per content; the window
   costs at most 8 undecoded slices. It fills only by PREDICTION (a run of full
@@ -399,9 +397,8 @@ Three `truncationReason` values mean different things:
   itself: the content that was read is returned (with the token when one can be
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
-Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
-`limit`" was a field defect: the caller paid every round trip and never saw the
-cut-off history.
+Keep this distinction in the README: collapsing `aggregate-bytes` into "raise
+`limit`" was a field defect.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -529,9 +526,7 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   cut, and the remedy follows the reason as set out above. The comparison is
   `<=`, so exactly 4,096 characters is still emitted. The guard measures the
   string it is about to hand out, never a reconstruction of its length, so a
-  format change cannot leave it behind. This is about what the tool ACCEPTS; a
-  well-behaved peer is far below it (the protocol's own `opaqueId` caps a cursor
-  at 256 characters).
+  format change cannot leave it behind.
 - **The `after:` arm's LENGTH case is pinned on the function; its CONTENT case
   runs through the tool.** Projecting the anchor message sends the same id to
   `agent.parts.list`, so an id above the token ceiling fails its parts walk and
@@ -569,7 +564,7 @@ The constraint that failed in the field is the **MCP output boundary**: it does
 not care which tool produced an oversized answer ("value is not lossless JSON"
 loses the verdict *along with* the content). One budget, one reason word; what
 differs between the faces is the **message ceiling**, not the cost of a message.
-A second value would drift silently.
+A second value would drift.
 
 The budget is checked only **between** messages and the first message is always
 taken before any check: the **newest message is always returned whole**, and a
@@ -601,7 +596,7 @@ integer ≤ 32 MiB (`RESOURCE_UNAVAILABLE`). We are **more tolerant**: a missing
 unusable `byteLength` falls back to a slice bound (`DEFAULT_CONTENT_SLICE_BOUND`
 = 4,096 slices), and the **cumulative bytes-read arm** still caps the walk, so a
 peer that serves more than it declared is stopped by bytes actually read.
-A test covers it; do not "align" it without a reason.
+Do not "align" it without a reason.
 
 ### Integrity: what degrades, what is fatal
 
@@ -647,8 +642,11 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   accepted `file` image via `saveImage` under our 4-image / 8 MiB per-call cap
   (`imagesOmitted: 'cap'`); the route must declare `image` input, and no
   attachments service answers `unsupported`. The BYTES outrank the label: an
-  `octet-stream` file earns a 512-byte sniff; a known prefix overrides a
-  mislabelled type (#396). Legacy `data` never qualifies.
+  `octet-stream` file earns ONE 512-byte sniff (bounded by the per-call image
+  count) and a known prefix overrides a mislabelled type at save time. That
+  slice is UNVERIFIED — it decides only whether to read, never becoming the
+  content, the stored image or an `imagesOmitted` marker — and a part found
+  this way is `cap` like a declared one (#396). Legacy `data` never qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict; guidance points at `cherry_read`.
 
