@@ -3905,13 +3905,16 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
     // The store received the WHOLE content, not the 512-byte guess.
     expect(attachments.saved[0]?.data.length).toBe(bytes.length)
     expect(Buffer.from(attachments.saved[0]!.data)).toEqual(Buffer.from(bytes))
-    // And the sniff asked for one bounded slice at offset 0 — bounded against
-    // the ticket's literal ceiling, not against the constant it came from.
-    expect(rig.fake.contentReadRequests()[0]?.offset).toBe('0')
-    expect(rig.fake.contentReadRequests()[0]!.maxBytes).toBeLessThanOrEqual(24 * 1024)
+    // And the sniff asked for ONE bounded slice at offset 0, sized by the sniff
+    // constant rather than by the walk's slice size (which is what makes this
+    // discriminating: the request is the sniff, not the first walk slice).
+    expect(rig.fake.contentReadRequests()[0]).toEqual({
+      offset: '0',
+      maxBytes: IMAGE_SNIFF_BYTES,
+    })
   })
 
-  it('㉜g an unlabelled picture past the call budget is reported as omitted, not dropped', async () => {
+  it('㉜f a run of unlabelled non-pictures cannot starve a later picture', async () => {
     const attachments = fakeAttachments()
     const bytes = imageBytes(PNG_MAGIC)
     const rig = await makeRig(
@@ -3931,6 +3934,7 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
                 { kind: 'file', text: '', name: 'one', mediaType: 'image/png' },
                 { kind: 'file', text: '', name: 'two', mediaType: 'application/octet-stream' },
                 { kind: 'file', text: '', name: 'three', mediaType: 'application/octet-stream' },
+                { kind: 'file', text: '', name: 'four', mediaType: 'application/octet-stream' },
               ],
             },
           ],
@@ -3943,8 +3947,10 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
       },
     )
     rig.fake.setContentBytes('m-1:0', '1001', bytes)
-    rig.fake.setContentBytes('m-1:1', '1001', bytes)
+    // The second part is NOT a picture: its sniff must cost a read but no slot.
+    rig.fake.setContentBytes('m-1:1', '1001', Buffer.from('just some text, no magic bytes here'))
     rig.fake.setContentBytes('m-1:2', '1001', bytes)
+    rig.fake.setContentBytes('m-1:3', '1001', bytes)
 
     const result = (await rig.call(
       'cherry_read',
@@ -3953,25 +3959,32 @@ describe('issue #396 ㉜: an image is identified by its own bytes, not only the 
     )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
 
     const parts = result.messages.flatMap((message) => message.parts)
-    // The single image slot went to the DECLARED picture; the second part's
-    // bytes were still asked (a sniff costs no slot), found a picture, and the
-    // budget was already spent — so it must SAY so instead of vanishing with no
-    // marker, which is the silent loss #396 opened with.
+    // The declared picture took the single slot.
     expect(parts[0]?.['image']).toBeDefined()
+    // The non-picture is believed by its bytes and marked with NOTHING — no
+    // picture was lost, and a cap marker here would be a false claim.
     expect(parts[1]?.['image']).toBeUndefined()
-    expect(parts[1]?.['imagesOmitted']).toBe('cap')
-    // The THIRD part is not even asked: the sniff budget is the per-call image
-    // count, so a message of `octet-stream` files cannot buy a read each.
+    expect(parts[1]?.['imagesOmitted']).toBeUndefined()
+    // The THIRD part is a real picture found by sniffing, with the slot already
+    // spent: it must SAY so. This is the assertion the first cut of the guard
+    // could not make — it had spent the budget on the text file and reported
+    // nothing at all.
     expect(parts[2]?.['image']).toBeUndefined()
-    expect(parts[2]?.['imagesOmitted']).toBeUndefined()
+    expect(parts[2]?.['imagesOmitted']).toBe('cap')
+    // The fourth is not even asked: one picture was already found by sniffing,
+    // so the call is at its cap whatever these bytes are.
+    expect(parts[3]?.['image']).toBeUndefined()
+    expect(parts[3]?.['imagesOmitted']).toBe('cap')
     expect(attachments.saved).toHaveLength(1)
     expect(rig.fake.contentReadRequests()).toEqual([
       { offset: '0', maxBytes: TEST_SLICE_BYTES },
       { offset: String(TEST_SLICE_BYTES), maxBytes: TEST_SLICE_BYTES },
       { offset: '0', maxBytes: IMAGE_SNIFF_BYTES },
+      { offset: '0', maxBytes: IMAGE_SNIFF_BYTES },
     ])
   })
-  it('㉜h a sniff whose slice echoes another offset makes no claim', async () => {
+
+  it('㉜g a sniff whose slice echoes another offset makes no claim', async () => {
     const bytes = imageBytes(PNG_MAGIC)
     const attachments = fakeAttachments()
     const rig = await rigForFile('application/octet-stream', 'photo', bytes, attachments)

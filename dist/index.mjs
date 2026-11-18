@@ -9777,6 +9777,7 @@ var CherryToolEngine = class {
 			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
 			if (String(slice["offset"] ?? "") !== "0" || String(slice["contentId"] ?? "") !== contentId || String(slice["revision"] ?? "") !== revision) return;
 			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
+			if (data.length > Math.ceil(512 / 3) * 4) return void 0;
 			return imageMediaTypeFromHeader(Buffer.from(data, "base64"));
 		} catch {
 			return;
@@ -9812,10 +9813,10 @@ var CherryToolEngine = class {
 		let mediaType = declaredType !== void 0 && declaredType.startsWith("image/") && accepted.includes(declaredType) ? declaredType : void 0;
 		if (mediaType === void 0) {
 			if (!isUnlabelled(declaredType)) return {};
-			if (images.sniffs >= images.maxImages) return {};
-			images.sniffs += 1;
+			if (images.sniffs >= images.maxImages) return { omitted: true };
 			const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline);
 			if (sniffed === void 0 || !accepted.includes(sniffed)) return {};
+			images.sniffs += 1;
 			mediaType = sniffed;
 		}
 		const declared = declaredRefBytes(ref);

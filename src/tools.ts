@@ -4916,7 +4916,9 @@ export class CherryToolEngine {
     // and the walk's own acquire is caught by `#projectImagePart` and degraded
     // to one part's `unavailable`. A sniff that threw it would fail the WHOLE
     // read over a part nobody knows is an image — so here it is just another
-    // guess that could not be made.
+    // guess that could not be made. Today `cherry_read` passes no deadline and
+    // the gate refuses only WITH one, so this arm is a guard, not a live path;
+    // it stays for the budgeted caller that would otherwise regress.
     let releaseSlot: (() => void) | undefined
     try {
       releaseSlot = await this.#contentGate.acquire(deadline?.instant)
@@ -4937,6 +4939,10 @@ export class CherryToolEngine {
         return undefined
       }
       const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
+      // The walk bounds the base64 LENGTH before decoding (a peer that serves
+      // more than it was asked for must not size our buffer); a guess does the
+      // same, and anything above the ceiling is simply no claim.
+      if (data.length > Math.ceil(IMAGE_SNIFF_BYTES / 3) * 4) return undefined
       return imageMediaTypeFromHeader(Buffer.from(data, 'base64'))
     } catch {
       return undefined
@@ -5002,15 +5008,22 @@ export class CherryToolEngine {
       // avoid. The ticket's "not `image/*`" arm was written before that
       // trade-off was visible; this is the narrower rule, on purpose.
       //
-      // Bounded by the SAME per-call image count: a sniff is a round trip, so a
-      // message carrying a hundred `octet-stream` files must not buy a hundred
-      // of them. A separate counter from `images`, because a sniff that finds
-      // no picture must not consume a picture's slot.
+      // The budget counts PICTURES FOUND, not attempts: a sniff that finds
+      // nothing is refunded by construction (the counter moves only on a hit),
+      // so a run of `octet-stream` text files cannot starve a real picture
+      // later in the message — the silent loss #396 opened with, which the
+      // first cut of this guard reintroduced (#399 review).
+      //
+      // Once the budget IS spent, `maxImages` pictures were already found this
+      // way, so the call is at its image cap whatever this part holds: it is
+      // reported `cap` like a declared one rather than vanishing unmarked.
+      // A sniffed type the deployment does not accept stays unmarked, exactly
+      // as a DECLARED type outside `mediaTypes` does — no picture was lost.
       if (!isUnlabelled(declaredType)) return {}
-      if (images.sniffs >= images.maxImages) return {}
-      images.sniffs += 1
+      if (images.sniffs >= images.maxImages) return { omitted: true }
       const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline)
       if (sniffed === undefined || !accepted.includes(sniffed)) return {}
+      images.sniffs += 1
       mediaType = sniffed
     }
 
