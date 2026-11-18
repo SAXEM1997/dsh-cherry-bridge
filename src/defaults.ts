@@ -158,6 +158,17 @@ export const DEFAULT_UPLOAD_RESUME_WAIT_MS = 30_000
  * is still one cheap slice.
  */
 export const IMAGE_SNIFF_BYTES = 512
+/**
+ * Probe reads one `cherry_read` may spend per image slot (#401).
+ *
+ * A sniff is a round trip, so the probe budget must be bounded like the image
+ * count it serves. Counting ATTEMPTS against the image count starved a picture
+ * that sat behind a run of `octet-stream` text files (#399/#401); counting
+ * nothing let a message of a hundred such files buy a hundred reads. Four per
+ * slot lets a short run pass without starving the picture while keeping the
+ * cost proportional to what the caller asked to attach.
+ */
+export const SNIFF_ATTEMPTS_PER_IMAGE_SLOT = 4
 
 /**
  * How many uploaded IMAGES one `cherry_read(includeImages: true)` may attach,

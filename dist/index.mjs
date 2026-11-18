@@ -9400,7 +9400,7 @@ var CherryToolEngine = class {
 	#readTool() {
 		return defineCherryTool({
 			name: "cherry_read",
-			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. An attachment is reported as METADATA by default, never as its bytes: a `kind: \"file\"` part, or a legacy `data` part named `file` (the metadata as JSON in `content.text`), comes back as `name`/`mediaType` (plus `byteLength` for the `file` kind) — with that metadata text emptied, or kept verbatim when the record carries a key this projection does not report. With `includeImages: true`, an uploaded `file` image is ALSO fetched through `agent.content.read`, sha256-verified, saved to the host attachment store and rendered as an image block beside this snapshot; that path requires the calling model route to declare image input and is refused before any content is read when it does not. A legacy `data` attachment (a desktop-local paste) carries no contentId, so its bytes are unreachable and it stays metadata-only. Non-image file parts likewise keep their metadata. A part whose image was skipped for the per-call cap keeps its metadata plus `imagesOmitted: \"cap\"`. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A failed message (`status: \"error\"`) may carry `failure: {reasonCode, retryable, message}` when the peer sent one — its classification, whether it judged a retry worthwhile, and a bounded summary; the peer's `source` and `context.responseBody` are never projected. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
+			description: "Read a session's message history snapshot. Two-level baseline: `agent.sessions.get` supplies the history revision, `agent.messages.list` the messages, and each message's own revision the parts. Large part text is externalized by the peer and fetched and sha256-verified through `agent.content.read`. An unchanged message (same message revision) reuses its cached part LIST, fenced by that revision, so a repeated read of a quiet session costs no `agent.parts.list` RPC; externalized content is still fetched and sha256-verified on every read, so unverified bytes are never served from memory. An attachment is reported as METADATA by default, never as its bytes: a `kind: \"file\"` part, or a legacy `data` part named `file` (the metadata as JSON in `content.text`), comes back as `name`/`mediaType` (plus `byteLength` for the `file` kind) — with that metadata text emptied, or kept verbatim when the record carries a key this projection does not report. With `includeImages: true`, an uploaded `file` image is ALSO fetched through `agent.content.read`, sha256-verified, saved to the host attachment store and rendered as an image block beside this snapshot; that path requires the calling model route to declare image input and is refused before any content is read when it does not. A legacy `data` attachment (a desktop-local paste) carries no contentId, so its bytes are unreachable and it stays metadata-only. Non-image file parts likewise keep their metadata. A part left unread by that budget — cap reached, or an unlabelled part out of probe reads — keeps its metadata plus `imagesOmitted: \"cap\"`. Messages come NEWEST-first, so the first entry is the latest and `limit` drops the OLDEST messages — truncation never cuts inside a retained message's parts; a message whose own parts could not be fully read carries `incomplete`, and may carry `unavailableParts` when parts were unreadable. A failed message (`status: \"error\"`) may carry `failure: {reasonCode, retryable, message}` when the peer sent one — its classification, whether it judged a retry worthwhile, and a bounded summary; the peer's `source` and `context.responseBody` are never projected. The answer is ALSO bounded by an output budget: `truncated` with `truncationReason: \"aggregate-bytes\"` means the walk stopped because the result reached its size limit, not because `limit` was reached — raising `limit` does NOT reach the messages left out (it only costs more round trips and stops at the same budget). THE OLDER MESSAGES ARE REACHED BY THE RESUME TOKEN: a truncated answer carries `messagesResumeCursor` when the stop point can be named — absent when it cannot, e.g. an empty or malformed position, a token past the length ceiling, or no anchor id — and passing it back as `messagesResumeCursor` continues the walk from there (`limit` then bounds how many messages are returned FROM that point). The two token forms are `\"cursor:<peer position>\"` (the walk consumed its whole page window) and `\"after:<messageId>\"` (it stopped inside the window; the read restarts at the newest end and resumes strictly after that message). A token this tool did not emit is refused locally rather than forwarded, and an `after:` anchor that no longer exists in the history is an error, not an empty page. A `truncationReason` of \"limit\" is the caller's own ceiling and is reached by raising `limit`. Either way the newest message is always returned whole.",
 			parameters: {
 				type: "object",
 				properties: {
@@ -9422,7 +9422,7 @@ var CherryToolEngine = class {
 					},
 					includeImages: {
 						type: "boolean",
-						description: "When true, fetch uploaded `file` images of a type this deployment accepts and return them as image blocks beside the snapshot (the part keeps the peer's media-type spelling; `image.mediaType` is normalised). Requires the calling model route to declare image input; a route without it is refused before any content is read. Desktop-local pasted images (legacy `data` parts) carry no bytes and stay metadata-only. At most a per-call image count/byte budget is read; a part over it keeps its metadata with `imagesOmitted: \"cap\"`. Defaults to false."
+						description: "When true, fetch uploaded `file` images of a type this deployment accepts and return them as image blocks beside the snapshot (the part keeps the peer's media-type spelling; `image.mediaType` is normalised). Requires the calling model route to declare image input; a route without it is refused before any content is read. Desktop-local pasted images (legacy `data` parts) carry no bytes and stay metadata-only. At most a per-call image count/byte budget is read, with a probe budget for unlabelled files; a part over either keeps its metadata with `imagesOmitted: \"cap\"`. Defaults to false."
 					}
 				},
 				required: ["device", "sessionId"],
@@ -9510,7 +9510,7 @@ var CherryToolEngine = class {
 		if (images !== void 0) {
 			images.images = 0;
 			images.bytes = 0;
-			images.sniffs = 0;
+			images.sniffAttempts = 0;
 		}
 		const sessionResult = await connection.rpc.request("agent.sessions.get", { sessionId });
 		const session = isRecord$1(sessionResult["session"]) ? sessionResult["session"] : {};
@@ -9708,14 +9708,16 @@ var CherryToolEngine = class {
 	#imageBudget(attachments) {
 		const limits = attachments.imageLimits;
 		const floor = (value) => Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+		const maxImages = Math.min(this.#readImagesPerCall, floor(limits.maxImagesPerMessage));
 		return {
 			attachments,
-			maxImages: Math.min(this.#readImagesPerCall, floor(limits.maxImagesPerMessage)),
+			maxImages,
 			maxBytes: Math.min(this.#readImageBytesPerCall, floor(limits.maxMessageImageBytes)),
 			maxImageBytes: floor(limits.maxImageBytes),
 			images: 0,
 			bytes: 0,
-			sniffs: 0
+			sniffAttempts: 0,
+			maxSniffs: maxImages * 4
 		};
 	}
 	/**
@@ -9793,7 +9795,8 @@ var CherryToolEngine = class {
 	*  - `image` — the peer's bytes were fetched through the verified walk, their
 	*    sha256 matched, and the host attachment store committed them.
 	*  - `omitted: true` — the call's image count/byte budget (or the deployment's
-	*    own per-image/message limits) had no room. The part keeps its metadata
+	*    own per-image/message limits) had no room, or the probe budget could not
+	*    tell whether the part held a picture at all. The part keeps its metadata
 	*    and says `imagesOmitted: 'cap'`.
 	*  - `unavailable` — the store refused the image (`AttachmentError`), or the
 	*    peer could not serve the bytes (the degradable class). Same treatment as
@@ -9813,10 +9816,10 @@ var CherryToolEngine = class {
 		let mediaType = declaredType !== void 0 && declaredType.startsWith("image/") && accepted.includes(declaredType) ? declaredType : void 0;
 		if (mediaType === void 0) {
 			if (!isUnlabelled(declaredType)) return {};
-			if (images.sniffs >= images.maxImages) return { omitted: true };
+			if (images.sniffAttempts >= images.maxSniffs) return { omitted: true };
+			images.sniffAttempts += 1;
 			const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline);
 			if (sniffed === void 0 || !accepted.includes(sniffed)) return {};
-			images.sniffs += 1;
 			mediaType = sniffed;
 		}
 		const declared = declaredRefBytes(ref);

@@ -183,9 +183,9 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   **4 × 3 × 32 MiB = 384 MiB worst case**, and in ordinary traffic
   `4 × 3 × (the declared size)`.
   It bounds what is ASSEMBLED, not everything resident: the caller keeps the
-  finished content OUTSIDE this product (up to one whole message per concurrent
-  read — `AGGREGATE_BYTES` is judged only between messages), plus the parts
-  cache's 32 MiB per device.
+  finished content OUTSIDE this product (up to one message per concurrent read;
+  `AGGREGATE_BYTES` is judged between messages), plus the parts cache's 32 MiB
+  per device.
 - **A slice window does not change that peak (#329).** Slices are decoded as
   they are CONSUMED, one at a time, so the 3× stands per content; the window
   costs at most 8 undecoded slices. It fills only by PREDICTION (a run of full
@@ -528,8 +528,8 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   `<=`, so exactly 4,096 characters is still emitted. The guard measures the
   string it is about to hand out, never a reconstruction of its length, so a
   format change cannot leave it behind. This is about what the tool ACCEPTS; a
-  well-behaved peer is far below it (the protocol's own `opaqueId` caps a cursor
-  at 256 characters).
+  well-behaved peer is far below it, since `opaqueId` caps a cursor at 256
+  characters.
 - **The `after:` arm's LENGTH case is pinned on the function; its CONTENT case
   runs through the tool.** Projecting the anchor message sends the same id to
   `agent.parts.list`, so an id above the token ceiling fails its parts walk and
@@ -599,7 +599,7 @@ integer ≤ 32 MiB (`RESOURCE_UNAVAILABLE`). We are **more tolerant**: a missing
 unusable `byteLength` falls back to a slice bound (`DEFAULT_CONTENT_SLICE_BOUND`
 = 4,096 slices), and the **cumulative bytes-read arm** still caps the walk, so a
 peer that serves more than it declared is stopped by bytes actually read.
-A test covers it; do not "align" it without a reason.
+A test covers it; do not "align" it without reason.
 
 ### Integrity: what degrades, what is fatal
 
@@ -645,10 +645,11 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   accepted `file` image via `saveImage` under our 4-image / 8 MiB per-call cap
   (`imagesOmitted: 'cap'`); the route must declare `image` input, and no
   attachments service answers `unsupported`. The BYTES outrank the label: an
-  `octet-stream` file earns ONE 512-byte sniff, bounded by the image count —
-  UNVERIFIED, deciding only whether to read, never the content, the stored image
-  or a marker — and a known prefix overrides a mislabelled type at save time
-  (#396). Legacy `data` never qualifies.
+  `octet-stream` file earns ONE 512-byte sniff under a probe budget (four per
+  image slot), UNVERIFIED — never the content or the stored image; an
+  unprobeable part is `cap`, since it may hold a picture (#396, #401). A known
+  prefix overrides a mislabelled type on save. Legacy `data` never
+  qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
   verdict; guidance points at `cherry_read`.
 
