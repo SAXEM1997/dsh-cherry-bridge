@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { createDeviceIdentity } from '@cherrystudio/remote-transport'
 import { DeviceStore } from '../../src/deviceStore.js'
 import {
+  IMAGE_SNIFF_BYTES,
   INTERACTIONS_LIST_PAGE_CLAMP,
   LIST_PAGE_CLAMP,
   PARTS_LIST_PAGE_CLAMP,
@@ -3745,6 +3746,161 @@ describe('issue #307: the image budget degrades per part', () => {
     const parts = result.messages.flatMap((message) => message.parts)
     expect(parts.filter((part) => part['image'] !== undefined)).toHaveLength(2)
     expect(parts.some((part) => part['imagesOmitted'] === 'cap')).toBe(false)
+  })
+})
+
+describe('issue #396 ㉜: an image is identified by its own bytes, not only the peer label', () => {
+  const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+  const JPEG_MAGIC = [0xff, 0xd8, 0xff, 0xe0]
+
+  /** A real magic prefix, padded past the test slice size so the walk spans two. */
+  function imageBytes(magic: readonly number[], total = 1508): Uint8Array {
+    const bytes = new Uint8Array(total)
+    bytes.set(magic, 0)
+    for (let index = magic.length; index < total; index += 1) bytes[index] = index % 251
+    return bytes
+  }
+
+  /**
+   * One `file` part, whose BYTES the peer pins before the part is projected —
+   * the same order the real desktop uses (`setContentBytes` records the digest
+   * the ref will advertise, so the walk still certifies what it reads).
+   */
+  async function rigForFile(
+    mediaType: string,
+    name: string,
+    bytes: Uint8Array,
+    attachments: ReturnType<typeof fakeAttachments> = fakeAttachments(),
+  ) {
+    const rig = await makeRig(
+      {
+        agent: {
+          agents: [{ agentId: 'agent-1', name: 'Agent One' }],
+          sessions: [
+            {
+              sessionId: 's-1',
+              agentId: 'agent-1',
+              workspaceId: 'ws-1',
+              title: 'Images',
+              historyRevision: '1000',
+            },
+          ],
+          messages: [
+            {
+              messageId: 'm-1',
+              revision: '1001',
+              role: 'user',
+              status: 'success',
+              parts: [
+                { kind: 'text', text: 'look at this' },
+                { kind: 'file', text: '', name, mediaType },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        engine: { contentReadSliceBytes: TEST_SLICE_BYTES },
+        attachments: attachments.service,
+        llm: fakeLlm(),
+      },
+    )
+    rig.fake.setContentBytes('m-1:1', '1001', bytes)
+    return rig
+  }
+
+  it('㉜a a file the peer labels application/octet-stream is read when its bytes are a PNG', async () => {
+    const bytes = imageBytes(PNG_MAGIC)
+    const attachments = fakeAttachments()
+    const rig = await rigForFile('application/octet-stream', 'photo', bytes, attachments)
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const parts = result.messages.flatMap((message) => message.parts)
+    const image = parts.find((part) => part['image'] !== undefined)?.['image'] as
+      | { mediaType: string; bytes: number }
+      | undefined
+    expect(image?.mediaType).toBe('image/png')
+    expect(image?.bytes).toBe(bytes.length)
+    // The store was handed the SNIFFED type, not the peer's `application/octet-stream`.
+    expect(attachments.saved[0]?.mediaType).toBe('image/png')
+    // ONE bounded sniff + the two slices of the verified walk.
+    expect(rig.fake.contentReadRequests().map((request) => request.maxBytes)).toEqual([
+      IMAGE_SNIFF_BYTES,
+      TEST_SLICE_BYTES,
+      TEST_SLICE_BYTES,
+    ])
+  })
+
+  it('㉜b a part labelled image/png whose bytes are a JPEG is saved as image/jpeg', async () => {
+    const bytes = imageBytes(JPEG_MAGIC)
+    const attachments = fakeAttachments()
+    const rig = await rigForFile('image/png', 'photo.png', bytes, attachments)
+
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', includeImages: true }, imageExec())
+
+    // The declaration was accepted, so no sniff read: the walk starts at slice one.
+    expect(rig.fake.contentReadRequests().map((request) => request.maxBytes)).toEqual([
+      TEST_SLICE_BYTES,
+      TEST_SLICE_BYTES,
+    ])
+    expect(attachments.saved[0]?.mediaType).toBe('image/jpeg')
+  })
+
+  it('㉜c an octet-stream file that is not an image stays metadata-only, with no cap marker', async () => {
+    const attachments = fakeAttachments()
+    const rig = await rigForFile(
+      'application/octet-stream',
+      'notes',
+      new TextEncoder().encode('this is not a picture'),
+      attachments,
+    )
+
+    const result = (await rig.call(
+      'cherry_read',
+      { device: 'dev-A', sessionId: 's-1', includeImages: true },
+      imageExec(),
+    )) as { messages: Array<{ parts: Array<Record<string, unknown>> }> }
+
+    const parts = result.messages.flatMap((message) => message.parts)
+    const file = parts.find((part) => part['kind'] === 'file')
+    expect(file?.['image']).toBeUndefined()
+    // NOT `imagesOmitted`: nothing was omitted, the bytes simply are not an image.
+    expect(file?.['imagesOmitted']).toBeUndefined()
+    expect(attachments.saved).toHaveLength(0)
+    // The sniff read happened; nothing else did.
+    expect(rig.fake.contentReadRequests()).toEqual([{ offset: '0', maxBytes: IMAGE_SNIFF_BYTES }])
+  })
+
+  it('㉜e a part the peer labels text/plain is believed without a sniff read', async () => {
+    const bytes = imageBytes(PNG_MAGIC)
+    const attachments = fakeAttachments()
+    const rig = await rigForFile('text/plain', 'notes.txt', bytes, attachments)
+
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', includeImages: true }, imageExec())
+
+    // A label that NAMES a type is a claim about the bytes; only a label that
+    // says nothing earns a read.
+    expect(rig.fake.contentReadRequests()).toEqual([])
+    expect(attachments.saved).toHaveLength(0)
+  })
+
+  it('㉜d the sniff slice never stands in for the content the walk certifies', async () => {
+    const bytes = imageBytes(PNG_MAGIC)
+    const attachments = fakeAttachments()
+    const rig = await rigForFile('application/octet-stream', 'photo', bytes, attachments)
+
+    await rig.call('cherry_read', { device: 'dev-A', sessionId: 's-1', includeImages: true }, imageExec())
+
+    // The store received the WHOLE content, not the 512-byte guess.
+    expect(attachments.saved[0]?.data.length).toBe(bytes.length)
+    expect(Buffer.from(attachments.saved[0]!.data)).toEqual(Buffer.from(bytes))
+    // And the sniff asked for one bounded slice at offset 0.
+    expect(rig.fake.contentReadRequests()[0]).toEqual({ offset: '0', maxBytes: IMAGE_SNIFF_BYTES })
   })
 })
 

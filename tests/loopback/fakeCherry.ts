@@ -1219,6 +1219,8 @@ export class FakeCherry {
   #contentReadsInFlight = 0
   #contentReadsPeak = 0
   #contentReadsServed = 0
+  /** Every `agent.content.read` this peer served, in order, as it was ASKED. */
+  readonly #contentReadRequests: Array<{ offset: string; maxBytes: number }> = []
   /** Per-offset slice delay, so answers can arrive OUT of request order (#329). */
   #contentReadDelays = new Map<string, number>()
   /** A delay on EVERY slice, so a client window is observable at all (#329). */
@@ -1643,6 +1645,15 @@ export class FakeCherry {
    */
   contentReadsServed(): number {
     return this.#contentReadsServed
+  }
+
+  /**
+   * Every `agent.content.read` this peer served, in order, as it was ASKED
+   * (#396): `offset` and `maxBytes` are what the client REQUESTED, so a test can
+   * tell a full slice from the bounded sniff read without guessing from timing.
+   */
+  contentReadRequests(): Array<{ offset: string; maxBytes: number }> {
+    return this.#contentReadRequests.map((request) => ({ ...request }))
   }
 
   /** Delay ONE offset's slice reply, so later slices overtake it (#329). */
@@ -3678,6 +3689,7 @@ export class FakeCherry {
     // inside the count, which is what makes an out-of-order arrival and a
     // still-settling window observable from a test.
     const offset = String(params['offset'] ?? '')
+    this.#contentReadRequests.push({ offset, maxBytes: Number(params['maxBytes'] ?? 0) })
     this.#contentReadsServed += 1
     this.#contentReadsInFlight += 1
     this.#contentReadsPeak = Math.max(this.#contentReadsPeak, this.#contentReadsInFlight)
