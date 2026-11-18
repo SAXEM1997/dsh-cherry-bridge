@@ -6897,6 +6897,59 @@ var ContentReadGate = class {
 	}
 };
 //#endregion
+//#region src/imageSniff.ts
+/**
+* Identify a raster image from its own first bytes (#396).
+*
+* The peer types an attachment from its NAME, so a file with no extension — or
+* one whose extension the desktop does not map — arrives as
+* `application/octet-stream` even when the bytes are a perfectly good PNG. The
+* image face used to take that label at its word and drop the picture silently.
+*
+* This reads a prefix and nothing else: no decode, no pixel validation, no
+* allocation beyond the slice it was handed. A format it does not know is
+* `undefined`, which callers must treat as "no claim", never as "not an image".
+*
+* The list is deliberately short — the formats a desktop actually uploads and a
+* host store accepts. Adding one is a line here plus a case in the unit test.
+*/
+function imageMediaTypeFromHeader(bytes) {
+	if (startsWith(bytes, 0, [
+		137,
+		80,
+		78,
+		71,
+		13,
+		10,
+		26,
+		10
+	])) return "image/png";
+	if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return "image/jpeg";
+	if (startsWith(bytes, 0, [
+		71,
+		73,
+		70,
+		56
+	]) && bytes.length >= 6 && (bytes[4] === 55 || bytes[4] === 57) && bytes[5] === 97) return "image/gif";
+	if (startsWith(bytes, 0, [
+		82,
+		73,
+		70,
+		70
+	]) && startsWith(bytes, 8, [
+		87,
+		69,
+		66,
+		80
+	])) return "image/webp";
+	if (startsWith(bytes, 0, [66, 77])) return "image/bmp";
+}
+function startsWith(bytes, at, magic) {
+	if (bytes.length < at + magic.length) return false;
+	for (let index = 0; index < magic.length; index += 1) if (bytes[at + index] !== magic[index]) return false;
+	return true;
+}
+//#endregion
 //#region src/tools.ts
 /** `provider_unavailable`-shaped: lowercase words separated by underscores. */
 const REASON_CODE_SHAPE = /^[a-z][a-z0-9_]{1,63}$/;
@@ -7960,6 +8013,17 @@ const IMAGE_ROUTE_UNRESOLVED = "cannot read images from this session: the curren
 * measure. One helper, so the text pre-flight and the verified walk cannot drift
 * apart on what "usable" means.
 */
+/**
+* A media type that claims nothing about the bytes (#396).
+*
+* `undefined` is the peer saying nothing; `application/octet-stream` is the
+* desktop's answer for a filename it could not map — which is exactly the case
+* a picture with no extension lands in. Every other type is a claim that the
+* bytes are something else, and is believed without spending a read on it.
+*/
+function isUnlabelled(mediaType) {
+	return mediaType === void 0 || mediaType === "application/octet-stream";
+}
 function declaredRefBytes(ref) {
 	const value = Number(ref["byteLength"]);
 	return Number.isFinite(value) ? value : void 0;
@@ -9702,12 +9766,50 @@ var CherryToolEngine = class {
 	* Returns `{}` for a part this face does not own — a non-image, a media type
 	* the deployment does not accept, or a `file` record with no ref.
 	*/
+	/**
+	* The first bytes of a ref, read ONLY to identify its format (#396).
+	*
+	* Unverified on purpose, and it must stay that way: a sniff decides whether a
+	* part is worth a full walk, so spending the walk's sha256 budget on it would
+	* defeat the point. The bytes it returns never leave this method — no caller
+	* stores them, returns them, or counts them as content — and the walk that
+	* follows re-reads the same prefix and certifies the whole.
+	*
+	* Every failure is `undefined`: a guess that cannot be made is not an error,
+	* and a part this face does not own must not turn into a failed read. It still
+	* takes a content-gate slot, because the request it makes is real.
+	*/
+	async #sniffImageMediaType(connection, sessionId, ref, deadline) {
+		const releaseSlot = await this.#contentGate.acquire(deadline?.instant);
+		try {
+			const slice = await connection.rpc.request("agent.content.read", {
+				sessionId,
+				contentId: String(ref["contentId"] ?? ""),
+				revision: String(ref["revision"] ?? ""),
+				offset: "0",
+				maxBytes: 512
+			}, deadline === void 0 ? void 0 : { deadline: deadline.instant });
+			const data = typeof slice["dataBase64"] === "string" ? slice["dataBase64"] : "";
+			return imageMediaTypeFromHeader(Buffer.from(data, "base64"));
+		} catch {
+			return;
+		} finally {
+			releaseSlot();
+		}
+	}
 	async #projectImagePart(connection, sessionId, raw, content, face, images, deadline) {
 		const ref = isRecord$1(raw["ref"]) ? raw["ref"] : isRecord$1(content["ref"]) ? content["ref"] : void 0;
-		const mediaType = face.mediaType?.toLowerCase();
-		if (ref === void 0 || mediaType === void 0) return {};
-		if (!mediaType.startsWith("image/")) return {};
-		if (!images.attachments.imageLimits.mediaTypes.includes(mediaType)) return {};
+		const declaredType = face.mediaType?.toLowerCase();
+		if (ref === void 0) return {};
+		const accepted = images.attachments.imageLimits.mediaTypes;
+		let mediaType = declaredType !== void 0 && declaredType.startsWith("image/") && accepted.includes(declaredType) ? declaredType : void 0;
+		if (mediaType === void 0) {
+			if (!isUnlabelled(declaredType)) return {};
+			if (images.images >= images.maxImages) return {};
+			const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline);
+			if (sniffed === void 0 || !accepted.includes(sniffed)) return {};
+			mediaType = sniffed;
+		}
 		const declared = declaredRefBytes(ref);
 		if (images.images >= images.maxImages) return { omitted: true };
 		if (declared !== void 0) {
@@ -9720,9 +9822,11 @@ var CherryToolEngine = class {
 		try {
 			releaseSlot = await this.#contentGate.acquire(deadline?.instant);
 			const bytes = await this.#readVerifiedBytes(connection, sessionId, ref, remaining, deadline);
+			const sniffedType = imageMediaTypeFromHeader(bytes);
+			const effective = sniffedType !== void 0 && accepted.includes(sniffedType) ? sniffedType : mediaType;
 			const saved = await images.attachments.saveImage({
 				data: bytes,
-				mediaType,
+				mediaType: effective,
 				...face.name === void 0 ? {} : { name: face.name }
 			});
 			images.images += 1;

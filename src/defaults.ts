@@ -162,6 +162,14 @@ export const DEFAULT_UPLOAD_RESUME_WAIT_MS = 30_000
  * the deployment's `attachments.imageLimits` can only tighten these further,
  * never widen them.
  */
+/**
+ * How many leading bytes the image face reads to IDENTIFY a file the peer did
+ * not label as an image (#396). Every signature in `imageSniff.ts` lives in the
+ * first 12 bytes; 512 leaves room for a peer that pads its container header and
+ * is still one cheap slice.
+ */
+export const IMAGE_SNIFF_BYTES = 512
+
 export const DEFAULT_READ_IMAGES_PER_CALL = 4
 export const DEFAULT_READ_IMAGE_BYTES_PER_CALL = 8 * 1024 * 1024
 

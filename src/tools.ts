@@ -6,6 +6,7 @@ import {
   MAX_SEND_ATTACHMENTS,
   MAX_SEND_ATTACHMENT_BYTES,
   MAX_SEND_MESSAGE_BYTES,
+  IMAGE_SNIFF_BYTES,
   MESSAGE_TEXT_MAX_CHARS,
   SUBAGENT_TITLE_FALLBACK_CHARS,
 } from './defaults.js'
@@ -31,6 +32,7 @@ import {
 } from './defaults.js'
 import { failureReason, isMethodNotFound, JsonRpcRequestError, RequestTimeoutError } from './rpc/jsonRpcClient.js'
 import { ContentReadGate } from './contentGate.js'
+import { imageMediaTypeFromHeader } from './imageSniff.js'
 import { truncateErrorMessage } from './diagnostics.js'
 import type { ReadResult, SessionSubscriptions } from './subscriptions.js'
 import { PairingError } from './pairing.js'
@@ -2273,6 +2275,18 @@ const IMAGE_ROUTE_UNRESOLVED =
  * measure. One helper, so the text pre-flight and the verified walk cannot drift
  * apart on what "usable" means.
  */
+/**
+ * A media type that claims nothing about the bytes (#396).
+ *
+ * `undefined` is the peer saying nothing; `application/octet-stream` is the
+ * desktop's answer for a filename it could not map — which is exactly the case
+ * a picture with no extension lands in. Every other type is a claim that the
+ * bytes are something else, and is believed without spending a read on it.
+ */
+function isUnlabelled(mediaType: string | undefined): boolean {
+  return mediaType === undefined || mediaType === 'application/octet-stream'
+}
+
 function declaredRefBytes(ref: Record<string, unknown>): number | undefined {
   const value = Number(ref['byteLength'])
   return Number.isFinite(value) ? value : undefined
@@ -4883,6 +4897,47 @@ export class CherryToolEngine {
    * Returns `{}` for a part this face does not own — a non-image, a media type
    * the deployment does not accept, or a `file` record with no ref.
    */
+  /**
+   * The first bytes of a ref, read ONLY to identify its format (#396).
+   *
+   * Unverified on purpose, and it must stay that way: a sniff decides whether a
+   * part is worth a full walk, so spending the walk's sha256 budget on it would
+   * defeat the point. The bytes it returns never leave this method — no caller
+   * stores them, returns them, or counts them as content — and the walk that
+   * follows re-reads the same prefix and certifies the whole.
+   *
+   * Every failure is `undefined`: a guess that cannot be made is not an error,
+   * and a part this face does not own must not turn into a failed read. It still
+   * takes a content-gate slot, because the request it makes is real.
+   */
+  async #sniffImageMediaType(
+    connection: DeviceConnection,
+    sessionId: string,
+    ref: Record<string, unknown>,
+    deadline?: AssemblyDeadline,
+  ): Promise<string | undefined> {
+    const releaseSlot = await this.#contentGate.acquire(deadline?.instant)
+    try {
+      const slice = (await connection.rpc.request(
+        'agent.content.read',
+        {
+          sessionId,
+          contentId: String(ref['contentId'] ?? ''),
+          revision: String(ref['revision'] ?? ''),
+          offset: '0',
+          maxBytes: IMAGE_SNIFF_BYTES,
+        },
+        deadline === undefined ? undefined : { deadline: deadline.instant },
+      )) as Record<string, unknown>
+      const data = typeof slice['dataBase64'] === 'string' ? slice['dataBase64'] : ''
+      return imageMediaTypeFromHeader(Buffer.from(data, 'base64'))
+    } catch {
+      return undefined
+    } finally {
+      releaseSlot()
+    }
+  }
+
   async #projectImagePart(
     connection: DeviceConnection,
     sessionId: string,
@@ -4897,10 +4952,30 @@ export class CherryToolEngine {
     // `IMAGE/PNG` means the same thing, and the deployment's accepted list is
     // lowercase. Normalise ONCE, here, and hand the store the normalised value
     // so a host that validates its own limits does not reject it later.
-    const mediaType = face.mediaType?.toLowerCase()
-    if (ref === undefined || mediaType === undefined) return {}
-    if (!mediaType.startsWith('image/')) return {}
-    if (!images.attachments.imageLimits.mediaTypes.includes(mediaType)) return {}
+    const declaredType = face.mediaType?.toLowerCase()
+    if (ref === undefined) return {}
+    const accepted = images.attachments.imageLimits.mediaTypes
+    // A DECLARED image type the deployment accepts is taken at its word: the
+    // peer owns the label, and a sniff read would cost a round trip for a part
+    // that is already eligible.
+    let mediaType =
+      declaredType !== undefined &&
+      declaredType.startsWith('image/') &&
+      accepted.includes(declaredType)
+        ? declaredType
+        : undefined
+    if (mediaType === undefined) {
+      // A LABEL THAT SAYS NOTHING (#396). The desktop types an attachment from
+      // its filename, so a picture with no extension arrives as
+      // `application/octet-stream` — the face used to drop it silently. Any
+      // OTHER label (`text/plain`, `application/pdf`, …) is a claim that the
+      // bytes are not a picture, and is believed without a read.
+      if (!isUnlabelled(declaredType)) return {}
+      if (images.images >= images.maxImages) return {}
+      const sniffed = await this.#sniffImageMediaType(connection, sessionId, ref, deadline)
+      if (sniffed === undefined || !accepted.includes(sniffed)) return {}
+      mediaType = sniffed
+    }
 
     const declared = declaredRefBytes(ref)
     if (images.images >= images.maxImages) return { omitted: true }
@@ -4920,9 +4995,17 @@ export class CherryToolEngine {
     try {
       releaseSlot = await this.#contentGate.acquire(deadline?.instant)
       const bytes = await this.#readVerifiedBytes(connection, sessionId, ref, remaining, deadline)
+      // THE BYTES OUTRANK THE LABEL (#396). A file renamed from `.jpg` to
+      // `.png` declares `image/png` and holds JPEG bytes; handing the store the
+      // declaration would make it judge the picture against the wrong type. The
+      // sniffed type wins whenever the deployment accepts it — the declaration
+      // stands only when the bytes name no format this code knows.
+      const sniffedType = imageMediaTypeFromHeader(bytes)
+      const effective =
+        sniffedType !== undefined && accepted.includes(sniffedType) ? sniffedType : mediaType
       const saved = await images.attachments.saveImage({
         data: bytes,
-        mediaType,
+        mediaType: effective,
         ...(face.name === undefined ? {} : { name: face.name }),
       })
       // Count what the WIRE cost, not what the store kept: a normalizing store

@@ -188,8 +188,8 @@ hello `agentUploadsVersion:1` is `limits.uploads`; absent refuses attachments.
   cache's 32 MiB per device.
 - **A slice window does not change that peak (#329).** Slices are decoded as
   they are CONSUMED, one at a time, so the 3× stands per content; the window
-  costs up to 8 undecoded `dataBase64` strings (~192 KiB at 24 KiB a slice). It
-  fills only by PREDICTION (a run of full contiguous slices fixes the stride);
+  costs at most 8 undecoded slices. It fills only by PREDICTION (a run of full
+  contiguous slices fixes the stride);
   any deviation DISCARDS it. A
   window is never awaited, only pre-observed: an unanswered sibling would hold a
   deadline-less read for the rpc default. Its EFFECTIVE
@@ -243,7 +243,7 @@ this beside the cache).
   wholesale to store itself.
 - **Eviction is FIFO** — `Map` order IS the policy (the same choice `#remember`
   documents). A **refresh keeps the key's insertion position** (a rewrite, not
-  a use; delete-then-set would silently make it LRU). Room is made BEFORE a
+  a use; delete-then-set would make it LRU). Room is made BEFORE a
   write for the write's **growth** (`bytes - previous`, zero when it shrinks),
   so a device never passes budget on either path — the refresh-that-grew case
   is the one that used to slip through. `#dropCachedMessage` is the ONE delete
@@ -352,7 +352,7 @@ absorbed it — a 1 s window answering ~150 s later (#3, #21).
 - **`clampedByDeadline` is a flag, not a clock test.** A timer may fire a
   millisecond early, so "has the deadline passed by the time I handle the
   rejection" is a race; `RequestTimeoutError` records whether its timeout was
-  DERIVED from the deadline, which is a fact about how the error was produced.
+  DERIVED from the deadline, a fact about how the error was produced.
   A plain client timeout (the 60 s default) is not the budget and is not
   converted.
 - **The snapshot is inside the budget and inside the degrade arm — on the
@@ -400,8 +400,8 @@ Three `truncationReason` values mean different things:
   named), and the rest is reached with `cherry_read`, which has no deadline.
 
 Keep this distinction in the README. Collapsing `aggregate-bytes` into "raise
-`limit`" was a field defect: a caller paid every round trip and still never saw
-the cut-off history.
+`limit`" was a field defect: the caller paid every round trip and never saw the
+cut-off history.
 
 **Two token forms, both prefixed** — the prefix is ours, the rest is opaque:
 
@@ -503,9 +503,8 @@ and `cherry_interactions` counts pre-filter rows against `limit`.
   a token the parser takes.
   **The round trip itself is a test, not a promise.** `parseMessageResume` is
   exported for one property: every token these emitters NAME is one it ACCEPTS,
-  asserted over a varied probe table rather than per-clause. Compensations: a
-  clause no probe reaches still slips through, and over-refusal costs
-  resumability, not correctness.
+  asserted over a probe table rather than per-clause. A clause no probe reaches
+  still slips through; over-refusal costs resumability, not correctness.
   The failure mode: an emitted stop point the same tool refuses — a useless
   token whose refusal surfaces at resume, not at the answer. A
   refused remainder yields no token at all — `truncated` already says the
@@ -647,9 +646,11 @@ Anything that certifies **wrong or unverifiable** bytes does not degrade:
   the record has a key we skip. `includeImages` fetches, verifies and saves an
   accepted `file` image via `saveImage` under our 4-image / 8 MiB per-call cap
   (`imagesOmitted: 'cap'`); the route must declare `image` input, and no
-  attachments service answers `unsupported`. Legacy `data` never qualifies.
+  attachments service answers `unsupported`. The BYTES outrank the label: an
+  `octet-stream` file earns a 512-byte sniff; a known prefix overrides a
+  mislabelled type (#396). Legacy `data` never qualifies.
 - A terminal aggregate that cannot assemble is a **content** problem, not a
-  verdict — the status stands; guidance points at `cherry_read`.
+  verdict; guidance points at `cherry_read`.
 
 ### `cherry_tasks`: an optional face discovered by PROBING (#381)
 
@@ -948,7 +949,7 @@ refuse; (3) `Origin` present and not same-origin with `Host` → refuse;
 - **`.scratch-csa`** (gitignored) — the official Cherry Studio **app**
   (`CherryHQ/cherry-studio-app`), the **same role we play** (protocol *client*).
   Its remote layer is `src/backend/services/remoteAgent/` — "what the official
-  client does" comes from there. v0.5.0–v0.5.4 were byte-identical there (tree
+  client does" comes from there. v0.5.0–v0.5.4 were byte-identical (tree
   `16e505fe…`); **v0.5.5** moves the pins to 0.8.0 / 0.2.6 — additive
   `agent.tasks.*` only, and our wire unchanged (ADR-0001) — SERVED since desktop
   **2.2.1** (see the range note below). Diff the tree first.
@@ -982,7 +983,7 @@ pairing only ADDED the v3 QR arm (below). Notable faces:
 
 **Traps in the official app (a cautionary list, not a spec).**
 
-- Its scope layer honours `details.retryable: false`, but it has no adaptive
-  page size, so a byte-budget `RESOURCE_EXHAUSTED` never converges at a fixed
-  limit. Our answer is the byte-safe page **clamp**.
+- Its scope layer honours `details.retryable: false` but has no adaptive page
+  size, so a byte-budget `RESOURCE_EXHAUSTED` never converges at a fixed limit.
+  Our answer is the byte-safe page **clamp**.
 
