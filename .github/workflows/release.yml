@@ -1,0 +1,285 @@
+# Tag-driven release: gate → npm publish → GitHub Release.
+#
+# Pushing `vX.Y.Z` is the whole trigger. The tag must name the version in
+# `package.json`, and the CHANGELOG section for that version must exist — that
+# section IS the release body, so the notes are reviewable in the repository
+# instead of being typed into a web form after the fact.
+#
+# WHY THE ORDER IS gate → publish → release, and not the reverse: a GitHub
+# Release announces an installable version. Creating it first means the release
+# page can point at a tarball npm has not accepted yet (or rejected outright),
+# which is the one failure a reader cannot see.
+#
+# THREE STEPS FAIL SILENTLY WHEN SKIPPED (the same list AGENTS.md keeps, and
+# the reason each check below exists):
+#
+#   1. The tag and `package.json` disagree. `npm publish` then publishes the
+#      version in `package.json` while the tag and the release announce another.
+#   2. The README install pins are not bumped before publishing. npm serves the
+#      README captured in the tarball, so a pin bumped afterwards is stale on
+#      the npm page for that version, permanently.
+#   3. The GitHub Release is missing, or the tarball is attached only under a
+#      version-specific name. `releases/latest/download/dsh-cherry-bridge.tgz`
+#      is what the plugin catalog resolves to; a versioned name 404s there.
+#
+# `workflow_dispatch` is a DRY RUN: it runs the same token preflight, notes,
+# pins and gate, then `npm publish --dry-run`; it never publishes or creates a
+# release. A real publish always requires a tag, so the release commit stays the
+# only place the version is decided.
+#
+# Re-running is safe. npm rejects a republished version with a 409, so the
+# publish step first asks the registry whether the version is already there and
+# skips if it is; the release steps are idempotent (`view || create`, `upload
+# --clobber`). That matters because the failure most likely to need a retry —
+# registry propagation — happens AFTER the irreversible step.
+#
+# `--latest` is explicit rather than left to gh's date-and-version heuristic:
+# `releases/latest/download/dsh-cherry-bridge.tgz` resolves against whichever
+# release is marked latest, so a release created out of order (a backfill, a
+# re-run for an older tag) would silently move that URL onto a release with no
+# asset on it. A backfill is refused BEFORE publishing: the pre-publish
+# `dist-tags.latest` check rejects a version older than the registry's latest,
+# because publishing it would move `latest` backwards and the post-publish
+# check would then agree with itself.
+#
+# The gate runs twice on purpose: once explicitly, and once inside `npm publish`
+# through `prepublishOnly`. The explicit run names the failing gate before the
+# publish step; the implicit run is npm's own and is deliberately NOT bypassed
+# with `--ignore-scripts`.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# `contents: write` uploads the release asset. Everything else is read-only.
+permissions:
+  contents: write
+
+# A re-run of the same tag must not race a second publish; different tags are
+# independent releases.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      # A dry run must answer "is the token still usable?" before the notes and
+      # the gate, not after two minutes of tests. This proves authentication,
+      # not the 2FA-bypass flag; only a real publish proves that, and the
+      # failure is safe (nothing is uploaded).
+      - name: the token can authenticate
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: the tag names the version in package.json
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            [ "v$VERSION" = "$TAG" ] || {
+              echo "::error::tag $TAG does not match package.json version $VERSION"
+              exit 1
+            }
+            echo "releasing $VERSION from $TAG"
+          else
+            echo "dry run: manifest version $VERSION (a dispatch has no tag to compare)"
+          fi
+
+      - name: the release notes for this version exist
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          awk -v h="## v$VERSION " '
+            index($0, h) == 1 { inside = 1; print; next }
+            inside && /^## v[0-9]/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || {
+            echo "::error file=CHANGELOG.md::missing the ## v$VERSION section — the release body is that section"
+            exit 1
+          }
+          ZH=$(grep -n '^\*\*中文\*\*$' release-notes.md | cut -d: -f1 || true)
+          EN=$(grep -n '^\*\*English\*\*$' release-notes.md | cut -d: -f1 || true)
+          [ -n "$ZH" ] && [ -n "$EN" ] && [ "$ZH" -lt "$EN" ] || {
+            echo "::error file=CHANGELOG.md::the ## v$VERSION section must carry **中文** then **English**"
+            exit 1
+          }
+          echo "release-notes.md: $ZH → $EN"
+
+      - name: the README install pins name the version being published
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          for f in README.md README.en.md; do
+            grep -q "dsh-cherry-bridge@$VERSION" "$f" \
+              || { echo "::error file=$f::missing the @$VERSION install pin"; exit 1; }
+            grep -q "#v$VERSION" "$f" \
+              || { echo "::error file=$f::missing the #v$VERSION install pin"; exit 1; }
+          done
+
+      # Publishing an older version moves `latest` backwards before the
+      # post-publish guard can see it, so the check has to run first. Equal
+      # (a re-run of the current latest) and greater (a new version) pass; an
+      # older version is refused here. Tags are plain X.Y.Z: `sort -V` is not
+      # semver, so a prerelease is refused outright rather than guessed at.
+      - name: a backfill must not move latest backwards
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          case "$VERSION" in
+            *-*) echo "::error::prerelease $VERSION is not supported by this release path"; exit 1 ;;
+          esac
+          LATEST=$(npm view dsh-cherry-bridge dist-tags.latest)
+          HIGHER=$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -1)
+          [ "$HIGHER" = "$VERSION" ] || {
+            echo "::error::dsh-cherry-bridge@$VERSION is older than dist-tags.latest $LATEST — a backfill must not move latest"
+            exit 1
+          }
+          echo "latest $LATEST → $VERSION"
+
+      - run: npm ci
+
+      # `prepublishOnly` IS the gate: typecheck, the full suite, both builds and
+      # `npm pack --dry-run`. It runs again inside `npm publish` below — that
+      # costs a few minutes on a job that runs a handful of times a year, and it
+      # means no step here depends on `publish` forwarding flags.
+      - run: npm run prepublishOnly
+
+      - name: committed artifacts match this source
+        run: git diff --exit-code -- dist lib
+
+      # Two steps, not one shell branch: a dispatch must not be one deleted
+      # `exit 0` away from publishing for real. The tag step is the only one
+      # that can publish; the dispatch step is the only one that can dry-run.
+      - name: publish (tag push only)
+        if: github.event_name == 'push'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "dsh-cherry-bridge@$VERSION" version >/dev/null 2>&1; then
+            echo "dsh-cherry-bridge@$VERSION is already published; skipping (re-run path)"
+          else
+            npm publish --tag latest
+          fi
+
+      - name: dry run (dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "dry run: not publishing"
+          npm publish --dry-run --tag latest
+
+      # Registry metadata can be visible minutes before the tarball is
+      # downloadable, so `npm pack` is retried rather than trusted once. Taking
+      # the PUBLISHED bytes and comparing the registry's own shasum is what
+      # makes the asset provably the artefact users install — a rebuild would
+      # only be a hope that the tarball is reproducible.
+      - name: take the published tarball, byte for byte
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          for attempt in $(seq 1 12); do
+            if npm pack "dsh-cherry-bridge@$VERSION" >/dev/null 2>&1; then
+              EXPECTED=$(npm view "dsh-cherry-bridge@$VERSION" dist.shasum)
+              ACTUAL=$(sha1sum "dsh-cherry-bridge-$VERSION.tgz" | cut -d' ' -f1)
+              if [ "$ACTUAL" = "$EXPECTED" ]; then
+                echo "sha1 $ACTUAL matches the registry"
+                cp "dsh-cherry-bridge-$VERSION.tgz" dsh-cherry-bridge.tgz
+                exit 0
+              fi
+              echo "::error::sha1 $ACTUAL != registry $EXPECTED"
+              exit 1
+            fi
+            echo "attempt $attempt: tarball not downloadable yet"
+            sleep 30
+          done
+          echo "::error::dsh-cherry-bridge@$VERSION never became downloadable"
+          exit 1
+
+      # The release may only announce a version the registry calls latest.
+      # The pre-publish check above refuses a backfill; this one confirms the
+      # publish moved `latest` (and tolerates registry lag).
+      - name: the registry's latest tag names this version
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          for attempt in $(seq 1 6); do
+            LATEST=$(npm view dsh-cherry-bridge dist-tags.latest)
+            if [ "$LATEST" = "$VERSION" ]; then
+              echo "dist-tags.latest is $VERSION (attempt $attempt)"
+              exit 0
+            fi
+            echo "attempt $attempt: dist-tags.latest is $LATEST"
+            sleep 10
+          done
+          echo "::error::dist-tags.latest is $LATEST, not $VERSION — refusing to announce it"
+          exit 1
+
+      - name: create the GitHub Release (idempotent)
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          # The checkout above already proved the tag exists; `--verify-tag`
+          # depends on a local tag ref that actions/checkout may not leave.
+          gh release view "v$VERSION" >/dev/null 2>&1 \
+            || gh release create "v$VERSION" \
+                 --title "v$VERSION" \
+                 --notes-file release-notes.md \
+                 --latest
+
+      - name: attach the version-independent tarball name
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          # The plugin catalog points at
+          # releases/latest/download/dsh-cherry-bridge.tgz — NOT at a name with
+          # the version in it.
+          gh release upload "v$VERSION" dsh-cherry-bridge.tgz --clobber
+
+      # A freshly uploaded asset is not instantly downloadable (0.3.0 answered
+      # 504 for about three minutes after the upload), so this is retried — a
+      # single curl turns a propagation delay into a red run for a complete
+      # release.
+      - name: the catalog's URL answers 200
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/dsh-cherry-bridge.tgz"
+          for attempt in $(seq 1 6); do
+            CODE=$(curl -sL -o /dev/null -w '%{http_code}' "$URL" || echo 000)
+            if [ "$CODE" = "200" ]; then
+              echo "$URL → 200 (attempt $attempt)"
+              exit 0
+            fi
+            echo "attempt $attempt → $CODE"
+            sleep 20
+          done
+          echo "::error::$URL never answered 200"
+          exit 1

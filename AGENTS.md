@@ -64,7 +64,7 @@ what loads it.
   `artifactFreshness` is the exception: it matters when source comments or
   build config changed.
 - **`npm run test:fast` is the daily lane, `npm test` is the gate.** The fast
-  lane runs `tests/unit` + `tests/contract` — 43 files, 776 tests, ~30 s — and
+  lane runs `tests/unit` + `tests/contract` — 45 files, 793 tests, ~30 s — and
   covers pure logic, every contract invariant, and `artifactFreshness`. It does
   NOT cover `tests/integration` (30 files, ~700 tests, ~120 s), which is where
   sockets, timers and the loopback peer live; a change that touches
@@ -180,13 +180,32 @@ their keys (there is a contract assertion for exactly that).
 
 ## Release
 
+**Primary path: push a `v*` tag.** [`.github/workflows/release.yml`](.github/workflows/release.yml)
+runs the gate, publishes to npm, creates the GitHub Release from the
+`CHANGELOG.md` section, and attaches the tarball under the catalog's fixed name.
+The release commit — version bump, both README pins and the CHANGELOG section —
+is still written and reviewed by hand; the tag is where the automation starts.
+Push the tag to `github`; the GitLab mirror does not run Actions.
+
+`workflow_dispatch` is a DRY RUN: the same token preflight, notes, pins and gate,
+then `npm publish --dry-run`; it never publishes or creates a release. Run it on
+`main` before the first tag and after any workflow change.
+
+The publish step needs `NPM_TOKEN`: a token that can publish with 2FA bypassed
+— a granular token scoped to `dsh-cherry-bridge`, read+write, with **bypass
+2FA** enabled. Without that capability `npm publish` fails `E403 … two-factor
+authentication … required` before any byte is uploaded; the failure is safe (no
+version, no release). The token preflight (`npm whoami`) proves the secret is
+usable, not the bypass flag; only a real tag does that.
+
 `npm run prepublishOnly` is the gate (typecheck, the full suite, both builds,
-and `npm pack --dry-run`).
+and `npm pack --dry-run`). `release.yml` runs it explicitly and npm runs it again
+inside `npm publish`; the duplicate is deliberate (the explicit run names the
+failing gate, the implicit one is npm's own).
 Then walk [`docs/e2e-checklist.md`](docs/e2e-checklist.md): Electron-side
 approvals cannot be CI'd, so pairing / send / interaction answers / disconnect
 recovery / multi-device coexistence must be exercised by hand on a real desktop.
-Tag `vX.Y.Z`, publish to npm (`publishConfig` pins the public registry), and
-attach the notes to the GitHub release.
+This walk is NOT part of `release.yml`; it stays a human gate before the tag.
 
 **The release notes have a fixed shape** (the CHANGELOG section ships verbatim as
 the GitHub release body, so this is the published text, not an internal summary):
@@ -197,43 +216,37 @@ the GitHub release body, so this is the published text, not an internal summary)
 - then the change list, **one line per PR**: a PR carrying several technical
   changes still gets exactly one line. Mechanism, root cause and measurement
   tables belong in the issue and the PR, never in the release body;
-- **both languages in two parts**, Chinese first, English second.
+- **both languages in two parts**, Chinese first, English second, each part
+  introduced by a line that is exactly `**中文**` / `**English**` — `release.yml`
+  requires both lines, in that order, or the tag run fails before publishing.
 
 **Three destinations from one artefact.** The tarball `npm pack --dry-run`
 checks is all three:
 
 | Destination | What a consumer hits | Who publishes it |
 | --- | --- | --- |
-| npm registry | `plugin add dsh-cherry-bridge@X.Y.Z` | the staged publish + the web approval (1) |
-| GitHub release asset | `releases/latest/download/dsh-cherry-bridge.tgz` | the same tarball, renamed, attached to the release (3) |
+| npm registry | `plugin add dsh-cherry-bridge@X.Y.Z` | `release.yml` on the tag; `NPM_TOKEN` needs bypass 2FA |
+| GitHub release asset | `releases/latest/download/dsh-cherry-bridge.tgz` | the same tarball, renamed, attached by `release.yml` (3) |
 | plugin catalog | that fixed URL, probed nightly at 02:23 UTC | nothing per version for `version`; a hand-written `description` needs a PR |
 
-**Three release steps fail silently when skipped.**
+**Three release steps fail silently when skipped — `release.yml` checks all three.**
 
-1. **Publish through staged publishing.** Direct `npm publish` is refused here
-   (`E403 … two-factor authentication … required`); the npm bundled with Node 22
-   (10.x) has no `stage`, so use npm 11:
-   `NPM_CONFIG_CACHE=/workspace/dsh/.superpowers/npm-cache npx npm@11 stage publish --registry=https://registry.npmjs.org/ --access public --tag latest`
-   (add `--ignore-scripts` only when `prepublishOnly` just passed on this exact
-   clean tree), then approve the printed stage id on npmjs.com →
-   **Staged Packages**. `npm stage approve` answers `404 staged version … not
-   found` here (every token tried, incl. `--otp`), while `GET /-/stage/<id>`
-   returns 200 — the web approval is the one that works.
-   Check the result with
-   `npm view dsh-cherry-bridge dist-tags`: an unapproved stage is silent.
-   A first publish also leaves a public `0.0.0-stage` placeholder in
-   `versions` (0.1.5 did); approving moves `latest` to the real version.
-2. **Bump BOTH README install pins in the same commit, before staging** — the
-   `@X.Y.Z` and `#vX.Y.Z` specs in `README.md` and `README.en.md`. npm serves
-   the README captured in the tarball, so a pin bumped after the publish is
-   stale on the npm page.
+1. **The tag and `package.json` disagree.** npm publishes the version in
+   `package.json` while the tag and the release announce another; the workflow
+   fails before publishing.
+2. **Bump BOTH README install pins in the same commit as the version, before the
+   tag** — the `@X.Y.Z` and `#vX.Y.Z` specs in `README.md` and `README.en.md`.
+   npm serves the README captured in the tarball, so a pin bumped after the
+   publish is stale on the npm page. The workflow greps both forms in both
+   files before `npm publish`.
 3. **Re-attach the version-INDEPENDENT release asset.** A plugin-catalog entry
    (`awesome-dsh-plugin`, `data/plugins/<owner>__<repo>.yml`) points at
    `releases/latest/download/dsh-cherry-bridge.tgz`, so **every** release must
    attach the tarball under exactly that name (not
-   `dsh-cherry-bridge-X.Y.Z.tgz`). Verify that URL answers 200 and that its sha1
-   equals the npm tarball's: without the asset the download URL 404s for every
-   catalog user (0.1.5 did exactly that).
+   `dsh-cherry-bridge-X.Y.Z.tgz`). The workflow attaches the bare name, compares
+   the published tarball's sha1 with `dist.shasum`, and retries the URL to 200:
+   without the asset the download URL 404s for every catalog user (0.1.5 did
+   exactly that).
    **The entry exists** — `data/plugins/SAXEM1997__dsh-cherry-bridge.yml` in
    `awesome-dsh-plugin/awesome-dsh-plugin`, added 2026-10-18. The market plugin
    (`dshmarket`) reads `https://awesome-dsh-plugin.com/plugins.json`, generated
@@ -247,12 +260,34 @@ checks is all three:
    repository through a PR: `SAXEM1997/awesome-dsh-plugin` is a stale fork
    (last commit 2026-09-18) and editing it changes nothing a user sees.
 
-**Retry discipline.** Re-read the published state before retrying (the stage
-id, `dist-tags`, the asset URL) — the silent failures above look like success
-from the terminal. A retry re-stages or re-attaches the SAME tarball: compare
-shas (`npm pack --dry-run` against the registry's `dist.shasum`) and stop on a
-mismatch, rather than rebuilding and publishing different bytes under a tag
-that is already out. That comparison is meaningful only because
+**Fallback: staged publishing.** Only when the token path is unavailable (the
+tag run fails at `npm publish` with E403). The npm bundled with Node 22 (10.x)
+has no `stage`, so use npm 11:
+`NPM_CONFIG_CACHE=/workspace/dsh/.superpowers/npm-cache npx npm@11 stage publish --registry=https://registry.npmjs.org/ --access public --tag latest`
+(add `--ignore-scripts` only when `prepublishOnly` just passed on this exact
+clean tree), then approve the printed stage id on npmjs.com → **Staged
+Packages**. `npm stage approve` answers `404 staged version … not found` here
+(every token tried, incl. `--otp`), while `GET /-/stage/<id>` returns 200 — the
+web approval is the one that works. Check `npm view dsh-cherry-bridge dist-tags`
+(an unapproved stage is silent), then run `.github/workflows/publish.yml` with
+`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1, attaches
+the bare name, and checks the URL.
+
+**Failure recovery.** Before `npm publish`: fix the tree, delete and re-push the
+tag — no bytes are out. After `npm publish`: re-run the workflow (the publish
+step skips, the release steps are idempotent) or finish the release by hand; do
+not move a tag that already published. A backfill of an older tag is refused
+by the pre-publish `dist-tags.latest` guard, so create that release manually
+without `--latest`.
+
+**Retry discipline.** Re-read the published state before retrying (`dist-tags`,
+the asset URL) — the silent failures above look like success from the terminal.
+A retry re-runs the SAME tag: `release.yml` skips an already-published version
+and re-attaches the same tarball; compare shas (`npm pack --dry-run` against the
+registry's `dist.shasum`) and stop on a mismatch, rather than rebuilding and
+publishing different bytes under a tag that is already out.
+
+That comparison is meaningful only because
 `repository.url` in `package.json` holds npm's NORMALISED form
 (`git+https://….git`): npm rewrites the browsable form while packing, which is
 how 0.4.0's local sha1 and registry shasum diverged (#377).
