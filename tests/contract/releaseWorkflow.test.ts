@@ -146,16 +146,23 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(pins.match(/exit 1/g)?.length, 'both pin forms must stop the run').toBe(2)
   })
 
-  it('①g the gate runs prepublishOnly and the committed-artifact diff before publishing', () => {
+  it('①g the gate runs prepublishOnly and the artifact diff before publishing', () => {
     const text = read(RELEASE)
     expect(text).toContain('npm run prepublishOnly')
-    expect(text).toContain('git diff --exit-code -- dist lib')
+    // The WHOLE tree, not `-- dist lib`: a tracked file under `files` rewritten
+    // by a script would land in the tag-tree pack AND the publish, so the
+    // content diff could not see it. A rebuild that changes committed bytes
+    // fails here too.
+    expect(text).toContain('run: git diff --exit-code')
+    expect(text, 'the diff is narrowed again').not.toContain(
+      'git diff --exit-code -- dist lib',
+    )
     expect(text).toContain('npm ci')
     expect(text.indexOf('npm ci')).toBeLessThan(text.indexOf('npm run prepublishOnly'))
     expect(text.indexOf('npm run prepublishOnly')).toBeLessThan(
       text.indexOf('npm publish --tag latest'),
     )
-    expect(text.indexOf('git diff --exit-code -- dist lib')).toBeLessThan(
+    expect(text.indexOf('run: git diff --exit-code')).toBeLessThan(
       text.indexOf('npm publish --tag latest'),
     )
   })
@@ -173,7 +180,12 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // fell through to `npm publish` would come back as a 409 on an
     // already-published version — the re-run this step exists for would break.
     expect(publish).toContain('set +e')
-    expect(publish).toContain('OUT=$(npm view "dsh-cherry-bridge@$VERSION" version 2>&1)')
+    // --prefer-online: an edge-cached packument from before the publish would
+    // report E404 for a version that IS published, and the publish that
+    // followed would come back 409.
+    expect(publish).toContain(
+      'OUT=$(npm view "dsh-cherry-bridge@$VERSION" version --prefer-online 2>&1)',
+    )
     expect(publish).toContain('RC=$?')
     expect(publish).toContain("elif printf '%s' \"$OUT\" | grep -qE 'E404|404 Not Found'; then")
     expect(publish).toContain('npm view failed for a reason other than E404')
@@ -203,7 +215,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // agree with itself.
     const backfill = text.slice(
       text.indexOf('a backfill must not move latest backwards'),
-      text.indexOf('      - run: npm ci'),
+      text.indexOf('no draft release for this tag'),
     )
     expect(backfill).toContain('case "$VERSION" in')
     expect(backfill).toContain('*-*')
@@ -270,6 +282,11 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // wrapper's first real tag went red waiting on exactly that cache.
     expect(verify).toContain('--prefer-online')
     expect(verify).toContain('for attempt in $(seq 1 20)')
+    // Reading a PUBLIC tarball needs no publish token; handing it to `npm
+    // pack` only widens what a compromised dependency script could read.
+    expect(verify, 'the publish token is exposed to a public download').not.toContain(
+      'NODE_AUTH_TOKEN',
+    )
     expect(verify).toContain('tar -xzf')
     expect(verify).toContain('diff -r local-x/package reg-x/package')
     // Only a matching tarball becomes the asset; the attached bytes are the
@@ -299,6 +316,23 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const upload = /^.*gh release upload.*$/m.exec(text)?.[0] ?? ''
     expect(upload, 'the upload step is gone').toContain('gh release upload')
     expect(upload).toContain('dsh-cherry-bridge.tgz')
+    // The draft gate must also run BEFORE the irreversible step: a draft left
+    // over from an earlier attempt would otherwise publish a version whose
+    // release can never be created.
+    const draftGate = text.slice(
+      text.indexOf('no draft release for this tag'),
+      text.indexOf('pack the tag tree'),
+    )
+    expect(draftGate, 'the pre-publish draft gate is missing').not.toBe('')
+    expect(draftGate, 'the pre-publish draft gate is not gated to a tag push').toMatch(
+      /^\s*if: github\.event_name == 'push'$/m,
+    )
+    expect(draftGate).toContain('--json isDraft')
+    expect(draftGate.match(/exit 1/g)?.length).toBe(1)
+    expect(text.indexOf('no draft release for this tag')).toBeLessThan(
+      text.indexOf('npm publish --tag latest'),
+    )
+
     const release = text.slice(
       text.indexOf('create the GitHub Release (idempotent)'),
       text.indexOf('attach the version-independent tarball name'),
@@ -381,6 +415,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const text = read(RELEASE)
     const gated = [
       'the tag commit is on main',
+      'no draft release for this tag',
       'publish (tag push only)',
       'pack the tag tree (tag push only)',
       'the published contents match the tag tree',

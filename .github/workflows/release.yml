@@ -69,6 +69,9 @@ permissions:
 
 # GLOBAL, not per-ref: two releases can race the backfill read (read-then-act)
 # and the `--latest` move, and a re-run must never overlap its own tag's run.
+# The cost is GitHub's queue rule: a third run joining the group replaces the
+# PENDING one, so a burst of tags can leave the middle tag unrun — visible as
+# no publish and no release for it, and fixed by re-running that tag.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -195,8 +198,29 @@ jobs:
       # means no step here depends on `publish` forwarding flags.
       - run: npm run prepublishOnly
 
-      - name: committed artifacts match this source
-        run: git diff --exit-code -- dist lib
+      # The WHOLE tree, not just `dist lib`: a tracked file under `files` that a
+      # script rewrote would land in the tag-tree pack AND in the publish, so
+      # the content diff could not see it. This also catches a rebuild that
+      # changes committed artifact bytes, and a file-MODE drift (0.4.1's 0600).
+      - name: the checkout still matches the tag tree
+        run: git diff --exit-code
+
+      # A draft left over from an earlier attempt would make the release step
+      # fail AFTER the irreversible publish, leaving a version nobody can
+      # install through the catalog URL. Refuse before publishing.
+      - name: no draft release for this tag
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          DRAFT=$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          if [ "$DRAFT" = "true" ]; then
+            echo "::error::v$VERSION already has a DRAFT release; publish or delete it by hand, then run this tag again"
+            exit 1
+          fi
+          echo "no draft release for v$VERSION ($DRAFT)"
 
       # The pack of THIS tree is the only non-circular reference: comparing a
       # registry tarball with the registry's own `dist.shasum` proves the
@@ -227,7 +251,7 @@ jobs:
           # answers with a 409 on an already-published version — breaking the
           # re-run this branch exists for.
           set +e
-          OUT=$(npm view "dsh-cherry-bridge@$VERSION" version 2>&1)
+          OUT=$(npm view "dsh-cherry-bridge@$VERSION" version --prefer-online 2>&1)
           RC=$?
           set -e
           if [ "$RC" -eq 0 ]; then
@@ -258,8 +282,6 @@ jobs:
       # whole retry window on exactly that cache.
       - name: the published contents match the tag tree
         if: github.event_name == 'push'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
