@@ -119,21 +119,24 @@ jobs:
           fi
 
       # A `v*` on a feature-branch tip would publish unreviewed code and mark it
-      # latest. `compare/main...<tag commit>` answers `behind` once main has
-      # taken the release merge (the normal case — measured on v0.4.2) and
-      # `identical` when the tag is main's tip; `ahead`/`diverged` mean the
-      # commit is not in main.
+      # latest. `compare/main...<HEAD>` answers `behind` when main has moved
+      # past the tag and `identical` when the tag is main's tip; `ahead` and
+      # `diverged` mean the commit is not in main. The SHA comes from the
+      # checkout — the commit the pack below reads. On a tag push it equals
+      # `$GITHUB_SHA`, which checkout has already matched to the tag ref; the
+      # gate reads it from the tree so the two cannot drift apart.
       - name: the tag commit is on main
         if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          STATUS=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          SHA=$(git rev-parse HEAD)
+          STATUS=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$SHA" --jq .status)
           case "$STATUS" in
-            behind|identical) echo "the tag commit is on main ($STATUS)" ;;
+            behind|identical) echo "the tag commit $SHA is on main ($STATUS)" ;;
             *)
-              echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main ($STATUS)"
+              echo "::error::$GITHUB_REF_NAME points at $SHA, which is not on main ($STATUS)"
               exit 1
               ;;
           esac
@@ -203,7 +206,19 @@ jobs:
       # the content diff could not see it. This also catches a rebuild that
       # changes committed artifact bytes.
       - name: the checkout still matches the tag tree
-        run: git diff --exit-code
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          # `git diff` sees TRACKED files only, and an untracked file inside
+          # `files` would be packed into the tag-tree pack AND the publish, so
+          # the content diff could not see it either. `release-notes.md` is the
+          # only file this run creates before packing.
+          UNTRACKED=$(git ls-files --others --exclude-standard | grep -v '^release-notes\.md$' || true)
+          [ -z "$UNTRACKED" ] || {
+            echo "::error::untracked files would be packed into the release:"
+            echo "$UNTRACKED"
+            exit 1
+          }
 
       # A draft left over from an earlier attempt would make the release step
       # fail AFTER the irreversible publish, leaving a version nobody can
@@ -273,13 +288,13 @@ jobs:
           echo "dry run: not publishing"
           npm publish --dry-run --tag latest
 
-      # Proof that the published artifact IS this tag's tree. Tarball BYTES are
-      # not reproducible across environments (0.4.1's mode ghost; the wrapper
-      # measured an 11-byte difference with identical unpacked contents), so the
-      # gate unpacks both tarballs and diffs CONTENTS. `--prefer-online` defeats
-      # the negative packument the pre-publish `npm view` left behind (registry
-      # cache-control: max-age=300) — the wrapper's first real tag spent its
-      # whole retry window on exactly that cache.
+      # Proof that the published artifact IS this tag's tree. Bytes are not a
+      # safe identity: tar metadata rides in them, so a file MODE in the working
+      # tree (0.4.1's 0600 LICENSE) changes the bytes without changing content.
+      # The gate therefore unpacks both tarballs and diffs CONTENTS.
+      # `--prefer-online` makes each download authoritative instead of trusting
+      # a packument cached before the publish (`cache-control: max-age=300`);
+      # the retry loop below covers ordinary registry propagation.
       - name: the published contents match the tag tree
         if: github.event_name == 'push'
         run: |
@@ -288,7 +303,8 @@ jobs:
           for attempt in $(seq 1 20); do
             rm -rf registry reg-x local-x
             mkdir -p registry reg-x local-x
-            if npm pack "dsh-cherry-bridge@$VERSION" --prefer-online --pack-destination registry >/dev/null 2>&1; then
+            if npm pack "dsh-cherry-bridge@$VERSION" --prefer-online --pack-destination registry >pack.log 2>&1; then
+              rm -f pack.log
               tar -xzf "registry/dsh-cherry-bridge-$VERSION.tgz" -C reg-x
               tar -xzf "$RUNNER_TEMP/tag-tree/dsh-cherry-bridge-$VERSION.tgz" -C local-x
               if ! diff -r local-x/package reg-x/package; then
@@ -302,9 +318,11 @@ jobs:
               exit 0
             fi
             echo "attempt $attempt: tarball not downloadable yet"
+            tail -n 1 pack.log 2>/dev/null || true
             sleep 30
           done
           echo "::error::dsh-cherry-bridge@$VERSION never became downloadable"
+          cat pack.log 2>/dev/null || true
           exit 1
 
       # The release may only announce a version the registry calls latest.
@@ -334,8 +352,10 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
-          # The checkout above already proved the tag exists; `--verify-tag`
-          # depends on a local tag ref that actions/checkout may not leave.
+          # `--verify-tag` checks the REMOTE tag. Without it, a tag deleted
+          # between checkout and this step makes `gh` create a new one from the
+          # default branch, and the release then points at a tree nobody
+          # released.
           if gh release view "v$VERSION" >/dev/null 2>&1; then
             # A draft is someone else's release in progress. Publishing it here
             # would announce text this chain never reviewed, so it is refused
@@ -352,6 +372,7 @@ jobs:
             gh release create "v$VERSION" \
               --title "v$VERSION" \
               --notes-file release-notes.md \
+              --verify-tag \
               --latest
           fi
 

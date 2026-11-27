@@ -186,11 +186,12 @@ runs the gate, publishes to npm, creates the GitHub Release from the
 `CHANGELOG.md` section, and attaches the tarball under the catalog's fixed name.
 The release commit — version bump, both README pins and the CHANGELOG section —
 is still written and reviewed by hand; the tag is where the automation starts.
-**The tag's commit must be on `main`**: the workflow asks
-`compare/main...$GITHUB_SHA` and accepts only `behind` (main has moved on since
-the release merge) or `identical` (the tag IS main's tip); a `v*` on a feature
-branch fails before anything is published. Push the tag to `github`; the GitLab
-mirror does not run Actions.
+**The tag's commit must be on `main`**: the workflow compares the CHECKED-OUT
+commit (`git rev-parse HEAD`, which on a tag push equals `$GITHUB_SHA`) against
+`main` and accepts only `behind` (main has moved on since the release merge) or
+`identical` (the tag IS main's tip); a `v*` on a feature branch fails before
+anything is published. Push the tag to `github`; the GitLab mirror does not run
+Actions.
 
 `workflow_dispatch` is a DRY RUN: the same token preflight, notes, pins and gate,
 then `npm publish --dry-run`; it never publishes or creates a release. Run it on
