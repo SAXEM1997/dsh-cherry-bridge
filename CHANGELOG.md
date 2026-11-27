@@ -18,6 +18,39 @@ wire this plugin uses is identical across the range. Sections written before thi
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.4.3 (2026-11-27)
+
+**中文**
+
+本版只改发布流水线与文档，插件行为未变。发版从「两段手工 dispatch + 网页 2FA 批准」改为推送
+`v*` tag 自动完成；「已发布内容 == tag 树」的证明从比较 registry 自己的 `dist.shasum` 换成解包两
+份 tarball 后 `diff -r`，并补齐只认 E404、tag 必须在 `main`、`--prefer-online`、全局并发、草稿
+Release 拒绝与整树 diff 等门。配置形状、工具族（15 个，另有默认关闭的 `cherry_subagent`）与协议
+pin（`0.8.0` / `0.2.5`）均未变，桌面端兼容范围仍是 **2.1.4 – 2.2.2**；除版本号、README 安装 pin
+与 lockfile 的版本字段外，发布产物与 0.4.2 相同。本版同时是 tag 驱动发布链的第一次实测。
+
+**变更**
+
+- #407 发版改为 tag 驱动：推送 `v*` 后跑门、`npm publish`、建 GitHub Release、挂 tarball、断言 catalog URL 返回 200；`publish.yml` 保留为 staged 应急路径。
+- #409 发布内容改以「解包后内容比对」证明是 tag 树，并补上 E404-only、tag-on-main、`--prefer-online`、全局并发、草稿 Release 拒绝与整树 diff。
+
+**English**
+
+This release changes only the release pipeline and the documentation; plugin behaviour is unchanged.
+Publishing moves from two manual dispatches with a web 2FA approval to a single `v*` tag push, and the
+proof that the published content is the tag's tree moves from comparing the registry's own `dist.shasum`
+to unpacking both tarballs and diffing their contents; it also adds the E404-only rule, the tag-on-main
+gate, `--prefer-online`, global concurrency, the draft refusal and the whole-tree diff. The configuration
+shape, the tool family (15 names, plus the off-by-default `cherry_subagent`) and the protocol pins
+(`0.8.0` / `0.2.5`) are unchanged; the verified desktop range remains **2.1.4 – 2.2.2**. Apart from the
+version number, the two README install pins and the lockfile's version field, the published artifact is
+identical to 0.4.2. This release is also the first real exercise of the tag-driven path.
+
+**Changes**
+
+- #407 Publish from a pushed `v*` tag: gate, `npm publish`, GitHub Release, tarball asset, catalog URL asserted at 200; `publish.yml` stays as the staged fallback.
+- #409 Prove the published content against the tag tree by unpacking and diffing, and add the E404-only rule, the tag-on-main gate, `--prefer-online`, global concurrency, the draft refusal and the whole-tree diff.
+
 ## v0.4.2 (2026-11-18)
 
 **中文**
