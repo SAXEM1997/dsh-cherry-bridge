@@ -14,9 +14,9 @@ import { fileURLToPath } from 'node:url'
  *  - a missing or one-language CHANGELOG section ships an empty or
  *    half-translated release body (npm also serves the README captured in the
  *    tarball, so a pin bumped after publishing is stale forever);
- *  - an already-published version must be skipped, not republished (npm 409);
- *    only a 404 says "not published" — any other `npm view` failure must stop
- *    the run rather than turn into a 409 on the publish;
+ *  - an already-published version must be skipped, not republished; only a 404
+ *    says "not published" — any other `npm view` failure must stop the run
+ *    rather than become a publish that cannot succeed;
  *  - the tag must sit on `main`: a `v*` on a feature branch would publish
  *    unreviewed code;
  *  - the release asset must be the PUBLISHED tarball, under the bare name the
@@ -179,7 +179,9 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // by a script would land in the tag-tree pack AND the publish, so the
     // content diff could not see it. A rebuild that changes committed bytes
     // fails here too.
-    expect(clean).toContain('git diff --exit-code')
+    // Against HEAD, not the index: a build step that `git add`s would pass an
+    // index-relative diff AND leave nothing for the untracked check.
+    expect(clean).toContain('git diff --exit-code HEAD')
     expect(clean, 'the diff is narrowed again').not.toContain(
       'git diff --exit-code -- dist lib',
     )
@@ -219,12 +221,12 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const publish = between(text, 'publish (tag push only)', 'dry run (dispatch only)')
     expect(publish).toContain("if: github.event_name == 'push'")
     // Only a 404 means "not published". A network, 5xx or auth failure that
-    // fell through to `npm publish` would come back as a 409 on an
-    // already-published version — the re-run this step exists for would break.
+    // fell through to `npm publish` would be refused on an already-published
+    // version — the re-run this step exists for would break.
     expect(publish).toContain('set +e')
     // --prefer-online: an edge-cached packument from before the publish would
     // report E404 for a version that IS published, and the publish that
-    // followed would come back 409.
+    // followed would be refused.
     expect(publish).toContain(
       'OUT=$(npm view "dsh-cherry-bridge@$VERSION" version --prefer-online 2>&1)',
     )
@@ -295,9 +297,9 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const text = read(RELEASE)
     // A registry tarball compared with the registry's own shasum proves the
     // download completed — never that the tag's tree is what was published.
-    // Tarball bytes are not reproducible across environments either (0.4.1's
-    // mode ghost, the wrapper's 11-byte difference), so the gate unpacks both
-    // and diffs CONTENTS.
+    // Nor is a sha1 a safe identity: tar metadata rides in the bytes (0.4.1's
+    // mode ghost — one 0600 file whose git mode is 100644), so the gate unpacks
+    // both tarballs and diffs CONTENTS.
     expect(code(text), 'the shasum tautology is back').not.toContain('dist.shasum')
     const pack = between(text, 'pack the tag tree', 'publish (tag push only)')
     expect(pack).toContain('npm pack --pack-destination "$RUNNER_TEMP/tag-tree"')
@@ -398,6 +400,25 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     )
   })
 
+  it('①q the release marked latest is this version, not just a 200 at the URL', () => {
+    // The URL answers 200 from whatever release is latest — including the
+    // PREVIOUS version's asset. A pre-release under this tag cannot become
+    // latest, and every step before this one still passes.
+    const text = read(RELEASE)
+    const step = between(
+      text,
+      'the release marked latest is this version',
+      "the catalog's URL answers 200",
+    )
+    expect(step).toContain('repos/$GITHUB_REPOSITORY/releases/latest')
+    expect(step).toContain('[ "$TAG" = "v$VERSION" ]')
+    expect(step.match(/exit 1/g)?.length, 'a wrong latest pointer must stop the run').toBe(1)
+    // Ordering: after the release exists, before the URL is believed.
+    expect(text.indexOf('create the GitHub Release')).toBeLessThan(
+      text.indexOf('the release marked latest is this version'),
+    )
+  })
+
   it('①l the catalog URL check retries, so propagation delay is not a red release', () => {
     // 0.3.0's attach run failed on a single curl that answered 504 for about
     // three minutes after the upload — the release was complete and correct.
@@ -484,7 +505,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     )
   })
 
-  it('①p a draft release is refused before the publish, not only after it', () => {
+  it('①p the release state is read before the publish, and only 404 is "none"', () => {
     // The late gate alone left a published version whose release could never be
     // created: a draft from an earlier attempt failed the run AFTER the
     // irreversible step. Same refusal, on the cheap side of the publish.
@@ -497,7 +518,21 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // Pin the comparison and the exit together: `= "false"` or a dead `if`
     // would leave the gate unable to fire while the exit count stayed 1.
     expect(gate).toMatch(/\[ "\$DRAFT" = "true" \][\s\S]*?exit 1/)
-    expect(gate.match(/exit 1/g)?.length, 'a draft must stop the run').toBe(1)
+    // A `2>/dev/null || echo none` swallowed every gh failure, so a rate limit
+    // or a token without the write scope surfaced only after the publish. Only
+    // "not found" may read as "no release yet"; anything else stops the run.
+    expect(gate, 'the not-found case is not distinguished').toContain(
+      "elif grep -qi 'not found'",
+    )
+    expect(gate).toContain('gh release view failed')
+    // The assignment itself must not fall back: `|| echo none` makes every
+    // failure look like "no release" and turns the branches below into dead
+    // code while their text stays put.
+    expect(gate).toContain('2>"$RUNNER_TEMP/gh-view.log"); then')
+    expect(gate, 'the read falls back to "none"').not.toContain('|| echo none')
+    expect(gate.match(/exit 1/g)?.length, 'a draft or a failed read must stop the run').toBe(
+      2,
+    )
     expect(text.indexOf('no draft release for this tag')).toBeLessThan(
       text.indexOf('npm publish --tag latest'),
     )

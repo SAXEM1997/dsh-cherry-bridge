@@ -28,10 +28,12 @@
 # release. A real publish always requires a tag, so the release commit stays the
 # only place the version is decided.
 #
-# Re-running is safe. npm rejects a republished version with a 409, so the
-# publish step first asks the registry whether the version is already there and
+# Re-running is safe. npm refuses to overwrite an already-published version, so
+# the publish step first asks the registry whether the version is there and
 # skips if it is — only a 404 means "not published"; any other answer stops the
-# run. The release steps are idempotent (`view`/`edit` or `create`, `upload
+# run, because a network or auth failure read as "not published" would send the
+# job into a publish that can only fail. The release steps are idempotent
+# (`view`/`edit` or `create`, `upload
 # --clobber`), except a DRAFT, which is refused: publishing someone else's
 # in-progress release would announce text this chain never reviewed. That
 # idempotency matters because the failure most likely to need a retry —
@@ -40,14 +42,14 @@
 #
 # "Published" is proved by CONTENT, not by the registry's own hash: the tarball
 # is unpacked beside a pack of this tag's tree and `diff -r`'d. Comparing the
-# download with `dist.shasum` only proves the download completed, and tarball
-# bytes are not reproducible across environments anyway.
+# download with `dist.shasum` only proves the download completed; where bytes do
+# differ, tar metadata (a file MODE) explains it without any content change.
 #
-# `--latest` is explicit rather than left to gh's date-and-version heuristic:
-# `releases/latest/download/dsh-cherry-bridge.tgz` resolves against whichever
-# release is marked latest, so a release created out of order (a backfill, a
-# re-run for an older tag) would silently move that URL onto a release with no
-# asset on it. A backfill is refused BEFORE publishing: the pre-publish
+# `--latest` is explicit rather than left to gh's own latest heuristic, which
+# ranks by the tag's semver: `releases/latest/download/dsh-cherry-bridge.tgz`
+# resolves against the release marked latest, so the pick is stated here and a
+# later step checks the pointer names THIS version. A backfill is refused BEFORE
+# publishing: the pre-publish
 # `dist-tags.latest` check rejects a version older than the registry's latest,
 # because publishing it would move `latest` backwards and the post-publish
 # check would then agree with itself.
@@ -63,7 +65,8 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
-# `contents: write` uploads the release asset. Everything else is read-only.
+# `contents: write` uploads the release asset and reads the compare API.
+# Scopes not listed here are `none`, not read-only.
 permissions:
   contents: write
 
@@ -208,7 +211,9 @@ jobs:
       - name: the checkout still matches the tag tree
         run: |
           set -euo pipefail
-          git diff --exit-code
+          # Against HEAD, not the index: a build step that stages a file would
+          # otherwise pass both this and the untracked check.
+          git diff --exit-code HEAD
           # `git diff` sees TRACKED files only, and an untracked file inside
           # `files` would be packed into the tag-tree pack AND the publish, so
           # the content diff could not see it either. `release-notes.md` is the
@@ -230,12 +235,22 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
-          DRAFT=$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null || echo none)
-          if [ "$DRAFT" = "true" ]; then
-            echo "::error::v$VERSION already has a DRAFT release; publish or delete it by hand, then run this tag again"
+          # Only "not found" means "no release yet". A rate limit or a token
+          # without the write scope must stop the run HERE, not leave the
+          # release step to fail after the irreversible publish.
+          if DRAFT=$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>"$RUNNER_TEMP/gh-view.log"); then
+            if [ "$DRAFT" = "true" ]; then
+              echo "::error::v$VERSION already has a DRAFT release; publish or delete it by hand, then run this tag again"
+              exit 1
+            fi
+            echo "release v$VERSION already exists"
+          elif grep -qi 'not found' "$RUNNER_TEMP/gh-view.log"; then
+            echo "no release for v$VERSION yet"
+          else
+            echo "::error::gh release view failed; refusing to publish without knowing the release state"
+            cat "$RUNNER_TEMP/gh-view.log"
             exit 1
           fi
-          echo "no draft release for v$VERSION ($DRAFT)"
 
       # The pack of THIS tree is the only non-circular reference: comparing a
       # registry tarball with the registry's own `dist.shasum` proves the
@@ -262,9 +277,9 @@ jobs:
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
           # Only a 404 means "not published". Treating any failure that way
-          # would send a network/5xx/auth error into `npm publish`, which npm
-          # answers with a 409 on an already-published version — breaking the
-          # re-run this branch exists for.
+          # would send a network/5xx/auth error into `npm publish`, which can
+          # only fail on an already-published version — breaking the re-run
+          # this branch exists for.
           set +e
           OUT=$(npm view "dsh-cherry-bridge@$VERSION" version --prefer-online 2>&1)
           RC=$?
@@ -387,6 +402,29 @@ jobs:
           # releases/latest/download/dsh-cherry-bridge.tgz — NOT at a name with
           # the version in it.
           gh release upload "v$VERSION" dsh-cherry-bridge.tgz --clobber
+
+      # `releases/latest/download/...` resolves against whichever release is
+      # marked latest, NOT against this tag. A pre-release, or a release gh
+      # declined to promote, leaves that URL on the previous tarball while every
+      # step above stays green — so the pointer is checked before the probe.
+      - name: the release marked latest is this version
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          for attempt in $(seq 1 6); do
+            TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || echo none)
+            if [ "$TAG" = "v$VERSION" ]; then
+              echo "releases/latest is v$VERSION (attempt $attempt)"
+              exit 0
+            fi
+            echo "attempt $attempt: releases/latest is $TAG"
+            sleep 10
+          done
+          echo "::error::releases/latest is $TAG, not v$VERSION — the catalog URL would serve another release"
+          exit 1
 
       # A freshly uploaded asset is not instantly downloadable (0.3.0 answered
       # 504 for about three minutes after the upload), so this is retried — a
