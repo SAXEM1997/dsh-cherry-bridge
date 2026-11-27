@@ -6,7 +6,7 @@ and a one-line-per-tool overview.
 
 THIS file holds the rules that apply wherever you work: the flow, the build
 facts, the release procedure. Each tree's own contracts live beside it, in a
-nested `AGENTS.md` the harness loads when you touch that tree, so ~54 KB of
+nested `AGENTS.md` the harness loads when you touch that tree, so ~70 KB of
 invariants is not paid on every turn. Review verdicts, fix histories and issue
 numbers are **not** migration targets: they are process records, and they stay
 in `docs/superpowers/**` (not published).
@@ -96,6 +96,7 @@ what loads it.
   truncates the tail** past it — observed here: rules at the file's end vanished
   from context. Keep each file **≤ 64,512 bytes** (64 KiB − 1 KiB safety; check
   `wc -c` on it); an addition needs a compensating trim in the same change.
+  `src/AGENTS.md` sits at that cap, so an edit there is a trim-first edit.
 - **Every promise a test starts settles INSIDE the test.** A request or
   `connect()` nobody awaits still holds its caller for `DEFAULT_TIMEOUT_MS` when
   the answer never comes; `void ... .catch(() => {})` hides that, and the next
@@ -275,38 +276,42 @@ clean tree), then approve the printed stage id on npmjs.com → **Staged
 Packages**. `npm stage approve` answers `404 staged version … not found` here
 (every token tried, incl. `--otp`), while `GET /-/stage/<id>` returns 200 — the
 web approval is the one that works. Check `npm view dsh-cherry-bridge dist-tags`
-(an unapproved stage is silent), then run `.github/workflows/publish.yml` with
-`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1 (that
-check only proves the download completed), attaches the bare name, and checks
-the URL.
+(an unapproved stage is silent), then create the GitHub Release for that version
+(body = its CHANGELOG section) and run `.github/workflows/publish.yml` with
+`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1 (that check
+only proves the download completed), attaches the bare name, and checks the URL.
+It refuses while the release is missing, on purpose — it never invents one.
 
 **Failure recovery.** Before `npm publish`: fix the tree, delete and re-push the
 tag — no bytes are out. After `npm publish`, re-run the SAME tag push:
-`gh run rerun <run-id>` (or "Re-run all jobs" on that tag's run). A
-`workflow_dispatch` cannot finish the job — it is a dry run, and every release
-step is gated to a tag push. The publish step skips, the content gate and the
-release steps are idempotent; do not move a tag that already published. If the
-re-run cannot proceed, finish the release by hand (attach the published
-tarball, then check the catalog URL) rather than rebuilding. A backfill of an
-older tag is refused by the pre-publish `dist-tags.latest` guard, so create
-that release manually without `--latest`. A DRAFT release under that tag is
-refused too: publish or delete it by hand, then re-run.
+`gh run rerun <run-id>` (or "Re-run all jobs" on that tag's run). A re-run
+replays the workflow file from the TAG's tree, not from `main`, so a pipeline
+fix merged afterwards does not reach it: a re-run is right for a transient
+failure, and finishing by hand is right for a broken step. A
+`workflow_dispatch` cannot finish the job either — it is a dry run, and every
+release step is gated to a tag push. The publish step skips, the content gate
+and the release steps are idempotent; do not move a tag that already published.
+Finishing by hand means: create the GitHub Release for `v$VERSION` with that
+CHANGELOG section as its body and the bare `dsh-cherry-bridge.tgz` attached,
+then check the catalog URL — `.github/workflows/publish.yml` (`mode=attach`, run
+from `main`) does the attach half and refuses while the release is missing. A
+backfill of an older tag is refused by the pre-publish `dist-tags.latest` guard,
+so create that release manually without `--latest`. A DRAFT release under that
+tag is refused too: publish or delete it by hand, then re-run.
 
 **Retry discipline.** Re-read the published state before retrying (`dist-tags`,
 the asset URL) — the silent failures above look like success from the terminal.
 A retry re-runs the SAME tag: `release.yml` skips an already-published version
 and re-attaches the same tarball. Prove identity by CONTENT, never by sha1 —
 unpack both tarballs and `diff -r` the trees (the workflow does exactly that).
-Tarball bytes are not reproducible across environments, so a sha1 mismatch is
-not evidence that the content differs:
-
-- a file MODE rides in the tar header — 0.4.1's local pack differed from the
-  registry by one `0600` file whose git mode is `100644`, and `chmod 644` made
-  the bytes agree; git tracks only the exec bit, so a clone with a tight umask
-  reproduces that ghost;
-- `npm view` caches the packument for 300 s, so a read taken before publishing
-  can hide the version you just published — the workflow's reads pass
-  `--prefer-online` for that reason.
+A sha1 mismatch is not evidence that the content differs: tar metadata rides in
+the bytes, so 0.4.1's local pack differed from the registry by one `0600` file
+whose git mode is `100644`, and `chmod 644` made them agree (git tracks only the
+exec bit, so a clone with a tight umask reproduces that ghost). The 0.4.3 run
+had identical bytes throughout — the ghost is the exception, not the rule.
+Separately, `npm view` caches the packument for 300 s, so a read taken before
+publishing can hide the version you just published — the post-publish reads and
+the publish-skip read pass `--prefer-online` for that reason.
 
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
 ruling`, `UltraReview` — point at internal SDD process records under
