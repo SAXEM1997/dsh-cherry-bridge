@@ -275,8 +275,9 @@ Packages**. `npm stage approve` answers `404 staged version … not found` here
 (every token tried, incl. `--otp`), while `GET /-/stage/<id>` returns 200 — the
 web approval is the one that works. Check `npm view dsh-cherry-bridge dist-tags`
 (an unapproved stage is silent), then run `.github/workflows/publish.yml` with
-`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1, attaches
-the bare name, and checks the URL.
+`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1 (that
+check only proves the download completed), attaches the bare name, and checks
+the URL.
 
 **Failure recovery.** Before `npm publish`: fix the tree, delete and re-push the
 tag — no bytes are out. After `npm publish`, re-run the SAME tag push:
