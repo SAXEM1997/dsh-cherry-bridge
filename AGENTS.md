@@ -194,8 +194,11 @@ anything is published. Push the tag to `github`; the GitLab mirror does not run
 Actions.
 
 `workflow_dispatch` is a DRY RUN: the same token preflight, notes, pins and gate,
-then `npm publish --dry-run`; it never publishes or creates a release. Run it on
-`main` before the first tag and after any workflow change.
+then `npm publish --dry-run`; it never publishes or creates a release. Its value
+is the shared half — it proves the workflow file parses, the token authenticates
+and every pre-publish gate passes on `main`. It cannot prove the tag-only half:
+the content gate, the release, the asset and the URL probe are all gated to a
+tag push and show as skipped.
 
 The publish step needs `NPM_TOKEN`: a token that can publish with 2FA bypassed
 — a granular token scoped to `dsh-cherry-bridge`, read+write, with **bypass
@@ -259,11 +262,11 @@ three, and guards more than them.**
    `awesome-dsh-plugin/awesome-dsh-plugin`, added 2026-10-18. The market plugin
    (`dshmarket`) reads `https://awesome-dsh-plugin.com/plugins.json`, generated
    from that repository, so a merged entry is what a one-click install resolves
-   to. Two of its fields move on their own and two do not: `version` is NOT in
-   the YAML — `scripts/probe-npm.mjs` records it in `data/npm-map.json` from the
-   packument, so it follows the npm publish; `description.en` / `description.zh`
-   are hand-written, so a release that changes what the plugin IS (a new tool, a
-   new capability) needs a PR there too. 0.3.0 shipped while the catalog still
+   to. The entry has no `version` field: `scripts/probe-npm.mjs` records it in
+   `data/npm-map.json` from the packument, so it follows the npm publish, and
+   `tarball` is the fixed URL; `description.en` / `description.zh` are
+   hand-written, so a release that changes what the plugin IS (a new tool, a new
+   capability) needs a PR there too. 0.3.0 shipped while the catalog still
    said "14 cherry_* tools" until #13557 refreshed it. Edit the UPSTREAM
    repository through a PR: `SAXEM1997/awesome-dsh-plugin` is a stale fork
    (last commit 2026-09-18) and editing it changes nothing a user sees.
