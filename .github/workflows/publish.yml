@@ -1,7 +1,13 @@
-# The release path has three steps that fail SILENTLY when skipped (AGENTS.md
-# → Release): the staged publish plus the web approval, bumping BOTH README
-# install pins BEFORE staging, and re-attaching the tarball to the GitHub
-# release under the version-independent name the plugin catalog probes.
+# FALLBACK, not the release path: `.github/workflows/release.yml` publishes
+# from a pushed `v*` tag. This workflow is for the case where that publish fails
+# with E403 (a token without the 2FA bypass), so the same version goes out
+# through staged publishing plus a web approval. It is also the tool for
+# attaching the published tarball by hand when a tag run died before doing it.
+#
+# The steps that fail SILENTLY when skipped (AGENTS.md → Release) still apply:
+# the staged publish plus the web approval, bumping BOTH README install pins
+# BEFORE staging, and re-attaching the tarball to the GitHub release under the
+# version-independent name the plugin catalog probes.
 #
 # Locally, publishing needs `npx npm@11` because the npm bundled with Node 22
 # has no `stage` command. On a runner we simply pick a Node whose npm has it.
@@ -10,7 +16,9 @@
 #
 #   stage  — gate, then `npm stage publish`; prints the stage id to approve
 #   attach — after approval: download the PUBLISHED tarball, prove it matches
-#            the registry's shasum, attach it as dsh-cherry-bridge.tgz
+#            the registry's shasum, attach it as dsh-cherry-bridge.tgz. It
+#            never creates the Release: create it by hand first (body = the
+#            CHANGELOG section), or this mode refuses.
 #
 # Running `attach` before approving is refused on purpose: an unapproved stage
 # leaves `latest` where it was, silently, and the asset would then advertise a
