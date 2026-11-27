@@ -188,6 +188,8 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // either; `release-notes.md` is this run's own scratch file.
     expect(clean).toContain('git ls-files --others --exclude-standard')
     expect(clean).toContain("grep -v '^release-notes\\.md$'")
+    // Pin the polarity too: `-n` would make the check fail on every clean run.
+    expect(clean).toContain('[ -z "$UNTRACKED" ]')
     expect(clean.match(/exit 1/g)?.length, 'a dirty checkout must stop the run').toBe(1)
     expect(text).toContain('npm ci')
     expect(text.indexOf('npm ci')).toBeLessThan(text.indexOf('npm run prepublishOnly'))
