@@ -187,12 +187,20 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // would be packed into both sides, so the content diff could not see it
     // either; `release-notes.md` is this run's own scratch file.
     expect(clean).toContain('git ls-files --others --exclude-standard')
-    expect(clean).toContain("grep -v '^release-notes\\.md$'")
+    // `|| true` is load-bearing: grep exits 1 on the scratch file that is
+    // always present, and pipefail would abort every clean run.
+    expect(clean).toContain("grep -v '^release-notes\\.md$' || true")
     // Pin the polarity too: `-n` would make the check fail on every clean run.
     expect(clean).toContain('[ -z "$UNTRACKED" ]')
     expect(clean.match(/exit 1/g)?.length, 'a dirty checkout must stop the run').toBe(1)
     expect(text).toContain('npm ci')
     expect(text.indexOf('npm ci')).toBeLessThan(text.indexOf('npm run prepublishOnly'))
+    // The check must follow the gate: both builds run inside `prepublishOnly`,
+    // and a script that rewrites a packed file AFTER a check placed earlier
+    // would still be packed.
+    expect(text.indexOf('npm run prepublishOnly')).toBeLessThan(
+      text.indexOf('git diff --exit-code'),
+    )
     for (const beforePublish of [
       'npm run prepublishOnly',
       'git diff --exit-code',
@@ -320,6 +328,9 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // The attempts' cause must be visible: npm's own stderr is captured rather
     // than discarded, and the exhausted loop prints it.
     expect(verify).toContain('>pack.log 2>&1')
+    // Each attempt overwrites pack.log, so the per-attempt tail is the only
+    // record of why THAT attempt failed.
+    expect(verify).toContain('tail -n 1 pack.log')
     expect(verify).toMatch(/never became downloadable[\s\S]*?cat pack\.log/)
     // Reading a PUBLIC tarball needs no publish token; handing it to `npm
     // pack` only widens what a compromised dependency script could read.
@@ -353,7 +364,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(text).toContain('--notes-file release-notes.md')
     // Anchor to the create command: the header comment mentions `--latest`
     // too, so a bare `toContain` would survive deleting the flag.
-    expect(text).toMatch(/gh release create[\s\S]*?--latest/)
+    expect(code(text)).toMatch(/gh release create[\s\S]*?--latest/)
     // The upload line is what the catalog URL resolves to; a versioned name
     // there 404s every catalog user (0.1.5 shipped exactly this way).
     const upload = /^.*gh release upload.*$/m.exec(text)?.[0] ?? ''
@@ -370,8 +381,9 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(release).toContain('[ "$DRAFT" = "true" ]')
     expect(release).toMatch(/DRAFT\" = \"true\"[\s\S]*?exit 1/)
     // Without `--verify-tag`, gh CREATES a missing tag from the default
-    // branch — a release would point at a tree nobody released.
-    expect(release).toMatch(/gh release create[\s\S]*?--verify-tag/)
+    // branch — a release would point at a tree nobody released. Matched on the
+    // CODE projection so a commented-out flag cannot satisfy it.
+    expect(code(release)).toMatch(/gh release create[\s\S]*?--verify-tag/)
     // An existing release is refreshed, never left with stale notes.
     expect(release).toContain(
       'gh release edit "v$VERSION" --notes-file release-notes.md --latest',
@@ -456,8 +468,8 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(step, 'the tag-on-main step is not gated to a tag push').toMatch(
       /^\s*if: github\.event_name == 'push'$/m,
     )
-    // The CHECKED-OUT commit, not `$GITHUB_SHA`: on a dispatch the latter is
-    // main's tip, so `compare/main...main` would always answer `identical`.
+    // The CHECKED-OUT commit: on a tag push it equals `$GITHUB_SHA`, but it
+    // names the tree the pack reads instead of the ref GitHub reports.
     expect(step).toContain('SHA=$(git rev-parse HEAD)')
     expect(step).toContain('gh api "repos/$GITHUB_REPOSITORY/compare/main...$SHA"')
     expect(code(step), 'the gate reads the ref GitHub chose, not the checkout').not.toContain(

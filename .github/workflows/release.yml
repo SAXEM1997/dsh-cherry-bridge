@@ -122,8 +122,9 @@ jobs:
       # latest. `compare/main...<HEAD>` answers `behind` when main has moved
       # past the tag and `identical` when the tag is main's tip; `ahead` and
       # `diverged` mean the commit is not in main. The SHA comes from the
-      # CHECKOUT, not `$GITHUB_SHA`: a dispatch reports main's tip there, which
-      # would make this gate compare main against itself.
+      # checkout — the commit the pack below reads. On a tag push it equals
+      # `$GITHUB_SHA`, which checkout has already matched to the tag ref; the
+      # gate reads it from the tree so the two cannot drift apart.
       - name: the tag commit is on main
         if: github.event_name == 'push'
         env:
