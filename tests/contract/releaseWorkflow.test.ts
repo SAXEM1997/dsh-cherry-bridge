@@ -167,25 +167,39 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(pins.match(/exit 1/g)?.length, 'both pin forms must stop the run').toBe(2)
   })
 
-  it('①g the gate runs prepublishOnly and the whole-tree diff before publishing', () => {
+  it('①g the gate runs prepublishOnly, then refuses a dirty checkout', () => {
     const text = read(RELEASE)
     expect(text).toContain('npm run prepublishOnly')
+    const clean = between(
+      text,
+      'the checkout still matches the tag tree',
+      'no draft release for this tag',
+    )
     // The WHOLE tree, not `-- dist lib`: a tracked file under `files` rewritten
     // by a script would land in the tag-tree pack AND the publish, so the
     // content diff could not see it. A rebuild that changes committed bytes
     // fails here too.
-    expect(text).toContain('run: git diff --exit-code')
-    expect(text, 'the diff is narrowed again').not.toContain(
+    expect(clean).toContain('git diff --exit-code')
+    expect(clean, 'the diff is narrowed again').not.toContain(
       'git diff --exit-code -- dist lib',
     )
+    // `git diff` sees TRACKED files only. An untracked file inside `files`
+    // would be packed into both sides, so the content diff could not see it
+    // either; `release-notes.md` is this run's own scratch file.
+    expect(clean).toContain('git ls-files --others --exclude-standard')
+    expect(clean).toContain("grep -v '^release-notes\\.md$'")
+    expect(clean.match(/exit 1/g)?.length, 'a dirty checkout must stop the run').toBe(1)
     expect(text).toContain('npm ci')
     expect(text.indexOf('npm ci')).toBeLessThan(text.indexOf('npm run prepublishOnly'))
-    expect(text.indexOf('npm run prepublishOnly')).toBeLessThan(
-      text.indexOf('npm publish --tag latest'),
-    )
-    expect(text.indexOf('run: git diff --exit-code')).toBeLessThan(
-      text.indexOf('npm publish --tag latest'),
-    )
+    for (const beforePublish of [
+      'npm run prepublishOnly',
+      'git diff --exit-code',
+      'git ls-files --others',
+    ]) {
+      expect(text.indexOf(beforePublish)).toBeLessThan(
+        text.indexOf('npm publish --tag latest'),
+      )
+    }
   })
 
   it('①h publishing is idempotent, names latest, and has a dry-run door', () => {
@@ -235,7 +249,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const backfill = between(
       text,
       'a backfill must not move latest backwards',
-      'no draft release for this tag',
+      'the checkout still matches the tag tree',
     )
     expect(backfill).toContain('case "$VERSION" in')
     expect(backfill).toContain('*-*')
@@ -301,6 +315,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // wrapper's first real tag went red waiting on exactly that cache.
     expect(verify).toContain('--prefer-online')
     expect(verify).toContain('for attempt in $(seq 1 20)')
+    // The attempts' cause must be visible: npm's own stderr is captured rather
+    // than discarded, and the exhausted loop prints it.
+    expect(verify).toContain('>pack.log 2>&1')
+    expect(verify).toMatch(/never became downloadable[\s\S]*?cat pack\.log/)
     // Reading a PUBLIC tarball needs no publish token; handing it to `npm
     // pack` only widens what a compromised dependency script could read.
     expect(verify, 'the publish token is exposed to a public download').not.toContain(
@@ -349,6 +367,9 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(release).toContain('--json isDraft')
     expect(release).toContain('[ "$DRAFT" = "true" ]')
     expect(release).toMatch(/DRAFT\" = \"true\"[\s\S]*?exit 1/)
+    // Without `--verify-tag`, gh CREATES a missing tag from the default
+    // branch — a release would point at a tree nobody released.
+    expect(release).toMatch(/gh release create[\s\S]*?--verify-tag/)
     // An existing release is refreshed, never left with stale notes.
     expect(release).toContain(
       'gh release edit "v$VERSION" --notes-file release-notes.md --latest',
@@ -433,7 +454,13 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(step, 'the tag-on-main step is not gated to a tag push').toMatch(
       /^\s*if: github\.event_name == 'push'$/m,
     )
-    expect(step).toContain('gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA"')
+    // The CHECKED-OUT commit, not `$GITHUB_SHA`: on a dispatch the latter is
+    // main's tip, so `compare/main...main` would always answer `identical`.
+    expect(step).toContain('SHA=$(git rev-parse HEAD)')
+    expect(step).toContain('gh api "repos/$GITHUB_REPOSITORY/compare/main...$SHA"')
+    expect(code(step), 'the gate reads the ref GitHub chose, not the checkout').not.toContain(
+      '$GITHUB_SHA',
+    )
     expect(step).toContain('--jq .status')
     expect(step).toMatch(/behind\|identical\)/)
     expect(step.match(/exit 1/g)?.length, 'a tag off main must stop the run').toBe(1)
