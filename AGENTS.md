@@ -64,7 +64,7 @@ what loads it.
   `artifactFreshness` is the exception: it matters when source comments or
   build config changed.
 - **`npm run test:fast` is the daily lane, `npm test` is the gate.** The fast
-  lane runs `tests/unit` + `tests/contract` — 45 files, 793 tests, ~30 s — and
+  lane runs `tests/unit` + `tests/contract` — 45 files, 795 tests, ~30 s — and
   covers pure logic, every contract invariant, and `artifactFreshness`. It does
   NOT cover `tests/integration` (30 files, ~700 tests, ~120 s), which is where
   sockets, timers and the loopback peer live; a change that touches
@@ -180,12 +180,16 @@ their keys (there is a contract assertion for exactly that).
 
 ## Release
 
-**Primary path: push a `v*` tag.** [`.github/workflows/release.yml`](.github/workflows/release.yml)
+**Primary path: push a `v*` tag on `main`.** [`.github/workflows/release.yml`](.github/workflows/release.yml)
 runs the gate, publishes to npm, creates the GitHub Release from the
 `CHANGELOG.md` section, and attaches the tarball under the catalog's fixed name.
 The release commit — version bump, both README pins and the CHANGELOG section —
 is still written and reviewed by hand; the tag is where the automation starts.
-Push the tag to `github`; the GitLab mirror does not run Actions.
+**The tag's commit must be on `main`**: the workflow asks
+`compare/main...$GITHUB_SHA` and accepts only `behind` (main has moved on since
+the release merge) or `identical` (the tag IS main's tip); a `v*` on a feature
+branch fails before anything is published. Push the tag to `github`; the GitLab
+mirror does not run Actions.
 
 `workflow_dispatch` is a DRY RUN: the same token preflight, notes, pins and gate,
 then `npm publish --dry-run`; it never publishes or creates a release. Run it on
@@ -229,7 +233,8 @@ checks is all three:
 | GitHub release asset | `releases/latest/download/dsh-cherry-bridge.tgz` | the same tarball, renamed, attached by `release.yml` (3) |
 | plugin catalog | that fixed URL, probed nightly at 02:23 UTC | nothing per version for `version`; a hand-written `description` needs a PR |
 
-**Three release steps fail silently when skipped — `release.yml` checks all three.**
+**Three release steps leave no trace when skipped — `release.yml` checks all
+three, and guards more than them.**
 
 1. **The tag and `package.json` disagree.** npm publishes the version in
    `package.json` while the tag and the release announce another; the workflow
@@ -243,10 +248,11 @@ checks is all three:
    (`awesome-dsh-plugin`, `data/plugins/<owner>__<repo>.yml`) points at
    `releases/latest/download/dsh-cherry-bridge.tgz`, so **every** release must
    attach the tarball under exactly that name (not
-   `dsh-cherry-bridge-X.Y.Z.tgz`). The workflow attaches the bare name, compares
-   the published tarball's sha1 with `dist.shasum`, and retries the URL to 200:
-   without the asset the download URL 404s for every catalog user (0.1.5 did
-   exactly that).
+   `dsh-cherry-bridge-X.Y.Z.tgz`). The workflow first PROVES the published
+   artifact is this tag's tree — it packs the tree, unpacks the published
+   tarball beside it and `diff -r`s the contents — then attaches the bare name
+   and retries the URL to 200: without the asset the download URL 404s for every
+   catalog user (0.1.5 did exactly that).
    **The entry exists** — `data/plugins/SAXEM1997__dsh-cherry-bridge.yml` in
    `awesome-dsh-plugin/awesome-dsh-plugin`, added 2026-10-18. The market plugin
    (`dshmarket`) reads `https://awesome-dsh-plugin.com/plugins.json`, generated
@@ -270,34 +276,37 @@ Packages**. `npm stage approve` answers `404 staged version … not found` here
 (every token tried, incl. `--otp`), while `GET /-/stage/<id>` returns 200 — the
 web approval is the one that works. Check `npm view dsh-cherry-bridge dist-tags`
 (an unapproved stage is silent), then run `.github/workflows/publish.yml` with
-`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1, attaches
-the bare name, and checks the URL.
+`mode=attach`: it downloads the PUBLISHED tarball, verifies its sha1 (that
+check only proves the download completed), attaches the bare name, and checks
+the URL.
 
 **Failure recovery.** Before `npm publish`: fix the tree, delete and re-push the
-tag — no bytes are out. After `npm publish`: re-run the workflow (the publish
-step skips, the release steps are idempotent) or finish the release by hand; do
-not move a tag that already published. A backfill of an older tag is refused
-by the pre-publish `dist-tags.latest` guard, so create that release manually
-without `--latest`.
+tag — no bytes are out. After `npm publish`, re-run the SAME tag push:
+`gh run rerun <run-id>` (or "Re-run all jobs" on that tag's run). A
+`workflow_dispatch` cannot finish the job — it is a dry run, and every release
+step is gated to a tag push. The publish step skips, the content gate and the
+release steps are idempotent; do not move a tag that already published. If the
+re-run cannot proceed, finish the release by hand (attach the published
+tarball, then check the catalog URL) rather than rebuilding. A backfill of an
+older tag is refused by the pre-publish `dist-tags.latest` guard, so create
+that release manually without `--latest`. A DRAFT release under that tag is
+refused too: publish or delete it by hand, then re-run.
 
 **Retry discipline.** Re-read the published state before retrying (`dist-tags`,
 the asset URL) — the silent failures above look like success from the terminal.
 A retry re-runs the SAME tag: `release.yml` skips an already-published version
-and re-attaches the same tarball; compare shas (`npm pack --dry-run` against the
-registry's `dist.shasum`) and stop on a mismatch, rather than rebuilding and
-publishing different bytes under a tag that is already out.
+and re-attaches the same tarball. Prove identity by CONTENT, never by sha1 —
+unpack both tarballs and `diff -r` the trees (the workflow does exactly that).
+Tarball bytes are not reproducible across environments, so a sha1 mismatch is
+not evidence that the content differs:
 
-That comparison is meaningful only because
-`repository.url` in `package.json` holds npm's NORMALISED form
-(`git+https://….git`): npm rewrites the browsable form while packing, which is
-how 0.4.0's local sha1 and registry shasum diverged (#377).
-
-A mismatch is not proof the CONTENT differs. Compare the two tarballs' entry
-listings before believing it — `diff <(tar tzvf local.tgz) <(tar tzvf
-published.tgz)` — because a file MODE rides in the tar header: 0.4.1's local
-pack differed from the registry by one `0600` file whose git mode is `100644`,
-and `chmod 644` made the shasums agree byte for byte. Git tracks only the
-exec bit, so a clone with a tight umask can reproduce the same ghost.
+- a file MODE rides in the tar header — 0.4.1's local pack differed from the
+  registry by one `0600` file whose git mode is `100644`, and `chmod 644` made
+  the bytes agree; git tracks only the exec bit, so a clone with a tight umask
+  reproduces that ghost;
+- `npm view` caches the packument for 300 s, so a read taken before publishing
+  can hide the version you just published — the workflow's reads pass
+  `--prefer-online` for that reason.
 
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
 ruling`, `UltraReview` — point at internal SDD process records under

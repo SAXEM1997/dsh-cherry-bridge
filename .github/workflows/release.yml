@@ -1,17 +1,18 @@
 # Tag-driven release: gate → npm publish → GitHub Release.
 #
 # Pushing `vX.Y.Z` is the whole trigger. The tag must name the version in
-# `package.json`, and the CHANGELOG section for that version must exist — that
-# section IS the release body, so the notes are reviewable in the repository
-# instead of being typed into a web form after the fact.
+# `package.json`, its commit must be on `main` (a `v*` on a feature branch
+# would publish unreviewed code), and the CHANGELOG section for that version
+# must exist — that section IS the release body, so the notes are reviewable in
+# the repository instead of being typed into a web form after the fact.
 #
 # WHY THE ORDER IS gate → publish → release, and not the reverse: a GitHub
 # Release announces an installable version. Creating it first means the release
 # page can point at a tarball npm has not accepted yet (or rejected outright),
 # which is the one failure a reader cannot see.
 #
-# THREE STEPS FAIL SILENTLY WHEN SKIPPED (the same list AGENTS.md keeps, and
-# the reason each check below exists):
+# THREE STEPS FAIL SILENTLY WHEN SKIPPED (the same list AGENTS.md keeps). The
+# other checks below fail the run visibly instead of leaving a trace:
 #
 #   1. The tag and `package.json` disagree. `npm publish` then publishes the
 #      version in `package.json` while the tag and the release announce another.
@@ -29,9 +30,18 @@
 #
 # Re-running is safe. npm rejects a republished version with a 409, so the
 # publish step first asks the registry whether the version is already there and
-# skips if it is; the release steps are idempotent (`view || create`, `upload
-# --clobber`). That matters because the failure most likely to need a retry —
-# registry propagation — happens AFTER the irreversible step.
+# skips if it is — only a 404 means "not published"; any other answer stops the
+# run. The release steps are idempotent (`view`/`edit` or `create`, `upload
+# --clobber`), except a DRAFT, which is refused: publishing someone else's
+# in-progress release would announce text this chain never reviewed. That
+# idempotency matters because the failure most likely to need a retry —
+# registry propagation — happens AFTER the irreversible step, and the
+# `--prefer-online` reads below are what make the retry see the new version.
+#
+# "Published" is proved by CONTENT, not by the registry's own hash: the tarball
+# is unpacked beside a pack of this tag's tree and `diff -r`'d. Comparing the
+# download with `dist.shasum` only proves the download completed, and tarball
+# bytes are not reproducible across environments anyway.
 #
 # `--latest` is explicit rather than left to gh's date-and-version heuristic:
 # `releases/latest/download/dsh-cherry-bridge.tgz` resolves against whichever
@@ -57,10 +67,13 @@ on:
 permissions:
   contents: write
 
-# A re-run of the same tag must not race a second publish; different tags are
-# independent releases.
+# GLOBAL, not per-ref: two releases can race the backfill read (read-then-act)
+# and the `--latest` move, and a re-run must never overlap its own tag's run.
+# The cost is GitHub's queue rule: a third run joining the group replaces the
+# PENDING one, so a burst of tags can leave the middle tag unrun — visible as
+# no publish and no release for it, and fixed by re-running that tag.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -68,7 +81,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      # The checkout token is not persisted: `contents: write` would otherwise
+      # sit in `.git/config` while `npm ci` scripts and the full suite run.
+      # Every step that needs the API passes GH_TOKEN instead.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -99,6 +117,26 @@ jobs:
           else
             echo "dry run: manifest version $VERSION (a dispatch has no tag to compare)"
           fi
+
+      # A `v*` on a feature-branch tip would publish unreviewed code and mark it
+      # latest. `compare/main...<tag commit>` answers `behind` once main has
+      # taken the release merge (the normal case — measured on v0.4.2) and
+      # `identical` when the tag is main's tip; `ahead`/`diverged` mean the
+      # commit is not in main.
+      - name: the tag commit is on main
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          STATUS=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          case "$STATUS" in
+            behind|identical) echo "the tag commit is on main ($STATUS)" ;;
+            *)
+              echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main ($STATUS)"
+              exit 1
+              ;;
+          esac
 
       - name: the release notes for this version exist
         run: |
@@ -160,8 +198,43 @@ jobs:
       # means no step here depends on `publish` forwarding flags.
       - run: npm run prepublishOnly
 
-      - name: committed artifacts match this source
-        run: git diff --exit-code -- dist lib
+      # The WHOLE tree, not just `dist lib`: a tracked file under `files` that a
+      # script rewrote would land in the tag-tree pack AND in the publish, so
+      # the content diff could not see it. This also catches a rebuild that
+      # changes committed artifact bytes.
+      - name: the checkout still matches the tag tree
+        run: git diff --exit-code
+
+      # A draft left over from an earlier attempt would make the release step
+      # fail AFTER the irreversible publish, leaving a version nobody can
+      # install through the catalog URL. Refuse before publishing.
+      - name: no draft release for this tag
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          DRAFT=$(gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null || echo none)
+          if [ "$DRAFT" = "true" ]; then
+            echo "::error::v$VERSION already has a DRAFT release; publish or delete it by hand, then run this tag again"
+            exit 1
+          fi
+          echo "no draft release for v$VERSION ($DRAFT)"
+
+      # The pack of THIS tree is the only non-circular reference: comparing a
+      # registry tarball with the registry's own `dist.shasum` proves the
+      # download completed, never that the tag's tree was what got published.
+      # Packed OUTSIDE the repo on purpose: nothing the gate creates can reach
+      # the packed tree, whatever `files` happens to whitelist.
+      - name: pack the tag tree (tag push only)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir -p "$RUNNER_TEMP/tag-tree"
+          npm pack --pack-destination "$RUNNER_TEMP/tag-tree"
+          echo "tag tree: $RUNNER_TEMP/tag-tree/dsh-cherry-bridge-$VERSION.tgz"
 
       # Two steps, not one shell branch: a dispatch must not be one deleted
       # `exit 0` away from publishing for real. The tag step is the only one
@@ -173,10 +246,22 @@ jobs:
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
-          if npm view "dsh-cherry-bridge@$VERSION" version >/dev/null 2>&1; then
+          # Only a 404 means "not published". Treating any failure that way
+          # would send a network/5xx/auth error into `npm publish`, which npm
+          # answers with a 409 on an already-published version — breaking the
+          # re-run this branch exists for.
+          set +e
+          OUT=$(npm view "dsh-cherry-bridge@$VERSION" version --prefer-online 2>&1)
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ]; then
             echo "dsh-cherry-bridge@$VERSION is already published; skipping (re-run path)"
-          else
+          elif printf '%s' "$OUT" | grep -qE 'E404|404 Not Found'; then
             npm publish --tag latest
+          else
+            echo "::error::npm view failed for a reason other than E404; refusing to publish"
+            printf '%s\n' "$OUT" >&2
+            exit 1
           fi
 
       - name: dry run (dispatch only)
@@ -188,27 +273,33 @@ jobs:
           echo "dry run: not publishing"
           npm publish --dry-run --tag latest
 
-      # Registry metadata can be visible minutes before the tarball is
-      # downloadable, so `npm pack` is retried rather than trusted once. Taking
-      # the PUBLISHED bytes and comparing the registry's own shasum is what
-      # makes the asset provably the artefact users install — a rebuild would
-      # only be a hope that the tarball is reproducible.
-      - name: take the published tarball, byte for byte
+      # Proof that the published artifact IS this tag's tree. Tarball BYTES are
+      # not reproducible across environments (0.4.1's mode ghost; the wrapper
+      # measured an 11-byte difference with identical unpacked contents), so the
+      # gate unpacks both tarballs and diffs CONTENTS. `--prefer-online` defeats
+      # the negative packument the pre-publish `npm view` left behind (registry
+      # cache-control: max-age=300) — the wrapper's first real tag spent its
+      # whole retry window on exactly that cache.
+      - name: the published contents match the tag tree
         if: github.event_name == 'push'
         run: |
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
-          for attempt in $(seq 1 12); do
-            if npm pack "dsh-cherry-bridge@$VERSION" >/dev/null 2>&1; then
-              EXPECTED=$(npm view "dsh-cherry-bridge@$VERSION" dist.shasum)
-              ACTUAL=$(sha1sum "dsh-cherry-bridge-$VERSION.tgz" | cut -d' ' -f1)
-              if [ "$ACTUAL" = "$EXPECTED" ]; then
-                echo "sha1 $ACTUAL matches the registry"
-                cp "dsh-cherry-bridge-$VERSION.tgz" dsh-cherry-bridge.tgz
-                exit 0
+          for attempt in $(seq 1 20); do
+            rm -rf registry reg-x local-x
+            mkdir -p registry reg-x local-x
+            if npm pack "dsh-cherry-bridge@$VERSION" --prefer-online --pack-destination registry >/dev/null 2>&1; then
+              tar -xzf "registry/dsh-cherry-bridge-$VERSION.tgz" -C reg-x
+              tar -xzf "$RUNNER_TEMP/tag-tree/dsh-cherry-bridge-$VERSION.tgz" -C local-x
+              if ! diff -r local-x/package reg-x/package; then
+                echo "::error::the published contents differ from the tag tree"
+                exit 1
               fi
-              echo "::error::sha1 $ACTUAL != registry $EXPECTED"
-              exit 1
+              echo "contents match ($(find reg-x/package -type f | wc -l) files)"
+              # The asset is the published tarball itself, copied only after its
+              # contents proved equal — a rebuild would be a hope, not evidence.
+              cp "registry/dsh-cherry-bridge-$VERSION.tgz" dsh-cherry-bridge.tgz
+              exit 0
             fi
             echo "attempt $attempt: tarball not downloadable yet"
             sleep 30
@@ -225,7 +316,7 @@ jobs:
           set -euo pipefail
           VERSION=$(node -p "require('./package.json').version")
           for attempt in $(seq 1 6); do
-            LATEST=$(npm view dsh-cherry-bridge dist-tags.latest)
+            LATEST=$(npm view dsh-cherry-bridge dist-tags.latest --prefer-online)
             if [ "$LATEST" = "$VERSION" ]; then
               echo "dist-tags.latest is $VERSION (attempt $attempt)"
               exit 0
@@ -245,11 +336,24 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           # The checkout above already proved the tag exists; `--verify-tag`
           # depends on a local tag ref that actions/checkout may not leave.
-          gh release view "v$VERSION" >/dev/null 2>&1 \
-            || gh release create "v$VERSION" \
-                 --title "v$VERSION" \
-                 --notes-file release-notes.md \
-                 --latest
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            # A draft is someone else's release in progress. Publishing it here
+            # would announce text this chain never reviewed, so it is refused
+            # rather than adopted: the tag chain owns the release lifecycle.
+            DRAFT=$(gh release view "v$VERSION" --json isDraft --jq .isDraft)
+            if [ "$DRAFT" = "true" ]; then
+              echo "::error::v$VERSION exists as a DRAFT; publish or delete it by hand, then re-run"
+              exit 1
+            fi
+            # A re-run of a published release refreshes its notes and keeps it
+            # latest; `view || create` alone would leave stale text in place.
+            gh release edit "v$VERSION" --notes-file release-notes.md --latest
+          else
+            gh release create "v$VERSION" \
+              --title "v$VERSION" \
+              --notes-file release-notes.md \
+              --latest
+          fi
 
       - name: attach the version-independent tarball name
         if: github.event_name == 'push'
