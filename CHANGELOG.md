@@ -18,6 +18,51 @@ wire this plugin uses is identical across the range. Sections written before thi
 convention do not carry the line; both READMEs state the same range for readers
 who never open this file.
 
+## v0.4.4 (2026-11-27)
+
+**中文**
+
+本版只改发布流水线与其文档，插件行为未变。较 0.4.3，发布链补上了三处此前只靠静态断言的门：
+`releases/latest` 必须指向本次版本（否则 catalog URL 会从上一个版本的 asset 拿到 200）、脏树检查
+改比 `HEAD`（原先比索引，脚本 `git add` 过的改动会同时躲过它和未跟踪检查）、`gh release create` 加上
+`--verify-tag`（tag 缺失时 `gh` 会从默认分支新建一个）；另加未跟踪文件拒绝、draft 预检只把
+「not found」当作「还没有 release」、保留 `npm pack` 的 stderr。同时修正 0.4.3 发布说明里关于 lockfile
+的错误句子，以及仓库中与事实不符的几处说法（重复发布是被拒绝的、不是可覆盖的冲突；未列出的
+`permissions` scope 是 `none` 而非只读）。配置形状、工具族（15 个，另有默认关闭的 `cherry_subagent`）与协议 pin
+（`0.8.0` / `0.2.5`）均未变，桌面端兼容范围仍是 **2.1.4 – 2.2.2**；除版本号与两份 README 的安装 pin
+外，发布产物与 0.4.3 相同。这些门在上一次 tag 运行之后合并，本版起随每一次发布执行。
+
+**变更**
+
+- #412 修正 0.4.3 发布说明中的 lockfile 说法与被撤回的「字节不可复现」，`publish.yml` 明确为 staged 应急路径，应急流程补上手工创建 Release 一步。
+- #413 发布尾段加固：`gh release create --verify-tag`、tag-on-main 比 checkout 的提交、脏树检查拒绝未跟踪文件，`npm pack` 的 stderr 保留到 `pack.log`。
+- #414 第二次通读：`releases/latest` 必须指向本版本后才相信 catalog URL，脏树检查改比 `HEAD`，draft 预检只认 not found，并修正四处与实测不符的说法。
+- #415 AGENTS 的快车道计数改为 45 文件 / 796 测试。
+
+**English**
+
+This release changes only the release pipeline and its documentation; plugin behaviour is unchanged.
+Since 0.4.3 the chain closes three gates that until now existed only as static assertions:
+`releases/latest` must name this version (otherwise the catalog URL answers 200 from the previous
+version's asset), the clean-tree check compares with `HEAD` instead of the index (a file a script
+`git add`s used to pass both it and the untracked check), and `gh release create` runs with
+`--verify-tag` (`gh` otherwise creates a missing tag from the default branch); it also refuses
+untracked files, reads "not found" as the only "no release yet" answer, and keeps `npm pack`'s
+stderr. It also corrects the lockfile sentence in 0.4.3's notes and the claims in this repository that
+did not match the tooling (a republish is refused, not a conflict that can be ignored; unlisted
+`permissions` scopes are `none`, not read-only). The configuration shape, the tool family (15 names, plus the off-by-default
+`cherry_subagent`) and the protocol pins (`0.8.0` / `0.2.5`) are unchanged; the verified desktop range
+remains **2.1.4 – 2.2.2**. Apart from the version number and the two README install pins, the published
+artifact is identical to 0.4.3. These gates were merged after the last tag run; every release from this
+version on runs them.
+
+**Changes**
+
+- #412 Correct the lockfile claim in 0.4.3's notes and the retracted "bytes are not reproducible" story, mark `publish.yml` as the staged fallback, and document the manual Release creation in the recovery path.
+- #413 Harden the release tail: `gh release create --verify-tag`, tag-on-main against the checked-out commit, untracked files refused by the clean-tree check, and `npm pack`'s stderr kept in `pack.log`.
+- #414 Second read-through: assert `releases/latest` names this version before trusting the catalog URL, compare the clean tree with `HEAD`, read only "not found" as "no release yet", and correct four claims that did not match the run.
+- #415 AGENTS fast-lane count is 45 files / 796 tests.
+
 ## v0.4.3 (2026-11-27)
 
 **中文**
