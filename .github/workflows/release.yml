@@ -11,8 +11,8 @@
 # page can point at a tarball npm has not accepted yet (or rejected outright),
 # which is the one failure a reader cannot see.
 #
-# THREE STEPS FAIL SILENTLY WHEN SKIPPED (the same list AGENTS.md keeps, and
-# the reason each check below exists):
+# THREE STEPS FAIL SILENTLY WHEN SKIPPED (the same list AGENTS.md keeps). The
+# other checks below fail the run visibly instead of leaving a trace:
 #
 #   1. The tag and `package.json` disagree. `npm publish` then publishes the
 #      version in `package.json` while the tag and the release announce another.
@@ -201,7 +201,7 @@ jobs:
       # The WHOLE tree, not just `dist lib`: a tracked file under `files` that a
       # script rewrote would land in the tag-tree pack AND in the publish, so
       # the content diff could not see it. This also catches a rebuild that
-      # changes committed artifact bytes, and a file-MODE drift (0.4.1's 0600).
+      # changes committed artifact bytes.
       - name: the checkout still matches the tag tree
         run: git diff --exit-code
 
@@ -225,8 +225,8 @@ jobs:
       # The pack of THIS tree is the only non-circular reference: comparing a
       # registry tarball with the registry's own `dist.shasum` proves the
       # download completed, never that the tag's tree was what got published.
-      # Packed OUTSIDE the repo on purpose — a tarball in the tree would be
-      # repacked into the very tarball that publishes.
+      # Packed OUTSIDE the repo on purpose: nothing the gate creates can reach
+      # the packed tree, whatever `files` happens to whitelist.
       - name: pack the tag tree (tag push only)
         if: github.event_name == 'push'
         run: |

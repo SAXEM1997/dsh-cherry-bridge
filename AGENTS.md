@@ -64,7 +64,7 @@ what loads it.
   `artifactFreshness` is the exception: it matters when source comments or
   build config changed.
 - **`npm run test:fast` is the daily lane, `npm test` is the gate.** The fast
-  lane runs `tests/unit` + `tests/contract` — 45 files, 794 tests, ~30 s — and
+  lane runs `tests/unit` + `tests/contract` — 45 files, 795 tests, ~30 s — and
   covers pure logic, every contract invariant, and `artifactFreshness`. It does
   NOT cover `tests/integration` (30 files, ~700 tests, ~120 s), which is where
   sockets, timers and the loopback peer live; a change that touches
@@ -233,7 +233,8 @@ checks is all three:
 | GitHub release asset | `releases/latest/download/dsh-cherry-bridge.tgz` | the same tarball, renamed, attached by `release.yml` (3) |
 | plugin catalog | that fixed URL, probed nightly at 02:23 UTC | nothing per version for `version`; a hand-written `description` needs a PR |
 
-**Three release steps fail silently when skipped — `release.yml` checks all three.**
+**Three release steps leave no trace when skipped — `release.yml` checks all
+three, and guards more than them.**
 
 1. **The tag and `package.json` disagree.** npm publishes the version in
    `package.json` while the tag and the release announce another; the workflow
@@ -304,12 +305,8 @@ not evidence that the content differs:
   the bytes agree; git tracks only the exec bit, so a clone with a tight umask
   reproduces that ghost;
 - `npm view` caches the packument for 300 s, so a read taken before publishing
-  can hide the version you just published — the workflow's post-publish reads
-  pass `--prefer-online` for that reason;
-- a content diff is meaningful only because `repository.url` in `package.json`
-  holds npm's NORMALISED form (`git+https://….git`): npm rewrites the browsable
-  form while packing, which is how 0.4.0's local sha1 and registry shasum
-  diverged (#377).
+  can hide the version you just published — the workflow's reads pass
+  `--prefer-online` for that reason.
 
 Documentary labels in code comments and docs — `Task N`, `spec §x`, `controller
 ruling`, `UltraReview` — point at internal SDD process records under

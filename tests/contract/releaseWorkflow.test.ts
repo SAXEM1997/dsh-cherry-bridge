@@ -51,6 +51,24 @@ const code = (text: string): string =>
     .filter((line) => !/^\s*#/.test(line))
     .join('\n')
 
+/** The workflow text between two anchors. Both must exist and be in order: an
+ * inverted pair used to yield `''`, which a `toContain` then fails on with a
+ * message that names neither anchor, and a `not.toContain` passes. */
+const between = (text: string, from: string, to: string): string => {
+  const start = text.indexOf(from)
+  const end = text.indexOf(to)
+  expect(start, `missing anchor: ${from}`).toBeGreaterThan(-1)
+  expect(end, `anchor ${to} does not follow ${from}`).toBeGreaterThan(start)
+  return text.slice(start, end)
+}
+
+/** The workflow text from `from` to the end of the file. */
+const after = (text: string, from: string): string => {
+  const start = text.indexOf(from)
+  expect(start, `missing anchor: ${from}`).toBeGreaterThan(-1)
+  return text.slice(start)
+}
+
 describe('the tag-driven release keeps the guards that fail silently', () => {
   it('①a release.yml exists, triggers on v* tags, and may write the release', () => {
     expect(existsSync(RELEASE), 'release.yml is gone: the release path is manual again').toBe(true)
@@ -68,9 +86,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
 
   it('①b the tag check names the package.json version, and only a tag push enforces it', () => {
     const text = read(RELEASE)
-    const tagStep = text.slice(
-      text.indexOf('the tag names the version in package.json'),
-      text.indexOf('the tag commit is on main'),
+    const tagStep = between(
+      text,
+      'the tag names the version in package.json',
+      'the tag commit is on main',
     )
     expect(tagStep).toContain('TAG="${GITHUB_REF_NAME}"')
     expect(tagStep).toContain('[ "v$VERSION" = "$TAG" ]')
@@ -122,9 +141,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     )
     // Both markers existing is not enough: the order check keeps Chinese first.
     expect(text).toContain('[ "$ZH" -lt "$EN" ]')
-    const notes = text.slice(
-      text.indexOf('the release notes for this version exist'),
-      text.indexOf('the README install pins'),
+    const notes = between(
+      text,
+      'the release notes for this version exist',
+      'the README install pins',
     )
     expect(notes.match(/exit 1/g)?.length, 'both notes failures must stop the run').toBe(2)
   })
@@ -139,14 +159,15 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(text).toContain('grep -q "dsh-cherry-bridge@$VERSION" "$f"')
     expect(text).toContain('grep -q "#v$VERSION" "$f"')
     expect(text.indexOf('README.en.md')).toBeLessThan(text.indexOf('npm publish --tag latest'))
-    const pins = text.slice(
-      text.indexOf('the README install pins'),
-      text.indexOf('a backfill must not move latest backwards'),
+    const pins = between(
+      text,
+      'the README install pins',
+      'a backfill must not move latest backwards',
     )
     expect(pins.match(/exit 1/g)?.length, 'both pin forms must stop the run').toBe(2)
   })
 
-  it('①g the gate runs prepublishOnly and the artifact diff before publishing', () => {
+  it('①g the gate runs prepublishOnly and the whole-tree diff before publishing', () => {
     const text = read(RELEASE)
     expect(text).toContain('npm run prepublishOnly')
     // The WHOLE tree, not `-- dist lib`: a tracked file under `files` rewritten
@@ -171,10 +192,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const text = read(RELEASE)
     // Two steps, not one shell branch: the tag step is the only one that can
     // publish; the dispatch step is the only one that can dry-run.
-    const publish = text.slice(
-      text.indexOf('publish (tag push only)'),
-      text.indexOf('dry run (dispatch only)'),
-    )
+    const publish = between(text, 'publish (tag push only)', 'dry run (dispatch only)')
     expect(publish).toContain("if: github.event_name == 'push'")
     // Only a 404 means "not published". A network, 5xx or auth failure that
     // fell through to `npm publish` would come back as a 409 on an
@@ -194,9 +212,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     )
     expect(publish).toContain('is already published; skipping')
     expect(publish).toContain('npm publish --tag latest')
-    const dry = text.slice(
-      text.indexOf('dry run (dispatch only)'),
-      text.indexOf('the published contents match the tag tree'),
+    const dry = between(
+      text,
+      'dry run (dispatch only)',
+      'the published contents match the tag tree',
     )
     expect(dry).toContain("if: github.event_name == 'workflow_dispatch'")
     expect(dry).toContain('npm publish --dry-run --tag latest')
@@ -213,9 +232,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // The pre-publish check is what refuses a backfill: publishing first would
     // move `latest` to the older version, and the post-publish check would then
     // agree with itself.
-    const backfill = text.slice(
-      text.indexOf('a backfill must not move latest backwards'),
-      text.indexOf('no draft release for this tag'),
+    const backfill = between(
+      text,
+      'a backfill must not move latest backwards',
+      'no draft release for this tag',
     )
     expect(backfill).toContain('case "$VERSION" in')
     expect(backfill).toContain('*-*')
@@ -235,9 +255,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     expect(text.indexOf("the registry's latest tag names this version")).toBeLessThan(
       text.indexOf('gh release create'),
     )
-    const latest = text.slice(
-      text.indexOf("the registry's latest tag names this version"),
-      text.indexOf('create the GitHub Release (idempotent)'),
+    const latest = between(
+      text,
+      "the registry's latest tag names this version",
+      'create the GitHub Release (idempotent)',
     )
     expect(latest.match(/exit 1/g)?.length, 'a stale latest tag must stop the release').toBe(1)
     // The pre-publish reads leave the packument cached without the new
@@ -254,13 +275,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // mode ghost, the wrapper's 11-byte difference), so the gate unpacks both
     // and diffs CONTENTS.
     expect(code(text), 'the shasum tautology is back').not.toContain('dist.shasum')
-    const pack = text.slice(
-      text.indexOf('pack the tag tree'),
-      text.indexOf('publish (tag push only)'),
-    )
+    const pack = between(text, 'pack the tag tree', 'publish (tag push only)')
     expect(pack).toContain('npm pack --pack-destination "$RUNNER_TEMP/tag-tree"')
-    // Packed OUTSIDE the repo: a tarball inside the tree would be repacked
-    // into the very tarball that publishes.
+    // Packed OUTSIDE the repo so nothing the gate creates can reach the packed
+    // tree, whatever `files` happens to whitelist.
     expect(pack).toContain('mkdir -p "$RUNNER_TEMP/tag-tree"')
     expect(pack, 'the tag-tree pack is not gated to a tag push').toMatch(
       /^\s*if: github\.event_name == 'push'$/m,
@@ -269,9 +287,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
       text.indexOf('npm publish --tag latest'),
     )
 
-    const verify = text.slice(
-      text.indexOf('the published contents match the tag tree'),
-      text.indexOf("the registry's latest tag names this version"),
+    const verify = between(
+      text,
+      'the published contents match the tag tree',
+      "the registry's latest tag names this version",
     )
     expect(verify, 'the verification step is gone').not.toBe('')
     expect(verify, 'the verification step is not gated to a tag push').toMatch(
@@ -299,11 +318,15 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
       verify.match(/exit 1/g)?.length,
       'a content mismatch and an exhausted retry must both stop the run',
     ).toBe(2)
-    // The proof exists only if it runs before the release announces anything.
-    expect(text.indexOf('diff -r')).toBeLessThan(text.indexOf('gh release create'))
+    // The proof exists only if the STEP runs before the release announces
+    // anything. Anchor on the step name: `diff -r` also appears in the header
+    // comment, so `indexOf('diff -r')` would hold for any step order.
+    expect(text.indexOf('the published contents match the tag tree')).toBeLessThan(
+      text.indexOf('gh release create'),
+    )
   })
 
-  it('①k the release is created from the extracted notes, and the bare asset is attached', () => {
+  it('①k the release is created from the extracted notes, refreshed, and the bare asset attached', () => {
     const text = read(RELEASE)
     expect(text).toContain('gh release view "v$VERSION"')
     expect(text).toContain('gh release create "v$VERSION"')
@@ -316,26 +339,10 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     const upload = /^.*gh release upload.*$/m.exec(text)?.[0] ?? ''
     expect(upload, 'the upload step is gone').toContain('gh release upload')
     expect(upload).toContain('dsh-cherry-bridge.tgz')
-    // The draft gate must also run BEFORE the irreversible step: a draft left
-    // over from an earlier attempt would otherwise publish a version whose
-    // release can never be created.
-    const draftGate = text.slice(
-      text.indexOf('no draft release for this tag'),
-      text.indexOf('pack the tag tree'),
-    )
-    expect(draftGate, 'the pre-publish draft gate is missing').not.toBe('')
-    expect(draftGate, 'the pre-publish draft gate is not gated to a tag push').toMatch(
-      /^\s*if: github\.event_name == 'push'$/m,
-    )
-    expect(draftGate).toContain('--json isDraft')
-    expect(draftGate.match(/exit 1/g)?.length).toBe(1)
-    expect(text.indexOf('no draft release for this tag')).toBeLessThan(
-      text.indexOf('npm publish --tag latest'),
-    )
-
-    const release = text.slice(
-      text.indexOf('create the GitHub Release (idempotent)'),
-      text.indexOf('attach the version-independent tarball name'),
+    const release = between(
+      text,
+      'create the GitHub Release (idempotent)',
+      'attach the version-independent tarball name',
     )
     // A draft is someone else's release in progress: publishing it here would
     // announce text this chain never reviewed. Refuse rather than adopt.
@@ -360,7 +367,7 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // 0.3.0's attach run failed on a single curl that answered 504 for about
     // three minutes after the upload — the release was complete and correct.
     const text = read(RELEASE)
-    const urlStep = text.slice(text.indexOf("the catalog's URL answers 200"))
+    const urlStep = after(text, "the catalog's URL answers 200")
     // Anchor to the URL step: the dist-tags loop also uses `seq 1 6`, so a bare
     // `toContain` would survive deleting the URL retry.
     expect(urlStep).toContain('for attempt in $(seq 1 6)')
@@ -382,30 +389,6 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
     // push trigger must also keep its branch filter.
     expect(on).not.toMatch(/tags:/)
     expect(on).toMatch(/push:\n\s+branches: \[main\]/)
-  })
-
-  it('①o the tag commit must be on main', () => {
-    // A `v*` on a feature-branch tip would publish unreviewed code and mark it
-    // latest. `compare/main...<tag commit>` answers `behind` once main has taken
-    // the release merge (measured on v0.4.2) and `identical` when the tag is
-    // main's tip; `ahead`/`diverged` mean the commit is not in main.
-    const text = read(RELEASE)
-    const step = text.slice(
-      text.indexOf('the tag commit is on main'),
-      text.indexOf('the release notes for this version exist'),
-    )
-    expect(step, 'the tag-on-main step is missing').not.toBe('')
-    expect(step, 'the tag-on-main step is not gated to a tag push').toMatch(
-      /^\s*if: github\.event_name == 'push'$/m,
-    )
-    expect(step).toContain('gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA"')
-    expect(step).toContain('--jq .status')
-    expect(step).toMatch(/behind\|identical\)/)
-    expect(step.match(/exit 1/g)?.length, 'a tag off main must stop the run').toBe(1)
-    // It must decide before anything is published.
-    expect(text.indexOf('the tag commit is on main')).toBeLessThan(
-      text.indexOf('npm publish --tag latest'),
-    )
   })
 
   it('①n every publishing and release step is gated to a tag push', () => {
@@ -434,5 +417,48 @@ describe('the tag-driven release keeps the guards that fail silently', () => {
         /^\s*if: github\.event_name == 'push'$/m,
       )
     }
+  })
+
+  it('①o the tag commit must be on main', () => {
+    // A `v*` on a feature-branch tip would publish unreviewed code and mark it
+    // latest. `compare/main...<tag commit>` answers `behind` once main has taken
+    // the release merge (measured on v0.4.2) and `identical` when the tag is
+    // main's tip; `ahead`/`diverged` mean the commit is not in main.
+    const text = read(RELEASE)
+    const step = between(
+      text,
+      'the tag commit is on main',
+      'the release notes for this version exist',
+    )
+    expect(step, 'the tag-on-main step is not gated to a tag push').toMatch(
+      /^\s*if: github\.event_name == 'push'$/m,
+    )
+    expect(step).toContain('gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA"')
+    expect(step).toContain('--jq .status')
+    expect(step).toMatch(/behind\|identical\)/)
+    expect(step.match(/exit 1/g)?.length, 'a tag off main must stop the run').toBe(1)
+    // It must decide before anything is published.
+    expect(text.indexOf('the tag commit is on main')).toBeLessThan(
+      text.indexOf('npm publish --tag latest'),
+    )
+  })
+
+  it('①p a draft release is refused before the publish, not only after it', () => {
+    // The late gate alone left a published version whose release could never be
+    // created: a draft from an earlier attempt failed the run AFTER the
+    // irreversible step. Same refusal, on the cheap side of the publish.
+    const text = read(RELEASE)
+    const gate = between(text, 'no draft release for this tag', 'pack the tag tree')
+    expect(gate, 'the pre-publish draft gate is not gated to a tag push').toMatch(
+      /^\s*if: github\.event_name == 'push'$/m,
+    )
+    expect(gate).toContain('gh release view "v$VERSION" --json isDraft --jq .isDraft')
+    // Pin the comparison and the exit together: `= "false"` or a dead `if`
+    // would leave the gate unable to fire while the exit count stayed 1.
+    expect(gate).toMatch(/\[ "\$DRAFT" = "true" \][\s\S]*?exit 1/)
+    expect(gate.match(/exit 1/g)?.length, 'a draft must stop the run').toBe(1)
+    expect(text.indexOf('no draft release for this tag')).toBeLessThan(
+      text.indexOf('npm publish --tag latest'),
+    )
   })
 })
